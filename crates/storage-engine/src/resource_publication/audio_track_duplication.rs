@@ -8,13 +8,13 @@
 use super::{
     INTENT_NAME, INTENT_STAGING_NAME, MANIFEST_NAME, MAX_ENTRIES, MAX_JSON_BYTES,
     MAX_JSON_FILE_BYTES, MAX_SAFE_INTEGER, PREVIOUS_PROJECT_NAME, PROJECT_STAGING_NAME,
-    ProjectResourcePublicationError, ProjectResourcePublicationErrorKind, StructurallyVerifiedProject,
-    TRANSACTION_NAME, TransactionFile, caused, decode_digest, digest, failure, file_name,
-    hex_digest, open_optional_dir, open_or_create_dir, open_stable_project_root,
-    missing_file, open_relative_parent, publish_staged_file, read_bounded, read_optional_file,
-    remove_optional_matching_file, require_canonical, sync_dir, validate_canonical_resource, verify_committed,
-    verify_project_candidate, verify_project_package, verify_retained_project_candidate,
-    write_exclusive_synced,
+    ProjectResourcePublicationError, ProjectResourcePublicationErrorKind,
+    StructurallyVerifiedProject, TRANSACTION_NAME, TransactionFile, caused, decode_digest, digest,
+    failure, file_name, hex_digest, missing_file, open_optional_dir, open_or_create_dir,
+    open_relative_parent, open_stable_project_root, publish_staged_file, read_bounded,
+    read_optional_file, remove_optional_matching_file, require_canonical, sync_dir,
+    validate_canonical_resource, verify_committed, verify_project_candidate,
+    verify_project_package, verify_retained_project_candidate, write_exclusive_synced,
 };
 use crate::project_lock::{
     AUDIO_TRACK_DUPLICATION_TRANSACTION_PREFIX, ProjectLock, ProjectTransactionFamily,
@@ -23,7 +23,9 @@ use crate::project_lock::{
 use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
 use hyper_native_device::DeviceChain;
-use hyper_playback_json::{AudioTrackDuplicationDocument, AudioTrackDuplicationDocuments, TrackDuplicationDocuments};
+use hyper_playback_json::{
+    AudioTrackDuplicationDocument, AudioTrackDuplicationDocuments, TrackDuplicationDocuments,
+};
 use hyper_project_model::{ProjectManifest, ResourceRole, is_valid_entity_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -302,8 +304,12 @@ fn publish_audio_track_duplication_observed(
                 "project revision cannot be incremented",
             )
         })?;
-    let candidate_project = candidate_duplication_manifest(&previous_project, &entries, next_revision)?;
-    let transaction_name = format!("{AUDIO_TRACK_DUPLICATION_TRANSACTION_PREFIX}{}", Uuid::new_v4());
+    let candidate_project =
+        candidate_duplication_manifest(&previous_project, &entries, next_revision)?;
+    let transaction_name = format!(
+        "{AUDIO_TRACK_DUPLICATION_TRANSACTION_PREFIX}{}",
+        Uuid::new_v4()
+    );
     backups.create_dir(&transaction_name).map_err(|error| {
         caused(
             ProjectResourcePublicationErrorKind::Io,
@@ -312,13 +318,15 @@ fn publish_audio_track_duplication_observed(
         )
     })?;
     sync_dir(&backups)?;
-    let transaction = backups.open_dir_nofollow(&transaction_name).map_err(|error| {
-        caused(
-            ProjectResourcePublicationErrorKind::Io,
-            "open audio-track duplication transaction",
-            error,
-        )
-    })?;
+    let transaction = backups
+        .open_dir_nofollow(&transaction_name)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "open audio-track duplication transaction",
+                error,
+            )
+        })?;
     let result = run_audio_track_duplication_publication(
         &verified,
         &backups,
@@ -340,7 +348,9 @@ fn publish_audio_track_duplication_observed(
             )
             .map_err(|error| ProjectResourcePublicationError {
                 kind: ProjectResourcePublicationErrorKind::Recovery,
-                message: "audio-track duplication was published but transaction cleanup is incomplete".to_owned(),
+                message:
+                    "audio-track duplication was published but transaction cleanup is incomplete"
+                        .to_owned(),
                 published: true,
                 source: Some(Box::new(error)),
             })?;
@@ -404,7 +414,10 @@ fn run_audio_track_duplication_publication(
     write_exclusive_synced(transaction, TRANSACTION_NAME, &bytes)?;
     sync_dir(transaction)?;
     sync_dir(backups)?;
-    observer(AudioTrackDuplicationPublicationPhase::Transaction, verified.root())?;
+    observer(
+        AudioTrackDuplicationPublicationPhase::Transaction,
+        verified.root(),
+    )?;
     for (index, entry) in tx.entries.iter().enumerate() {
         let parent = prepare_entry_parent(&verified.root_dir, entry)?;
         publish_staged_file(
@@ -416,16 +429,21 @@ fn run_audio_track_duplication_publication(
             &format!(".audio-track-duplication-{index}-{}.json", tx.id),
             "audio-track duplication resource",
         )?;
-        observer(AudioTrackDuplicationPublicationPhase::Resource(index), verified.root())?;
+        observer(
+            AudioTrackDuplicationPublicationPhase::Resource(index),
+            verified.root(),
+        )?;
     }
-    let candidate = verify_project_candidate(verified.root(), &verified.root_dir, candidate_project)
-        .map_err(|error| {
-            caused(
-                ProjectResourcePublicationErrorKind::Integrity,
-                "audio-track duplication candidate does not verify",
-                error,
-            )
-        })?;
+    let candidate =
+        verify_project_candidate(verified.root(), &verified.root_dir, candidate_project).map_err(
+            |error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "audio-track duplication candidate does not verify",
+                    error,
+                )
+            },
+        )?;
     if candidate.revision() != next_revision {
         return Err(failure(
             ProjectResourcePublicationErrorKind::Integrity,
@@ -441,8 +459,15 @@ fn run_audio_track_duplication_publication(
         &format!(".audio-track-duplication-project-{}.json", tx.id),
         "audio-track duplication project manifest",
     )?;
-    observer(AudioTrackDuplicationPublicationPhase::Manifest, verified.root())?;
-    verify_committed(verified.root(), &verified.root_dir, digest(candidate_project))?;
+    observer(
+        AudioTrackDuplicationPublicationPhase::Manifest,
+        verified.root(),
+    )?;
+    verify_committed(
+        verified.root(),
+        &verified.root_dir,
+        digest(candidate_project),
+    )?;
     Ok(AudioTrackDuplicationPublicationOutcome {
         project_identity: digest(candidate_project),
         project_revision: next_revision,
@@ -476,7 +501,12 @@ fn resolve_entries<'a>(
                 "allocate audio-track duplication resource entries",
             )
         })?;
-    push_addition(verified, &mut entries, documents.track(), ResourceRole::Track)?;
+    push_addition(
+        verified,
+        &mut entries,
+        documents.track(),
+        ResourceRole::Track,
+    )?;
     for document in documents.clips() {
         push_addition(verified, &mut entries, document, ResourceRole::Clip)?;
     }
@@ -557,7 +587,11 @@ fn push_addition<'a>(
         descriptor.id() == document.id()
             || descriptor.path().eq_ignore_ascii_case(&path)
             || descriptor.id() == document.id()
-    }) || verified.manifest().assets().iter().any(|asset| asset.id() == document.id())
+    }) || verified
+        .manifest()
+        .assets()
+        .iter()
+        .any(|asset| asset.id() == document.id())
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::ResourceConflict,
@@ -908,13 +942,15 @@ fn write_duplication_intent(
         )
     })?;
     write_exclusive_synced(transaction, INTENT_STAGING_NAME, &bytes)?;
-    transaction.rename(INTENT_STAGING_NAME, transaction, INTENT_NAME).map_err(|error| {
-        caused(
-            ProjectResourcePublicationErrorKind::Io,
-            "publish audio-track duplication intent",
-            error,
-        )
-    })?;
+    transaction
+        .rename(INTENT_STAGING_NAME, transaction, INTENT_NAME)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "publish audio-track duplication intent",
+                error,
+            )
+        })?;
     sync_dir(transaction)
 }
 
@@ -944,12 +980,14 @@ fn transaction_id(directory_name: &str) -> Result<String, ProjectResourcePublica
 }
 
 fn resource_parent(path: &str) -> Result<&str, ProjectResourcePublicationError> {
-    path.rsplit_once('/').map(|(parent, _)| parent).ok_or_else(|| {
-        failure(
-            ProjectResourcePublicationErrorKind::Integrity,
-            "audio-track duplication resource path has no parent",
-        )
-    })
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "audio-track duplication resource path has no parent",
+            )
+        })
 }
 
 fn prepare_entry_parent(
@@ -1015,13 +1053,19 @@ fn recover_after_publication_error(
         Ok(tx) => tx,
         Err(_) if missing_file(&transaction, TRANSACTION_NAME)? => {
             validate_duplication_prepublication_residue(&transaction, transaction_name)?;
-            clear_and_remove_audio_track_duplication_transaction(backups, transaction, transaction_name)?;
+            clear_and_remove_audio_track_duplication_transaction(
+                backups,
+                transaction,
+                transaction_name,
+            )?;
             return Err(operation_error);
         }
         Err(source) => {
             return Err(ProjectResourcePublicationError {
                 kind: ProjectResourcePublicationErrorKind::Recovery,
-                message: "audio-track duplication failed and its durable transaction could not be read".to_owned(),
+                message:
+                    "audio-track duplication failed and its durable transaction could not be read"
+                        .to_owned(),
                 published: false,
                 source: Some(Box::new(source)),
             });
@@ -1140,11 +1184,13 @@ fn recover_audio_track_duplication_transaction(
     let after = decode_digest(&tx.after_project_sha256)?;
     let active = read_bounded(root, MANIFEST_NAME, MAX_JSON_BYTES).map(|bytes| digest(&bytes))?;
     if active == after {
-        verify_committed(root_path, root, after).map_err(|source| ProjectResourcePublicationError {
-            kind: ProjectResourcePublicationErrorKind::Recovery,
-            message: "committed audio-track duplication could not be verified".to_owned(),
-            published: true,
-            source: Some(Box::new(source)),
+        verify_committed(root_path, root, after).map_err(|source| {
+            ProjectResourcePublicationError {
+                kind: ProjectResourcePublicationErrorKind::Recovery,
+                message: "committed audio-track duplication could not be verified".to_owned(),
+                published: true,
+                source: Some(Box::new(source)),
+            }
         })?;
         cleanup_duplication_temporaries(root, backups, tx)?;
         return Ok(AudioTrackDuplicationPublicationRecoveryDisposition::Committed);
@@ -1181,14 +1227,17 @@ fn recover_audio_track_duplication_transaction(
         }
     }
     remove_created_parents(root, tx)?;
-    verify_retained_project_candidate(root, &read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?)
-        .map_err(|error| {
-            caused(
-                ProjectResourcePublicationErrorKind::Recovery,
-                "rolled-back audio-track duplication project does not verify",
-                error,
-            )
-        })?;
+    verify_retained_project_candidate(
+        root,
+        &read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?,
+    )
+    .map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "rolled-back audio-track duplication project does not verify",
+            error,
+        )
+    })?;
     cleanup_duplication_temporaries(root, backups, tx)?;
     Ok(AudioTrackDuplicationPublicationRecoveryDisposition::RolledBack)
 }
@@ -1200,7 +1249,9 @@ fn validate_duplication_rollback_authority(
     for entry in &tx.entries {
         let parent = match open_relative_parent(root, &entry.resource.path) {
             Ok(parent) => parent,
-            Err(_) if entry.previous_resource.is_none() && entry.created_parent_directory => continue,
+            Err(_) if entry.previous_resource.is_none() && entry.created_parent_directory => {
+                continue;
+            }
             Err(error) => return Err(error),
         };
         let current = read_optional_file(&parent, file_name(&entry.resource.path)?)?;
@@ -1359,11 +1410,13 @@ fn validate_staged_duplication_transaction(
             )
         })?;
         let bytes = read_bounded(transaction, &staged_name(index), MAX_JSON_BYTES)?;
-        validate_document(&entry.id, &bytes, role).map_err(|error| ProjectResourcePublicationError {
-            kind: ProjectResourcePublicationErrorKind::Recovery,
-            message: "staged audio-track duplication resource is invalid".to_owned(),
-            published: false,
-            source: Some(Box::new(error)),
+        validate_document(&entry.id, &bytes, role).map_err(|error| {
+            ProjectResourcePublicationError {
+                kind: ProjectResourcePublicationErrorKind::Recovery,
+                message: "staged audio-track duplication resource is invalid".to_owned(),
+                published: false,
+                source: Some(Box::new(error)),
+            }
         })?;
         if bytes.len() as u64 != entry.resource.byte_length
             || digest(&bytes) != decode_digest(&entry.resource.sha256)?
@@ -1375,11 +1428,13 @@ fn validate_staged_duplication_transaction(
         }
         let previous = match &entry.previous_resource {
             Some(previous) => {
-                let bytes = read_bounded(transaction, &previous_staged_name(index), MAX_JSON_BYTES)?;
+                let bytes =
+                    read_bounded(transaction, &previous_staged_name(index), MAX_JSON_BYTES)?;
                 validate_document(&entry.id, &bytes, role).map_err(|error| {
                     ProjectResourcePublicationError {
                         kind: ProjectResourcePublicationErrorKind::Recovery,
-                        message: "staged previous audio-track duplication resource is invalid".to_owned(),
+                        message: "staged previous audio-track duplication resource is invalid"
+                            .to_owned(),
                         published: false,
                         source: Some(Box::new(error)),
                     }
@@ -1430,7 +1485,8 @@ fn validate_staged_duplication_transaction(
             created_parent_directory: entry.created_parent_directory,
         });
     }
-    let expected = candidate_duplication_manifest(&previous_project, &entries, tx.after_project_revision)?;
+    let expected =
+        candidate_duplication_manifest(&previous_project, &entries, tx.after_project_revision)?;
     if expected != candidate_project {
         return Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
@@ -1479,7 +1535,10 @@ fn validate_manifest_entry(
                 && before.path() == entry.resource.path
                 && before.byte_length() == bytes.len() as u64
                 && before.sha256() == hex_digest(digest(bytes))
-                && file.path == entry.resource.path => Ok(()),
+                && file.path == entry.resource.path =>
+        {
+            Ok(())
+        }
         _ => Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
             "audio-track duplication transaction does not match the previous manifest",
@@ -1493,13 +1552,14 @@ fn read_duplication_transaction(
 ) -> Result<DuplicationTransactionRecord, ProjectResourcePublicationError> {
     let intent_bytes = read_bounded(transaction, INTENT_NAME, MAX_JSON_BYTES)?;
     require_canonical(&intent_bytes, "audio-track duplication transaction intent")?;
-    let intent: DuplicationTransactionIntent = serde_json::from_slice(&intent_bytes).map_err(|error| {
-        caused(
-            ProjectResourcePublicationErrorKind::Recovery,
-            "parse audio-track duplication transaction intent",
-            error,
-        )
-    })?;
+    let intent: DuplicationTransactionIntent =
+        serde_json::from_slice(&intent_bytes).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "parse audio-track duplication transaction intent",
+                error,
+            )
+        })?;
     let bytes = read_bounded(transaction, TRANSACTION_NAME, MAX_JSON_BYTES)?;
     require_canonical(&bytes, "audio-track duplication transaction")?;
     let tx: DuplicationTransactionRecord = serde_json::from_slice(&bytes).map_err(|error| {
@@ -1571,14 +1631,18 @@ fn validate_duplication_prepublication_residue(
         0
     } else {
         let bytes = read_bounded(transaction, INTENT_NAME, MAX_JSON_BYTES)?;
-        require_canonical(&bytes, "incomplete audio-track duplication transaction intent")?;
-        let intent: DuplicationTransactionIntent = serde_json::from_slice(&bytes).map_err(|error| {
-            caused(
-                ProjectResourcePublicationErrorKind::Recovery,
-                "parse incomplete audio-track duplication transaction intent",
-                error,
-            )
-        })?;
+        require_canonical(
+            &bytes,
+            "incomplete audio-track duplication transaction intent",
+        )?;
+        let intent: DuplicationTransactionIntent =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "parse incomplete audio-track duplication transaction intent",
+                    error,
+                )
+            })?;
         if intent.format != "hyper-audio-track-duplication-intent"
             || intent.format_version != 1
             || !intent.extensions.is_empty()
@@ -1673,13 +1737,15 @@ fn clear_and_remove_audio_track_duplication_transaction(
     name: &str,
 ) -> Result<(), ProjectResourcePublicationError> {
     let quarantine = format!(".audio-track-duplication-cleanup-{}", Uuid::new_v4());
-    backups.rename(name, backups, &quarantine).map_err(|error| {
-        caused(
-            ProjectResourcePublicationErrorKind::Recovery,
-            "quarantine audio-track duplication transaction",
-            error,
-        )
-    })?;
+    backups
+        .rename(name, backups, &quarantine)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "quarantine audio-track duplication transaction",
+                error,
+            )
+        })?;
     let moved = backups.open_dir_nofollow(&quarantine).map_err(|error| {
         caused(
             ProjectResourcePublicationErrorKind::Recovery,
@@ -1847,7 +1913,13 @@ mod tests {
                 ],"assets":[],"extensions":{}
             }));
             fs::write(root.join(MANIFEST_NAME), manifest).unwrap();
-            Self { root, parent, timeline, track, mixer }
+            Self {
+                root,
+                parent,
+                timeline,
+                track,
+                mixer,
+            }
         }
 
         fn documents(&self) -> ([u8; 32], AudioTrackDuplicationDocuments) {
@@ -2108,8 +2180,14 @@ mod tests {
         assert_eq!(outcome.project_revision(), 2);
         let package = verify_project_package(&fixture.root).unwrap();
         assert_eq!(*package.manifest_sha256(), *outcome.project_identity());
-        assert_eq!(package.read_resource(DUPLICATED_TRACK_ID).unwrap(), documents.track().bytes());
-        assert_eq!(package.read_resource(MIXER_ID).unwrap(), documents.mixer().bytes());
+        assert_eq!(
+            package.read_resource(DUPLICATED_TRACK_ID).unwrap(),
+            documents.track().bytes()
+        );
+        assert_eq!(
+            package.read_resource(MIXER_ID).unwrap(),
+            documents.mixer().bytes()
+        );
     }
 
     #[test]
@@ -2141,17 +2219,24 @@ mod tests {
             documents.scenes()[0].bytes()
         );
         assert_eq!(
-            package.read_resource(documents.arrangement().unwrap().id()).unwrap(),
+            package
+                .read_resource(documents.arrangement().unwrap().id())
+                .unwrap(),
             documents.arrangement().unwrap().bytes()
         );
         assert_eq!(
-            package.read_resource(documents.automation_takes()[0].id()).unwrap(),
+            package
+                .read_resource(documents.automation_takes()[0].id())
+                .unwrap(),
             documents.automation_takes()[0].bytes()
         );
         let device = documents.device_chain().unwrap();
         assert_eq!(package.read_resource(device.id()).unwrap(), device.bytes());
         assert!(fixture.root.join("devices").is_dir());
-        assert_eq!(DeviceChain::parse(device.bytes()).unwrap().format_version(), 2);
+        assert_eq!(
+            DeviceChain::parse(device.bytes()).unwrap().format_version(),
+            2
+        );
     }
 
     #[test]
@@ -2166,8 +2251,7 @@ mod tests {
                 NativeDeviceInstance::try_new_compressor(
                     device_id.to_owned(),
                     true,
-                    NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 0)
-                        .unwrap(),
+                    NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 0).unwrap(),
                 )
                 .unwrap(),
             ],
@@ -2215,7 +2299,10 @@ mod tests {
             } else {
                 AudioTrackDuplicationPublicationRecoveryDisposition::RolledBack
             };
-            assert_eq!(recovered.audio_track_duplications()[0].disposition(), expected);
+            assert_eq!(
+                recovered.audio_track_duplications()[0].disposition(),
+                expected
+            );
             let package = verify_project_package(&fixture.root).unwrap();
             if expected == AudioTrackDuplicationPublicationRecoveryDisposition::Committed {
                 assert_eq!(package.manifest().revision(), 2);
@@ -2225,11 +2312,13 @@ mod tests {
                 );
             } else {
                 assert_eq!(*package.manifest_sha256(), identity);
-                assert!(package
-                    .manifest()
-                    .resources()
-                    .iter()
-                    .all(|resource| resource.id() != DUPLICATED_TRACK_ID));
+                assert!(
+                    package
+                        .manifest()
+                        .resources()
+                        .iter()
+                        .all(|resource| resource.id() != DUPLICATED_TRACK_ID)
+                );
             }
         }
     }
@@ -2264,7 +2353,10 @@ mod tests {
                 AudioTrackDuplicationPublicationRecoveryDisposition::RolledBack
             };
             assert_eq!(recovered.audio_track_duplications().len(), 1);
-            assert_eq!(recovered.audio_track_duplications()[0].disposition(), expected);
+            assert_eq!(
+                recovered.audio_track_duplications()[0].disposition(),
+                expected
+            );
             let package = verify_project_package(&fixture.root).unwrap();
             if expected == AudioTrackDuplicationPublicationRecoveryDisposition::Committed {
                 assert_eq!(package.manifest().revision(), 2);
@@ -2291,11 +2383,13 @@ mod tests {
                     package.read_resource(DEVICE_CHAIN_ID).unwrap(),
                     fs::read(fixture.root.join("devices/lead.json")).unwrap()
                 );
-                assert!(package
-                    .manifest()
-                    .resources()
-                    .iter()
-                    .all(|resource| resource.id() != documents.track().id()));
+                assert!(
+                    package
+                        .manifest()
+                        .resources()
+                        .iter()
+                        .all(|resource| resource.id() != documents.track().id())
+                );
                 assert_eq!(
                     package.read_resource(ARRANGEMENT_ID).unwrap(),
                     fs::read(fixture.root.join("arrangement/main.json")).unwrap()

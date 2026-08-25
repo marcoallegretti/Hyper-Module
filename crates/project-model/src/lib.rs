@@ -722,7 +722,9 @@ mod tests {
     #[test]
     fn distinguishes_manifest_and_interactive_project_name_domains() {
         assert!(is_valid_project_name("Imported\u{0007} project"));
-        assert!(!is_valid_interactive_project_name("Imported\u{0007} project"));
+        assert!(!is_valid_interactive_project_name(
+            "Imported\u{0007} project"
+        ));
         assert!(!is_valid_interactive_project_name(" Outer whitespace"));
         assert!(is_valid_interactive_project_name("Session 01"));
     }

@@ -96,7 +96,8 @@ fn the_handshake_completes_and_reports_the_panel_it_found() {
         panic!("expected a connection, saw {events:?}");
     };
     assert_eq!(
-        found, descriptor(),
+        found,
+        descriptor(),
         "the runtime learns the panel's own description, not a default"
     );
     assert!(peers.session.is_connected());
@@ -285,9 +286,7 @@ fn heartbeat_overflow_is_contained_after_the_link_has_allocated_its_sequence() {
     }
 
     assert!(matches!(
-        peers
-            .session
-            .poll(u64::from(HEARTBEAT_INTERVAL_MS) + 1),
+        peers.session.poll(u64::from(HEARTBEAT_INTERVAL_MS) + 1),
         Some(PanelEvent::TransmitFailed(
             PanelSessionError::TransmitOverflow
         ))

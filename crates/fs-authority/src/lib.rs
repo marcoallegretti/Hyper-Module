@@ -400,13 +400,8 @@ fn read_stable_file_observed(
     maximum_bytes: u64,
     after_first_read: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<Vec<u8>> {
-    read_stable_file_snapshot_observed(
-        directory,
-        Path::new(name),
-        maximum_bytes,
-        after_first_read,
-    )
-    .map(|snapshot| snapshot.bytes)
+    read_stable_file_snapshot_observed(directory, Path::new(name), maximum_bytes, after_first_read)
+        .map(|snapshot| snapshot.bytes)
 }
 
 fn read_stable_file_snapshot_observed(
@@ -1394,12 +1389,12 @@ mod stable_file_tests {
     use cap_std::ambient_authority;
     use cap_std::fs::Dir;
 
+    #[cfg(target_os = "linux")]
+    use super::publish_bytes_no_replace;
     use super::{
         confirm_stable_absolute_file, open_syncable_directory_ambient, path_is_proven_absent,
         read_stable_absolute_file, read_stable_file, read_stable_file_observed, sync_directory,
     };
-    #[cfg(target_os = "linux")]
-    use super::publish_bytes_no_replace;
 
     struct TemporaryDirectory(PathBuf);
 
@@ -1456,10 +1451,16 @@ mod stable_file_tests {
         let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
 
         publish_bytes_no_replace(&directory, "mix.flac", b"verified").unwrap();
-        assert_eq!(fs::read(temporary.path().join("mix.flac")).unwrap(), b"verified");
+        assert_eq!(
+            fs::read(temporary.path().join("mix.flac")).unwrap(),
+            b"verified"
+        );
 
         assert!(publish_bytes_no_replace(&directory, "mix.flac", b"replacement").is_err());
-        assert_eq!(fs::read(temporary.path().join("mix.flac")).unwrap(), b"verified");
+        assert_eq!(
+            fs::read(temporary.path().join("mix.flac")).unwrap(),
+            b"verified"
+        );
     }
 
     #[test]

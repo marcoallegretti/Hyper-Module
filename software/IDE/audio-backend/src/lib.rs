@@ -75,20 +75,20 @@ where
     }
 }
 
-mod offline_export;
 mod capture;
+mod offline_export;
+pub use capture::{
+    CaptureCallback, CaptureCallbackConfigError, CaptureCallbackStatus, CaptureStreamCounters,
+    CaptureStreamSnapshot, InterleavedStereoCaptureProcessor,
+};
 pub use offline_export::{
     OfflineExportError, OfflineExportReport, OfflineExportSpec, OfflineTrackStem,
     OfflineTrackStemExportFile, OfflineTrackStemExportFormat, OfflineTrackStemExportReport,
     export_prepared_project_flac_with_mixer, export_prepared_project_track_stems_with_mixer,
-    export_prepared_project_wav_with_mixer,
-    export_project_wav, export_project_wav_with_mixer,
+    export_prepared_project_wav_with_mixer, export_project_wav, export_project_wav_with_mixer,
     render_prepared_project_offline_with_mixer, render_prepared_project_track_stems_with_mixer,
-    render_project_offline, render_project_offline_with_mixer, render_project_track_stems_with_mixer,
-};
-pub use capture::{
-    CaptureCallback, CaptureCallbackConfigError, CaptureCallbackStatus, CaptureStreamCounters,
-    CaptureStreamSnapshot, InterleavedStereoCaptureProcessor,
+    render_project_offline, render_project_offline_with_mixer,
+    render_project_track_stems_with_mixer,
 };
 
 #[cfg(any(
@@ -901,14 +901,14 @@ mod playback_session;
     target_os = "windows"
 ))]
 pub use playback_session::{
-    DesktopControlMappingBuildError, DesktopOutputStartError, DesktopOutputStopError,
-    DesktopMixerSend, DesktopMixerSendTap, DesktopNativeDevice,
-    DesktopPlaybackRecovery, DesktopPlaybackRecoveryPendingStart,
-    DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopWait,
-    DesktopPlaybackRecoveryPendingWait, DesktopPlaybackRecoveryStartError,
-    DesktopPlaybackRecoveryStopError, DesktopPlaybackSession, DesktopPlaybackSessionBuildError,
-    DesktopPlaybackSessionInput, DesktopPlaybackSessionStartError, DesktopPlaybackSessionStopError,
-    DesktopProjectOpenError, DesktopSceneAvailability,
+    DesktopControlMappingBuildError, DesktopMixerSend, DesktopMixerSendTap, DesktopNativeDevice,
+    DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackRecovery,
+    DesktopPlaybackRecoveryPendingStart, DesktopPlaybackRecoveryPendingStop,
+    DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackRecoveryPendingWait,
+    DesktopPlaybackRecoveryStartError, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
+    DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
+    DesktopPlaybackSessionStartError, DesktopPlaybackSessionStopError, DesktopProjectOpenError,
+    DesktopSceneAvailability,
 };
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),

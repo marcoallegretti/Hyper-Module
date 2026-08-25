@@ -158,12 +158,14 @@ fn publish_native_filter(source_root: &Path) {
         "018f47a2-6b2d-7c11-8a44-0011223375a0".to_owned(),
         project_id,
         track_id,
-        vec![NativeDeviceInstance::try_new_filter(
-            "018f47a2-6b2d-7c11-8a44-0011223375a1".to_owned(),
-            true,
-            NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_000).unwrap(),
-        )
-        .unwrap()],
+        vec![
+            NativeDeviceInstance::try_new_filter(
+                "018f47a2-6b2d-7c11-8a44-0011223375a1".to_owned(),
+                true,
+                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_000).unwrap(),
+            )
+            .unwrap(),
+        ],
     )
     .unwrap();
     let chain_bytes = chain.to_canonical_vec().unwrap();
@@ -196,12 +198,14 @@ fn publish_native_compressor(source_root: &Path) {
         "018f47a2-6b2d-7c11-8a44-0011223375a2".to_owned(),
         project_id,
         track_id,
-        vec![NativeDeviceInstance::try_new_compressor(
-            "018f47a2-6b2d-7c11-8a44-0011223375a3".to_owned(),
-            true,
-            NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 0).unwrap(),
-        )
-        .unwrap()],
+        vec![
+            NativeDeviceInstance::try_new_compressor(
+                "018f47a2-6b2d-7c11-8a44-0011223375a3".to_owned(),
+                true,
+                NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 0).unwrap(),
+            )
+            .unwrap(),
+        ],
     )
     .unwrap();
     let chain_bytes = chain.to_canonical_vec().unwrap();
@@ -234,12 +238,14 @@ fn publish_native_filter_and_compressor(source_root: &Path) {
         "018f47a2-6b2d-7c11-8a44-0011223375a4".to_owned(),
         project_id,
         track_id,
-        vec![NativeDeviceInstance::try_new_filter(
-            "018f47a2-6b2d-7c11-8a44-0011223375a5".to_owned(),
-            true,
-            NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_000).unwrap(),
-        )
-        .unwrap()],
+        vec![
+            NativeDeviceInstance::try_new_filter(
+                "018f47a2-6b2d-7c11-8a44-0011223375a5".to_owned(),
+                true,
+                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_000).unwrap(),
+            )
+            .unwrap(),
+        ],
     )
     .unwrap()
     .try_with_appended_compressor(

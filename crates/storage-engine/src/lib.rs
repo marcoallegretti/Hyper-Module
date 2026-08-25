@@ -3,8 +3,8 @@
 
 mod mapping_publication;
 mod mixer_recovery;
-mod project_creation;
 mod project_copy;
+mod project_creation;
 mod project_lock;
 mod project_recovery;
 mod project_rename;
@@ -16,29 +16,28 @@ pub use mapping_publication::{
     ControlMappingPublicationError, ControlMappingPublicationErrorKind,
     ControlMappingPublicationOutcome, ControlMappingPublicationRecovery,
     ControlMappingPublicationRecoveryDisposition, ControlMappingPublicationRequest,
-    RequiredControlCapabilities,
-    publish_control_mapping, recover_control_mapping_publications,
+    RequiredControlCapabilities, publish_control_mapping, recover_control_mapping_publications,
 };
 pub use mixer_recovery::{
     MixerRecoverySnapshot, MixerRecoverySnapshotError, MixerRecoverySnapshotErrorKind,
-    MixerRecoverySnapshotRequest, clear_mixer_recovery_snapshot,
-    load_mixer_recovery_snapshot, store_mixer_recovery_snapshot,
+    MixerRecoverySnapshotRequest, clear_mixer_recovery_snapshot, load_mixer_recovery_snapshot,
+    store_mixer_recovery_snapshot,
+};
+pub use project_copy::{
+    ProjectCopyError, ProjectCopyErrorKind, ProjectCopyOutcome, ProjectCopyRequest, copy_project,
 };
 pub use project_creation::{
     ProjectCreationError, ProjectCreationErrorKind, ProjectCreationOutcome, ProjectCreationRequest,
     create_project,
-};
-pub use project_copy::{
-    ProjectCopyError, ProjectCopyErrorKind, ProjectCopyOutcome, ProjectCopyRequest, copy_project,
 };
 pub use project_recovery::{
     ProjectTransactionRecoveryError, ProjectTransactionRecoveryErrorSource,
     ProjectTransactionRecoveryReport, recover_project_transactions,
 };
 pub use project_rename::{
-    ProjectRenameError, ProjectRenameErrorKind, ProjectRenameOutcome,
-    ProjectRenameRecovery, ProjectRenameRecoveryDisposition, ProjectRenameRequest,
-    recover_project_renames, rename_project,
+    ProjectRenameError, ProjectRenameErrorKind, ProjectRenameOutcome, ProjectRenameRecovery,
+    ProjectRenameRecoveryDisposition, ProjectRenameRequest, recover_project_renames,
+    rename_project,
 };
 pub use recording_import::{
     RecordingImportError, RecordingImportOutcome, RecordingImportRecovery,
@@ -48,38 +47,34 @@ pub use recording_import::{
 pub use resource_publication::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRecovery,
     AudioClipPublicationRecoveryDisposition, AudioClipPublicationRequest, AudioClipRemovalOutcome,
-    AudioClipRemovalRequest,
-    SampleCleanupOutcome, SampleCleanupRecovery, SampleCleanupRecoveryDisposition,
-    SampleCleanupRequest,
-    AudioTrackDuplicationPublicationOutcome, AudioTrackDuplicationPublicationRecovery,
-    AudioTrackDuplicationPublicationRecoveryDisposition, AudioTrackDuplicationPublicationRequest,
-    RoutingBusDuplicationPublicationRequest,
-    AudioTrackContentRemovalPublicationOutcome, AudioTrackContentRemovalPublicationRecovery,
+    AudioClipRemovalRequest, AudioTrackContentRemovalPublicationOutcome,
+    AudioTrackContentRemovalPublicationRecovery,
     AudioTrackContentRemovalPublicationRecoveryDisposition,
-    AudioTrackContentRemovalPublicationRequest,
-    AudioTrackPublicationOutcome, AudioTrackPublicationRecovery,
-    AudioTrackPublicationRecoveryDisposition, AudioTrackPublicationRequest,
-    AudioTrackRemovalOutcome, AudioTrackRemovalRequest, RoutingBusRemovalKind,
-    RoutingBusRemovalOutcome, RoutingBusRemovalRequest, AutomationTakePublicationRequest,
-    AutomationTakeRemovalRequest, DeviceChainPublicationRequest, DeviceChainRemovalRequest,
-    ImportedAudioClipPublicationRequest, ProjectResourcePublicationError,
-    ProjectResourcePublicationErrorKind, ProjectResourcePublicationOutcome,
-    ProjectResourcePublicationRecovery, ProjectResourcePublicationRecoveryDisposition,
-    ProjectResourcePublicationRequest, RoutingBusPublicationKind,
-    RoutingBusPublicationRequest, ScenePublicationRequest, SceneRemovalRequest, publish_arrangement,
-    publish_audio_clip, publish_audio_track, publish_audio_track_content_removal,
-    publish_audio_track_duplication, publish_automation_take, publish_device_chain,
-    publish_routing_bus_duplication,
-    publish_imported_audio_clip,
-    publish_project_resource, publish_routing_bus, publish_scene, publish_track_order,
+    AudioTrackContentRemovalPublicationRequest, AudioTrackDuplicationPublicationOutcome,
+    AudioTrackDuplicationPublicationRecovery, AudioTrackDuplicationPublicationRecoveryDisposition,
+    AudioTrackDuplicationPublicationRequest, AudioTrackPublicationOutcome,
+    AudioTrackPublicationRecovery, AudioTrackPublicationRecoveryDisposition,
+    AudioTrackPublicationRequest, AudioTrackRemovalOutcome, AudioTrackRemovalRequest,
+    AutomationTakePublicationRequest, AutomationTakeRemovalRequest, DeviceChainPublicationRequest,
+    DeviceChainRemovalRequest, ImportedAudioClipPublicationRequest,
+    ProjectResourcePublicationError, ProjectResourcePublicationErrorKind,
+    ProjectResourcePublicationOutcome, ProjectResourcePublicationRecovery,
+    ProjectResourcePublicationRecoveryDisposition, ProjectResourcePublicationRequest,
+    RoutingBusDuplicationPublicationRequest, RoutingBusPublicationKind,
+    RoutingBusPublicationRequest, RoutingBusRemovalKind, RoutingBusRemovalOutcome,
+    RoutingBusRemovalRequest, SampleCleanupOutcome, SampleCleanupRecovery,
+    SampleCleanupRecoveryDisposition, SampleCleanupRequest, ScenePublicationRequest,
+    SceneRemovalRequest, TrackOrderPublicationOutcome, TrackOrderPublicationRecovery,
+    TrackOrderPublicationRecoveryDisposition, TrackOrderPublicationRequest, clean_unused_samples,
+    publish_arrangement, publish_audio_clip, publish_audio_track,
+    publish_audio_track_content_removal, publish_audio_track_duplication, publish_automation_take,
+    publish_device_chain, publish_imported_audio_clip, publish_project_resource,
+    publish_routing_bus, publish_routing_bus_duplication, publish_scene, publish_track_order,
     recover_audio_clip_publications, recover_audio_track_content_removals,
     recover_audio_track_duplications, recover_audio_track_publications,
-    recover_project_resource_publications, recover_track_order_publications,
-    recover_sample_cleanups, remove_audio_clip, remove_audio_track, remove_routing_bus,
-    remove_automation_take, remove_scene,
-    remove_device_chain, clean_unused_samples, TrackOrderPublicationOutcome,
-    TrackOrderPublicationRecovery, TrackOrderPublicationRecoveryDisposition,
-    TrackOrderPublicationRequest,
+    recover_project_resource_publications, recover_sample_cleanups,
+    recover_track_order_publications, remove_audio_clip, remove_audio_track,
+    remove_automation_take, remove_device_chain, remove_routing_bus, remove_scene,
 };
 
 use core::error::Error;

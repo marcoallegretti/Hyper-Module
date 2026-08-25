@@ -53,7 +53,8 @@ pub(crate) fn copy_open_stable(
     expected_sha256: [u8; 32],
     destination: &mut impl Write,
 ) -> Result<(), StorageError> {
-    let mut handle = Handle::from_file(file).map_err(|error| io_error(label, "open file", error))?;
+    let mut handle =
+        Handle::from_file(file).map_err(|error| io_error(label, "open file", error))?;
     let before = handle
         .as_file()
         .metadata()

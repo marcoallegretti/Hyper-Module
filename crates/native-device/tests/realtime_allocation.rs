@@ -2,8 +2,8 @@
 mod realtime_allocator;
 
 use hyper_native_device::{
-    DeviceChain, NativeDeviceChainProcessor, NativeDeviceInstance, NativeFilterMode,
-    NativeCompressorState, NativeFilterState, PROJECT_SAMPLE_RATE_HZ,
+    DeviceChain, NativeCompressorState, NativeDeviceChainProcessor, NativeDeviceInstance,
+    NativeFilterMode, NativeFilterState, PROJECT_SAMPLE_RATE_HZ,
 };
 use realtime_allocator::HeapMeasurement;
 

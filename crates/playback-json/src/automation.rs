@@ -8,10 +8,10 @@ use serde_json::{Value, json};
 
 use super::{
     CollectionLimit, CompiledMixerGraph, DocumentKind, DocumentLocation, ExtensionsDocument,
-    LoadError, LoadedMixer, LoadedPlaybackProject, LoaderLimits, MediaAssetFact,
-    MixerCompileError, TrackKind, capacity_error, domain_error, enforce_loader_limit,
-    parse_document, project_contains_identity, validate_contract_document,
-    validate_entity_reference, validate_header,
+    LoadError, LoadedMixer, LoadedPlaybackProject, LoaderLimits, MediaAssetFact, MixerCompileError,
+    TrackKind, capacity_error, domain_error, enforce_loader_limit, parse_document,
+    project_contains_identity, validate_contract_document, validate_entity_reference,
+    validate_header,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -690,10 +690,7 @@ pub fn serialize_automation_take_addition(
             "track_id": track_id,
             "parameter": channel_parameter_name(parameter),
         }),
-        AutomationTargetSelection::Send {
-            send_id,
-            parameter,
-        } => json!({
+        AutomationTargetSelection::Send { send_id, parameter } => json!({
             "kind": "mixer-send",
             "send_id": send_id,
             "parameter": send_parameter_name(parameter),
@@ -824,8 +821,8 @@ pub fn serialize_automation_take_activation(
         .position(|take| take.id() == take_id)
         .ok_or(AutomationTakeEditSerializationError::TakeMissing)?;
     let source = takes[index];
-    let mut value: Value =
-        serde_json::from_slice(source).map_err(AutomationTakeEditSerializationError::Serialization)?;
+    let mut value: Value = serde_json::from_slice(source)
+        .map_err(AutomationTakeEditSerializationError::Serialization)?;
     let canonical_source = serde_json_canonicalizer::to_vec(&value)
         .map_err(AutomationTakeEditSerializationError::Serialization)?;
     if canonical_source != source {

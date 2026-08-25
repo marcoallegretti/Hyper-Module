@@ -808,7 +808,7 @@ mod tests {
                 release_receiver.recv().unwrap();
                 Ok(())
             },
-            TEST_STARTUP_TIMEOUT,
+            Duration::from_millis(20),
             Duration::from_millis(20),
         )
         .unwrap();

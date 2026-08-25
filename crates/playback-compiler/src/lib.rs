@@ -1208,9 +1208,15 @@ mod tests {
             "the origin is bar one beat one, not bar zero"
         );
         let second_beat = at(1_920);
-        assert_eq!((second_beat.bar(), second_beat.beat(), second_beat.tick()), (1, 2, 0));
+        assert_eq!(
+            (second_beat.bar(), second_beat.beat(), second_beat.tick()),
+            (1, 2, 0)
+        );
         let second_bar = at(7_680);
-        assert_eq!((second_bar.bar(), second_bar.beat(), second_bar.tick()), (2, 1, 0));
+        assert_eq!(
+            (second_bar.bar(), second_bar.beat(), second_bar.tick()),
+            (2, 1, 0)
+        );
         let inside = at(7_680 + 1_920 + 960);
         assert_eq!(
             (inside.bar(), inside.beat(), inside.tick()),
@@ -1233,7 +1239,11 @@ mod tests {
                 denominator: 4,
             },
         ];
-        assert_eq!(events[1].ticks_per_bar(), 5_760, "a 3/4 bar is three quarters");
+        assert_eq!(
+            events[1].ticks_per_bar(),
+            5_760,
+            "a 3/4 bar is three quarters"
+        );
 
         let at = |tick| musical_position(&events, tick).unwrap();
         let boundary = at(15_360);

@@ -8,9 +8,9 @@ use serde_json::Value;
 
 use crate::{
     AdapterCompileError, AutomationCompileError, DocumentKind, DocumentLocation, GraphLimits,
-    LoadError, LoadedPlaybackProject, LoaderLimits, MediaAssetFact,
-    MixerCompileError, SceneLimits, capacity_error, load_arrangement, load_clip, load_scene,
-    load_track, validate_loaded_identities, validate_track_hierarchy,
+    LoadError, LoadedPlaybackProject, LoaderLimits, MediaAssetFact, MixerCompileError, SceneLimits,
+    capacity_error, load_arrangement, load_clip, load_scene, load_track,
+    validate_loaded_identities, validate_track_hierarchy,
 };
 
 /// One canonical resource document emitted by independent track duplication.
@@ -364,7 +364,8 @@ pub fn serialize_audio_track_duplication(
             if canonical != bytes {
                 return Err(AudioTrackDuplicationSerializationError::SourceDeviceChainMismatch);
             }
-            let chain = DeviceChain::parse(bytes).map_err(AudioTrackDuplicationSerializationError::Device)?;
+            let chain = DeviceChain::parse(bytes)
+                .map_err(AudioTrackDuplicationSerializationError::Device)?;
             if chain.id() != expected_id
                 || chain.project_id() != project.project_id()
                 || chain.track_id() != source_track_id
@@ -455,7 +456,8 @@ pub fn serialize_audio_track_duplication(
         .try_reserve(1)
         .map_err(|_| AudioTrackDuplicationSerializationError::Source(capacity_error()))?;
     candidate.tracks.push(cloned_track);
-    validate_track_hierarchy(&candidate.tracks).map_err(AudioTrackDuplicationSerializationError::Source)?;
+    validate_track_hierarchy(&candidate.tracks)
+        .map_err(AudioTrackDuplicationSerializationError::Source)?;
 
     let arrangement = duplicate_arrangement(
         &mut candidate,
@@ -477,7 +479,8 @@ pub fn serialize_audio_track_duplication(
         &cloned_clip_ids,
         limits,
     )?;
-    validate_loaded_identities(&candidate).map_err(AudioTrackDuplicationSerializationError::Source)?;
+    validate_loaded_identities(&candidate)
+        .map_err(AudioTrackDuplicationSerializationError::Source)?;
 
     let (mixer, source_send_ids, candidate_mixer) = duplicate_mixer(
         &candidate,
@@ -514,7 +517,10 @@ pub fn serialize_audio_track_duplication(
                 .try_reserve_exact(chain.devices().len())
                 .map_err(|_| AudioTrackDuplicationSerializationError::Source(capacity_error()))?;
             for _ in chain.devices() {
-                device_ids.push(allocate_identity(&mut known_identities, &mut next_identity)?);
+                device_ids.push(allocate_identity(
+                    &mut known_identities,
+                    &mut next_identity,
+                )?);
             }
             let cloned = chain
                 .try_clone_for_track(chain_id.clone(), duplicated_track_id.clone(), &device_ids)
@@ -522,7 +528,10 @@ pub fn serialize_audio_track_duplication(
             let bytes = cloned
                 .to_canonical_vec()
                 .map_err(AudioTrackDuplicationSerializationError::Device)?;
-            Ok(AudioTrackDuplicationDocument { id: chain_id, bytes })
+            Ok(AudioTrackDuplicationDocument {
+                id: chain_id,
+                bytes,
+            })
         })
         .transpose()?;
 
@@ -726,7 +735,8 @@ fn same_track(left: &super::LoadedTrack, right: &super::LoadedTrack) -> bool {
 fn canonical_value(
     bytes: &[u8],
 ) -> Result<(Value, Vec<u8>), AudioTrackDuplicationSerializationError> {
-    let value = serde_json::from_slice(bytes).map_err(AudioTrackDuplicationSerializationError::Serialization)?;
+    let value = serde_json::from_slice(bytes)
+        .map_err(AudioTrackDuplicationSerializationError::Serialization)?;
     let canonical = canonical_bytes(&value)?;
     Ok((value, canonical))
 }
@@ -800,7 +810,10 @@ fn replace_string_array(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments, reason = "the helper carries one complete arrangement identity map")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper carries one complete arrangement identity map"
+)]
 fn duplicate_arrangement(
     candidate: &mut LoadedPlaybackProject,
     project: &LoadedPlaybackProject,
@@ -906,7 +919,10 @@ fn placement_order(left: &Value, right: &Value) -> std::cmp::Ordering {
         .then_with(|| left_id.cmp(&right_id))
 }
 
-#[allow(clippy::too_many_arguments, reason = "the helper carries one complete scene-slot identity map")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper carries one complete scene-slot identity map"
+)]
 fn duplicate_scene_actions(
     candidate: &mut LoadedPlaybackProject,
     project: &LoadedPlaybackProject,
@@ -973,7 +989,10 @@ fn duplicate_scene_actions(
     Ok(output)
 }
 
-#[allow(clippy::too_many_arguments, reason = "the helper validates one complete mixer replacement and its send identity map")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper validates one complete mixer replacement and its send identity map"
+)]
 fn duplicate_mixer(
     candidate: &LoadedPlaybackProject,
     source: &[u8],
@@ -1005,7 +1024,9 @@ fn duplicate_mixer(
         .ok_or(AudioTrackDuplicationSerializationError::InvalidDocumentShape)?;
     let source_channel_index = channels
         .iter()
-        .position(|channel| channel.get("track_id").and_then(Value::as_str) == Some(source_track_id))
+        .position(|channel| {
+            channel.get("track_id").and_then(Value::as_str) == Some(source_track_id)
+        })
         .ok_or(AudioTrackDuplicationSerializationError::SourceMixerMismatch)?;
     let mut duplicate = channels[source_channel_index].clone();
     rewrite_string(&mut duplicate, "track_id", duplicated_track_id)?;
@@ -1050,7 +1071,10 @@ fn duplicate_mixer(
     ))
 }
 
-#[allow(clippy::too_many_arguments, reason = "the helper atomically rewrites every source-targeted automation lane")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper atomically rewrites every source-targeted automation lane"
+)]
 fn duplicate_automation_lanes(
     project: &LoadedPlaybackProject,
     assets: &[MediaAssetFact<'_>],
@@ -1341,13 +1365,10 @@ pub fn serialize_routing_bus_duplication(
         limits,
     )?;
     let mut known_identities = known_identities(project, assets, &loaded_mixer, &source_automation);
-    let parsed_chain = routing_bus_source_device_chain(
-        project,
-        source,
-        source_track_id,
-        &mut known_identities,
-    )?;
-    let duplicated_track_id = routing_bus_allocate_identity(&mut known_identities, &mut next_identity)?;
+    let parsed_chain =
+        routing_bus_source_device_chain(project, source, source_track_id, &mut known_identities)?;
+    let duplicated_track_id =
+        routing_bus_allocate_identity(&mut known_identities, &mut next_identity)?;
     routing_bus_rewrite_string(&mut track_value, "id", &duplicated_track_id)?;
     routing_bus_rewrite_string(&mut track_value, "name", duplicated_track_name)?;
     routing_bus_replace_u8(&mut track_value, "order", next_order)?;
@@ -1366,8 +1387,10 @@ pub fn serialize_routing_bus_duplication(
         .try_reserve(1)
         .map_err(|_| RoutingBusDuplicationSerializationError::Source(capacity_error()))?;
     candidate.tracks.push(duplicated_track);
-    validate_track_hierarchy(&candidate.tracks).map_err(RoutingBusDuplicationSerializationError::Source)?;
-    validate_loaded_identities(&candidate).map_err(RoutingBusDuplicationSerializationError::Source)?;
+    validate_track_hierarchy(&candidate.tracks)
+        .map_err(RoutingBusDuplicationSerializationError::Source)?;
+    validate_loaded_identities(&candidate)
+        .map_err(RoutingBusDuplicationSerializationError::Source)?;
 
     let (mixer, source_send_ids, candidate_mixer) = duplicate_routing_bus_mixer(
         &candidate,
@@ -1398,13 +1421,17 @@ pub fn serialize_routing_bus_duplication(
         .map_err(RoutingBusDuplicationSerializationError::ProjectCompilation)?;
     let device_chain = parsed_chain
         .map(|chain| {
-            let chain_id = routing_bus_allocate_identity(&mut known_identities, &mut next_identity)?;
+            let chain_id =
+                routing_bus_allocate_identity(&mut known_identities, &mut next_identity)?;
             let mut device_ids = Vec::new();
             device_ids
                 .try_reserve_exact(chain.devices().len())
                 .map_err(|_| RoutingBusDuplicationSerializationError::Source(capacity_error()))?;
             for _ in chain.devices() {
-                device_ids.push(routing_bus_allocate_identity(&mut known_identities, &mut next_identity)?);
+                device_ids.push(routing_bus_allocate_identity(
+                    &mut known_identities,
+                    &mut next_identity,
+                )?);
             }
             let cloned = chain
                 .try_clone_for_track(chain_id.clone(), duplicated_track_id.clone(), &device_ids)
@@ -1412,7 +1439,10 @@ pub fn serialize_routing_bus_duplication(
             let bytes = cloned
                 .to_canonical_vec()
                 .map_err(RoutingBusDuplicationSerializationError::Device)?;
-            Ok(TrackDuplicationDocument { id: chain_id, bytes })
+            Ok(TrackDuplicationDocument {
+                id: chain_id,
+                bytes,
+            })
         })
         .transpose()?;
     Ok(TrackDuplicationDocuments {
@@ -1492,7 +1522,8 @@ fn routing_bus_source_device_chain(
             if canonical != bytes {
                 return Err(RoutingBusDuplicationSerializationError::SourceDeviceChainMismatch);
             }
-            let chain = DeviceChain::parse(bytes).map_err(RoutingBusDuplicationSerializationError::Device)?;
+            let chain = DeviceChain::parse(bytes)
+                .map_err(RoutingBusDuplicationSerializationError::Device)?;
             if chain.id() != expected_id
                 || chain.project_id() != project.project_id()
                 || chain.track_id() != source_track_id
@@ -1509,7 +1540,10 @@ fn routing_bus_source_device_chain(
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "the helper carries the owned channel, send, and return-bus identity transformations together")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper carries the owned channel, send, and return-bus identity transformations together"
+)]
 fn duplicate_routing_bus_mixer(
     candidate: &LoadedPlaybackProject,
     source: &[u8],
@@ -1543,7 +1577,9 @@ fn duplicate_routing_bus_mixer(
             .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)?;
         let source_index = channels
             .iter()
-            .position(|channel| channel.get("track_id").and_then(Value::as_str) == Some(source_track_id))
+            .position(|channel| {
+                channel.get("track_id").and_then(Value::as_str) == Some(source_track_id)
+            })
             .ok_or(RoutingBusDuplicationSerializationError::SourceMixerMismatch)?;
         let mut duplicate = channels[source_index].clone();
         routing_bus_rewrite_string(&mut duplicate, "track_id", duplicated_track_id)?;
@@ -1611,7 +1647,10 @@ fn duplicate_routing_bus_mixer(
     ))
 }
 
-#[allow(clippy::too_many_arguments, reason = "the helper rewrites every owned routing-bus automation target in one candidate mixer domain")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper rewrites every owned routing-bus automation target in one candidate mixer domain"
+)]
 fn duplicate_routing_bus_automation_lanes(
     project: &LoadedPlaybackProject,
     assets: &[MediaAssetFact<'_>],
@@ -1727,7 +1766,8 @@ fn routing_bus_allocate_identity(
 fn routing_bus_canonical_value(
     bytes: &[u8],
 ) -> Result<(Value, Vec<u8>), RoutingBusDuplicationSerializationError> {
-    let value = serde_json::from_slice(bytes).map_err(RoutingBusDuplicationSerializationError::Serialization)?;
+    let value = serde_json::from_slice(bytes)
+        .map_err(RoutingBusDuplicationSerializationError::Serialization)?;
     let canonical = routing_bus_canonical_bytes(&value)?;
     Ok((value, canonical))
 }
@@ -1735,7 +1775,8 @@ fn routing_bus_canonical_value(
 fn routing_bus_canonical_bytes(
     value: &Value,
 ) -> Result<Vec<u8>, RoutingBusDuplicationSerializationError> {
-    serde_json_canonicalizer::to_vec(value).map_err(RoutingBusDuplicationSerializationError::Serialization)
+    serde_json_canonicalizer::to_vec(value)
+        .map_err(RoutingBusDuplicationSerializationError::Serialization)
 }
 
 fn routing_bus_extensions_empty(
@@ -1923,12 +1964,10 @@ impl fmt::Display for AudioTrackContentRemovalSerializationError {
             Self::SourceMixerMismatch => {
                 formatter.write_str("source mixer bytes do not match the loaded project")
             }
-            Self::SourceAutomationCoverage => {
-                formatter.write_str("source automation documents have duplicate or misaddressed identities")
-            }
-            Self::SourceDeviceChainMismatch => {
-                formatter.write_str("source native device chain does not belong to the selected track")
-            }
+            Self::SourceAutomationCoverage => formatter
+                .write_str("source automation documents have duplicate or misaddressed identities"),
+            Self::SourceDeviceChainMismatch => formatter
+                .write_str("source native device chain does not belong to the selected track"),
             Self::InvalidDocumentShape => {
                 formatter.write_str("a source document shape changed after typed validation")
             }
@@ -2022,7 +2061,8 @@ pub fn serialize_audio_track_content_removal(
         return Err(AudioTrackContentRemovalSerializationError::UnknownExtensionSemantics);
     }
 
-    let source_clips = removal_source_clip_map(project, &loaded_source_track, source.clips, limits)?;
+    let source_clips =
+        removal_source_clip_map(project, &loaded_source_track, source.clips, limits)?;
     let source_scenes = removal_source_scene_map(project, source.scenes, limits)?;
     let source_arrangement = removal_source_arrangement(project, source.arrangement, limits)?;
 
@@ -2079,7 +2119,8 @@ pub fn serialize_audio_track_content_removal(
         source_track_id,
         limits,
     )?;
-    validate_loaded_identities(&candidate).map_err(AudioTrackContentRemovalSerializationError::Source)?;
+    validate_loaded_identities(&candidate)
+        .map_err(AudioTrackContentRemovalSerializationError::Source)?;
 
     let mixer = removal_mixer(
         &candidate,
@@ -2409,7 +2450,11 @@ fn removal_scene_actions(
 ) -> Result<Vec<AudioTrackContentRemovalDocument>, AudioTrackContentRemovalSerializationError> {
     let mut output = Vec::new();
     for (index, scene) in project.scenes.iter().enumerate() {
-        if !scene.slots.iter().any(|slot| slot.track_id == source_track_id) {
+        if !scene
+            .slots
+            .iter()
+            .any(|slot| slot.track_id == source_track_id)
+        {
             continue;
         }
         let source = source_scenes
@@ -2462,7 +2507,9 @@ fn removal_mixer(
         .ok_or(AudioTrackContentRemovalSerializationError::InvalidDocumentShape)?;
     let source_index = channels
         .iter()
-        .position(|channel| channel.get("track_id").and_then(Value::as_str) == Some(source_track_id))
+        .position(|channel| {
+            channel.get("track_id").and_then(Value::as_str) == Some(source_track_id)
+        })
         .ok_or(AudioTrackContentRemovalSerializationError::SourceMixerMismatch)?;
     if source_index >= loaded_source.channels.len()
         || loaded_source.channels[source_index].track_id != source_track_id
@@ -2481,7 +2528,10 @@ fn removal_mixer(
     })
 }
 
-#[allow(clippy::too_many_arguments, reason = "the helper keeps complete automation coverage and the removed target domain together")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper keeps complete automation coverage and the removed target domain together"
+)]
 fn removal_automation_lanes(
     project: &LoadedPlaybackProject,
     assets: &[MediaAssetFact<'_>],
@@ -2567,9 +2617,7 @@ fn removal_automation_lanes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper_native_device::{
-        NativeDeviceInstance, NativeFilterMode, NativeFilterState,
-    };
+    use hyper_native_device::{NativeDeviceInstance, NativeFilterMode, NativeFilterState};
 
     const PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122335001";
     const TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122335002";
@@ -2599,7 +2647,15 @@ mod tests {
         reason = "the compact fixture returns the complete independently-owned resource inventory"
     )]
     fn fixture() -> (
-        Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
     ) {
         let timeline = canonical(serde_json::json!({
             "format":"hyper-timeline", "format_version":1,
@@ -2678,7 +2734,17 @@ mod tests {
         .unwrap()
         .to_canonical_vec()
         .unwrap();
-        (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain)
+        (
+            timeline,
+            track,
+            return_track,
+            clip,
+            scene,
+            arrangement,
+            mixer,
+            take,
+            device_chain,
+        )
     }
 
     #[test]
@@ -2687,7 +2753,8 @@ mod tests {
         reason = "the one complete graph fixture asserts every independent mutable identity edge"
     )]
     fn duplicates_the_complete_audio_track_identity_graph() {
-        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) =
+            fixture();
         let source_track = track.clone();
         let source_clip = clip.clone();
         let source_scene = scene.clone();
@@ -2747,11 +2814,17 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(documents.track().id(), "018f47a2-6b2d-7c11-8a44-001122335101");
+        assert_eq!(
+            documents.track().id(),
+            "018f47a2-6b2d-7c11-8a44-001122335101"
+        );
         assert_eq!(documents.clips().len(), 1);
         assert_eq!(documents.scenes().len(), 1);
         assert_eq!(documents.automation_takes().len(), 1);
-        assert_eq!(documents.device_chain().unwrap().id(), "018f47a2-6b2d-7c11-8a44-001122335107");
+        assert_eq!(
+            documents.device_chain().unwrap().id(),
+            "018f47a2-6b2d-7c11-8a44-001122335107"
+        );
         assert_eq!(track, source_track);
         assert_eq!(clip, source_clip);
         assert_eq!(scene, source_scene);
@@ -2793,11 +2866,17 @@ mod tests {
         candidate
             .compile_main_automation(&candidate_mixer.compile_main_graph().unwrap(), &automation)
             .unwrap();
-        assert_eq!(candidate.track_name(documents.track().id()), Some("Lead copy"));
+        assert_eq!(
+            candidate.track_name(documents.track().id()),
+            Some("Lead copy")
+        );
         assert_eq!(candidate.clip_track_id_at(1), Some(documents.track().id()));
         assert_eq!(candidate.clip_asset_id_at(1), Some(ASSET_ID));
         let track_value: Value = serde_json::from_slice(cloned_track).unwrap();
-        assert_eq!(track_value["clip_ids"], serde_json::json!(["018f47a2-6b2d-7c11-8a44-001122335102"]));
+        assert_eq!(
+            track_value["clip_ids"],
+            serde_json::json!(["018f47a2-6b2d-7c11-8a44-001122335102"])
+        );
         let arrangement_value: Value = serde_json::from_slice(cloned_arrangement).unwrap();
         assert_eq!(arrangement_value["placements"].as_array().unwrap().len(), 2);
         assert_eq!(
@@ -2819,17 +2898,39 @@ mod tests {
             })
         );
         let mixer_value: Value = serde_json::from_slice(documents.mixer().bytes()).unwrap();
-        assert_eq!(mixer_value["channels"][2]["track_id"], "018f47a2-6b2d-7c11-8a44-001122335101");
-        assert_eq!(mixer_value["channels"][2]["sends"][0]["id"], "018f47a2-6b2d-7c11-8a44-001122335104");
-        let automation_value: Value = serde_json::from_slice(documents.automation_takes()[0].bytes()).unwrap();
+        assert_eq!(
+            mixer_value["channels"][2]["track_id"],
+            "018f47a2-6b2d-7c11-8a44-001122335101"
+        );
+        assert_eq!(
+            mixer_value["channels"][2]["sends"][0]["id"],
+            "018f47a2-6b2d-7c11-8a44-001122335104"
+        );
+        let automation_value: Value =
+            serde_json::from_slice(documents.automation_takes()[0].bytes()).unwrap();
         assert_eq!(automation_value["lanes"].as_array().unwrap().len(), 5);
-        assert_eq!(automation_value["lanes"][3]["id"], "018f47a2-6b2d-7c11-8a44-001122335105");
-        assert_eq!(automation_value["lanes"][3]["target"]["track_id"], "018f47a2-6b2d-7c11-8a44-001122335101");
-        assert_eq!(automation_value["lanes"][4]["id"], "018f47a2-6b2d-7c11-8a44-001122335106");
-        assert_eq!(automation_value["lanes"][4]["target"]["send_id"], "018f47a2-6b2d-7c11-8a44-001122335104");
+        assert_eq!(
+            automation_value["lanes"][3]["id"],
+            "018f47a2-6b2d-7c11-8a44-001122335105"
+        );
+        assert_eq!(
+            automation_value["lanes"][3]["target"]["track_id"],
+            "018f47a2-6b2d-7c11-8a44-001122335101"
+        );
+        assert_eq!(
+            automation_value["lanes"][4]["id"],
+            "018f47a2-6b2d-7c11-8a44-001122335106"
+        );
+        assert_eq!(
+            automation_value["lanes"][4]["target"]["send_id"],
+            "018f47a2-6b2d-7c11-8a44-001122335104"
+        );
         let cloned_chain = DeviceChain::parse(documents.device_chain().unwrap().bytes()).unwrap();
         assert_eq!(cloned_chain.track_id(), documents.track().id());
-        assert_eq!(cloned_chain.devices()[0].id(), "018f47a2-6b2d-7c11-8a44-001122335108");
+        assert_eq!(
+            cloned_chain.devices()[0].id(),
+            "018f47a2-6b2d-7c11-8a44-001122335108"
+        );
     }
 
     #[test]
@@ -2898,7 +2999,8 @@ mod tests {
         reason = "the fixture proves a copied group retains only its owned identity graph and never creates a new inbound route"
     )]
     fn duplicates_group_owned_state_without_copying_incoming_routes() {
-        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) =
+            fixture();
         let mut group_track: Value = serde_json::from_slice(&return_track).unwrap();
         group_track["kind"] = "group".into();
         group_track["name"] = "Drums".into();
@@ -2910,16 +3012,20 @@ mod tests {
         second_return["order"] = 2.into();
         let second_return = canonical(second_return);
         let mut group_mixer: Value = serde_json::from_slice(&mixer).unwrap();
-        group_mixer["channels"][0]["destination"] = serde_json::json!({"kind":"track", "track_id": RETURN_ID});
+        group_mixer["channels"][0]["destination"] =
+            serde_json::json!({"kind":"track", "track_id": RETURN_ID});
         group_mixer["channels"][0]["sends"] = serde_json::json!([]);
         group_mixer["channels"][1]["track_id"] = RETURN_ID.into();
         group_mixer["channels"][1]["sends"] = serde_json::json!([
             {"id": SEND_ID, "bus":"a", "tap":"post-fader", "gain_millionths":500_000, "pan_millionths":100_000, "enabled":true}
         ]);
-        group_mixer["channels"].as_array_mut().unwrap().push(serde_json::json!({
-            "track_id": return_two_id, "gain_millionths":1_000_000, "pan_millionths":0,
-            "mute":false, "solo":false, "destination":{"kind":"main"}, "sends":[]
-        }));
+        group_mixer["channels"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "track_id": return_two_id, "gain_millionths":1_000_000, "pan_millionths":0,
+                "mute":false, "solo":false, "destination":{"kind":"main"}, "sends":[]
+            }));
         group_mixer["return_buses"] = serde_json::json!([{"bus":"a", "track_id":return_two_id}]);
         let group_mixer = canonical(group_mixer);
         let mut group_take: Value = serde_json::from_slice(&take).unwrap();
@@ -2929,7 +3035,11 @@ mod tests {
         let mut group_chain: Value = serde_json::from_slice(&device_chain).unwrap();
         group_chain["track_id"] = RETURN_ID.into();
         let group_chain = canonical(group_chain);
-        let tracks = [track.as_slice(), group_track.as_slice(), second_return.as_slice()];
+        let tracks = [
+            track.as_slice(),
+            group_track.as_slice(),
+            second_return.as_slice(),
+        ];
         let clips = [clip.as_slice()];
         let scenes = [scene.as_slice()];
         let project = crate::load(
@@ -2979,27 +3089,44 @@ mod tests {
 
         let group_copy_id = documents.track().id();
         let mixer_value: Value = serde_json::from_slice(documents.mixer().bytes()).unwrap();
-        assert_eq!(mixer_value["channels"][0]["destination"]["track_id"], RETURN_ID);
+        assert_eq!(
+            mixer_value["channels"][0]["destination"]["track_id"],
+            RETURN_ID
+        );
         let group_copy = mixer_value["channels"]
             .as_array()
             .unwrap()
             .iter()
             .find(|channel| channel["track_id"] == group_copy_id)
             .unwrap();
-        assert_eq!(group_copy["sends"][0]["id"], "018f47a2-6b2d-7c11-8a44-001122335102");
+        assert_eq!(
+            group_copy["sends"][0]["id"],
+            "018f47a2-6b2d-7c11-8a44-001122335102"
+        );
         assert_eq!(group_copy["sends"][0]["bus"], "a");
-        let automation_value: Value = serde_json::from_slice(documents.automation_takes()[0].bytes()).unwrap();
+        let automation_value: Value =
+            serde_json::from_slice(documents.automation_takes()[0].bytes()).unwrap();
         assert_eq!(automation_value["lanes"].as_array().unwrap().len(), 5);
-        assert_eq!(automation_value["lanes"][3]["target"]["track_id"], group_copy_id);
-        assert_eq!(automation_value["lanes"][4]["target"]["send_id"], "018f47a2-6b2d-7c11-8a44-001122335102");
+        assert_eq!(
+            automation_value["lanes"][3]["target"]["track_id"],
+            group_copy_id
+        );
+        assert_eq!(
+            automation_value["lanes"][4]["target"]["send_id"],
+            "018f47a2-6b2d-7c11-8a44-001122335102"
+        );
         let cloned_chain = DeviceChain::parse(documents.device_chain().unwrap().bytes()).unwrap();
         assert_eq!(cloned_chain.track_id(), group_copy_id);
-        assert_eq!(cloned_chain.devices()[0].id(), "018f47a2-6b2d-7c11-8a44-001122335106");
+        assert_eq!(
+            cloned_chain.devices()[0].id(),
+            "018f47a2-6b2d-7c11-8a44-001122335106"
+        );
     }
 
     #[test]
     fn duplicates_return_with_a_fresh_bus_without_copying_its_incoming_sends() {
-        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) =
+            fixture();
         let mut return_chain: Value = serde_json::from_slice(&device_chain).unwrap();
         return_chain["track_id"] = RETURN_ID.into();
         let return_chain = canonical(return_chain);
@@ -3050,18 +3177,28 @@ mod tests {
 
         assert!(documents.automation_takes().is_empty());
         let mixer_value: Value = serde_json::from_slice(documents.mixer().bytes()).unwrap();
-        assert_eq!(mixer_value["channels"][0]["sends"].as_array().unwrap().len(), 1);
-        assert_eq!(mixer_value["return_buses"], serde_json::json!([
-            {"bus":"a", "track_id":RETURN_ID},
-            {"bus":"b", "track_id":documents.track().id()}
-        ]));
+        assert_eq!(
+            mixer_value["channels"][0]["sends"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            mixer_value["return_buses"],
+            serde_json::json!([
+                {"bus":"a", "track_id":RETURN_ID},
+                {"bus":"b", "track_id":documents.track().id()}
+            ])
+        );
         let cloned_chain = DeviceChain::parse(documents.device_chain().unwrap().bytes()).unwrap();
         assert_eq!(cloned_chain.track_id(), documents.track().id());
     }
 
     #[test]
     fn refuses_return_duplication_when_all_return_buses_are_occupied() {
-        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) =
+            fixture();
         let second_return_id = "018f47a2-6b2d-7c11-8a44-001122335204";
         let mut second_return: Value = serde_json::from_slice(&return_track).unwrap();
         second_return["id"] = second_return_id.into();
@@ -3069,11 +3206,14 @@ mod tests {
         second_return["order"] = 2.into();
         let second_return = canonical(second_return);
         let mut occupied_mixer: Value = serde_json::from_slice(&mixer).unwrap();
-        occupied_mixer["channels"].as_array_mut().unwrap().push(serde_json::json!({
-            "track_id": second_return_id, "gain_millionths": 1_000_000,
-            "pan_millionths": 0, "mute": false, "solo": false,
-            "destination": {"kind": "main"}, "sends": []
-        }));
+        occupied_mixer["channels"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "track_id": second_return_id, "gain_millionths": 1_000_000,
+                "pan_millionths": 0, "mute": false, "solo": false,
+                "destination": {"kind": "main"}, "sends": []
+            }));
         occupied_mixer["return_buses"] = serde_json::json!([
             {"bus": "a", "track_id": RETURN_ID},
             {"bus": "b", "track_id": second_return_id}
@@ -3083,7 +3223,11 @@ mod tests {
         let mut return_chain: Value = serde_json::from_slice(&device_chain).unwrap();
         return_chain["track_id"] = RETURN_ID.into();
         let return_chain = canonical(return_chain);
-        let tracks = [track.as_slice(), return_track.as_slice(), second_return.as_slice()];
+        let tracks = [
+            track.as_slice(),
+            return_track.as_slice(),
+            second_return.as_slice(),
+        ];
         let clips = [clip.as_slice()];
         let scenes = [scene.as_slice()];
         let project = crate::load(
@@ -3130,7 +3274,8 @@ mod tests {
 
     #[test]
     fn removes_the_complete_audio_track_identity_graph_and_keeps_immutable_media() {
-        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) =
+            fixture();
         let tracks = [track.as_slice(), return_track.as_slice()];
         let clips = [clip.as_slice()];
         let scenes = [scene.as_slice()];
@@ -3190,7 +3335,9 @@ mod tests {
                 tracks: &remaining_tracks,
                 clips: &[],
                 scenes: &remaining_scenes,
-                arrangement: documents.arrangement().map(AudioTrackContentRemovalDocument::bytes),
+                arrangement: documents
+                    .arrangement()
+                    .map(AudioTrackContentRemovalDocument::bytes),
             },
             LoaderLimits::VERSION_1,
         )
@@ -3225,7 +3372,8 @@ mod tests {
 
     #[test]
     fn track_content_removal_refuses_incomplete_owned_document_authority() {
-        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) =
+            fixture();
         let tracks = [track.as_slice(), return_track.as_slice()];
         let clips = [clip.as_slice()];
         let scenes = [scene.as_slice()];
@@ -3272,9 +3420,11 @@ mod tests {
 
     #[test]
     fn track_content_removal_refuses_unknown_owned_track_extensions() {
-        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) =
+            fixture();
         let mut extended_track: Value = serde_json::from_slice(&track).unwrap();
-        extended_track["extensions"] = serde_json::json!({"org.example.owned-state": {"opaque": true}});
+        extended_track["extensions"] =
+            serde_json::json!({"org.example.owned-state": {"opaque": true}});
         let extended_track = canonical(extended_track);
         let tracks = [extended_track.as_slice(), return_track.as_slice()];
         let clips = [clip.as_slice()];
@@ -3339,7 +3489,8 @@ mod tests {
         )
         .unwrap();
         let mut extended_track: Value = serde_json::from_slice(&track).unwrap();
-        extended_track["extensions"] = serde_json::json!({"org.example.identity": {"opaque": true}});
+        extended_track["extensions"] =
+            serde_json::json!({"org.example.identity": {"opaque": true}});
         let extended_track = canonical(extended_track);
         let assets = [MediaAssetFact {
             id: ASSET_ID,

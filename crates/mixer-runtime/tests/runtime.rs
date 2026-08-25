@@ -6,30 +6,28 @@ use hyper_audio_engine::{
     MAX_PROCESS_FRAMES, Pan, StereoCallbackError, StereoOutput,
 };
 use hyper_media_cache::PreparedSceneAvailability;
-use hyper_playback_compiler::{MeterEvent, TempoEvent};
 use hyper_mixer_runtime::{
     EbuLoudnessPresentationConfig, EbuLoudnessScale, FlatMainRuntime, GraphMainRuntime,
     GraphTransportRuntime, LocateState, LoudnessCommandSendError, LoudnessCommandSender,
     LoudnessDisplayUnit, MAX_QUEUED_LOUDNESS_COMMANDS, MAX_QUEUED_MIXER_PARAMETER_COMMANDS,
-    MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, MetronomePlan,
-    MixerChannelHandle,
-    MixerParameterCommand, MixerParameterCommandSendError, MixerParameterCommandSender,
-    MixerParameterResolveError, MixerParameterStateRestoreError, MixerParameterTargetError,
-    NativeDeviceCommand, NativeDeviceCommandSendError, NativeDeviceResolveError,
-    NativeDeviceTargetError, MAX_QUEUED_NATIVE_DEVICE_COMMANDS,
+    MAX_QUEUED_NATIVE_DEVICE_COMMANDS, MAX_QUEUED_OUTPUT_METER_SNAPSHOTS,
+    MAX_QUEUED_TRANSPORT_COMMANDS, MetronomePlan, MixerChannelHandle, MixerParameterCommand,
+    MixerParameterCommandSendError, MixerParameterCommandSender, MixerParameterResolveError,
+    MixerParameterStateRestoreError, MixerParameterTargetError, NativeDeviceCommand,
+    NativeDeviceCommandSendError, NativeDeviceResolveError, NativeDeviceTargetError,
     OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
     PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, RuntimeCreationError,
     RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig, SceneLaunchState,
     StereoSamplePeakBallistics, TransportCommand, TransportCommandApplyError,
     TransportCommandSendError, TransportCycle, TransportLoopRange, TransportLoopRangeError,
-    TransportOutputCreationError,
-    TransportOutputProcessor, TransportState, loudness_command_channel, output_meter_channel,
-    playback_recovery_channel,
+    TransportOutputCreationError, TransportOutputProcessor, TransportState,
+    loudness_command_channel, output_meter_channel, playback_recovery_channel,
 };
 use hyper_native_device::{
     DeviceChain, NativeCompressorState, NativeDeviceInstance, NativeDeviceState, NativeFilterMode,
     NativeFilterState,
 };
+use hyper_playback_compiler::{MeterEvent, TempoEvent};
 
 use common::{PlaybackFixture, fixture, graph_fixture, playback_fixture};
 
@@ -76,8 +74,7 @@ fn native_filter_chain_for_track(
             NativeDeviceInstance::try_new_filter(
                 device_id.to_owned(),
                 enabled,
-                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107)
-                    .unwrap(),
+                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107).unwrap(),
             )
             .unwrap(),
         ],
@@ -94,19 +91,21 @@ fn native_compressor_chain_with_makeup(enabled: bool, makeup_millidecibels: i32)
         "018f47a2-6b2d-7c11-8a44-001122336474".to_owned(),
         PROJECT_ID.to_owned(),
         ARRANGEMENT_TRACK_ID.to_owned(),
-        vec![NativeDeviceInstance::try_new_compressor(
-            "018f47a2-6b2d-7c11-8a44-001122336475".to_owned(),
-            enabled,
-            NativeCompressorState::try_new(
-                -80_000,
-                4_000_000,
-                100,
-                100_000,
-                makeup_millidecibels,
+        vec![
+            NativeDeviceInstance::try_new_compressor(
+                "018f47a2-6b2d-7c11-8a44-001122336475".to_owned(),
+                enabled,
+                NativeCompressorState::try_new(
+                    -80_000,
+                    4_000_000,
+                    100,
+                    100_000,
+                    makeup_millidecibels,
+                )
+                .unwrap(),
             )
             .unwrap(),
-        )
-        .unwrap()],
+        ],
     )
     .unwrap()
 }
@@ -256,7 +255,11 @@ fn prepared_playback_channel_tap_captures_post_fader_audio_before_main_processin
     assert_samples(&tap_left, &fixture.arrangement_samples[..64]);
     assert_constant(&tap_right, 0.0);
     assert_constant(&scene_tap_left, 0.0);
-    assert!(scene_tap_right.iter().any(|sample| sample.abs() > f32::EPSILON));
+    assert!(
+        scene_tap_right
+            .iter()
+            .any(|sample| sample.abs() > f32::EPSILON)
+    );
     assert!(main_right.iter().any(|sample| sample.abs() > f32::EPSILON));
 }
 
@@ -526,7 +529,10 @@ fn native_device_commands_are_bound_to_the_prepared_graph_and_commit_at_the_cycl
 
     let foreign_fixture = playback_fixture();
     let foreign_graph = foreign_fixture.compile_playback();
-    let foreign_prepared = foreign_fixture.cache.prepare_playback(&foreign_graph).unwrap();
+    let foreign_prepared = foreign_fixture
+        .cache
+        .prepare_playback(&foreign_graph)
+        .unwrap();
     let foreign_runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
         &foreign_prepared,
         &foreign_fixture.mixer,
@@ -607,8 +613,16 @@ fn prepared_playback_preserves_native_filter_compressor_processing_order() {
     let filter_then_compressor = native_filter_then_compressor_chain();
     let compressor_then_filter = native_compressor_then_filter_chain();
     assert!(filter_then_compressor.devices()[0].filter_state().is_some());
-    assert!(filter_then_compressor.devices()[1].compressor_state().is_some());
-    assert!(compressor_then_filter.devices()[0].compressor_state().is_some());
+    assert!(
+        filter_then_compressor.devices()[1]
+            .compressor_state()
+            .is_some()
+    );
+    assert!(
+        compressor_then_filter.devices()[0]
+            .compressor_state()
+            .is_some()
+    );
     assert!(compressor_then_filter.devices()[1].filter_state().is_some());
 
     let first = render_with_device_chain(Some(&filter_then_compressor));
@@ -694,7 +708,10 @@ fn locating_resets_native_filter_history() {
         .unwrap();
 
     assert_eq!(first_left.map(f32::to_bits), replay_left.map(f32::to_bits));
-    assert_eq!(first_right.map(f32::to_bits), replay_right.map(f32::to_bits));
+    assert_eq!(
+        first_right.map(f32::to_bits),
+        replay_right.map(f32::to_bits)
+    );
 }
 
 fn render_routed_graph_with_device(target: Option<&str>) -> ([f32; 64], [f32; 64]) {
@@ -773,8 +790,14 @@ fn native_filter_processes_arrangement_and_scheduled_scene_sources() {
         "018f47a2-6b2d-7c11-8a44-001122336477",
     );
     let filtered_arrangement = render_with_device_chain(Some(&arrangement));
-    assert_ne!(baseline.0.map(f32::to_bits), filtered_arrangement.0.map(f32::to_bits));
-    assert_eq!(baseline.1.map(f32::to_bits), filtered_arrangement.1.map(f32::to_bits));
+    assert_ne!(
+        baseline.0.map(f32::to_bits),
+        filtered_arrangement.0.map(f32::to_bits)
+    );
+    assert_eq!(
+        baseline.1.map(f32::to_bits),
+        filtered_arrangement.1.map(f32::to_bits)
+    );
 
     let scene = native_filter_chain_for_track(
         PROJECT_ID,
@@ -784,8 +807,14 @@ fn native_filter_processes_arrangement_and_scheduled_scene_sources() {
         "018f47a2-6b2d-7c11-8a44-001122336479",
     );
     let filtered_scene = render_with_device_chain(Some(&scene));
-    assert_eq!(baseline.0.map(f32::to_bits), filtered_scene.0.map(f32::to_bits));
-    assert_ne!(baseline.1.map(f32::to_bits), filtered_scene.1.map(f32::to_bits));
+    assert_eq!(
+        baseline.0.map(f32::to_bits),
+        filtered_scene.0.map(f32::to_bits)
+    );
+    assert_ne!(
+        baseline.1.map(f32::to_bits),
+        filtered_scene.1.map(f32::to_bits)
+    );
 }
 
 fn assert_meter_delivery_and_backpressure(
@@ -1335,7 +1364,11 @@ fn a_range_shorter_than_the_block_wraps_repeatedly_within_one_callback() {
         )
         .unwrap();
 
-    assert_eq!(cycle.loop_wrap_count(), 3, "35 frames over a 10-frame range");
+    assert_eq!(
+        cycle.loop_wrap_count(),
+        3,
+        "35 frames over a 10-frame range"
+    );
     assert_eq!(transport.position_frame(), 15);
     let (segment_left, _) = render_linear(&fixture, 10, 10);
     for (index, sample) in left.iter().enumerate() {
@@ -1377,7 +1410,9 @@ fn a_loop_shorter_than_the_callback_block_is_refused_at_the_sender() {
         "a range exactly one block long wraps at most once per callback"
     );
     assert!(
-        sender.try_send(TransportCommand::SetLoopRange(None)).is_ok(),
+        sender
+            .try_send(TransportCommand::SetLoopRange(None))
+            .is_ok(),
         "and clearing the range is never refused"
     );
 }
@@ -1518,7 +1553,11 @@ fn a_range_that_is_armed_but_not_enabled_does_nothing() {
         0,
         "a range alone does not loop; the enabled flag is what engages it"
     );
-    assert_eq!(transport.position_frame(), 70, "playback ran straight past 50");
+    assert_eq!(
+        transport.position_frame(),
+        70,
+        "playback ran straight past 50"
+    );
     let (expected_left, expected_right) = render_linear(&fixture, 40, 30);
     assert_samples(&left, &expected_left);
     assert_samples(&right, &expected_right);
@@ -1937,10 +1976,7 @@ fn failed_cycle_restores_the_prior_interactive_scene_state() {
     assert_eq!(retry.state(), TransportState::Stopped);
     assert_eq!(retry.position_frame(), 125);
     assert_eq!(retry.scene_launch_state().queued_scene_index(), Some(0));
-    assert_eq!(
-        retry.scene_launch_state().queued_launch_frame(),
-        Some(125)
-    );
+    assert_eq!(retry.scene_launch_state().queued_launch_frame(), Some(125));
     assert_eq!(
         retry.scene_launch_state().last_launched_scene_index(),
         Some(0)
@@ -2566,9 +2602,11 @@ fn metronome_commands_commit_at_the_transport_boundary_and_mix_into_output() {
             "the transport click is a centered output voice"
         );
     }
-    assert!(left.iter().zip(&baseline_left).any(|(actual, baseline)| {
-        (*actual - *baseline).abs() > f32::EPSILON
-    }));
+    assert!(
+        left.iter()
+            .zip(&baseline_left)
+            .any(|(actual, baseline)| { (*actual - *baseline).abs() > f32::EPSILON })
+    );
 
     sender
         .try_send(TransportCommand::Locate {

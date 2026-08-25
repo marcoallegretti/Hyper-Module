@@ -24,9 +24,6 @@ pub use hyper_control_mappings::{
     MainParameter as IdeControlMainParameter, SceneAction,
     SendParameter as IdeControlSendParameter, TransportAction, TriggerBehavior,
 };
-pub use hyper_desktop_audio::{
-    OfflineExportReport, OfflineTrackStemExportFormat, OfflineTrackStemExportReport,
-};
 use hyper_desktop_audio::{
     CaptureStreamSnapshot, DesktopAudioPreviewCommandError, DesktopAudioPreviewControlError,
     DesktopAudioPreviewSnapshot, DesktopDirectControlError, DesktopInputConfig,
@@ -39,19 +36,22 @@ use hyper_desktop_audio::{
     MonitoringSnapshot, OfflineExportError, OfflineExportSpec, OutputStreamSnapshot,
     OutputStreamState, PendingNativeShutdown, PendingNativeShutdownWait, StreamState,
     discover_desktop_input_targets, discover_desktop_output_targets,
-    export_prepared_project_flac_with_mixer, export_prepared_project_wav_with_mixer,
-    export_prepared_project_track_stems_with_mixer,
+    export_prepared_project_flac_with_mixer, export_prepared_project_track_stems_with_mixer,
+    export_prepared_project_wav_with_mixer,
 };
 pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
 };
+pub use hyper_desktop_audio::{
+    OfflineExportReport, OfflineTrackStemExportFormat, OfflineTrackStemExportReport,
+};
 
 /// Version-1 maximum number of return sends authored by one source channel.
 pub const MAX_IDE_MIXER_SENDS_PER_CHANNEL: usize = hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT;
-use hyper_mapping_compiler::{ControlMappingResolver, MixerSendAddress};
 use hyper_fs_authority::{
     StableFileEvidence, confirm_stable_absolute_file, read_stable_absolute_file,
 };
+use hyper_mapping_compiler::{ControlMappingResolver, MixerSendAddress};
 use hyper_mapping_editor::{
     MappingEditor, MappingEditorMutationError, MappingEditorPreviewError,
     MappingEditorPublicationError,
@@ -74,6 +74,18 @@ use hyper_mixer_runtime::{
 };
 #[cfg(test)]
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
+use hyper_native_device::{
+    DeviceChain, DeviceChainError, NativeCompressorState, NativeDeviceInstance, NativeFilterState,
+};
+pub use hyper_native_device::{
+    MAX_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    MAX_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RELEASE_MICROSECONDS,
+    MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MAX_DEVICES_PER_CHAIN, MAX_FILTER_CUTOFF_MILLIHERTZ,
+    MAX_FILTER_RESONANCE_MILLIONTHS, MIN_COMPRESSOR_ATTACK_MICROSECONDS,
+    MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS, MIN_COMPRESSOR_RATIO_MILLIONTHS,
+    MIN_COMPRESSOR_RELEASE_MICROSECONDS, MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
+    MIN_FILTER_CUTOFF_MILLIHERTZ, MIN_FILTER_RESONANCE_MILLIONTHS, NativeFilterMode,
+};
 use hyper_playback_compiler::scene::LaunchQuantization;
 pub use hyper_playback_compiler::{
     MeterEvent, MusicalPosition, TempoEvent, musical_position_at_frame,
@@ -84,28 +96,25 @@ use hyper_playback_json::{
     AudioClipDocumentSerializationError, AudioClipDuplicationSerializationError,
     AudioClipFadeSerializationError, AudioClipGainSerializationError,
     AudioClipLoopSerializationError, AudioClipRemovalSerializationError,
-    AudioClipRenameSerializationError,
-    AudioClipSourceStartSerializationError, AudioClipSourceViewSerializationError,
-    AudioTrackAdditionSerializationError,
+    AudioClipRenameSerializationError, AudioClipSourceStartSerializationError,
+    AudioClipSourceViewSerializationError, AudioPrimaryRouteSerializationError,
+    AudioPrimaryRouteTarget, AudioTrackAdditionSerializationError,
     AudioTrackContentRemovalDocuments, AudioTrackContentRemovalSerializationError,
-    AudioTrackContentRemovalSource,
-    AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
-    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
+    AudioTrackContentRemovalSource, AudioTrackDocumentSerializationError,
     AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
-    RoutingBusDuplicationSerializationError, RoutingBusDuplicationSource,
-    MixerStripReorderSerializationError,
-    AudioPrimaryRouteSerializationError, AudioPrimaryRouteTarget,
-    ReturnSendSerializationError, RoutingBusCreationSerializationError,
+    AudioTrackRemovalBlockers, AudioTrackRemovalSerializationError,
+    AudioTrackRenameSerializationError, AutomationTakeAddition,
+    AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
+    AutomationTargetSelection, CompiledMixerDestination, CompiledMixerGraph, CompiledMixerTap,
+    CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact,
+    MixerBaseState, MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
+    MixerStripReorderSerializationError, ReturnSendSerializationError,
+    RoutingBusCreationSerializationError, RoutingBusDuplicationSerializationError,
+    RoutingBusDuplicationSource, RoutingBusKind as PlaybackRoutingBusKind,
     RoutingBusRemovalSerializationError, RoutingBusRenameSerializationError,
-    RoutingBusKind as PlaybackRoutingBusKind,
-    AutomationTakeAddition, AutomationTakeAdditionSerializationError,
-    AutomationTakeEditSerializationError, AutomationTargetSelection, CompiledMixerDestination,
-    CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
-    LoadError as PlaybackDocumentLoadError, LoaderLimits,
-    MediaAssetFact, MixerBaseState, MixerChannelBaseState, MixerSendBaseState,
-    MixerStateSerializationError, SceneAdditionSerializationError, SceneDocumentSerializationError,
-    SceneDuplicationSerializationError, SceneRenameSerializationError, SceneSlotEdit,
-    SceneRemovalBlockers, SceneRemovalSerializationError, SceneSlotEditSerializationError,
+    SceneAdditionSerializationError, SceneDocumentSerializationError,
+    SceneDuplicationSerializationError, SceneRemovalBlockers, SceneRemovalSerializationError,
+    SceneRenameSerializationError, SceneSlotEdit, SceneSlotEditSerializationError,
     TempoSerializationError, serialize_arrangement_loop_range,
     serialize_arrangement_placement_activation, serialize_arrangement_placement_addition,
     serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
@@ -116,22 +125,18 @@ use hyper_playback_json::{
     serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
     serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_removal,
     serialize_audio_clip_rename, serialize_audio_clip_reverse, serialize_audio_clip_source_start,
-    serialize_audio_clip_source_view,
+    serialize_audio_clip_source_view, serialize_audio_primary_route_change,
     serialize_audio_track_activation, serialize_audio_track_addition,
-    serialize_audio_track_content_removal,
+    serialize_audio_track_content_removal, serialize_audio_track_duplication,
     serialize_audio_track_removal, serialize_audio_track_rename,
-    serialize_audio_track_duplication, serialize_mixer_strip_reorder,
-    serialize_routing_bus_duplication,
-    serialize_audio_primary_route_change, serialize_return_send_addition,
-    serialize_return_send_removal,
-    serialize_routing_bus_creation, serialize_routing_bus_removal,
-    serialize_routing_bus_rename,
     serialize_automation_take_activation, serialize_automation_take_addition,
-    serialize_mixer_base_state, serialize_recording_audio_clip_addition,
+    serialize_mixer_base_state, serialize_mixer_strip_reorder,
+    serialize_recording_audio_clip_addition, serialize_return_send_addition,
+    serialize_return_send_removal, serialize_routing_bus_creation,
+    serialize_routing_bus_duplication, serialize_routing_bus_removal, serialize_routing_bus_rename,
     serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
-    serialize_scene_removal,
-    serialize_scene_rename, serialize_scene_slot_edit, serialize_timeline_meter,
-    serialize_timeline_tempo,
+    serialize_scene_removal, serialize_scene_rename, serialize_scene_slot_edit,
+    serialize_timeline_meter, serialize_timeline_tempo,
 };
 pub use hyper_playback_json::{
     AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
@@ -154,42 +159,26 @@ pub use hyper_project_history::{
 };
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackError, ProjectPlaybackLimits};
 use hyper_project_model::ResourceRole;
-pub use hyper_native_device::{
-    MAX_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
-    MAX_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RELEASE_MICROSECONDS,
-    MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
-    MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS,
-    MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
-    MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
-    MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
-    MIN_FILTER_CUTOFF_MILLIHERTZ, MIN_FILTER_RESONANCE_MILLIONTHS,
-    MAX_DEVICES_PER_CHAIN, NativeFilterMode,
-};
-use hyper_native_device::{
-    DeviceChain, DeviceChainError, NativeCompressorState, NativeDeviceInstance, NativeFilterState,
-};
 use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
-    AudioClipRemovalOutcome, AudioClipRemovalRequest,
-    AudioTrackContentRemovalPublicationOutcome, AudioTrackContentRemovalPublicationRequest,
-    AudioTrackDuplicationPublicationOutcome, AudioTrackDuplicationPublicationRequest,
-    AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
-    AudioTrackRemovalRequest, AutomationTakePublicationRequest, AutomationTakeRemovalRequest,
-    ControlMappingPublicationRequest,
-    DeviceChainPublicationRequest, DeviceChainRemovalRequest,
-    ImportedAudioClipPublicationRequest, ProjectResourcePublicationError,
-    ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
-    MixerRecoverySnapshotError, MixerRecoverySnapshotRequest,
-    RequiredControlCapabilities, SampleCleanupOutcome, SampleCleanupRequest,
-    RoutingBusPublicationKind, RoutingBusPublicationRequest, RoutingBusRemovalKind,
-    RoutingBusRemovalOutcome, RoutingBusRemovalRequest,
-    ScenePublicationRequest, SceneRemovalRequest, StorageError, clean_unused_samples, publish_arrangement,
-    publish_audio_clip, publish_audio_track, publish_audio_track_content_removal, publish_audio_track_duplication, publish_automation_take, publish_control_mapping,
-    publish_device_chain, publish_imported_audio_clip, publish_project_resource, publish_routing_bus, publish_scene,
-    remove_audio_clip, remove_audio_track, remove_routing_bus, remove_automation_take, remove_device_chain,
-    remove_scene,
-    TrackOrderPublicationOutcome, TrackOrderPublicationRequest, publish_track_order,
-    store_mixer_recovery_snapshot,
+    AudioClipRemovalOutcome, AudioClipRemovalRequest, AudioTrackContentRemovalPublicationOutcome,
+    AudioTrackContentRemovalPublicationRequest, AudioTrackDuplicationPublicationOutcome,
+    AudioTrackDuplicationPublicationRequest, AudioTrackPublicationOutcome,
+    AudioTrackPublicationRequest, AudioTrackRemovalOutcome, AudioTrackRemovalRequest,
+    AutomationTakePublicationRequest, AutomationTakeRemovalRequest,
+    ControlMappingPublicationRequest, DeviceChainPublicationRequest, DeviceChainRemovalRequest,
+    ImportedAudioClipPublicationRequest, MixerRecoverySnapshotError, MixerRecoverySnapshotRequest,
+    ProjectResourcePublicationError, ProjectResourcePublicationOutcome,
+    ProjectResourcePublicationRequest, RequiredControlCapabilities, RoutingBusPublicationKind,
+    RoutingBusPublicationRequest, RoutingBusRemovalKind, RoutingBusRemovalOutcome,
+    RoutingBusRemovalRequest, SampleCleanupOutcome, SampleCleanupRequest, ScenePublicationRequest,
+    SceneRemovalRequest, StorageError, TrackOrderPublicationOutcome, TrackOrderPublicationRequest,
+    clean_unused_samples, publish_arrangement, publish_audio_clip, publish_audio_track,
+    publish_audio_track_content_removal, publish_audio_track_duplication, publish_automation_take,
+    publish_control_mapping, publish_device_chain, publish_imported_audio_clip,
+    publish_project_resource, publish_routing_bus, publish_scene, publish_track_order,
+    remove_audio_clip, remove_audio_track, remove_automation_take, remove_device_chain,
+    remove_routing_bus, remove_scene, store_mixer_recovery_snapshot,
 };
 
 mod recording;
@@ -204,7 +193,8 @@ pub use recording::{
 pub use worker::{
     DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeAudioClip,
     IdeAudioClipEditCommittedWarning, IdeAudioPreviewObservation, IdeClosedSnapshot,
-    IdeMixerChannel, IdeMixerChannelDestination, IdeMixerSend, IdeNativeCompressor, IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError, IdeRecordingCaptureKind,
+    IdeMixerChannel, IdeMixerChannelDestination, IdeMixerSend, IdeNativeCompressor,
+    IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError, IdeRecordingCaptureKind,
     IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeRuntimePreparationError,
     IdeScene, IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure,
     IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
@@ -306,17 +296,16 @@ fn plan_audio_import_memory(
         .checked_mul(input.channels)
         .and_then(|samples| samples.checked_mul(size_of::<f32>()))
         .ok_or(IdeAudioImportError::CapacityUnavailable)?;
-    let encoded_output_bytes = float_wav_encoded_capacity(
-        resampling.expected_output_frames(),
-        input.channels,
-    )
-    .map_err(IdeAudioImportError::Source)?;
+    let encoded_output_bytes =
+        float_wav_encoded_capacity(resampling.expected_output_frames(), input.channels)
+            .map_err(IdeAudioImportError::Source)?;
     let decode_peak = input
         .retained_project_bytes
         .checked_add(input.encoded_source_bytes)
         .and_then(|bytes| bytes.checked_add(resampling.input_bytes()))
         .ok_or(IdeAudioImportError::CapacityUnavailable)?;
-    let resampling_peak = input.retained_project_bytes
+    let resampling_peak = input
+        .retained_project_bytes
         .checked_add(resampling.working_bytes())
         .ok_or(IdeAudioImportError::CapacityUnavailable)?;
     let encoding_peak = input
@@ -2055,7 +2044,10 @@ impl fmt::Display for IdeAudioTrackAdditionError {
                 formatter.write_str("audio-track name must contain 1 through 120 characters")
             }
             Self::MixerSave(source) => {
-                write!(formatter, "live mixer state could not be preserved: {source}")
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
             }
             Self::Serialization(source) => source.fmt(formatter),
             Self::CapacityUnavailable => {
@@ -2154,7 +2146,10 @@ impl fmt::Display for IdeRoutingBusCreationError {
                 formatter.write_str("routing-bus creation requires at least one audio source")
             }
             Self::MixerSave(source) => {
-                write!(formatter, "live mixer state could not be preserved: {source}")
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
             }
             Self::Serialization(source) => source.fmt(formatter),
             Self::CapacityUnavailable => {
@@ -2246,7 +2241,10 @@ impl fmt::Display for IdeRoutingBusRemovalError {
             Self::InvalidTrackIdentity => {
                 formatter.write_str("routing-bus removal requires a track identity")
             }
-            Self::MixerSave(source) => write!(formatter, "live mixer state could not be preserved: {source}"),
+            Self::MixerSave(source) => write!(
+                formatter,
+                "live mixer state could not be preserved: {source}"
+            ),
             Self::Blocked(blockers) => write!(
                 formatter,
                 "routing bus cannot be removed while referenced (clips: {}, child tracks: {}, scene slots: {}, placements: {}, mappings: {}, recordings: {}, automation: {})",
@@ -2259,13 +2257,38 @@ impl fmt::Display for IdeRoutingBusRemovalError {
                 blockers.has_automation
             ),
             Self::Serialization(source) => source.fmt(formatter),
-            Self::CapacityUnavailable => formatter.write_str("routing-bus removal capacity is unavailable"),
+            Self::CapacityUnavailable => {
+                formatter.write_str("routing-bus removal capacity is unavailable")
+            }
             Self::Publication(source) => source.fmt(formatter),
-            Self::NativeClose(source) => write!(formatter, "native playback did not close cleanly before removing the routing bus: {source:?}"),
-            Self::NativeCloseAndReopen { close, reopen } => write!(formatter, "native playback did not close cleanly before removing the routing bus ({close:?}) and the unchanged project could not be reopened ({reopen})"),
-            Self::ReopenAfterPreparation { preparation, reopen } => write!(formatter, "routing-bus removal preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"),
-            Self::ReopenAfterPublication { outcome, source } => write!(formatter, "routing bus {} was removed in project revision {} but the project could not be reopened: {source}", outcome.track_id(), outcome.project_revision()),
-            Self::PublicationAndReopen { publication, reopen } => write!(formatter, "routing-bus removal failed ({publication}) and the project could not be reopened ({reopen})"),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before removing the routing bus: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before removing the routing bus ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "routing-bus removal preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "routing bus {} was removed in project revision {} but the project could not be reopened: {source}",
+                outcome.track_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "routing-bus removal failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
         }
     }
 }
@@ -2280,7 +2303,10 @@ impl Error for IdeRoutingBusRemovalError {
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
             Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
             Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
-            Self::InvalidTrackIdentity | Self::Blocked(_) | Self::CapacityUnavailable | Self::NativeClose(_) => None,
+            Self::InvalidTrackIdentity
+            | Self::Blocked(_)
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
         }
     }
 }
@@ -2328,7 +2354,10 @@ impl fmt::Display for IdeReturnSendEditError {
                 "return-send removal is blocked by {control_mappings} control mapping(s) and {automation_lanes} automation lane(s)"
             ),
             Self::MixerSave(source) => {
-                write!(formatter, "live mixer state could not be preserved: {source}")
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
             }
             Self::Serialization(source) => source.fmt(formatter),
             Self::CapacityUnavailable => {
@@ -2414,11 +2443,12 @@ pub enum IdeAudioPrimaryRouteError {
 impl fmt::Display for IdeAudioPrimaryRouteError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRouteIdentity => {
-                formatter.write_str("primary-route identity is invalid")
-            }
+            Self::InvalidRouteIdentity => formatter.write_str("primary-route identity is invalid"),
             Self::MixerSave(source) => {
-                write!(formatter, "live mixer state could not be preserved: {source}")
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
             }
             Self::Serialization(source) => source.fmt(formatter),
             Self::CapacityUnavailable => {
@@ -2519,14 +2549,16 @@ impl fmt::Display for IdeMixerStripReorderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MixerSave(source) => {
-                write!(formatter, "live mixer state could not be preserved: {source}")
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
             }
             Self::TrackResourceMissing => {
                 formatter.write_str("a track required for mixer-strip reorder is unavailable")
             }
-            Self::TrackResourceRoleMismatch => formatter.write_str(
-                "the project cannot safely reorder this set of structural tracks",
-            ),
+            Self::TrackResourceRoleMismatch => formatter
+                .write_str("the project cannot safely reorder this set of structural tracks"),
             Self::Storage(source) => source.fmt(formatter),
             Self::CapacityUnavailable => {
                 formatter.write_str("mixer-strip reorder capacity is unavailable")
@@ -2634,7 +2666,10 @@ impl fmt::Display for IdeAudioTrackDuplicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MixerSave(source) => {
-                write!(formatter, "live mixer state could not be preserved: {source}")
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
             }
             Self::Storage(source) => source.fmt(formatter),
             Self::Device(source) => source.fmt(formatter),
@@ -2644,9 +2679,9 @@ impl fmt::Display for IdeAudioTrackDuplicationError {
             Self::TrackResourceRoleMismatch => formatter.write_str(
                 "the selected mixer strip cannot be duplicated as independent track state",
             ),
-            Self::DeviceChainAmbiguous => formatter.write_str(
-                "the source track has more than one native device chain",
-            ),
+            Self::DeviceChainAmbiguous => {
+                formatter.write_str("the source track has more than one native device chain")
+            }
             Self::CapacityUnavailable => {
                 formatter.write_str("audio-track duplication capacity is unavailable")
             }
@@ -2662,7 +2697,10 @@ impl fmt::Display for IdeAudioTrackDuplicationError {
                 formatter,
                 "native playback did not close cleanly before duplicating the mixer strip ({close:?}) and the unchanged project could not be reopened ({reopen})"
             ),
-            Self::ReopenAfterPreparation { preparation, reopen } => write!(
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
                 formatter,
                 "mixer-strip duplication preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
             ),
@@ -2672,7 +2710,10 @@ impl fmt::Display for IdeAudioTrackDuplicationError {
                 outcome.track_id(),
                 outcome.project_revision()
             ),
-            Self::PublicationAndReopen { publication, reopen } => write!(
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
                 formatter,
                 "mixer-strip duplication failed ({publication}) and the project could not be reopened ({reopen})"
             ),
@@ -2778,16 +2819,19 @@ impl fmt::Display for IdeAudioTrackContentRemovalError {
                 formatter.write_str("full audio-track removal requires a track identity")
             }
             Self::MixerSave(source) => {
-                write!(formatter, "live mixer state could not be preserved: {source}")
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
             }
             Self::Storage(source) => source.fmt(formatter),
             Self::Device(source) => source.fmt(formatter),
             Self::TrackResourceMissing => {
                 formatter.write_str("the selected audio track is unavailable")
             }
-            Self::TrackResourceRoleMismatch => formatter.write_str(
-                "the selected track cannot be removed with its musical state",
-            ),
+            Self::TrackResourceRoleMismatch => {
+                formatter.write_str("the selected track cannot be removed with its musical state")
+            }
             Self::DeviceChainAmbiguous => formatter.write_str(
                 "the selected track has multiple native device chains and cannot be removed safely",
             ),
@@ -3141,19 +3185,52 @@ pub enum IdeRoutingBusRenameError {
 impl fmt::Display for IdeRoutingBusRenameError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidName => formatter.write_str("routing-bus name must contain 1 through 120 characters"),
-            Self::MixerSave(source) => write!(formatter, "live mixer state could not be preserved: {source}"),
-            Self::TrackResourceMissing => formatter.write_str("the selected routing-bus resource is no longer present"),
-            Self::TrackResourceRoleMismatch => formatter.write_str("the selected project resource is not a structural track"),
+            Self::InvalidName => {
+                formatter.write_str("routing-bus name must contain 1 through 120 characters")
+            }
+            Self::MixerSave(source) => write!(
+                formatter,
+                "live mixer state could not be preserved: {source}"
+            ),
+            Self::TrackResourceMissing => {
+                formatter.write_str("the selected routing-bus resource is no longer present")
+            }
+            Self::TrackResourceRoleMismatch => {
+                formatter.write_str("the selected project resource is not a structural track")
+            }
             Self::Storage(source) => source.fmt(formatter),
             Self::Serialization(source) => source.fmt(formatter),
-            Self::CapacityUnavailable => formatter.write_str("routing-bus rename capacity is unavailable"),
+            Self::CapacityUnavailable => {
+                formatter.write_str("routing-bus rename capacity is unavailable")
+            }
             Self::Publication(source) => source.fmt(formatter),
-            Self::NativeClose(source) => write!(formatter, "native playback did not close cleanly before renaming the routing bus: {source:?}"),
-            Self::NativeCloseAndReopen { close, reopen } => write!(formatter, "native playback did not close cleanly before renaming the routing bus ({close:?}) and the unchanged project could not be reopened ({reopen})"),
-            Self::ReopenAfterPreparation { preparation, reopen } => write!(formatter, "routing-bus rename preparation failed ({preparation}) and the project could not be reopened ({reopen})"),
-            Self::ReopenAfterPublication { outcome, source } => write!(formatter, "routing bus was renamed in project revision {} but the project could not be reopened: {source}", outcome.project_revision()),
-            Self::PublicationAndReopen { publication, reopen } => write!(formatter, "routing-bus rename publication failed ({publication}) and the project could not be reopened ({reopen})"),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before renaming the routing bus: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before renaming the routing bus ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "routing-bus rename preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "routing bus was renamed in project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "routing-bus rename publication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
         }
     }
 }
@@ -3169,7 +3246,11 @@ impl Error for IdeRoutingBusRenameError {
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
             Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
             Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
-            Self::InvalidName | Self::TrackResourceMissing | Self::TrackResourceRoleMismatch | Self::CapacityUnavailable | Self::NativeClose(_) => None,
+            Self::InvalidName
+            | Self::TrackResourceMissing
+            | Self::TrackResourceRoleMismatch
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
         }
     }
 }
@@ -3779,9 +3860,7 @@ impl IdeAudioClipRemovalError {
             | Self::ReopenAfterPublication { .. } => true,
             Self::Publication(source) => source.published(),
             Self::PublicationAndReopen { publication, .. } => publication.published(),
-            Self::ReopenAfterPreparation { preparation, .. } => {
-                preparation.publication_committed()
-            }
+            Self::ReopenAfterPreparation { preparation, .. } => preparation.publication_committed(),
             _ => false,
         }
     }
@@ -3799,9 +3878,7 @@ impl fmt::Display for IdeAudioClipRemovalError {
                     "live mixer state could not be preserved: {source}"
                 )
             }
-            Self::ClipResourceMissing => {
-                formatter.write_str("the audio clip is no longer present")
-            }
+            Self::ClipResourceMissing => formatter.write_str("the audio clip is no longer present"),
             Self::ClipResourceRoleMismatch => {
                 formatter.write_str("the selected identity is not an audio-clip resource")
             }
@@ -4695,20 +4772,48 @@ impl fmt::Display for IdeNativeFilterEditError {
             }
             Self::TrackUnavailable => formatter.write_str("native device track is unavailable"),
             Self::ChainUnavailable => formatter.write_str("native device chain is unavailable"),
-            Self::MixerSave(source) => write!(formatter, "live mixer state could not be preserved: {source}"),
+            Self::MixerSave(source) => write!(
+                formatter,
+                "live mixer state could not be preserved: {source}"
+            ),
             Self::Device(source) | Self::Serialization(source) => source.fmt(formatter),
-            Self::MixerPublication(source) => write!(formatter, "live mixer state could not be published: {source}"),
+            Self::MixerPublication(source) => write!(
+                formatter,
+                "live mixer state could not be published: {source}"
+            ),
             Self::Publication { mixer, source } if mixer.changed() => write!(
                 formatter,
                 "live mixer was preserved in project revision {} but native device publication failed: {source}",
                 mixer.project_revision()
             ),
             Self::Publication { source, .. } => source.fmt(formatter),
-            Self::NativeClose(source) => write!(formatter, "native playback did not close cleanly before editing native devices: {source:?}"),
-            Self::NativeCloseAndReopen { close, reopen } => write!(formatter, "native playback did not close cleanly before editing native devices ({close:?}) and authoritative playback could not be reopened: {reopen}"),
-            Self::ReopenAfterPreparation { preparation, reopen } => write!(formatter, "native device edit was refused ({preparation}) and authoritative playback could not be reopened: {reopen}"),
-            Self::ReopenAfterPublication { outcome, source } => write!(formatter, "native device edit committed as project revision {}, but playback could not be reopened: {source}", outcome.project_revision()),
-            Self::PublicationAndReopen { publication, reopen } => write!(formatter, "native device publication failed ({publication}) and authoritative playback could not be reopened: {reopen}"),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before editing native devices: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before editing native devices ({close:?}) and authoritative playback could not be reopened: {reopen}"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "native device edit was refused ({preparation}) and authoritative playback could not be reopened: {reopen}"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "native device edit committed as project revision {}, but playback could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "native device publication failed ({publication}) and authoritative playback could not be reopened: {reopen}"
+            ),
         }
     }
 }
@@ -6023,8 +6128,13 @@ impl fmt::Display for IdeSceneRemovalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSceneIdentity => formatter.write_str("scene removal requires an identity"),
-            Self::MixerSave(source) => write!(formatter, "live mixer state could not be preserved: {source}"),
-            Self::SceneResourceMissing => formatter.write_str("the selected scene resource is missing"),
+            Self::MixerSave(source) => write!(
+                formatter,
+                "live mixer state could not be preserved: {source}"
+            ),
+            Self::SceneResourceMissing => {
+                formatter.write_str("the selected scene resource is missing")
+            }
             Self::SceneResourceRoleMismatch => {
                 formatter.write_str("the selected identity is not a scene resource")
             }
@@ -6032,11 +6142,12 @@ impl fmt::Display for IdeSceneRemovalError {
             Self::Blocked(blockers) => write!(
                 formatter,
                 "scene removal is blocked by {} arrangement launch(es) and {} control mapping(s)",
-                blockers.playback.arrangement_scene_launches,
-                blockers.control_mappings
+                blockers.playback.arrangement_scene_launches, blockers.control_mappings
             ),
             Self::Serialization(source) => source.fmt(formatter),
-            Self::CapacityUnavailable => formatter.write_str("scene removal capacity is unavailable"),
+            Self::CapacityUnavailable => {
+                formatter.write_str("scene removal capacity is unavailable")
+            }
             Self::Publication(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
@@ -6046,7 +6157,10 @@ impl fmt::Display for IdeSceneRemovalError {
                 formatter,
                 "native playback did not close cleanly before removing the scene ({close:?}) and the unchanged project could not be reopened ({reopen})"
             ),
-            Self::ReopenAfterPreparation { preparation, reopen } => write!(
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
                 formatter,
                 "scene removal preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
             ),
@@ -6055,11 +6169,17 @@ impl fmt::Display for IdeSceneRemovalError {
                 "scene was removed in project revision {} but the project could not be reopened: {source}",
                 outcome.project_revision()
             ),
-            Self::PublicationAndReopen { publication, reopen } if publication.scene_published() => write!(
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.scene_published() => write!(
                 formatter,
                 "scene removal was committed with incomplete project verification or transaction recovery ({publication}) and the project could not be reopened ({reopen})"
             ),
-            Self::PublicationAndReopen { publication, reopen } => write!(
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
                 formatter,
                 "scene removal failed ({publication}) and the project could not be reopened ({reopen})"
             ),
@@ -6805,7 +6925,10 @@ impl fmt::Display for IdeAudioClipSourceSlipEditError {
                 formatter.write_str("audio-clip source slip requires a clip identity")
             }
             Self::MixerSave(source) => {
-                write!(formatter, "live mixer state could not be preserved: {source}")
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
             }
             Self::ClipResourceMissing => {
                 formatter.write_str("the selected audio-clip resource is missing")
@@ -7278,14 +7401,11 @@ impl IdeUnusedSampleCleanupPlan {
 
 impl IdeAudioClipRemovalPlan {
     fn publish(&self) -> Result<AudioClipRemovalOutcome, IdeAudioClipRemovalError> {
-        let mixer = self
-            .mixer
-            .publish()
-            .map_err(|source| {
-                IdeAudioClipRemovalError::MixerSave(Box::new(IdeProjectSaveError::Publication(
-                    Box::new(source),
-                )))
-            })?;
+        let mixer = self.mixer.publish().map_err(|source| {
+            IdeAudioClipRemovalError::MixerSave(Box::new(IdeProjectSaveError::Publication(
+                Box::new(source),
+            )))
+        })?;
         remove_audio_clip(
             &self.mixer.project_path,
             AudioClipRemovalRequest {
@@ -7339,10 +7459,7 @@ impl IdeRoutingBusRemovalPlan {
 impl IdeAudioTrackContentRemovalPlan {
     fn publish(
         &self,
-    ) -> Result<
-        AudioTrackContentRemovalPublicationOutcome,
-        ProjectResourcePublicationError,
-    > {
+    ) -> Result<AudioTrackContentRemovalPublicationOutcome, ProjectResourcePublicationError> {
         publish_audio_track_content_removal(
             &self.project_path,
             AudioTrackContentRemovalPublicationRequest {
@@ -7633,12 +7750,12 @@ impl IdeDeviceChainHistoryRestorePlan {
 
 impl IdeResourceRestorePlan {
     fn displaced(&self) -> Option<IdeHistoryOperation> {
-        self.displaced_bytes.as_ref().map(|bytes| {
-            IdeHistoryOperation::ResourceReplacement {
+        self.displaced_bytes
+            .as_ref()
+            .map(|bytes| IdeHistoryOperation::ResourceReplacement {
                 resource_id: self.resource_id.clone(),
                 bytes: bytes.clone(),
-            }
-        })
+            })
     }
 
     fn publish(&self) -> Result<ProjectResourcePublicationOutcome, IdeResourceRestoreError> {
@@ -7788,9 +7905,7 @@ fn native_compressor_state(
     .map_err(IdeNativeFilterEditError::Device)
 }
 
-fn serialize_native_filter_chain(
-    chain: &DeviceChain,
-) -> Result<Vec<u8>, IdeNativeFilterEditError> {
+fn serialize_native_filter_chain(chain: &DeviceChain) -> Result<Vec<u8>, IdeNativeFilterEditError> {
     chain
         .to_canonical_vec()
         .map_err(IdeNativeFilterEditError::Serialization)
@@ -7801,9 +7916,7 @@ impl IdeNativeFilterEditPlan {
         self.inverse.clone()
     }
 
-    fn publish(
-        &self,
-    ) -> Result<ProjectResourcePublicationOutcome, IdeNativeFilterEditError> {
+    fn publish(&self) -> Result<ProjectResourcePublicationOutcome, IdeNativeFilterEditError> {
         let mixer = self
             .mixer
             .publish()
@@ -8486,7 +8599,6 @@ impl IdeMixerStripReorderPlan {
             },
         )
     }
-
 }
 
 impl IdeAudioTrackDuplicationPlan {
@@ -8753,7 +8865,11 @@ impl RunningDesktopIdeApplication {
         let IdePlaybackSessionOwner::Native(session) = &self.session;
         let project = session.prepared_project()?;
         let (_, mixer, _, _) = project.session().parts();
-        match session.recovery_checkpoint().snapshot().mixer_parameter_state() {
+        match session
+            .recovery_checkpoint()
+            .snapshot()
+            .mixer_parameter_state()
+        {
             Some(state) => live_mixer_state_is_dirty(mixer, &state),
             None => Some(false),
         }
@@ -8929,11 +9045,7 @@ impl RunningDesktopIdeApplication {
             .prepared_project()
             .ok_or(IdeProjectSaveError::ProjectSnapshotUnavailable)?;
         let checkpoint = session.recovery_checkpoint().snapshot();
-        let plan = Self::prepare_mixer_save_from_snapshot(
-            &self.application,
-            project,
-            &checkpoint,
-        )?;
+        let plan = Self::prepare_mixer_save_from_snapshot(&self.application, project, &checkpoint)?;
         store_mixer_recovery_snapshot(
             &plan.project_path,
             MixerRecoverySnapshotRequest {
@@ -9121,13 +9233,17 @@ impl RunningDesktopIdeApplication {
             ))
         })?;
         let (project, compiled_mixer, _, media) = prepared.session().parts();
-        let address = compiled_mixer.slots().iter().enumerate().find_map(|(slot, channel)| {
-            channel
-                .sends()
-                .iter()
-                .position(|send| send.id() == send_id)
-                .map(|send| (slot, send))
-        });
+        let address = compiled_mixer
+            .slots()
+            .iter()
+            .enumerate()
+            .find_map(|(slot, channel)| {
+                channel
+                    .sends()
+                    .iter()
+                    .position(|send| send.id() == send_id)
+                    .map(|send| (slot, send))
+            });
         let (control_mappings, automation_lanes) = address.map_or((0, 0), |(slot, send)| {
             let control_mappings = prepared.control_mapping().map_or(0, |mapping| {
                 mapping
@@ -9202,7 +9318,10 @@ impl RunningDesktopIdeApplication {
             .try_reserve_exact(media.asset_count())
             .map_err(|_| IdeAudioPrimaryRouteError::CapacityUnavailable)?;
         assets.extend(media.media_asset_facts());
-        let target = target_group_track_id.map_or(AudioPrimaryRouteTarget::Main, AudioPrimaryRouteTarget::Group);
+        let target = target_group_track_id.map_or(
+            AudioPrimaryRouteTarget::Main,
+            AudioPrimaryRouteTarget::Group,
+        );
         mixer.resource_bytes = serialize_audio_primary_route_change(
             project,
             &assets,
@@ -9302,7 +9421,10 @@ impl RunningDesktopIdeApplication {
             ))
         })?;
         let (project, mixer, _, media) = prepared.session().parts();
-        let track_slot = mixer.slots().iter().find(|slot| slot.track_id() == track_id);
+        let track_slot = mixer
+            .slots()
+            .iter()
+            .find(|slot| slot.track_id() == track_id);
         let blockers = IdeAudioTrackRemovalBlockers {
             playback: project.audio_track_removal_blockers(track_id),
             control_mappings: prepared.control_mapping().map_or(0, |mapping| {
@@ -9507,7 +9629,10 @@ impl RunningDesktopIdeApplication {
             .iter()
             .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
             .collect::<Vec<_>>();
-        let automation_take_ids = automation_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let automation_take_ids = automation_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let automation_sources = automation_takes
             .iter()
             .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
@@ -9688,10 +9813,7 @@ impl RunningDesktopIdeApplication {
             application.config.project_limits.session.documents,
         )
         .map_err(IdeMixerStripReorderError::Serialization)?;
-        Ok(IdeMixerStripReorderPlan {
-            mixer,
-            documents,
-        })
+        Ok(IdeMixerStripReorderPlan { mixer, documents })
     }
 
     #[allow(
@@ -9814,7 +9936,10 @@ impl RunningDesktopIdeApplication {
             .iter()
             .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
             .collect::<Vec<_>>();
-        let automation_take_ids = automation_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let automation_take_ids = automation_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let automation_sources = automation_takes
             .iter()
             .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
@@ -10078,10 +10203,8 @@ impl RunningDesktopIdeApplication {
         let decoded = decode_bytes_at_source_rate(source_bytes, container, limits.audio)
             .map_err(IdeAudioImportError::Source)?;
         let media = prepared.session().parts().3;
-        let maximum_output_frames = u64::try_from(
-            limits.session.media_cache.max_frames_per_asset,
-        )
-        .map_err(|_| IdeAudioImportError::CapacityUnavailable)?;
+        let maximum_output_frames = u64::try_from(limits.session.media_cache.max_frames_per_asset)
+            .map_err(|_| IdeAudioImportError::CapacityUnavailable)?;
         let memory = plan_audio_import_memory(
             AudioImportMemoryInput {
                 retained_project_bytes: media.decoded_sample_bytes(),
@@ -10313,12 +10436,7 @@ impl RunningDesktopIdeApplication {
                 IdeProjectSaveError::ProjectSnapshotUnavailable,
             ))
         })?;
-        Self::prepare_audio_clip_removal_from_project(
-            application,
-            mixer,
-            prepared,
-            clip_id,
-        )
+        Self::prepare_audio_clip_removal_from_project(application, mixer, prepared, clip_id)
     }
 
     fn prepare_unused_sample_cleanup(
@@ -11386,26 +11504,28 @@ impl RunningDesktopIdeApplication {
         };
         match operation {
             IdeHistoryOperation::DeviceChainAddition { chain_id, bytes } => {
-                let chain = DeviceChain::parse(bytes)
-                    .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
-                let canonical = chain
-                    .to_canonical_vec()
-                    .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
+                let chain = DeviceChain::parse(bytes).map_err(|source| {
+                    IdeResourceRestoreError::CandidateInvalid(Box::new(source))
+                })?;
+                let canonical = chain.to_canonical_vec().map_err(|source| {
+                    IdeResourceRestoreError::CandidateInvalid(Box::new(source))
+                })?;
                 if canonical != *bytes
                     || chain.id() != chain_id
                     || chain.project_id() != prepared.package().manifest().project_id()
                 {
-                    return Err(invalid("device-chain undo bytes do not match their authority"));
+                    return Err(invalid(
+                        "device-chain undo bytes do not match their authority",
+                    ));
                 }
                 let (_, compiled_mixer, _, _) = prepared.session().parts();
                 if !compiled_mixer
                     .slots()
                     .iter()
                     .any(|slot| slot.track_id() == chain.track_id())
-                    || prepared
-                        .device_chains()
-                        .iter()
-                        .any(|active| active.id() == chain_id || active.track_id() == chain.track_id())
+                    || prepared.device_chains().iter().any(|active| {
+                        active.id() == chain_id || active.track_id() == chain.track_id()
+                    })
                 {
                     return Err(invalid(
                         "device-chain undo addition conflicts with the active project",
@@ -11430,9 +11550,9 @@ impl RunningDesktopIdeApplication {
                     .iter()
                     .find(|chain| chain.id() == chain_id)
                     .ok_or(IdeResourceRestoreError::ResourceMissing)?;
-                let active_bytes = active
-                    .to_canonical_vec()
-                    .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
+                let active_bytes = active.to_canonical_vec().map_err(|source| {
+                    IdeResourceRestoreError::CandidateInvalid(Box::new(source))
+                })?;
                 if active_bytes != *expected_bytes {
                     return Err(invalid(
                         "device-chain undo removal no longer matches the active resource",
@@ -11914,9 +12034,9 @@ impl RunningDesktopIdeApplication {
                     let previous = serialize_native_filter_chain(chain)?;
                     (
                         chain.id().to_owned(),
-                        IdeNativeFilterPublication::Replacement(
-                            serialize_native_filter_chain(&changed)?,
-                        ),
+                        IdeNativeFilterPublication::Replacement(serialize_native_filter_chain(
+                            &changed,
+                        )?),
                         IdeHistoryOperation::ResourceReplacement {
                             resource_id: chain.id().to_owned(),
                             bytes: previous,
@@ -11983,9 +12103,9 @@ impl RunningDesktopIdeApplication {
                     let previous = serialize_native_filter_chain(chain)?;
                     (
                         chain.id().to_owned(),
-                        IdeNativeFilterPublication::Replacement(
-                            serialize_native_filter_chain(&changed)?,
-                        ),
+                        IdeNativeFilterPublication::Replacement(serialize_native_filter_chain(
+                            &changed,
+                        )?),
                         IdeHistoryOperation::ResourceReplacement {
                             resource_id: chain.id().to_owned(),
                             bytes: previous,
@@ -12036,9 +12156,9 @@ impl RunningDesktopIdeApplication {
                     .map_err(IdeNativeFilterEditError::Device)?;
                 (
                     chain_id.clone(),
-                    IdeNativeFilterPublication::Replacement(
-                        serialize_native_filter_chain(&changed)?,
-                    ),
+                    IdeNativeFilterPublication::Replacement(serialize_native_filter_chain(
+                        &changed,
+                    )?),
                     IdeHistoryOperation::ResourceReplacement {
                         resource_id: chain.id().to_owned(),
                         bytes: serialize_native_filter_chain(chain)?,
@@ -12071,9 +12191,9 @@ impl RunningDesktopIdeApplication {
                     .map_err(IdeNativeFilterEditError::Device)?;
                 (
                     chain_id.clone(),
-                    IdeNativeFilterPublication::Replacement(
-                        serialize_native_filter_chain(&changed)?,
-                    ),
+                    IdeNativeFilterPublication::Replacement(serialize_native_filter_chain(
+                        &changed,
+                    )?),
                     IdeHistoryOperation::ResourceReplacement {
                         resource_id: chain.id().to_owned(),
                         bytes: serialize_native_filter_chain(chain)?,
@@ -12091,9 +12211,9 @@ impl RunningDesktopIdeApplication {
                     .map_err(IdeNativeFilterEditError::Device)?;
                 (
                     chain_id.clone(),
-                    IdeNativeFilterPublication::Replacement(
-                        serialize_native_filter_chain(&changed)?,
-                    ),
+                    IdeNativeFilterPublication::Replacement(serialize_native_filter_chain(
+                        &changed,
+                    )?),
                     IdeHistoryOperation::ResourceReplacement {
                         resource_id: chain.id().to_owned(),
                         bytes: serialize_native_filter_chain(chain)?,
@@ -12113,9 +12233,9 @@ impl RunningDesktopIdeApplication {
                     .map_err(IdeNativeFilterEditError::Device)?;
                 (
                     chain_id.clone(),
-                    IdeNativeFilterPublication::Replacement(
-                        serialize_native_filter_chain(&changed)?,
-                    ),
+                    IdeNativeFilterPublication::Replacement(serialize_native_filter_chain(
+                        &changed,
+                    )?),
                     IdeHistoryOperation::ResourceReplacement {
                         resource_id: chain.id().to_owned(),
                         bytes: serialize_native_filter_chain(chain)?,
@@ -12131,21 +12251,15 @@ impl RunningDesktopIdeApplication {
                 if source_chain_id == target_chain_id {
                     return Err(IdeNativeFilterEditError::CopyRequiresDistinctChains);
                 }
-                let source_chain = find_native_filter_chain(
-                    prepared,
-                    source_chain_id,
-                    source_device_instance_id,
-                )?;
+                let source_chain =
+                    find_native_filter_chain(prepared, source_chain_id, source_device_instance_id)?;
                 let source = source_chain
                     .devices()
                     .iter()
                     .find(|device| device.id() == source_device_instance_id)
                     .ok_or(IdeNativeFilterEditError::InvalidIdentity)?;
-                let target_chain = find_native_filter_chain(
-                    prepared,
-                    target_chain_id,
-                    target_device_instance_id,
-                )?;
+                let target_chain =
+                    find_native_filter_chain(prepared, target_chain_id, target_device_instance_id)?;
                 let changed = target_chain
                     .try_with_copied_device_after(
                         source,
@@ -12155,9 +12269,9 @@ impl RunningDesktopIdeApplication {
                     .map_err(IdeNativeFilterEditError::Device)?;
                 (
                     target_chain_id.clone(),
-                    IdeNativeFilterPublication::Replacement(
-                        serialize_native_filter_chain(&changed)?,
-                    ),
+                    IdeNativeFilterPublication::Replacement(serialize_native_filter_chain(
+                        &changed,
+                    )?),
                     IdeHistoryOperation::ResourceReplacement {
                         resource_id: target_chain.id().to_owned(),
                         bytes: serialize_native_filter_chain(target_chain)?,
@@ -12175,9 +12289,9 @@ impl RunningDesktopIdeApplication {
                     .map_err(IdeNativeFilterEditError::Device)?
                 {
                     Some(changed) => (
-                        IdeNativeFilterPublication::Replacement(
-                            serialize_native_filter_chain(&changed)?,
-                        ),
+                        IdeNativeFilterPublication::Replacement(serialize_native_filter_chain(
+                            &changed,
+                        )?),
                         IdeHistoryOperation::ResourceReplacement {
                             resource_id: chain.id().to_owned(),
                             bytes: previous.clone(),
@@ -12947,7 +13061,8 @@ impl RunningDesktopIdeApplication {
         let mut mixer_channel_names = [""; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_kinds = [IdeMixerChannelKind::Audio; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_active = [false; MAX_IDE_MIXER_CHANNELS];
-        let mut mixer_channel_destinations = [IdeMixerPrimaryDestination::Main; MAX_IDE_MIXER_CHANNELS];
+        let mut mixer_channel_destinations =
+            [IdeMixerPrimaryDestination::Main; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_states = [None; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_send_counts = [0; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_send_ids =
@@ -14475,10 +14590,15 @@ mod tests {
 
     fn arrangement_test_import_plan(
         source: &Path,
-    ) -> (ArrangementProjectFixture, IdeImportedAudioClipPlan, [u8; 32]) {
+    ) -> (
+        ArrangementProjectFixture,
+        IdeImportedAudioClipPlan,
+        [u8; 32],
+    ) {
         let fixture = ArrangementProjectFixture::new();
         let limits = desktop_ide_application_config().unwrap().project_limits();
-        let prepared = hyper_project_loader::prepare_project_playback(fixture.root(), limits).unwrap();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(fixture.root(), limits).unwrap();
         let original_identity = *prepared.package().manifest_sha256();
         let application = DesktopIdeApplication::from_inventory(
             desktop_ide_application_config().unwrap(),
@@ -14843,7 +14963,10 @@ mod tests {
             mixer.main_gain(),
             mixer.main_muted(),
         );
-        assert_eq!(live_mixer_state_is_dirty(mixer, &changed_channel), Some(true));
+        assert_eq!(
+            live_mixer_state_is_dirty(mixer, &changed_channel),
+            Some(true)
+        );
 
         for (parameters, muted, solo) in [
             (
@@ -14890,7 +15013,10 @@ mod tests {
             mixer.main_gain(),
             !mixer.main_muted(),
         );
-        assert_eq!(live_mixer_state_is_dirty(mixer, &changed_main_mute), Some(true));
+        assert_eq!(
+            live_mixer_state_is_dirty(mixer, &changed_main_mute),
+            Some(true)
+        );
         let malformed = hyper_mixer_runtime::MixerParameterStateSnapshot::for_test(
             &[],
             mixer.main_gain(),
@@ -14956,7 +15082,10 @@ mod tests {
                 send_mixer.main_gain(),
                 send_mixer.main_muted(),
             );
-            assert_eq!(live_mixer_state_is_dirty(&send_mixer, &snapshot), Some(true));
+            assert_eq!(
+                live_mixer_state_is_dirty(&send_mixer, &snapshot),
+                Some(true)
+            );
         }
         let malformed_send = hyper_mixer_runtime::MixerParameterStateSnapshot::for_test(
             &[
@@ -14971,7 +15100,10 @@ mod tests {
             send_mixer.main_gain(),
             send_mixer.main_muted(),
         );
-        assert_eq!(live_mixer_state_is_dirty(&send_mixer, &malformed_send), Some(true));
+        assert_eq!(
+            live_mixer_state_is_dirty(&send_mixer, &malformed_send),
+            Some(true)
+        );
     }
 
     fn compiled_mixer_with_one_send() -> CompiledMixerGraph {
@@ -14986,16 +15118,27 @@ mod tests {
             "format":"hyper-track", "format_version":1, "id":"018f47a2-6b2d-7c11-8a44-00112233a002",
             "project_id":project_id, "name":"Source", "kind":"audio", "order":0,
             "active":true, "clip_ids":[], "extensions":{}
-        })).unwrap();
+        }))
+        .unwrap();
         let return_bus = serde_json_canonicalizer::to_vec(&json!({
             "format":"hyper-track", "format_version":1, "id":"018f47a2-6b2d-7c11-8a44-00112233a003",
             "project_id":project_id, "name":"Return", "kind":"return", "order":1,
             "active":true, "clip_ids":[], "extensions":{}
-        })).unwrap();
-        let project = load(PlaybackJsonInput {
-            project_id, sample_rate_hz:48_000, timeline:&timeline, tracks:&[&audio, &return_bus],
-            clips:&[], scenes:&[], arrangement:None,
-        }, LoaderLimits::VERSION_1).unwrap();
+        }))
+        .unwrap();
+        let project = load(
+            PlaybackJsonInput {
+                project_id,
+                sample_rate_hz: 48_000,
+                timeline: &timeline,
+                tracks: &[&audio, &return_bus],
+                clips: &[],
+                scenes: &[],
+                arrangement: None,
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
         let mixer = serde_json_canonicalizer::to_vec(&json!({
             "format":"hyper-mixer", "format_version":1, "id":"018f47a2-6b2d-7c11-8a44-00112233a004", "project_id":project_id,
             "channels":[
@@ -15004,7 +15147,11 @@ mod tests {
             ], "return_buses":[{"bus":"a", "track_id":"018f47a2-6b2d-7c11-8a44-00112233a003"}],
             "main":{"gain_millionths":1_000_000,"mute":false}, "cue":{"source":"main","gain_millionths":1_000_000,"mute":false}, "extensions":{}
         })).unwrap();
-        project.load_mixer(&mixer, &[], LoaderLimits::VERSION_1).unwrap().compile_main_graph().unwrap()
+        project
+            .load_mixer(&mixer, &[], LoaderLimits::VERSION_1)
+            .unwrap()
+            .compile_main_graph()
+            .unwrap()
     }
 
     #[test]
@@ -16433,14 +16580,15 @@ mod tests {
                 AudioClipRemovalSerializationError::Blocked(_)
             ))
         ));
-        let duplication = RunningDesktopIdeApplication::prepare_audio_clip_duplication_from_project(
-            &application,
-            mixer_plan(),
-            &prepared,
-            ARRANGEMENT_TEST_CLIP_ID,
-            "Unused copy",
-        )
-        .unwrap();
+        let duplication =
+            RunningDesktopIdeApplication::prepare_audio_clip_duplication_from_project(
+                &application,
+                mixer_plan(),
+                &prepared,
+                ARRANGEMENT_TEST_CLIP_ID,
+                "Unused copy",
+            )
+            .unwrap();
         let duplicate_id = duplication.clip_id.clone();
         drop(prepared);
         duplication.publish().unwrap();
@@ -16820,12 +16968,12 @@ mod tests {
         };
         let restore =
             RunningDesktopIdeApplication::prepare_automation_take_history_restore_from_project(
-            &application,
-            restore_mixer,
-            &removed,
-            &inverse,
-        )
-        .unwrap();
+                &application,
+                restore_mixer,
+                &removed,
+                &inverse,
+            )
+            .unwrap();
         assert_eq!(
             restore.displaced(),
             IdeHistoryOperation::AutomationTakeRemoval {
@@ -16842,7 +16990,10 @@ mod tests {
         let restored =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
         assert!(restored.session().has_automation());
-        assert_eq!(restored.session().automation_takes().takes()[0].id(), take_id);
+        assert_eq!(
+            restored.session().automation_takes().takes()[0].id(),
+            take_id
+        );
         assert_eq!(
             restored.package().read_resource(take_id).unwrap(),
             original_take_bytes
@@ -16861,7 +17012,6 @@ mod tests {
                 .unwrap(),
             live_mixer_bytes
         );
-
     }
 
     #[test]
@@ -16911,8 +17061,7 @@ mod tests {
         let conflicting_id = "018f47a2-6b2d-7c11-8a44-00112233850b";
         let mut conflicting: Value = serde_json::from_slice(&take_bytes).unwrap();
         conflicting["id"] = conflicting_id.into();
-        conflicting["lanes"][0]["id"] =
-            "018f47a2-6b2d-7c11-8a44-00112233850c".into();
+        conflicting["lanes"][0]["id"] = "018f47a2-6b2d-7c11-8a44-00112233850c".into();
         assert!(matches!(
             RunningDesktopIdeApplication::prepare_automation_take_history_restore_from_project(
                 &application,
@@ -16929,7 +17078,10 @@ mod tests {
             std::fs::read(project_path.join("project.json")).unwrap(),
             manifest_before
         );
-        assert_eq!(prepared.package().read_resource(take_id).unwrap(), take_bytes);
+        assert_eq!(
+            prepared.package().read_resource(take_id).unwrap(),
+            take_bytes
+        );
     }
 
     #[test]

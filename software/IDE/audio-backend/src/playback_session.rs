@@ -31,14 +31,14 @@ use hyper_control_runtime::{ControlRuntime, ControlRuntimeBuildErrorReason};
 use hyper_mapping_compiler::{CompiledControlMappingTable, ControlMappingCompileError};
 use hyper_media_cache::{DecodedMediaCache, PreparePlaybackError};
 use hyper_mixer_runtime::{
-    LoudnessCommandSender, MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSender,
-    MixerParameterResolveError, MixerParameterStateRestoreError, MixerSendHandle,
-    NativeDeviceCommand, NativeDeviceCommandSender, NativeDeviceHandle, NativeDeviceResolveError,
-    MetronomePlan, MetronomePlanError, OutputMeterReceiver, RoutedMainRuntime,
-    RoutedTransportRuntime, RuntimeCreationError,
-    TransportCommand, TransportCommandSendError, TransportCommandSender, TransportLoopRange,
-    TransportLoopRangeError, TransportOutputCreationError, TransportOutputProcessor,
-    loudness_command_channel, output_meter_channel,
+    LoudnessCommandSender, MetronomePlan, MetronomePlanError, MixerChannelHandle,
+    MixerParameterCommand, MixerParameterCommandSender, MixerParameterResolveError,
+    MixerParameterStateRestoreError, MixerSendHandle, NativeDeviceCommand,
+    NativeDeviceCommandSender, NativeDeviceHandle, NativeDeviceResolveError, OutputMeterReceiver,
+    RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError, TransportCommand,
+    TransportCommandSendError, TransportCommandSender, TransportLoopRange, TransportLoopRangeError,
+    TransportOutputCreationError, TransportOutputProcessor, loudness_command_channel,
+    output_meter_channel,
     playback_recovery_channel_with_initial_loop_metronome_and_native_device_state,
 };
 use hyper_native_device::DeviceChain;
@@ -1765,7 +1765,10 @@ impl DesktopPlaybackSession {
         };
         let mut current = 0;
         for channel_index in 0..self.mixer_channel_count() {
-            let Some(track_id) = self.source.session().mixer_channel_track_id_at(channel_index)
+            let Some(track_id) = self
+                .source
+                .session()
+                .mixer_channel_track_id_at(channel_index)
             else {
                 return Ok(None);
             };
@@ -2271,14 +2274,12 @@ fn initialize_session(
             device_chains,
             maximum_block_frames,
         ),
-        None => {
-            RoutedMainRuntime::try_new_prepared_playback_with_devices(
-                &prepared,
-                mixer,
-                device_chains,
-                maximum_block_frames,
-            )
-        }
+        None => RoutedMainRuntime::try_new_prepared_playback_with_devices(
+            &prepared,
+            mixer,
+            device_chains,
+            maximum_block_frames,
+        ),
     }
     .map_err(DesktopPlaybackSessionBuildError::Runtime)
     .or_else(|source| fail_build(publication, source))?;
@@ -2333,15 +2334,16 @@ fn initialize_session(
         .or_else(|source| fail_build(publication, source))?;
     let (preview_control, preview) =
         prepare_audio_preview(media, recordings, sample_rate_hz, publication)?;
-    let (publisher, recovery) = playback_recovery_channel_with_initial_loop_metronome_and_native_device_state(
-        initial_checkpoint,
-        Some(&initial_mixer_parameter_state),
-        Some(&initial_native_device_state),
-        initial_loop_range,
-        initial_loop_enabled,
-        initial_metronome_available,
-        initial_metronome_enabled,
-    );
+    let (publisher, recovery) =
+        playback_recovery_channel_with_initial_loop_metronome_and_native_device_state(
+            initial_checkpoint,
+            Some(&initial_mixer_parameter_state),
+            Some(&initial_native_device_state),
+            initial_loop_range,
+            initial_loop_enabled,
+            initial_metronome_available,
+            initial_metronome_enabled,
+        );
     let controls = build_session_controls(
         commands,
         mixer_parameter_commands,
@@ -2996,8 +2998,7 @@ mod tests {
             .unwrap();
         let prepared = media.prepare_playback(&graph).unwrap();
         let runtime = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
-        let (sender, _mixer, mut transport) =
-            RoutedTransportRuntime::with_command_queues(runtime);
+        let (sender, _mixer, mut transport) = RoutedTransportRuntime::with_command_queues(runtime);
 
         prepare_initial_transport_authority(&sender, &mut transport, Some(persisted), None)
             .unwrap();
@@ -3027,18 +3028,20 @@ mod tests {
                 },
             )
             .unwrap();
-        let (mut publisher, recovery) = hyper_mixer_runtime::playback_recovery_channel_with_initial_loop(
-            None,
-            None,
-            transport.loop_range(),
-            transport.loop_enabled(),
-        );
+        let (mut publisher, recovery) =
+            hyper_mixer_runtime::playback_recovery_channel_with_initial_loop(
+                None,
+                None,
+                transport.loop_range(),
+                transport.loop_enabled(),
+            );
         publisher.publish_cycle(cycle, None);
         let checkpoint = recovery.snapshot();
         assert_eq!(checkpoint.loop_range(), transport.loop_range());
         assert!(!checkpoint.loop_enabled());
 
-        let replacement = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
+        let replacement =
+            RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
         let (replacement_sender, _mixer, mut replacement) =
             RoutedTransportRuntime::with_command_queues(replacement);
         prepare_initial_transport_authority(
@@ -3086,8 +3089,7 @@ mod tests {
             .unwrap();
         let prepared = media.prepare_playback(&graph).unwrap();
         let runtime = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
-        let (sender, _mixer, mut transport) =
-            RoutedTransportRuntime::with_command_queues(runtime);
+        let (sender, _mixer, mut transport) = RoutedTransportRuntime::with_command_queues(runtime);
 
         prepare_initial_transport_authority(&sender, &mut transport, Some(persisted), None)
             .unwrap();

@@ -651,10 +651,7 @@ pub fn resample_audio(
     maximum_output_frames: u64,
     maximum_resampling_bytes: usize,
 ) -> Result<DecodedAudio, DecodeError> {
-    if target_sample_rate_hz == 0
-        || maximum_output_frames == 0
-        || maximum_resampling_bytes == 0
-    {
+    if target_sample_rate_hz == 0 || maximum_output_frames == 0 || maximum_resampling_bytes == 0 {
         return Err(DecodeError::InvalidLimits);
     }
     if audio.sample_rate_hz == target_sample_rate_hz {
@@ -722,12 +719,9 @@ pub fn resample_audio(
         .map_err(|error| DecodeError::Resampling(error.to_string()))?;
     let mut converted = allocate_resampling_output(channels, rubato_required_output_frames)?;
     let output_frames = {
-        let mut output = SequentialSliceOfVecs::new_mut(
-            &mut converted,
-            channels,
-            rubato_required_output_frames,
-        )
-        .map_err(|error| DecodeError::Resampling(error.to_string()))?;
+        let mut output =
+            SequentialSliceOfVecs::new_mut(&mut converted, channels, rubato_required_output_frames)
+                .map_err(|error| DecodeError::Resampling(error.to_string()))?;
         resampler.reset();
         let (_, output_frames) = resampler
             .process_all_into_buffer(&input, &mut output, input_frames, None)
@@ -783,11 +777,9 @@ fn finish_resampled_audio(
     }
     match planes.as_mut_slice() {
         [mono] => DecodedAudio::from_mono(sample_rate_hz, std::mem::take(mono)),
-        [left, right] => DecodedAudio::from_stereo(
-            sample_rate_hz,
-            std::mem::take(left),
-            std::mem::take(right),
-        ),
+        [left, right] => {
+            DecodedAudio::from_stereo(sample_rate_hz, std::mem::take(left), std::mem::take(right))
+        }
         _ => Err(DecodeError::InvalidDecodedAudio(
             "resampler returned an unsupported channel count",
         )),
@@ -800,10 +792,7 @@ fn finish_resampled_audio(
 /// # Errors
 ///
 /// Returns [`DecodeError`] for an unsupported shape or arithmetic overflow.
-pub fn float_wav_encoded_capacity(
-    frames: usize,
-    channels: usize,
-) -> Result<usize, DecodeError> {
+pub fn float_wav_encoded_capacity(frames: usize, channels: usize) -> Result<usize, DecodeError> {
     if frames == 0 || !matches!(channels, 1 | 2) {
         return Err(DecodeError::InvalidLimits);
     }

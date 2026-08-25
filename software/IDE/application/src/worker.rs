@@ -13,63 +13,59 @@ use hyper_desktop_audio::{DesktopAudioPreviewSnapshot, DesktopAudioPreviewState}
 use hyper_fs_authority::path_is_proven_absent;
 use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, TransportCommand};
 use hyper_playback_json::SceneTrackAction;
-use hyper_project_model::{ResourceRole, is_valid_interactive_project_name};
 use hyper_project_history::{ProjectHistory, ProjectHistoryError, RecentProject};
+use hyper_project_model::{ResourceRole, is_valid_interactive_project_name};
 use hyper_recording_metadata::RecordingCaptureKind;
 use hyper_runtime_bundle_builder::{
     DEFAULT_MAXIMUM_RUNTIME_BUNDLE_BYTES, PublishedRuntimeBundle, RuntimeBundleBuildError,
     build_project_runtime_bundle,
 };
 use hyper_storage_engine::{
-    ProjectCopyError, ProjectCopyRequest, ProjectCreationError, ProjectCreationRequest,
-    ProjectRenameError, ProjectRenameOutcome, ProjectRenameRequest,
-    MixerRecoverySnapshot, MixerRecoverySnapshotErrorKind, clear_mixer_recovery_snapshot,
-    load_mixer_recovery_snapshot,
-    ProjectResourcePublicationRequest, publish_project_resource,
+    MixerRecoverySnapshot, MixerRecoverySnapshotErrorKind, ProjectCopyError, ProjectCopyRequest,
+    ProjectCreationError, ProjectCreationRequest, ProjectRenameError, ProjectRenameOutcome,
+    ProjectRenameRequest, ProjectResourcePublicationRequest, clear_mixer_recovery_snapshot,
     copy_project as copy_project_package, create_project as create_project_package,
+    load_mixer_recovery_snapshot, publish_project_resource,
     rename_project as rename_project_package,
 };
 use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSnapshot};
 
 use super::recording::{IdeRecordingPlan, IdeRecordingTarget, RecordingDesktopIdeApplication};
 use super::{
-    control_binding_references_scene,
     ControlBinding, ControlScope, ControlSource, ControlTarget, ControlTransform,
     DesktopIdeApplication, DesktopIdePendingClose, DesktopIdePendingSaveClose,
     DesktopPlaybackRecovery, Edge, IdeApplicationConfig, IdeArrangementLocateError,
     IdeArrangementPlacementEditError, IdeAudioClipActivationEditError,
     IdeAudioClipDuplicationError, IdeAudioClipFadeEditError, IdeAudioClipGainEditError,
-    IdeAudioClipRemovalError,
-    IdeAudioClipLoopEditError, IdeAudioClipRenameEditError, IdeAudioClipReverseEditError,
-    IdeAudioClipSourceSlipEditError, IdeAudioClipSourceTrimEditError, IdeAudioImportBatchFailure,
-    IdeAudioImportBatchOutcome,
-    IdeAudioImportError, IdeAudioInputInventory, IdeAudioOutputInventory,
-    IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
+    IdeAudioClipLoopEditError, IdeAudioClipRemovalError, IdeAudioClipRenameEditError,
+    IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError, IdeAudioClipSourceTrimEditError,
+    IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome, IdeAudioImportError,
+    IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
+    IdeAudioPreviewError, IdeAudioPrimaryRouteError, IdeAudioTrackAdditionError,
     IdeAudioTrackContentRemovalError, IdeAudioTrackDuplicationError, IdeAudioTrackEditError,
-    IdeAudioPrimaryRouteError, IdeAudioTrackRemovalError, IdeMixerStripReorderError,
-    IdeReturnSendEditError,
-    IdeRoutingBusCreationError, IdeRoutingBusRemovalError, IdeRoutingBusRenameError,
-    IdeRoutingBusKind,
-    IdeAutomationTakeCreationError,
-    IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
-    IdeHistoryOperation, IdeNativeFilterEdit, IdeNativeFilterEditError, NativeFilterMode,
-    IdeControlMappingEdit, IdeControlMappingEditError, IdeInputDiscoveryError, IdeInputSelection,
+    IdeAudioTrackRemovalError, IdeAutomationTakeCreationError, IdeAutomationTakeEditError,
+    IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome, IdeControlMappingEdit,
+    IdeControlMappingEditError, IdeHistoryOperation, IdeInputDiscoveryError, IdeInputSelection,
     IdeInputSelectionError, IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessCommandError,
     IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
-    IdeMixerMainState, IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState,
-    IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError,
+    IdeMixerMainState, IdeMixerPrimaryDestination, IdeMixerStripReorderError, IdeMonitoringCommand,
+    IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure, IdeNativeFilterEdit,
+    IdeNativeFilterEditError, IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError,
     IdeOutputTestError, IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
     IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
-    IdePendingSaveCloseWait, IdeProjectExportError, IdeProjectExportFormat, IdeProjectOpenError, IdeProjectSaveError,
-    IdeRecordingAbortError, IdeRecordingAbortOutcome, IdeRecordingClipCreationError,
-    IdeRecordingError, IdeRecordingImportOutcome, IdeRecordingObservation, IdeResourceRestoreError,
-    IdeSaveCloseOutcome, IdeSceneAvailability, IdeSceneCreationError, IdeSceneDuplicationError,
-    IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEdit,
-    IdeSceneSlotEditError, IdeTempoEditError, IdeTransportSeekError, IdeUnusedSampleCleanupError,
-    IdeUnusedSampleCleanupSummary, IdeMixerPrimaryDestination, InputInventoryError,
-    LocateState, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
-    MAX_DEVICES_PER_CHAIN,
+    IdePendingSaveCloseWait, IdeProjectExportError, IdeProjectExportFormat, IdeProjectOpenError,
+    IdeProjectSaveError, IdeRecordingAbortError, IdeRecordingAbortOutcome,
+    IdeRecordingClipCreationError, IdeRecordingError, IdeRecordingImportOutcome,
+    IdeRecordingObservation, IdeResourceRestoreError, IdeReturnSendEditError,
+    IdeRoutingBusCreationError, IdeRoutingBusKind, IdeRoutingBusRemovalError,
+    IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability, IdeSceneCreationError,
+    IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRemovalError,
+    IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError, IdeTempoEditError,
+    IdeTransportSeekError, IdeUnusedSampleCleanupError, IdeUnusedSampleCleanupSummary,
+    InputInventoryError, LocateState, MAX_DEVICES_PER_CHAIN, NativeFilterMode,
+    OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
     OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication, RunningIdeSnapshot,
+    control_binding_references_scene,
 };
 
 #[cfg(test)]
@@ -549,9 +545,7 @@ impl IdeWorkerCommand {
             Self::RemoveReturnSend { .. } => IdeWorkerCommandKind::RemoveReturnSend,
             Self::SetAudioPrimaryRoute { .. } => IdeWorkerCommandKind::SetAudioPrimaryRoute,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
-            Self::RemoveAudioTrackContent { .. } => {
-                IdeWorkerCommandKind::RemoveAudioTrackContent
-            }
+            Self::RemoveAudioTrackContent { .. } => IdeWorkerCommandKind::RemoveAudioTrackContent,
             Self::ReorderMixerStrips { .. } => IdeWorkerCommandKind::ReorderMixerStrips,
             Self::DuplicateAudioTrack { .. } => IdeWorkerCommandKind::DuplicateAudioTrack,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
@@ -862,29 +856,53 @@ pub enum IdeNativeDevice {
 
 impl IdeNativeCompressor {
     #[must_use]
-    pub fn chain_id(&self) -> &str { &self.chain_id }
+    pub fn chain_id(&self) -> &str {
+        &self.chain_id
+    }
     #[must_use]
-    pub fn device_instance_id(&self) -> &str { &self.device_instance_id }
+    pub fn device_instance_id(&self) -> &str {
+        &self.device_instance_id
+    }
     #[must_use]
-    pub fn track_id(&self) -> &str { &self.track_id }
+    pub fn track_id(&self) -> &str {
+        &self.track_id
+    }
     #[must_use]
-    pub const fn enabled(&self) -> bool { self.enabled }
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
     #[must_use]
-    pub const fn can_move_earlier(&self) -> bool { self.editing.can_move_earlier }
+    pub const fn can_move_earlier(&self) -> bool {
+        self.editing.can_move_earlier
+    }
     #[must_use]
-    pub const fn can_move_later(&self) -> bool { self.editing.can_move_later }
+    pub const fn can_move_later(&self) -> bool {
+        self.editing.can_move_later
+    }
     #[must_use]
-    pub const fn can_duplicate(&self) -> bool { self.editing.can_duplicate }
+    pub const fn can_duplicate(&self) -> bool {
+        self.editing.can_duplicate
+    }
     #[must_use]
-    pub const fn threshold_millidecibels(&self) -> i32 { self.threshold_millidecibels }
+    pub const fn threshold_millidecibels(&self) -> i32 {
+        self.threshold_millidecibels
+    }
     #[must_use]
-    pub const fn ratio_millionths(&self) -> u32 { self.ratio_millionths }
+    pub const fn ratio_millionths(&self) -> u32 {
+        self.ratio_millionths
+    }
     #[must_use]
-    pub const fn attack_microseconds(&self) -> u32 { self.attack_microseconds }
+    pub const fn attack_microseconds(&self) -> u32 {
+        self.attack_microseconds
+    }
     #[must_use]
-    pub const fn release_microseconds(&self) -> u32 { self.release_microseconds }
+    pub const fn release_microseconds(&self) -> u32 {
+        self.release_microseconds
+    }
     #[must_use]
-    pub const fn makeup_millidecibels(&self) -> i32 { self.makeup_millidecibels }
+    pub const fn makeup_millidecibels(&self) -> i32 {
+        self.makeup_millidecibels
+    }
 }
 
 impl IdeNativeFilter {
@@ -1768,7 +1786,10 @@ pub enum IdeProjectCopyError {
 impl fmt::Display for IdeProjectCopyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Save(source) => write!(formatter, "project could not be saved before copying: {source}"),
+            Self::Save(source) => write!(
+                formatter,
+                "project could not be saved before copying: {source}"
+            ),
             Self::Copy(source) => write!(formatter, "project copy failed: {source}"),
             Self::SourceReopen { copy, source } => write!(
                 formatter,
@@ -2062,11 +2083,13 @@ impl fmt::Display for IdeProjectCloseError {
                 formatter.write_str("the audio runtime did not provide a mixer close fence")
             }
             Self::MixerCommit(source) => {
-                write!(formatter, "the audio runtime could not queue the mixer close fence: {source}")
+                write!(
+                    formatter,
+                    "the audio runtime could not queue the mixer close fence: {source}"
+                )
             }
-            Self::MixerCommitTimeout => {
-                formatter.write_str("the audio runtime did not commit the mixer close fence in time")
-            }
+            Self::MixerCommitTimeout => formatter
+                .write_str("the audio runtime did not commit the mixer close fence in time"),
             Self::MixerCheckpointUnavailable => {
                 formatter.write_str("the committed mixer checkpoint cannot authorize project close")
             }
@@ -3435,9 +3458,7 @@ impl ProjectMutation {
             Self::RemoveReturnSend { .. } => IdeWorkerCommandKind::RemoveReturnSend,
             Self::SetAudioPrimaryRoute { .. } => IdeWorkerCommandKind::SetAudioPrimaryRoute,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
-            Self::RemoveAudioTrackContent { .. } => {
-                IdeWorkerCommandKind::RemoveAudioTrackContent
-            }
+            Self::RemoveAudioTrackContent { .. } => IdeWorkerCommandKind::RemoveAudioTrackContent,
             Self::ReorderMixerStrips { .. } => IdeWorkerCommandKind::ReorderMixerStrips,
             Self::DuplicateAudioTrack { .. } => IdeWorkerCommandKind::DuplicateAudioTrack,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
@@ -4279,18 +4300,9 @@ fn process_command(
             destination_directory,
             format,
             block_frames,
-        } => export_track_stems(
-            state,
-            events,
-            &destination_directory,
-            format,
-            block_frames,
-        ),
+        } => export_track_stems(state, events, &destination_directory, format, block_frames),
         IdeWorkerCommand::Observe => publish_state(state, events, unpublished_native_failure),
-        IdeWorkerCommand::CloseProject => request_project_close(
-            state,
-            events,
-        ),
+        IdeWorkerCommand::CloseProject => request_project_close(state, events),
         IdeWorkerCommand::DiscardCloseProject => discard_project_close(
             state,
             events,
@@ -4298,11 +4310,9 @@ fn process_command(
             IdeWorkerCommandKind::CloseProject,
             history,
         ),
-        IdeWorkerCommand::CancelCloseProject => cancel_project_close(
-            state,
-            events,
-            unpublished_native_failure,
-        ),
+        IdeWorkerCommand::CancelCloseProject => {
+            cancel_project_close(state, events, unpublished_native_failure)
+        }
         IdeWorkerCommand::Shutdown => unreachable!("shutdown is handled by the worker loop"),
     }
 }
@@ -4404,7 +4414,9 @@ fn process_project_mutation_command(
             source_track_id,
             return_track_id,
         } => add_return_send(state, events, &source_track_id, &return_track_id),
-        IdeWorkerCommand::RemoveReturnSend { send_id } => remove_return_send(state, events, &send_id),
+        IdeWorkerCommand::RemoveReturnSend { send_id } => {
+            remove_return_send(state, events, &send_id)
+        }
         IdeWorkerCommand::SetAudioPrimaryRoute {
             source_track_id,
             target_group_track_id,
@@ -4519,9 +4531,7 @@ fn process_project_mutation_command(
         IdeWorkerCommand::RemoveAutomationTake { take_id } => {
             remove_automation_take_request(state, events, &take_id)
         }
-        IdeWorkerCommand::EditNativeFilter { edit } => {
-            edit_native_filter(state, events, edit)
-        }
+        IdeWorkerCommand::EditNativeFilter { edit } => edit_native_filter(state, events, edit),
         IdeWorkerCommand::EditControlMapping { edit } => edit_control_mapping(state, events, edit),
         IdeWorkerCommand::Undo => restore_edit(state, events, history, false),
         IdeWorkerCommand::Redo => restore_edit(state, events, history, true),
@@ -4780,10 +4790,17 @@ fn restore_mixer_recovery(
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
     project_history: Option<&ProjectHistory>,
 ) -> bool {
-    let WorkerState::AwaitingMixerRecovery { application, path, snapshot } =
-        std::mem::replace(state, WorkerState::Empty)
+    let WorkerState::AwaitingMixerRecovery {
+        application,
+        path,
+        snapshot,
+    } = std::mem::replace(state, WorkerState::Empty)
     else {
-        return publish_failure(events, IdeWorkerCommandKind::OpenProject, IdeWorkerCommandFailure::InvalidState);
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::OpenProject,
+            IdeWorkerCommandFailure::InvalidState,
+        );
     };
     let publication = publish_project_resource(
         &path,
@@ -4795,21 +4812,35 @@ fn restore_mixer_recovery(
         },
     );
     if let Err(reason) = publication {
-        *state = WorkerState::AwaitingMixerRecovery { application, path, snapshot };
+        *state = WorkerState::AwaitingMixerRecovery {
+            application,
+            path,
+            snapshot,
+        };
         return send_event(
             events,
-            IdeWorkerEvent::MixerRecoverySnapshotWarning(IdeProjectSaveError::Publication(Box::new(reason))),
+            IdeWorkerEvent::MixerRecoverySnapshotWarning(IdeProjectSaveError::Publication(
+                Box::new(reason),
+            )),
         );
     }
     let clear = clear_mixer_recovery_snapshot(&path);
-    open_recovery_project(state, application, &path, events, unpublished_native_failure, project_history)
-        && match clear {
-            Ok(()) => true,
-            Err(reason) => send_event(
-                events,
-                IdeWorkerEvent::MixerRecoverySnapshotWarning(IdeProjectSaveError::RecoverySnapshot(reason)),
-            ),
-        }
+    open_recovery_project(
+        state,
+        application,
+        &path,
+        events,
+        unpublished_native_failure,
+        project_history,
+    ) && match clear {
+        Ok(()) => true,
+        Err(reason) => send_event(
+            events,
+            IdeWorkerEvent::MixerRecoverySnapshotWarning(IdeProjectSaveError::RecoverySnapshot(
+                reason,
+            )),
+        ),
+    }
 }
 
 fn discard_mixer_recovery(
@@ -4818,10 +4849,17 @@ fn discard_mixer_recovery(
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
     project_history: Option<&ProjectHistory>,
 ) -> bool {
-    let WorkerState::AwaitingMixerRecovery { application, path, snapshot } =
-        std::mem::replace(state, WorkerState::Empty)
+    let WorkerState::AwaitingMixerRecovery {
+        application,
+        path,
+        snapshot,
+    } = std::mem::replace(state, WorkerState::Empty)
     else {
-        return publish_failure(events, IdeWorkerCommandKind::OpenProject, IdeWorkerCommandFailure::InvalidState);
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::OpenProject,
+            IdeWorkerCommandFailure::InvalidState,
+        );
     };
     if let Err(reason) = clear_mixer_recovery_snapshot(&path) {
         *state = WorkerState::AwaitingMixerRecovery {
@@ -4831,10 +4869,19 @@ fn discard_mixer_recovery(
         };
         return send_event(
             events,
-            IdeWorkerEvent::MixerRecoverySnapshotWarning(IdeProjectSaveError::RecoverySnapshot(reason)),
+            IdeWorkerEvent::MixerRecoverySnapshotWarning(IdeProjectSaveError::RecoverySnapshot(
+                reason,
+            )),
         );
     }
-    open_recovery_project(state, application, &path, events, unpublished_native_failure, project_history)
+    open_recovery_project(
+        state,
+        application,
+        &path,
+        events,
+        unpublished_native_failure,
+        project_history,
+    )
 }
 
 fn open_recovery_project(
@@ -4854,7 +4901,11 @@ fn open_recovery_project(
         Err(failure) => {
             let (application, reason) = failure.into_parts();
             *state = WorkerState::Closed(application);
-            publish_failure(events, IdeWorkerCommandKind::OpenProject, IdeWorkerCommandFailure::ProjectOpen(reason))
+            publish_failure(
+                events,
+                IdeWorkerCommandKind::OpenProject,
+                IdeWorkerCommandFailure::ProjectOpen(reason),
+            )
         }
     }
 }
@@ -5803,7 +5854,9 @@ fn discard_project_close(
             IdeWorkerCommandFailure::ProjectClose(IdeProjectCloseError::DiscardNotAuthorized),
         );
     }
-    let WorkerState::AwaitingCloseDiscard(application) = std::mem::replace(state, WorkerState::Empty) else {
+    let WorkerState::AwaitingCloseDiscard(application) =
+        std::mem::replace(state, WorkerState::Empty)
+    else {
         unreachable!("the close-discard state was checked before ownership transfer");
     };
     *state = WorkerState::Running(application);
@@ -5822,7 +5875,9 @@ fn cancel_project_close(
             IdeWorkerCommandFailure::ProjectClose(IdeProjectCloseError::DiscardNotAuthorized),
         );
     }
-    let WorkerState::AwaitingCloseDiscard(application) = std::mem::replace(state, WorkerState::Empty) else {
+    let WorkerState::AwaitingCloseDiscard(application) =
+        std::mem::replace(state, WorkerState::Empty)
+    else {
         unreachable!("the close-discard state was checked before ownership transfer");
     };
     *state = WorkerState::Running(application);
@@ -7575,10 +7630,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::ReorderMixerStrips(Ok(_))
         | ProjectMutationAttempt::DuplicateAudioTrack(Ok(_))
         | ProjectMutationAttempt::ImportAudio(
-            Ok(_)
-            | Err(IdeAudioImportBatchFailure {
-                completed: 1.., ..
-            }),
+            Ok(_) | Err(IdeAudioImportBatchFailure { completed: 1.., .. }),
         )
         | ProjectMutationAttempt::CreateAudioClipFromTake(Ok(_))
         | ProjectMutationAttempt::DuplicateAudioClip { result: Ok(_), .. }
@@ -7588,19 +7640,13 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::EditControlMapping { result: Ok(_), .. } => {
             HistoryEffect::Invalidate
         }
-        ProjectMutationAttempt::RemoveAudioClip(Err(reason))
-            if reason.publication_committed() =>
-        {
+        ProjectMutationAttempt::RemoveAudioClip(Err(reason)) if reason.publication_committed() => {
             HistoryEffect::Invalidate
         }
         ProjectMutationAttempt::RemoveScene {
             result: Err(reason),
             ..
-        }
-            if reason.publication_committed() =>
-        {
-            HistoryEffect::Invalidate
-        }
+        } if reason.publication_committed() => HistoryEffect::Invalidate,
         ProjectMutationAttempt::CleanUnusedSamples(Err(reason))
             if reason.publication_committed() =>
         {
@@ -8384,11 +8430,9 @@ fn project_mutation_save_failure(
                 Box::new(reason),
             )))
         }
-        ProjectMutation::SetAudioPrimaryRoute { .. } => {
-            IdeWorkerCommandFailure::AudioPrimaryRoute(Box::new(
-                IdeAudioPrimaryRouteError::MixerSave(Box::new(reason)),
-            ))
-        }
+        ProjectMutation::SetAudioPrimaryRoute { .. } => IdeWorkerCommandFailure::AudioPrimaryRoute(
+            Box::new(IdeAudioPrimaryRouteError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::RemoveAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRemoval(
             Box::new(IdeAudioTrackRemovalError::MixerSave(Box::new(reason))),
         ),
@@ -8413,14 +8457,14 @@ fn project_mutation_save_failure(
                 IdeAudioTrackEditError::MixerSave(Box::new(reason)),
             ))
         }
-        ProjectMutation::ImportAudio { paths, .. } => IdeWorkerCommandFailure::AudioImport(
-            Box::new(IdeAudioImportBatchFailure {
+        ProjectMutation::ImportAudio { paths, .. } => {
+            IdeWorkerCommandFailure::AudioImport(Box::new(IdeAudioImportBatchFailure {
                 completed: 0,
                 total: paths.len(),
                 path: paths.first().cloned().unwrap_or_default(),
                 source: Box::new(IdeAudioImportError::MixerSave(Box::new(reason))),
-            }),
-        ),
+            }))
+        }
         ProjectMutation::CreateAudioClipFromTake { .. } => {
             IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
                 IdeRecordingClipCreationError::MixerSave(Box::new(reason)),
@@ -8434,11 +8478,9 @@ fn project_mutation_save_failure(
         ProjectMutation::RemoveAudioClip { .. } => IdeWorkerCommandFailure::AudioClipRemoval(
             Box::new(IdeAudioClipRemovalError::MixerSave(Box::new(reason))),
         ),
-        ProjectMutation::CleanUnusedSamples { .. } => {
-            IdeWorkerCommandFailure::UnusedSampleCleanup(Box::new(
-                IdeUnusedSampleCleanupError::MixerSave(Box::new(reason)),
-            ))
-        }
+        ProjectMutation::CleanUnusedSamples { .. } => IdeWorkerCommandFailure::UnusedSampleCleanup(
+            Box::new(IdeUnusedSampleCleanupError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::AddArrangementPlacement { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementAddition(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -8556,11 +8598,9 @@ fn project_mutation_save_failure(
                 IdeAutomationTakeEditError::MixerSave(Box::new(reason)),
             ))
         }
-        ProjectMutation::EditNativeFilter { .. } => {
-            IdeWorkerCommandFailure::NativeFilterEdit(Box::new(
-                IdeNativeFilterEditError::MixerSave(Box::new(reason)),
-            ))
-        }
+        ProjectMutation::EditNativeFilter { .. } => IdeWorkerCommandFailure::NativeFilterEdit(
+            Box::new(IdeNativeFilterEditError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::EditControlMapping { .. } => IdeWorkerCommandFailure::ControlMappingEdit(
             Box::new(IdeControlMappingEditError::MixerSave(Box::new(reason))),
         ),
@@ -8689,11 +8729,9 @@ fn project_mutation_native_close_failure(
                 failure,
             )))
         }
-        ProjectMutation::SetAudioPrimaryRoute { .. } => {
-            IdeWorkerCommandFailure::AudioPrimaryRoute(Box::new(
-                IdeAudioPrimaryRouteError::NativeClose(failure),
-            ))
-        }
+        ProjectMutation::SetAudioPrimaryRoute { .. } => IdeWorkerCommandFailure::AudioPrimaryRoute(
+            Box::new(IdeAudioPrimaryRouteError::NativeClose(failure)),
+        ),
         ProjectMutation::RemoveAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRemoval(
             Box::new(IdeAudioTrackRemovalError::NativeClose(failure)),
         ),
@@ -8718,14 +8756,14 @@ fn project_mutation_native_close_failure(
                 IdeAudioTrackEditError::NativeClose(failure),
             ))
         }
-        ProjectMutation::ImportAudio { paths, .. } => IdeWorkerCommandFailure::AudioImport(
-            Box::new(IdeAudioImportBatchFailure {
+        ProjectMutation::ImportAudio { paths, .. } => {
+            IdeWorkerCommandFailure::AudioImport(Box::new(IdeAudioImportBatchFailure {
                 completed: 0,
                 total: paths.len(),
                 path: paths.first().cloned().unwrap_or_default(),
                 source: Box::new(IdeAudioImportError::NativeClose(failure)),
-            }),
-        ),
+            }))
+        }
         ProjectMutation::CreateAudioClipFromTake { .. } => {
             IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
                 IdeRecordingClipCreationError::NativeClose(failure),
@@ -8739,11 +8777,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::RemoveAudioClip { .. } => IdeWorkerCommandFailure::AudioClipRemoval(
             Box::new(IdeAudioClipRemovalError::NativeClose(failure)),
         ),
-        ProjectMutation::CleanUnusedSamples { .. } => {
-            IdeWorkerCommandFailure::UnusedSampleCleanup(Box::new(
-                IdeUnusedSampleCleanupError::NativeClose(failure),
-            ))
-        }
+        ProjectMutation::CleanUnusedSamples { .. } => IdeWorkerCommandFailure::UnusedSampleCleanup(
+            Box::new(IdeUnusedSampleCleanupError::NativeClose(failure)),
+        ),
         ProjectMutation::AddArrangementPlacement { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementAddition(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
@@ -8861,11 +8897,9 @@ fn project_mutation_native_close_failure(
                 IdeAutomationTakeEditError::NativeClose(failure),
             ))
         }
-        ProjectMutation::EditNativeFilter { .. } => {
-            IdeWorkerCommandFailure::NativeFilterEdit(Box::new(
-                IdeNativeFilterEditError::NativeClose(failure),
-            ))
-        }
+        ProjectMutation::EditNativeFilter { .. } => IdeWorkerCommandFailure::NativeFilterEdit(
+            Box::new(IdeNativeFilterEditError::NativeClose(failure)),
+        ),
         ProjectMutation::EditControlMapping { .. } => IdeWorkerCommandFailure::ControlMappingEdit(
             Box::new(IdeControlMappingEditError::NativeClose(failure)),
         ),
@@ -8950,7 +8984,10 @@ enum ProjectMutationAttempt {
         Result<hyper_storage_engine::TrackOrderPublicationOutcome, IdeMixerStripReorderError>,
     ),
     DuplicateAudioTrack(
-        Result<hyper_storage_engine::AudioTrackDuplicationPublicationOutcome, IdeAudioTrackDuplicationError>,
+        Result<
+            hyper_storage_engine::AudioTrackDuplicationPublicationOutcome,
+            IdeAudioTrackDuplicationError,
+        >,
     ),
     RenameAudioTrack(
         Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAudioTrackEditError>,
@@ -9140,10 +9177,8 @@ enum ProjectMutationAttempt {
     },
     RemoveScene {
         scene_id: String,
-        result: Result<
-            hyper_storage_engine::ProjectResourcePublicationOutcome,
-            IdeSceneRemovalError,
-        >,
+        result:
+            Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeSceneRemovalError>,
     },
     AddAutomationTake {
         name: String,
@@ -9245,9 +9280,7 @@ fn audio_clip_edit_failure_event<E>(
     }
 }
 
-pub(super) fn audio_clip_removal_failure_event(
-    reason: IdeAudioClipRemovalError,
-) -> IdeWorkerEvent {
+pub(super) fn audio_clip_removal_failure_event(reason: IdeAudioClipRemovalError) -> IdeWorkerEvent {
     if reason.publication_committed() {
         IdeWorkerEvent::AudioClipRemovalCommittedWithWarning {
             warning: Box::new(reason),
@@ -10645,40 +10678,40 @@ fn complete_project_copy(
         Err(failure) => {
             let (application, source) = failure.into_parts();
             match application.open_project(source_path) {
-            Ok(running) => {
-                *state = WorkerState::Running(running);
-                let mut no_native_failure = None;
-                publish_state(state, events, &mut no_native_failure)
-                    && publish_failure(
-                        events,
-                        IdeWorkerCommandKind::SaveProjectAs,
-                        IdeWorkerCommandFailure::ProjectCopy(Box::new(
-                            IdeProjectCopyError::CopiedButNotOpened {
-                                project_path: destination_path,
-                                source,
-                            },
-                        )),
-                    )
-            }
-            Err(reopen) => {
-                let (application, reopen) = reopen.into_parts();
-                *state = WorkerState::Closed(application);
-                let mut no_native_failure = None;
-                publish_state(state, events, &mut no_native_failure)
-                    && publish_failure(
-                        events,
-                        IdeWorkerCommandKind::SaveProjectAs,
-                        IdeWorkerCommandFailure::ProjectCopy(Box::new(
-                            IdeProjectCopyError::SourceReopen {
-                                copy: Box::new(IdeProjectCopyError::CopiedButNotOpened {
+                Ok(running) => {
+                    *state = WorkerState::Running(running);
+                    let mut no_native_failure = None;
+                    publish_state(state, events, &mut no_native_failure)
+                        && publish_failure(
+                            events,
+                            IdeWorkerCommandKind::SaveProjectAs,
+                            IdeWorkerCommandFailure::ProjectCopy(Box::new(
+                                IdeProjectCopyError::CopiedButNotOpened {
                                     project_path: destination_path,
                                     source,
-                                }),
-                                source: Box::new(reopen),
-                            },
-                        )),
-                    )
-            }
+                                },
+                            )),
+                        )
+                }
+                Err(reopen) => {
+                    let (application, reopen) = reopen.into_parts();
+                    *state = WorkerState::Closed(application);
+                    let mut no_native_failure = None;
+                    publish_state(state, events, &mut no_native_failure)
+                        && publish_failure(
+                            events,
+                            IdeWorkerCommandKind::SaveProjectAs,
+                            IdeWorkerCommandFailure::ProjectCopy(Box::new(
+                                IdeProjectCopyError::SourceReopen {
+                                    copy: Box::new(IdeProjectCopyError::CopiedButNotOpened {
+                                        project_path: destination_path,
+                                        source,
+                                    }),
+                                    source: Box::new(reopen),
+                                },
+                            )),
+                        )
+                }
             }
         }
     }
@@ -10743,9 +10776,8 @@ fn attempt_project_mutation(
             } else {
                 match RunningDesktopIdeApplication::prepare_mixer_save(application, recovery)
                     .and_then(|plan| {
-                        plan.publish().map_err(|source| {
-                            IdeProjectSaveError::Publication(Box::new(source))
-                        })
+                        plan.publish()
+                            .map_err(|source| IdeProjectSaveError::Publication(Box::new(source)))
                     }) {
                     Ok(outcome) => {
                         mixer = Some(outcome);
@@ -10907,9 +10939,8 @@ fn attempt_project_mutation(
                     &track_id,
                 )
                 .and_then(|plan| {
-                    plan.publish().map_err(|source| {
-                        IdeRoutingBusRemovalError::Publication(Box::new(source))
-                    })
+                    plan.publish()
+                        .map_err(|source| IdeRoutingBusRemovalError::Publication(Box::new(source)))
                 })
             })
         }
@@ -10924,9 +10955,8 @@ fn attempt_project_mutation(
                     &name,
                 )
                 .and_then(|plan| {
-                    plan.publish().map_err(|source| {
-                        IdeRoutingBusRenameError::Publication(Box::new(source))
-                    })
+                    plan.publish()
+                        .map_err(|source| IdeRoutingBusRenameError::Publication(Box::new(source)))
                 })
             })
         }
@@ -10951,12 +10981,15 @@ fn attempt_project_mutation(
             ProjectMutationAttempt::ReturnSendEdit(if let Some(failure) = native_failure {
                 Err(IdeReturnSendEditError::NativeClose(failure))
             } else {
-                RunningDesktopIdeApplication::prepare_return_send_removal(application, recovery, &send_id)
-                    .and_then(|plan| {
-                        plan.publish().map_err(|source| {
-                            IdeReturnSendEditError::Publication(Box::new(source))
-                        })
-                    })
+                RunningDesktopIdeApplication::prepare_return_send_removal(
+                    application,
+                    recovery,
+                    &send_id,
+                )
+                .and_then(|plan| {
+                    plan.publish()
+                        .map_err(|source| IdeReturnSendEditError::Publication(Box::new(source)))
+                })
             })
         }
         ProjectMutation::SetAudioPrimaryRoute {
@@ -11492,11 +11525,9 @@ fn attempt_project_mutation(
                             bytes,
                         ) {
                             Ok(plan) => {
-                                let displaced = plan
-                                    .displaced()
-                                    .map(|operation| {
-                                        UndoEntry::from_operation(operation, entry.label)
-                                    });
+                                let displaced = plan.displaced().map(|operation| {
+                                    UndoEntry::from_operation(operation, entry.label)
+                                });
                                 (displaced, plan.publish())
                             }
                             Err(reason) => (None, Err(reason)),
@@ -11510,10 +11541,8 @@ fn attempt_project_mutation(
                             &operation,
                         ) {
                             Ok(plan) => {
-                                let displaced = Some(UndoEntry::from_operation(
-                                    plan.displaced(),
-                                    entry.label,
-                                ));
+                                let displaced =
+                                    Some(UndoEntry::from_operation(plan.displaced(), entry.label));
                                 (displaced, plan.publish())
                             }
                             Err(reason) => (None, Err(reason)),
@@ -11527,10 +11556,8 @@ fn attempt_project_mutation(
                             &operation,
                         ) {
                             Ok(plan) => {
-                                let displaced = Some(UndoEntry::from_operation(
-                                    plan.displaced(),
-                                    entry.label,
-                                ));
+                                let displaced =
+                                    Some(UndoEntry::from_operation(plan.displaced(), entry.label));
                                 (displaced, plan.publish())
                             }
                             Err(reason) => (None, Err(reason)),
@@ -11558,12 +11585,8 @@ fn attempt_project_mutation(
             }
         }
         ProjectMutation::RemoveAutomationTake { take_id } => {
-            let (inverse, result) = attempt_automation_take_removal(
-                application,
-                recovery,
-                &take_id,
-                native_failure,
-            );
+            let (inverse, result) =
+                attempt_automation_take_removal(application, recovery, &take_id, native_failure);
             ProjectMutationAttempt::RemoveAutomationTake {
                 take_id,
                 inverse,
@@ -11571,12 +11594,8 @@ fn attempt_project_mutation(
             }
         }
         ProjectMutation::AddAutomationTake { request } => {
-            let (inverse, result) = attempt_automation_take_creation(
-                application,
-                recovery,
-                &request,
-                native_failure,
-            );
+            let (inverse, result) =
+                attempt_automation_take_creation(application, recovery, &request, native_failure);
             ProjectMutationAttempt::AddAutomationTake {
                 name: request.name.clone(),
                 inverse,
@@ -11605,11 +11624,15 @@ fn attempt_project_mutation(
             result: if let Some(failure) = native_failure {
                 Err(IdeSceneRemovalError::NativeClose(failure))
             } else {
-                RunningDesktopIdeApplication::prepare_scene_removal(application, recovery, &scene_id)
-                    .and_then(|plan| {
-                        plan.publish()
-                            .map_err(|source| IdeSceneRemovalError::Publication(Box::new(source)))
-                    })
+                RunningDesktopIdeApplication::prepare_scene_removal(
+                    application,
+                    recovery,
+                    &scene_id,
+                )
+                .and_then(|plan| {
+                    plan.publish()
+                        .map_err(|source| IdeSceneRemovalError::Publication(Box::new(source)))
+                })
             },
         },
         ProjectMutation::DuplicateScene { scene_id, name } => {
@@ -11794,7 +11817,10 @@ fn attempt_automation_take_creation(
     Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAutomationTakeCreationError>,
 ) {
     if let Some(failure) = native_failure {
-        return (None, Err(IdeAutomationTakeCreationError::NativeClose(failure)));
+        return (
+            None,
+            Err(IdeAutomationTakeCreationError::NativeClose(failure)),
+        );
     }
     match RunningDesktopIdeApplication::prepare_automation_take_creation(
         application,
@@ -12179,7 +12205,10 @@ fn attempt_audio_clip_source_trim(
     native_failure: Option<IdeNativeCloseFailure>,
 ) -> (
     Option<IdeHistoryOperation>,
-    Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAudioClipSourceTrimEditError>,
+    Result<
+        hyper_storage_engine::ProjectResourcePublicationOutcome,
+        IdeAudioClipSourceTrimEditError,
+    >,
 ) {
     if let Some(failure) = native_failure {
         return (
@@ -12198,8 +12227,9 @@ fn attempt_audio_clip_source_trim(
             let inverse = plan.inverse();
             (
                 Some(inverse),
-                plan.publish()
-                    .map_err(|source| IdeAudioClipSourceTrimEditError::Publication(Box::new(source))),
+                plan.publish().map_err(|source| {
+                    IdeAudioClipSourceTrimEditError::Publication(Box::new(source))
+                }),
             )
         }
         Err(reason) => (None, Err(reason)),
@@ -12364,14 +12394,14 @@ fn project_mutation_reopen_failure(
                 reopen: Box::new(reopen),
             },
         )),
-        ProjectMutationAttempt::ReturnSendEdit(Err(IdeReturnSendEditError::NativeClose(
-            close,
-        ))) => IdeWorkerCommandFailure::ReturnSendEdit(Box::new(
-            IdeReturnSendEditError::NativeCloseAndReopen {
-                close,
-                reopen: Box::new(reopen),
-            },
-        )),
+        ProjectMutationAttempt::ReturnSendEdit(Err(IdeReturnSendEditError::NativeClose(close))) => {
+            IdeWorkerCommandFailure::ReturnSendEdit(Box::new(
+                IdeReturnSendEditError::NativeCloseAndReopen {
+                    close,
+                    reopen: Box::new(reopen),
+                },
+            ))
+        }
         ProjectMutationAttempt::ReturnSendEdit(Err(preparation)) => {
             IdeWorkerCommandFailure::ReturnSendEdit(Box::new(
                 IdeReturnSendEditError::ReopenAfterPreparation {
@@ -12919,13 +12949,13 @@ fn native_filter_edit_reopen_failure(
                 reopen: Box::new(reopen),
             }
         }
-        Err(publication @ (IdeNativeFilterEditError::Publication { .. }
-        | IdeNativeFilterEditError::MixerPublication(_))) => {
-            IdeNativeFilterEditError::PublicationAndReopen {
-                publication: Box::new(publication),
-                reopen: Box::new(reopen),
-            }
-        }
+        Err(
+            publication @ (IdeNativeFilterEditError::Publication { .. }
+            | IdeNativeFilterEditError::MixerPublication(_)),
+        ) => IdeNativeFilterEditError::PublicationAndReopen {
+            publication: Box::new(publication),
+            reopen: Box::new(reopen),
+        },
         Err(preparation) => IdeNativeFilterEditError::ReopenAfterPreparation {
             preparation: Box::new(preparation),
             reopen: Box::new(reopen),
@@ -13615,7 +13645,10 @@ fn audio_track_edit_reopen_failure(
 }
 
 fn routing_bus_rename_reopen_failure(
-    result: Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeRoutingBusRenameError>,
+    result: Result<
+        hyper_storage_engine::ProjectResourcePublicationOutcome,
+        IdeRoutingBusRenameError,
+    >,
     reopen: IdeProjectOpenError,
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
@@ -13738,7 +13771,14 @@ fn poll_pending_state(
             deadline,
         } => {
             if application.committed_mixer_fence() >= sequence {
-                begin_save_close(state, application, operation, events, history, project_history)
+                begin_save_close(
+                    state,
+                    application,
+                    operation,
+                    events,
+                    history,
+                    project_history,
+                )
             } else if Instant::now() >= deadline {
                 let command = operation.command();
                 let reason = project_mutation_save_failure(
@@ -13954,13 +13994,15 @@ fn publish_state(
         WorkerState::Closing(_) => IdeWorkerEvent::Closing,
         WorkerState::AutosaveFence { application, .. }
         | WorkerState::CloseFence { application, .. }
-        | WorkerState::AwaitingCloseDiscard(application) => match running_observation(application) {
-            Ok(observation) => IdeWorkerEvent::Running(observation),
-            Err(reason) => {
-                let delivered = publish_failure(events, IdeWorkerCommandKind::Observe, reason);
-                return delivered && unpublished_native_failure.is_none();
+        | WorkerState::AwaitingCloseDiscard(application) => {
+            match running_observation(application) {
+                Ok(observation) => IdeWorkerEvent::Running(observation),
+                Err(reason) => {
+                    let delivered = publish_failure(events, IdeWorkerCommandKind::Observe, reason);
+                    return delivered && unpublished_native_failure.is_none();
+                }
             }
-        },
+        }
         WorkerState::SaveFence { operation, .. } | WorkerState::Saving { operation, .. } => {
             operation.pending_event()
         }
@@ -14524,8 +14566,8 @@ mod tests {
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
     use hyper_project_loader::ProjectPlaybackLimits;
     use hyper_storage_engine::{
-        MixerRecoverySnapshotRequest, ProjectCreationErrorKind,
-        store_mixer_recovery_snapshot, verify_project_package,
+        MixerRecoverySnapshotRequest, ProjectCreationErrorKind, store_mixer_recovery_snapshot,
+        verify_project_package,
     };
 
     const WAIT: Duration = Duration::from_secs(2);
@@ -14635,7 +14677,10 @@ mod tests {
         let mut output = Vec::with_capacity(encoded.len() * 3 / 4);
         let mut accumulator = 0_u32;
         let mut bits = 0_u8;
-        for byte in encoded.bytes().filter(|byte| !byte.is_ascii_whitespace() && *byte != b'=') {
+        for byte in encoded
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+        {
             let value = match byte {
                 b'A'..=b'Z' => byte - b'A',
                 b'a'..=b'z' => byte - b'a' + 26,
@@ -14708,10 +14753,12 @@ mod tests {
         let IdeWorkerEvent::Running(renamed) = recv(worker) else {
             panic!("the renamed project must reopen before completion");
         };
-        assert!(renamed
-            .audio_clips()
-            .iter()
-            .any(|clip| clip.id() == retained_clip_id && clip.name() == "Stereo retained"));
+        assert!(
+            renamed
+                .audio_clips()
+                .iter()
+                .any(|clip| clip.id() == retained_clip_id && clip.name() == "Stereo retained")
+        );
         let renamed_generation = renamed.playback_session_generation();
         assert!(matches!(
             recv(worker),
@@ -14939,7 +14986,10 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(matches!(recv_native_mutation(worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
         assert!(matches!(
             recv_native_mutation(worker),
             IdeWorkerEvent::UndoStateChanged {
@@ -14947,8 +14997,14 @@ mod tests {
                 redo_label: None,
             }
         ));
-        assert!(matches!(recv_native_mutation(worker), IdeWorkerEvent::Running(_)));
-        assert!(matches!(recv_native_mutation(worker), IdeWorkerEvent::NativeFilterEdited { .. }));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::Running(_)
+        ));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::NativeFilterEdited { .. }
+        ));
     }
 
     fn undo_native_device_history(worker: &DesktopIdeWorker) {
@@ -14967,7 +15023,10 @@ mod tests {
                 redo_label: Some("native device"),
             }
         ));
-        assert!(matches!(recv_native_mutation(worker), IdeWorkerEvent::Running(_)));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::Running(_)
+        ));
         assert!(matches!(
             recv_native_mutation(worker),
             IdeWorkerEvent::EditRestored {
@@ -14978,11 +15037,7 @@ mod tests {
         ));
     }
 
-    fn refuse_audio_import(
-        worker: &DesktopIdeWorker,
-        unsupported: &Path,
-        track_id: String,
-    ) {
+    fn refuse_audio_import(worker: &DesktopIdeWorker, unsupported: &Path, track_id: String) {
         worker
             .try_send(IdeWorkerCommand::ImportAudio {
                 paths: vec![unsupported.to_path_buf()],
@@ -15208,8 +15263,13 @@ mod tests {
         worker
             .try_send(IdeWorkerCommand::OpenProject(project.clone()))
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::MixerRecoveryAvailable));
-        worker.try_send(IdeWorkerCommand::RestoreMixerRecovery).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::MixerRecoveryAvailable
+        ));
+        worker
+            .try_send(IdeWorkerCommand::RestoreMixerRecovery)
+            .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
         assert_eq!(
             load_mixer_recovery_snapshot(&project).unwrap(),
@@ -15225,8 +15285,13 @@ mod tests {
         worker
             .try_send(IdeWorkerCommand::OpenProject(project.clone()))
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::MixerRecoveryAvailable));
-        worker.try_send(IdeWorkerCommand::DiscardMixerRecovery).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::MixerRecoveryAvailable
+        ));
+        worker
+            .try_send(IdeWorkerCommand::DiscardMixerRecovery)
+            .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
         assert_eq!(
             load_mixer_recovery_snapshot(&project).unwrap(),
@@ -15384,14 +15449,20 @@ mod tests {
                 switch_to: true,
             })
             .unwrap();
-        assert!(matches!(recv_native_mutation(&worker), IdeWorkerEvent::Saving));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::Saving
+        ));
         let destination = projects.join("Independent");
         let recent = recv_native_mutation(&worker);
-        assert!(matches!(
-            recent,
-            IdeWorkerEvent::RecentProjectsChanged { ref projects }
-                if projects.len() == 2 && projects[0].name() == "Independent"
-        ), "unexpected Save As history event: {recent:?}");
+        assert!(
+            matches!(
+                recent,
+                IdeWorkerEvent::RecentProjectsChanged { ref projects }
+                    if projects.len() == 2 && projects[0].name() == "Independent"
+            ),
+            "unexpected Save As history event: {recent:?}"
+        );
         assert!(matches!(
             recv_native_mutation(&worker),
             IdeWorkerEvent::UndoStateChanged {
@@ -15491,7 +15562,10 @@ mod tests {
                 switch_to: false,
             })
             .unwrap();
-        assert!(matches!(recv_native_mutation(&worker), IdeWorkerEvent::Saving));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::Saving
+        ));
         assert!(matches!(
             recv_native_mutation(&worker),
             IdeWorkerEvent::UndoStateChanged {
@@ -15559,8 +15633,8 @@ mod tests {
         let project = created.project().root().to_path_buf();
         drop(created);
 
-        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8)
-            .unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project))
@@ -15599,7 +15673,10 @@ mod tests {
             .expect("the reopened project exposes the group")
             .id()
             .to_owned();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::RoutingBusAdded { revision: 2, .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdded { revision: 2, .. }
+        ));
 
         worker
             .try_send(IdeWorkerCommand::AddRoutingBus {
@@ -15624,7 +15701,10 @@ mod tests {
             .expect("the reopened project exposes the return")
             .id()
             .to_owned();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::RoutingBusAdded { revision: 3, .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdded { revision: 3, .. }
+        ));
         add_compressor_history(&worker, audio_track_id.clone());
         while worker.events.as_ref().unwrap().try_recv().is_ok() {}
 
@@ -15645,7 +15725,9 @@ mod tests {
                     redo_label: None,
                 } => break,
                 IdeWorkerEvent::Running(_) => {}
-                event => panic!("mixer-strip reorder must invalidate history before final reopen: {event:?}"),
+                event => panic!(
+                    "mixer-strip reorder must invalidate history before final reopen: {event:?}"
+                ),
             }
         }
         let IdeWorkerEvent::Running(reordered) = recv_native_mutation(&worker) else {
@@ -15702,12 +15784,8 @@ mod tests {
         let project = created.project().root().to_path_buf();
         drop(created);
 
-        let worker = DesktopIdeWorker::start_state(
-            WorkerState::Closed(closed_application()),
-            2,
-            8,
-        )
-        .unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project.clone()))
@@ -15794,7 +15872,9 @@ mod tests {
                 // A timer observation can race the close fence. It predates
                 // publication and is not a replacement for the final reopen.
                 IdeWorkerEvent::Running(_) => {}
-                event => panic!("track reorder must invalidate history before final reopen: {event:?}"),
+                event => {
+                    panic!("track reorder must invalidate history before final reopen: {event:?}")
+                }
             }
         }
         let IdeWorkerEvent::Running(reordered) = recv_native_mutation(&worker) else {
@@ -15873,12 +15953,8 @@ mod tests {
         let project = created.project().root().to_path_buf();
         drop(created);
 
-        let worker = DesktopIdeWorker::start_state(
-            WorkerState::Closed(closed_application()),
-            2,
-            8,
-        )
-        .unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project))
@@ -15965,7 +16041,9 @@ mod tests {
         let return_id = with_return
             .mixer_channels()
             .iter()
-            .find(|channel| channel.kind() == IdeMixerChannelKind::Return && channel.name() == "Verb")
+            .find(|channel| {
+                channel.kind() == IdeMixerChannelKind::Return && channel.name() == "Verb"
+            })
             .expect("the reopened project exposes the created return")
             .id()
             .to_owned();
@@ -16179,13 +16257,15 @@ mod tests {
         let IdeWorkerEvent::Running(without_return_send) = recv(&worker) else {
             panic!("clearing the return dependency must reopen the project");
         };
-        assert!(without_return_send
-            .mixer_channels()
-            .iter()
-            .find(|channel| channel.id() == source_track_id)
-            .expect("the source remains present after clearing its return send")
-            .sends()
-            .is_empty());
+        assert!(
+            without_return_send
+                .mixer_channels()
+                .iter()
+                .find(|channel| channel.id() == source_track_id)
+                .expect("the source remains present after clearing its return send")
+                .sends()
+                .is_empty()
+        );
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::ReturnSendEdited { revision: 10 }
@@ -16274,27 +16354,29 @@ mod tests {
         let IdeWorkerEvent::Running(without_return) = recv(&worker) else {
             panic!("removing the cleared return bus must reopen the project");
         };
-        assert!(without_return
-            .mixer_channels()
-            .iter()
-            .all(|channel| channel.kind() != IdeMixerChannelKind::Return));
+        assert!(
+            without_return
+                .mixer_channels()
+                .iter()
+                .all(|channel| channel.kind() != IdeMixerChannelKind::Return)
+        );
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::RoutingBusRemoved { revision: 14, .. }
         ));
         worker
-            .try_send(IdeWorkerCommand::RemoveRoutingBus {
-                track_id: group_id,
-            })
+            .try_send(IdeWorkerCommand::RemoveRoutingBus { track_id: group_id })
             .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Saving));
         let IdeWorkerEvent::Running(without_group) = recv(&worker) else {
             panic!("removing the cleared group bus must reopen the project");
         };
-        assert!(without_group
-            .mixer_channels()
-            .iter()
-            .all(|channel| channel.kind() != IdeMixerChannelKind::Group));
+        assert!(
+            without_group
+                .mixer_channels()
+                .iter()
+                .all(|channel| channel.kind() != IdeMixerChannelKind::Group)
+        );
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::RoutingBusRemoved { revision: 15, .. }
@@ -16325,12 +16407,8 @@ mod tests {
         let project = created.project().root().to_path_buf();
         drop(created);
 
-        let worker = DesktopIdeWorker::start_state(
-            WorkerState::Closed(closed_application()),
-            2,
-            8,
-        )
-        .unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project.clone()))
@@ -16478,8 +16556,8 @@ mod tests {
         .unwrap();
         let project = created.project().root().to_path_buf();
         drop(created);
-        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8)
-            .unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project.clone()))
@@ -16540,7 +16618,10 @@ mod tests {
                     undo_label: None,
                     redo_label: None,
                 } => {}
-                IdeWorkerEvent::AudioTrackDuplicated { revision: 3, track_id } => {
+                IdeWorkerEvent::AudioTrackDuplicated {
+                    revision: 3,
+                    track_id,
+                } => {
                     duplicated_event_track_id = Some(track_id);
                 }
                 IdeWorkerEvent::Running(snapshot) => {
@@ -16569,10 +16650,14 @@ mod tests {
                 break;
             }
         }
-        let copied_group_id = copied_group_id.expect("the independently named group copy is present after reopen");
+        let copied_group_id =
+            copied_group_id.expect("the independently named group copy is present after reopen");
         assert_ne!(copied_group_id, group_id);
         assert!(source_kept_original_destination);
-        assert_eq!(duplicated_event_track_id.as_deref(), Some(copied_group_id.as_str()));
+        assert_eq!(
+            duplicated_event_track_id.as_deref(),
+            Some(copied_group_id.as_str())
+        );
         let package = verify_project_package(&project).unwrap();
         assert_eq!(package.manifest().revision(), 3);
         drop(package);
@@ -16602,12 +16687,8 @@ mod tests {
         let project = created.project().root().to_path_buf();
         drop(created);
 
-        let worker = DesktopIdeWorker::start_state(
-            WorkerState::Closed(closed_application()),
-            2,
-            8,
-        )
-        .unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project.clone()))
@@ -16673,15 +16754,12 @@ mod tests {
             "the removed track must not survive the reopened project"
         );
         assert!(
-            reopened
-                .native_devices()
-                .iter()
-                .all(|device| match device {
-                    IdeNativeDevice::Filter(filter) => filter.track_id() != source_track_id,
-                    IdeNativeDevice::Compressor(compressor) => {
-                        compressor.track_id() != source_track_id
-                    }
-                }),
+            reopened.native_devices().iter().all(|device| match device {
+                IdeNativeDevice::Filter(filter) => filter.track_id() != source_track_id,
+                IdeNativeDevice::Compressor(compressor) => {
+                    compressor.track_id() != source_track_id
+                }
+            }),
             "the removed track's native device chain must not survive the reopened project"
         );
         assert!(matches!(
@@ -16811,7 +16889,10 @@ mod tests {
                 name,
             } if name == "Renamed session"
         ));
-        assert_eq!(project.file_name().and_then(std::ffi::OsStr::to_str), Some("Stable-directory"));
+        assert_eq!(
+            project.file_name().and_then(std::ffi::OsStr::to_str),
+            Some("Stable-directory")
+        );
         assert_eq!(
             verify_project_package(&project).unwrap().manifest().name(),
             "Renamed session"
@@ -16850,12 +16931,8 @@ mod tests {
         .root()
         .to_path_buf();
         let (_, original_mixer) = project_mixer_bytes(&project);
-        let worker = DesktopIdeWorker::start_state(
-            WorkerState::Closed(closed_application()),
-            2,
-            8,
-        )
-        .unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project.clone()))
@@ -17094,7 +17171,10 @@ mod tests {
                 switch_to: true,
             })
             .unwrap();
-        assert!(matches!(recv_native_mutation(&worker), IdeWorkerEvent::Saving));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::Saving
+        ));
         let IdeWorkerEvent::Running(reopened) = recv_native_mutation(&worker) else {
             panic!("an unpublished Save As refusal must reopen the source project");
         };
@@ -17194,7 +17274,9 @@ mod tests {
             "the native playback owner is replaced exactly at the worker fence"
         );
         let IdeWorkerEvent::AudioImported(outcome) = completion else {
-            panic!("the successful batch must be reported after the reloaded state: {completion:?}");
+            panic!(
+                "the successful batch must be reported after the reloaded state: {completion:?}"
+            );
         };
         assert_eq!(reopened.audio_clips().len(), 2);
         assert_eq!(
@@ -17205,7 +17287,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Stereo", "Voice"]
         );
-        assert!(reopened.audio_clips().iter().all(|clip| clip.track_id() == track_id));
+        assert!(
+            reopened
+                .audio_clips()
+                .iter()
+                .all(|clip| clip.track_id() == track_id)
+        );
         assert_eq!(
             reopened
                 .audio_clips()
@@ -17241,50 +17328,121 @@ mod tests {
         .unwrap();
         let project = created.project().root().to_path_buf();
         drop(created);
-        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
-        worker.try_send(IdeWorkerCommand::OpenProject(project.clone())).unwrap();
-        let IdeWorkerEvent::Running(opened) = recv(&worker) else { panic!("the project must open"); };
-        let track_id = opened.mixer_channels().iter().find(|channel| channel.kind() == IdeMixerChannelKind::Audio).unwrap().id().to_owned();
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::AddCompressor {
-            track_id, threshold_millidecibels: -18_000, ratio_millionths: 4_000_000,
-            attack_microseconds: 10_000, release_microseconds: 100_000, makeup_millidecibels: 0,
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the project must open");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::AddCompressor {
+                    track_id,
+                    threshold_millidecibels: -18_000,
+                    ratio_millionths: 4_000_000,
+                    attack_microseconds: 10_000,
+                    release_microseconds: 100_000,
+                    makeup_millidecibels: 0,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
         let history_event = recv(&worker);
-        assert!(matches!(history_event, IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), .. }), "unexpected compressor history event: {history_event:?}");
-        let IdeWorkerEvent::Running(added) = recv(&worker) else { panic!("the compressor must reopen"); };
+        assert!(
+            matches!(
+                history_event,
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: Some("native device"),
+                    ..
+                }
+            ),
+            "unexpected compressor history event: {history_event:?}"
+        );
+        let IdeWorkerEvent::Running(added) = recv(&worker) else {
+            panic!("the compressor must reopen");
+        };
         assert_eq!(added.native_compressors().len(), 1);
         let compressor = &added.native_compressors()[0];
         let chain_id = compressor.chain_id().to_owned();
         let device_id = compressor.device_instance_id().to_owned();
         assert_eq!(compressor.threshold_millidecibels(), -18_000);
         assert_eq!(compressor.ratio_millionths(), 4_000_000);
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 2, .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { revision: 2, .. }
+        ));
 
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::UpdateCompressor {
-            chain_id: chain_id.clone(), device_instance_id: device_id.clone(), enabled: false,
-            threshold_millidecibels: -12_000, ratio_millionths: 6_000_000,
-            attack_microseconds: 2_000, release_microseconds: 60_000, makeup_millidecibels: 1_000,
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
-        let IdeWorkerEvent::Running(updated) = recv(&worker) else { panic!("the compressor update must reopen"); };
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::UpdateCompressor {
+                    chain_id: chain_id.clone(),
+                    device_instance_id: device_id.clone(),
+                    enabled: false,
+                    threshold_millidecibels: -12_000,
+                    ratio_millionths: 6_000_000,
+                    attack_microseconds: 2_000,
+                    release_microseconds: 60_000,
+                    makeup_millidecibels: 1_000,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
+        let IdeWorkerEvent::Running(updated) = recv(&worker) else {
+            panic!("the compressor update must reopen");
+        };
         let compressor = &updated.native_compressors()[0];
         assert!(!compressor.enabled());
         assert_eq!(compressor.threshold_millidecibels(), -12_000);
         assert_eq!(compressor.makeup_millidecibels(), 1_000);
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }
+        ));
 
         worker.try_send(IdeWorkerCommand::Undo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
-        let IdeWorkerEvent::Running(restored) = recv(&worker) else { panic!("the restored compressor must reopen"); };
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring { redo: false, .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
+        let IdeWorkerEvent::Running(restored) = recv(&worker) else {
+            panic!("the restored compressor must reopen");
+        };
         let compressor = &restored.native_compressors()[0];
         assert!(compressor.enabled());
         assert_eq!(compressor.threshold_millidecibels(), -18_000);
         assert_eq!(compressor.device_instance_id(), device_id);
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 4, redo: false, .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 4,
+                redo: false,
+                ..
+            }
+        ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
@@ -17310,94 +17468,222 @@ mod tests {
         .unwrap();
         let project = created.project().root().to_path_buf();
         drop(created);
-        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
-        worker.try_send(IdeWorkerCommand::OpenProject(project)).unwrap();
-        let IdeWorkerEvent::Running(opened) = recv(&worker) else { panic!("the project must open"); };
-        let track_id = opened.mixer_channels().iter().find(|channel| channel.kind() == IdeMixerChannelKind::Audio).unwrap().id().to_owned();
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the project must open");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
 
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Add {
-            track_id: track_id.clone(), mode: NativeFilterMode::LowPass,
-            cutoff_millihertz: 1_000_000, resonance_millionths: 707_000,
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::Add {
+                    track_id: track_id.clone(),
+                    mode: NativeFilterMode::LowPass,
+                    cutoff_millihertz: 1_000_000,
+                    resonance_millionths: 707_000,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
         assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 2, .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { revision: 2, .. }
+        ));
 
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::AddCompressor {
-            track_id, threshold_millidecibels: -18_000, ratio_millionths: 4_000_000,
-            attack_microseconds: 10_000, release_microseconds: 100_000, makeup_millidecibels: 1_000,
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
-        let IdeWorkerEvent::Running(running) = recv(&worker) else { panic!("the mixed chain must reopen"); };
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::AddCompressor {
+                    track_id,
+                    threshold_millidecibels: -18_000,
+                    ratio_millionths: 4_000_000,
+                    attack_microseconds: 10_000,
+                    release_microseconds: 100_000,
+                    makeup_millidecibels: 1_000,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
+        let IdeWorkerEvent::Running(running) = recv(&worker) else {
+            panic!("the mixed chain must reopen");
+        };
         assert!(matches!(
             running.native_devices(),
             [IdeNativeDevice::Filter(_), IdeNativeDevice::Compressor(_)]
         ));
         assert_eq!(running.native_devices().len(), 2);
-        assert_eq!(running.native_compressors()[0].makeup_millidecibels(), 1_000);
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }));
+        assert_eq!(
+            running.native_compressors()[0].makeup_millidecibels(),
+            1_000
+        );
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }
+        ));
 
         let (chain_id, filter_id, compressor_id) = match running.native_devices() {
-            [IdeNativeDevice::Filter(filter), IdeNativeDevice::Compressor(compressor)] => (
+            [
+                IdeNativeDevice::Filter(filter),
+                IdeNativeDevice::Compressor(compressor),
+            ] => (
                 filter.chain_id().to_owned(),
                 filter.device_instance_id().to_owned(),
                 compressor.device_instance_id().to_owned(),
             ),
             _ => panic!("the reopened native device order must remain authoritative"),
         };
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Move {
-            chain_id: chain_id.clone(), device_instance_id: filter_id.clone(), destination_index: 1,
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), .. }));
-        let IdeWorkerEvent::Running(moved) = recv(&worker) else { panic!("the reordered chain must reopen"); };
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::Move {
+                    chain_id: chain_id.clone(),
+                    device_instance_id: filter_id.clone(),
+                    destination_index: 1,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("native device"),
+                ..
+            }
+        ));
+        let IdeWorkerEvent::Running(moved) = recv(&worker) else {
+            panic!("the reordered chain must reopen");
+        };
         assert!(matches!(
             moved.native_devices(),
             [IdeNativeDevice::Compressor(compressor), IdeNativeDevice::Filter(filter)]
                 if compressor.device_instance_id() == compressor_id
                     && filter.device_instance_id() == filter_id
         ));
-        let [IdeNativeDevice::Compressor(compressor), IdeNativeDevice::Filter(filter)] = moved.native_devices() else {
+        let [
+            IdeNativeDevice::Compressor(compressor),
+            IdeNativeDevice::Filter(filter),
+        ] = moved.native_devices()
+        else {
             panic!("the reordered device observation must retain both movement boundaries");
         };
         assert!(!compressor.can_move_earlier());
         assert!(compressor.can_move_later());
         assert!(filter.can_move_earlier());
         assert!(!filter.can_move_later());
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 4, .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { revision: 4, .. }
+        ));
 
         worker.try_send(IdeWorkerCommand::Undo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, label: "native device" }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { redo_label: Some("native device"), .. }));
-        let IdeWorkerEvent::Running(restored) = recv(&worker) else { panic!("undo must restore the prior device order"); };
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "native device"
+            }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                redo_label: Some("native device"),
+                ..
+            }
+        ));
+        let IdeWorkerEvent::Running(restored) = recv(&worker) else {
+            panic!("undo must restore the prior device order");
+        };
         assert!(matches!(
             restored.native_devices(),
             [IdeNativeDevice::Filter(filter), IdeNativeDevice::Compressor(compressor)]
                 if filter.device_instance_id() == filter_id
                     && compressor.device_instance_id() == compressor_id
         ));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 5, redo: false, label: "native device" }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 5,
+                redo: false,
+                label: "native device"
+            }
+        ));
 
         worker.try_send(IdeWorkerCommand::Redo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, label: "native device" }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), redo_label: None }));
-        let IdeWorkerEvent::Running(redone) = recv(&worker) else { panic!("redo must restore the later processing order"); };
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: true,
+                label: "native device"
+            }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("native device"),
+                redo_label: None
+            }
+        ));
+        let IdeWorkerEvent::Running(redone) = recv(&worker) else {
+            panic!("redo must restore the later processing order");
+        };
         assert!(matches!(
             redone.native_devices(),
             [IdeNativeDevice::Compressor(compressor), IdeNativeDevice::Filter(filter)]
                 if compressor.device_instance_id() == compressor_id
                     && filter.device_instance_id() == filter_id
         ));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 6, redo: true, label: "native device" }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 6,
+                redo: true,
+                label: "native device"
+            }
+        ));
 
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Move {
-            chain_id: chain_id.clone(), device_instance_id: compressor_id.clone(), destination_index: 0,
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        let IdeWorkerEvent::Running(refused) = recv(&worker) else { panic!("a refused move must reopen the unchanged project"); };
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::Move {
+                    chain_id: chain_id.clone(),
+                    device_instance_id: compressor_id.clone(),
+                    destination_index: 0,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        let IdeWorkerEvent::Running(refused) = recv(&worker) else {
+            panic!("a refused move must reopen the unchanged project");
+        };
         assert!(matches!(
             refused.native_devices(),
             [IdeNativeDevice::Compressor(compressor), IdeNativeDevice::Filter(filter)]
@@ -17413,16 +17699,37 @@ mod tests {
         ));
 
         worker.try_send(IdeWorkerCommand::Undo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, label: "native device" }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { redo_label: Some("native device"), .. }));
-        let IdeWorkerEvent::Running(after_refusal_undo) = recv(&worker) else { panic!("the retained reorder inverse must remain undoable"); };
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "native device"
+            }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                redo_label: Some("native device"),
+                ..
+            }
+        ));
+        let IdeWorkerEvent::Running(after_refusal_undo) = recv(&worker) else {
+            panic!("the retained reorder inverse must remain undoable");
+        };
         assert!(matches!(
             after_refusal_undo.native_devices(),
             [IdeNativeDevice::Filter(filter), IdeNativeDevice::Compressor(compressor)]
                 if filter.device_instance_id() == filter_id
                     && compressor.device_instance_id() == compressor_id
         ));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 7, redo: false, label: "native device" }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 7,
+                redo: false,
+                label: "native device"
+            }
+        ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
@@ -17448,10 +17755,15 @@ mod tests {
         .unwrap();
         let project = created.project().root().to_path_buf();
         drop(created);
-        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
-        worker.try_send(IdeWorkerCommand::OpenProject(project)).unwrap();
-        let IdeWorkerEvent::Running(opened) = recv(&worker) else { panic!("the project must open"); };
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the project must open");
+        };
         let track_id = opened
             .mixer_channels()
             .iter()
@@ -17460,81 +17772,194 @@ mod tests {
             .id()
             .to_owned();
 
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::AddCompressor {
-            track_id,
-            threshold_millidecibels: -21_000,
-            ratio_millionths: 3_000_000,
-            attack_microseconds: 6_000,
-            release_microseconds: 90_000,
-            makeup_millidecibels: 1_500,
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
-        let IdeWorkerEvent::Running(added) = recv(&worker) else { panic!("the source device must reopen"); };
-        let IdeNativeDevice::Compressor(source) = &added.native_devices()[0] else { panic!("the source must be a compressor"); };
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::AddCompressor {
+                    track_id,
+                    threshold_millidecibels: -21_000,
+                    ratio_millionths: 3_000_000,
+                    attack_microseconds: 6_000,
+                    release_microseconds: 90_000,
+                    makeup_millidecibels: 1_500,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
+        let IdeWorkerEvent::Running(added) = recv(&worker) else {
+            panic!("the source device must reopen");
+        };
+        let IdeNativeDevice::Compressor(source) = &added.native_devices()[0] else {
+            panic!("the source must be a compressor");
+        };
         let chain_id = source.chain_id().to_owned();
         let source_id = source.device_instance_id().to_owned();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 2, .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { revision: 2, .. }
+        ));
 
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Duplicate {
-            chain_id: chain_id.clone(),
-            device_instance_id: source_id.clone(),
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), .. }));
-        let IdeWorkerEvent::Running(duplicated) = recv(&worker) else { panic!("the duplicated chain must reopen"); };
-        let [IdeNativeDevice::Compressor(source), IdeNativeDevice::Compressor(duplicate)] = duplicated.native_devices() else {
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::Duplicate {
+                    chain_id: chain_id.clone(),
+                    device_instance_id: source_id.clone(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("native device"),
+                ..
+            }
+        ));
+        let IdeWorkerEvent::Running(duplicated) = recv(&worker) else {
+            panic!("the duplicated chain must reopen");
+        };
+        let [
+            IdeNativeDevice::Compressor(source),
+            IdeNativeDevice::Compressor(duplicate),
+        ] = duplicated.native_devices()
+        else {
             panic!("duplication must preserve the source and append one same-kind device");
         };
         assert_eq!(source.device_instance_id(), source_id);
         assert_ne!(source.device_instance_id(), duplicate.device_instance_id());
         assert_eq!(source.chain_id(), chain_id);
         assert_eq!(duplicate.chain_id(), chain_id);
-        assert_eq!(source.threshold_millidecibels(), duplicate.threshold_millidecibels());
+        assert_eq!(
+            source.threshold_millidecibels(),
+            duplicate.threshold_millidecibels()
+        );
         assert_eq!(source.ratio_millionths(), duplicate.ratio_millionths());
-        assert_eq!(source.attack_microseconds(), duplicate.attack_microseconds());
-        assert_eq!(source.release_microseconds(), duplicate.release_microseconds());
-        assert_eq!(source.makeup_millidecibels(), duplicate.makeup_millidecibels());
+        assert_eq!(
+            source.attack_microseconds(),
+            duplicate.attack_microseconds()
+        );
+        assert_eq!(
+            source.release_microseconds(),
+            duplicate.release_microseconds()
+        );
+        assert_eq!(
+            source.makeup_millidecibels(),
+            duplicate.makeup_millidecibels()
+        );
         let duplicate_id = duplicate.device_instance_id().to_owned();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }
+        ));
 
         worker.try_send(IdeWorkerCommand::Undo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, label: "native device" }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { redo_label: Some("native device"), .. }));
-        let IdeWorkerEvent::Running(undone) = recv(&worker) else { panic!("undo must restore the one-device chain"); };
-        assert!(matches!(undone.native_devices(), [IdeNativeDevice::Compressor(source)] if source.device_instance_id() == source_id));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 4, redo: false, label: "native device" }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "native device"
+            }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                redo_label: Some("native device"),
+                ..
+            }
+        ));
+        let IdeWorkerEvent::Running(undone) = recv(&worker) else {
+            panic!("undo must restore the one-device chain");
+        };
+        assert!(
+            matches!(undone.native_devices(), [IdeNativeDevice::Compressor(source)] if source.device_instance_id() == source_id)
+        );
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 4,
+                redo: false,
+                label: "native device"
+            }
+        ));
 
         worker.try_send(IdeWorkerCommand::Redo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, label: "native device" }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), redo_label: None }));
-        let IdeWorkerEvent::Running(redone) = recv(&worker) else { panic!("redo must restore the duplicated chain"); };
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: true,
+                label: "native device"
+            }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("native device"),
+                redo_label: None
+            }
+        ));
+        let IdeWorkerEvent::Running(redone) = recv(&worker) else {
+            panic!("redo must restore the duplicated chain");
+        };
         assert!(matches!(
             redone.native_devices(),
             [IdeNativeDevice::Compressor(source), IdeNativeDevice::Compressor(duplicate)]
                 if source.device_instance_id() == source_id
                     && duplicate.device_instance_id() == duplicate_id
         ));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 5, redo: true, label: "native device" }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 5,
+                redo: true,
+                label: "native device"
+            }
+        ));
 
         for expected_device_count in 3..=MAX_DEVICES_PER_CHAIN {
-            worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Duplicate {
-                chain_id: chain_id.clone(),
-                device_instance_id: source_id.clone(),
-            }}).unwrap();
-            assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-            assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+            worker
+                .try_send(IdeWorkerCommand::EditNativeFilter {
+                    edit: IdeNativeFilterEdit::Duplicate {
+                        chain_id: chain_id.clone(),
+                        device_instance_id: source_id.clone(),
+                    },
+                })
+                .unwrap();
+            assert!(matches!(
+                recv(&worker),
+                IdeWorkerEvent::NativeFilterEditing { .. }
+            ));
+            assert!(matches!(
+                recv(&worker),
+                IdeWorkerEvent::UndoStateChanged { .. }
+            ));
             let IdeWorkerEvent::Running(full_chain) = recv(&worker) else {
                 panic!("each duplicate must reopen the authoritative chain");
             };
             assert_eq!(full_chain.native_devices().len(), expected_device_count);
             if expected_device_count == MAX_DEVICES_PER_CHAIN {
-                assert!(full_chain.native_devices().iter().all(|device| match device {
-                    IdeNativeDevice::Filter(filter) => !filter.can_duplicate(),
-                    IdeNativeDevice::Compressor(compressor) => !compressor.can_duplicate(),
-                }));
+                assert!(
+                    full_chain
+                        .native_devices()
+                        .iter()
+                        .all(|device| match device {
+                            IdeNativeDevice::Filter(filter) => !filter.can_duplicate(),
+                            IdeNativeDevice::Compressor(compressor) => !compressor.can_duplicate(),
+                        })
+                );
             }
-            assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { .. }));
+            assert!(matches!(
+                recv(&worker),
+                IdeWorkerEvent::NativeFilterEdited { .. }
+            ));
         }
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
@@ -17561,10 +17986,15 @@ mod tests {
         .unwrap();
         let project = created.project().root().to_path_buf();
         drop(created);
-        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
-        worker.try_send(IdeWorkerCommand::OpenProject(project)).unwrap();
-        let IdeWorkerEvent::Running(opened) = recv(&worker) else { panic!("the project must open"); };
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the project must open");
+        };
         let source_track_id = opened
             .mixer_channels()
             .iter()
@@ -17573,88 +18003,196 @@ mod tests {
             .id()
             .to_owned();
 
-        worker.try_send(IdeWorkerCommand::AddAudioTrack { name: "Target".to_owned() }).unwrap();
+        worker
+            .try_send(IdeWorkerCommand::AddAudioTrack {
+                name: "Target".to_owned(),
+            })
+            .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::AudioTrackAdding));
-        let IdeWorkerEvent::Running(with_target_track) = recv(&worker) else { panic!("the added target track must reopen"); };
+        let IdeWorkerEvent::Running(with_target_track) = recv(&worker) else {
+            panic!("the added target track must reopen");
+        };
         let target_track_id = with_target_track
             .mixer_channels()
             .iter()
-            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio && channel.id() != source_track_id)
+            .find(|channel| {
+                channel.kind() == IdeMixerChannelKind::Audio && channel.id() != source_track_id
+            })
             .unwrap()
             .id()
             .to_owned();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::AudioTrackAdded { revision: 2 }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioTrackAdded { revision: 2 }
+        ));
 
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::AddCompressor {
-            track_id: source_track_id.clone(),
-            threshold_millidecibels: -21_000,
-            ratio_millionths: 3_000_000,
-            attack_microseconds: 6_000,
-            release_microseconds: 90_000,
-            makeup_millidecibels: 1_500,
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
-        let IdeWorkerEvent::Running(with_source) = recv(&worker) else { panic!("the source device must reopen"); };
-        let IdeNativeDevice::Compressor(source) = &with_source.native_devices()[0] else { panic!("the source must be a compressor"); };
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::AddCompressor {
+                    track_id: source_track_id.clone(),
+                    threshold_millidecibels: -21_000,
+                    ratio_millionths: 3_000_000,
+                    attack_microseconds: 6_000,
+                    release_microseconds: 90_000,
+                    makeup_millidecibels: 1_500,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
+        let IdeWorkerEvent::Running(with_source) = recv(&worker) else {
+            panic!("the source device must reopen");
+        };
+        let IdeNativeDevice::Compressor(source) = &with_source.native_devices()[0] else {
+            panic!("the source must be a compressor");
+        };
         let source_chain_id = source.chain_id().to_owned();
         let source_device_id = source.device_instance_id().to_owned();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }
+        ));
 
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Add {
-            track_id: target_track_id.clone(),
-            mode: NativeFilterMode::HighPass,
-            cutoff_millihertz: 800_000,
-            resonance_millionths: 1_000_000,
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
-        let IdeWorkerEvent::Running(with_target) = recv(&worker) else { panic!("the target device must reopen"); };
-        let IdeNativeDevice::Filter(target) = &with_target.native_devices()[1] else { panic!("the target must be a filter"); };
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::Add {
+                    track_id: target_track_id.clone(),
+                    mode: NativeFilterMode::HighPass,
+                    cutoff_millihertz: 800_000,
+                    resonance_millionths: 1_000_000,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
+        let IdeWorkerEvent::Running(with_target) = recv(&worker) else {
+            panic!("the target device must reopen");
+        };
+        let IdeNativeDevice::Filter(target) = &with_target.native_devices()[1] else {
+            panic!("the target must be a filter");
+        };
         let target_chain_id = target.chain_id().to_owned();
         let target_device_id = target.device_instance_id().to_owned();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 4, .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { revision: 4, .. }
+        ));
 
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::CopyTo {
-            source_chain_id: source_chain_id.clone(),
-            source_device_instance_id: source_device_id.clone(),
-            target_chain_id: target_chain_id.clone(),
-            target_device_instance_id: target_device_id.clone(),
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), .. }));
-        let IdeWorkerEvent::Running(copied) = recv(&worker) else { panic!("the copied target chain must reopen"); };
-        let [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target), IdeNativeDevice::Compressor(copied)] = copied.native_devices() else {
-            panic!("copy must retain the source chain and insert the copied state only after the target");
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::CopyTo {
+                    source_chain_id: source_chain_id.clone(),
+                    source_device_instance_id: source_device_id.clone(),
+                    target_chain_id: target_chain_id.clone(),
+                    target_device_instance_id: target_device_id.clone(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("native device"),
+                ..
+            }
+        ));
+        let IdeWorkerEvent::Running(copied) = recv(&worker) else {
+            panic!("the copied target chain must reopen");
+        };
+        let [
+            IdeNativeDevice::Compressor(source),
+            IdeNativeDevice::Filter(target),
+            IdeNativeDevice::Compressor(copied),
+        ] = copied.native_devices()
+        else {
+            panic!(
+                "copy must retain the source chain and insert the copied state only after the target"
+            );
         };
         assert_eq!(source.device_instance_id(), source_device_id);
         assert_eq!(target.device_instance_id(), target_device_id);
         assert_eq!(copied.chain_id(), target_chain_id);
         assert_ne!(copied.device_instance_id(), source_device_id);
-        assert_eq!(copied.threshold_millidecibels(), source.threshold_millidecibels());
+        assert_eq!(
+            copied.threshold_millidecibels(),
+            source.threshold_millidecibels()
+        );
         assert_eq!(copied.ratio_millionths(), source.ratio_millionths());
         assert_eq!(copied.attack_microseconds(), source.attack_microseconds());
         assert_eq!(copied.release_microseconds(), source.release_microseconds());
         assert_eq!(copied.makeup_millidecibels(), source.makeup_millidecibels());
         let copied_device_id = copied.device_instance_id().to_owned();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 5, .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { revision: 5, .. }
+        ));
 
         worker.try_send(IdeWorkerCommand::Undo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, label: "native device" }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { redo_label: Some("native device"), .. }));
-        let IdeWorkerEvent::Running(undone) = recv(&worker) else { panic!("undo must restore the target chain only"); };
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "native device"
+            }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                redo_label: Some("native device"),
+                ..
+            }
+        ));
+        let IdeWorkerEvent::Running(undone) = recv(&worker) else {
+            panic!("undo must restore the target chain only");
+        };
         assert!(matches!(
             undone.native_devices(),
             [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target)]
                 if source.device_instance_id() == source_device_id
                     && target.device_instance_id() == target_device_id
         ));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 6, redo: false, label: "native device" }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 6,
+                redo: false,
+                label: "native device"
+            }
+        ));
 
         worker.try_send(IdeWorkerCommand::Redo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, label: "native device" }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), redo_label: None }));
-        let IdeWorkerEvent::Running(redone) = recv(&worker) else { panic!("redo must restore the copied target chain"); };
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: true,
+                label: "native device"
+            }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("native device"),
+                redo_label: None
+            }
+        ));
+        let IdeWorkerEvent::Running(redone) = recv(&worker) else {
+            panic!("redo must restore the copied target chain");
+        };
         assert!(matches!(
             redone.native_devices(),
             [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target), IdeNativeDevice::Compressor(copied)]
@@ -17662,16 +18200,32 @@ mod tests {
                     && target.device_instance_id() == target_device_id
                     && copied.device_instance_id() == copied_device_id
         ));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 7, redo: true, label: "native device" }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 7,
+                redo: true,
+                label: "native device"
+            }
+        ));
 
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::CopyTo {
-            source_chain_id: source_chain_id.clone(),
-            source_device_instance_id: source_device_id.clone(),
-            target_chain_id: source_chain_id.clone(),
-            target_device_instance_id: source_device_id.clone(),
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        let IdeWorkerEvent::Running(same_chain_refused) = recv(&worker) else { panic!("a same-chain copy must reopen the unchanged project"); };
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::CopyTo {
+                    source_chain_id: source_chain_id.clone(),
+                    source_device_instance_id: source_device_id.clone(),
+                    target_chain_id: source_chain_id.clone(),
+                    target_device_instance_id: source_device_id.clone(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        let IdeWorkerEvent::Running(same_chain_refused) = recv(&worker) else {
+            panic!("a same-chain copy must reopen the unchanged project");
+        };
         assert!(matches!(
             same_chain_refused.native_devices(),
             [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target), IdeNativeDevice::Compressor(copied)]
@@ -17690,20 +18244,29 @@ mod tests {
             )
         ));
 
-        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::CopyTo {
-            source_chain_id: source_chain_id.clone(),
-            source_device_instance_id: "018f47a2-6b2d-7c11-8a44-001122338099".to_owned(),
-            target_chain_id: target_chain_id.clone(),
-            target_device_instance_id: target_device_id.clone(),
-        }}).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(stale_source_refused) if matches!(
-            stale_source_refused.native_devices(),
-            [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target), IdeNativeDevice::Compressor(copied)]
-                if source.device_instance_id() == source_device_id
-                    && target.device_instance_id() == target_device_id
-                    && copied.device_instance_id() == copied_device_id
-        )));
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::CopyTo {
+                    source_chain_id: source_chain_id.clone(),
+                    source_device_instance_id: "018f47a2-6b2d-7c11-8a44-001122338099".to_owned(),
+                    target_chain_id: target_chain_id.clone(),
+                    target_device_instance_id: target_device_id.clone(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(
+            matches!(recv(&worker), IdeWorkerEvent::Running(stale_source_refused) if matches!(
+                stale_source_refused.native_devices(),
+                [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target), IdeNativeDevice::Compressor(copied)]
+                    if source.device_instance_id() == source_device_id
+                        && target.device_instance_id() == target_device_id
+                        && copied.device_instance_id() == copied_device_id
+            ))
+        );
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::CommandFailed {
@@ -17713,15 +18276,36 @@ mod tests {
         ));
 
         worker.try_send(IdeWorkerCommand::Undo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, label: "native device" }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { redo_label: Some("native device"), .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(after_refusal_undo) if matches!(
-            after_refusal_undo.native_devices(),
-            [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target)]
-                if source.device_instance_id() == source_device_id
-                    && target.device_instance_id() == target_device_id
-        )));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 8, redo: false, label: "native device" }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "native device"
+            }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                redo_label: Some("native device"),
+                ..
+            }
+        ));
+        assert!(
+            matches!(recv(&worker), IdeWorkerEvent::Running(after_refusal_undo) if matches!(
+                after_refusal_undo.native_devices(),
+                [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target)]
+                    if source.device_instance_id() == source_device_id
+                        && target.device_instance_id() == target_device_id
+            ))
+        );
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 8,
+                redo: false,
+                label: "native device"
+            }
+        ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
@@ -17748,12 +18332,8 @@ mod tests {
         let project = created.project().root().to_path_buf();
         drop(created);
 
-        let worker = DesktopIdeWorker::start_state(
-            WorkerState::Closed(closed_application()),
-            2,
-            8,
-        )
-        .unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project.clone()))
@@ -17779,7 +18359,10 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::UndoStateChanged {
@@ -17873,13 +18456,22 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
         let IdeWorkerEvent::Running(updated) = recv(&worker) else {
             panic!("the updated native filter must reopen before completion");
         };
         assert!(!updated.native_filters()[0].enabled());
-        assert_eq!(updated.native_filters()[0].mode(), NativeFilterMode::HighPass);
+        assert_eq!(
+            updated.native_filters()[0].mode(),
+            NativeFilterMode::HighPass
+        );
         assert_eq!(updated.native_filters()[0].cutoff_millihertz(), 2_000_000);
         assert!(matches!(
             recv(&worker),
@@ -17887,13 +18479,22 @@ mod tests {
         ));
 
         worker.try_send(IdeWorkerCommand::Undo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring { redo: false, .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
         let IdeWorkerEvent::Running(update_undone) = recv(&worker) else {
             panic!("the undone filter update must reopen before completion");
         };
         assert!(update_undone.native_filters()[0].enabled());
-        assert_eq!(update_undone.native_filters()[0].mode(), NativeFilterMode::LowPass);
+        assert_eq!(
+            update_undone.native_filters()[0].mode(),
+            NativeFilterMode::LowPass
+        );
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::EditRestored {
@@ -17904,13 +18505,22 @@ mod tests {
         ));
 
         worker.try_send(IdeWorkerCommand::Redo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring { redo: true, .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
         let IdeWorkerEvent::Running(update_redone) = recv(&worker) else {
             panic!("the redone filter update must reopen before completion");
         };
         assert!(!update_redone.native_filters()[0].enabled());
-        assert_eq!(update_redone.native_filters()[0].mode(), NativeFilterMode::HighPass);
+        assert_eq!(
+            update_redone.native_filters()[0].mode(),
+            NativeFilterMode::HighPass
+        );
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::EditRestored {
@@ -17928,8 +18538,14 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
         let IdeWorkerEvent::Running(removed) = recv(&worker) else {
             panic!("the removed native filter must reopen before completion");
         };
@@ -17941,14 +18557,23 @@ mod tests {
         assert!(!project.join("devices").exists());
 
         worker.try_send(IdeWorkerCommand::Undo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring { redo: false, .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
         let IdeWorkerEvent::Running(removal_undone) = recv(&worker) else {
             panic!("the undone filter removal must reopen before completion");
         };
         assert_eq!(removal_undone.native_filters().len(), 1);
         assert_eq!(removal_undone.native_filters()[0].chain_id(), chain_id);
-        assert_eq!(removal_undone.native_filters()[0].device_instance_id(), device_id);
+        assert_eq!(
+            removal_undone.native_filters()[0].device_instance_id(),
+            device_id
+        );
         assert!(!removal_undone.native_filters()[0].enabled());
         assert!(matches!(
             recv(&worker),
@@ -17960,8 +18585,14 @@ mod tests {
         ));
 
         worker.try_send(IdeWorkerCommand::Redo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring { redo: true, .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
         let IdeWorkerEvent::Running(removal_redone) = recv(&worker) else {
             panic!("the redone filter removal must reopen before completion");
         };
@@ -18001,12 +18632,8 @@ mod tests {
         .unwrap();
         let project = created.project().root().to_path_buf();
         drop(created);
-        let worker = DesktopIdeWorker::start_state(
-            WorkerState::Closed(closed_application()),
-            2,
-            8,
-        )
-        .unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project.clone()))
@@ -18023,19 +18650,16 @@ mod tests {
                     },
                     interpolation: crate::AutomationInterpolation::Linear,
                     points: vec![
-                        crate::AutomationPoint::new(
-                            0,
-                            crate::AutomationValue::Integer(1_000_000),
-                        ),
-                        crate::AutomationPoint::new(
-                            959,
-                            crate::AutomationValue::Integer(0),
-                        ),
+                        crate::AutomationPoint::new(0, crate::AutomationValue::Integer(1_000_000)),
+                        crate::AutomationPoint::new(959, crate::AutomationValue::Integer(0)),
                     ],
                 },
             })
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::AutomationTakeAdding));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AutomationTakeAdding
+        ));
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::UndoStateChanged {
@@ -18064,7 +18688,10 @@ mod tests {
                 label: "automation take",
             }
         ));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
         assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
         assert!(matches!(
             recv(&worker),
@@ -18076,8 +18703,14 @@ mod tests {
         ));
         assert!(!project.join("takes").exists());
         worker.try_send(IdeWorkerCommand::Redo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring { redo: true, .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
         assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
         assert!(matches!(
             recv(&worker),
@@ -18125,7 +18758,10 @@ mod tests {
                 label: "automation take removal",
             }
         ));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
         let IdeWorkerEvent::Running(_) = recv(&worker) else {
             panic!("the restored automation take must reopen before completion");
         };
@@ -18142,12 +18778,21 @@ mod tests {
             closed_application().config.project_limits,
         )
         .unwrap();
-        assert_eq!(reopened.session().automation_takes().takes()[0].id(), take_id);
+        assert_eq!(
+            reopened.session().automation_takes().takes()[0].id(),
+            take_id
+        );
         drop(reopened);
 
         worker.try_send(IdeWorkerCommand::Redo).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring { redo: true, .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
         let IdeWorkerEvent::Running(_) = recv(&worker) else {
             panic!("the redone automation removal must reopen before completion");
         };
@@ -18191,12 +18836,9 @@ mod tests {
             .collect::<Vec<_>>();
         std::fs::write(&source, mono_pcm16_wav(48_000, &source_samples)).unwrap();
 
-        let worker = DesktopIdeWorker::start_state(
-            WorkerState::Closed(audio_import_application()),
-            2,
-            8,
-        )
-        .unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 8)
+                .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project))
@@ -18247,7 +18889,10 @@ mod tests {
         assert_eq!(placed.arrangement().placements().len(), 1);
         let placement_result = recv(&worker);
         assert!(
-            matches!(placement_result, IdeWorkerEvent::ArrangementPlacementAdded { start_tick: 0, .. }),
+            matches!(
+                placement_result,
+                IdeWorkerEvent::ArrangementPlacementAdded { start_tick: 0, .. }
+            ),
             "unexpected placement result for {placed:?}: {placement_result:?}"
         );
 
@@ -18349,7 +18994,10 @@ mod tests {
                 block_frames: 64,
             })
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectStemExporting));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ProjectStemExporting
+        ));
         let stem_export = recv(&worker);
         let IdeWorkerEvent::ProjectStemsExported { report } = stem_export else {
             panic!("unexpected stem export result: {stem_export:?}");
@@ -18388,11 +19036,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stem.frame_count(), 500);
-        assert!(stem
-            .plane(0)
-            .unwrap()
-            .iter()
-            .any(|sample| sample.abs() > 0.0));
+        assert!(
+            stem.plane(0)
+                .unwrap()
+                .iter()
+                .any(|sample| sample.abs() > 0.0)
+        );
 
         let mismatched_path = fixture.join("must-remain.flac");
         std::fs::write(&mismatched_path, b"previous export").unwrap();
@@ -18423,10 +19072,19 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEditing { .. }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
         assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
-        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { .. }
+        ));
 
         let filtered_path = fixture.join("filtered.wav");
         worker
@@ -18499,7 +19157,12 @@ mod tests {
             assert!((main - (group + returned)).abs() <= f32::EPSILON);
             assert!((source - group).abs() <= f32::EPSILON);
         }
-        for (&wav, &lossless) in baseline.plane(0).unwrap().iter().zip(flac.plane(0).unwrap()) {
+        for (&wav, &lossless) in baseline
+            .plane(0)
+            .unwrap()
+            .iter()
+            .zip(flac.plane(0).unwrap())
+        {
             assert!(
                 (wav - lossless).abs() <= 1.5 / 8_388_607.0,
                 "FLAC must preserve the defined 24-bit PCM export: {wav} versus {lossless}"
@@ -18549,8 +19212,7 @@ mod tests {
         std::fs::write(&unsupported, b"not an accepted container").unwrap();
 
         let worker =
-            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 5)
-                .unwrap();
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 5).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project.clone()))
@@ -18577,12 +19239,15 @@ mod tests {
         ));
         let reopened = recv(&worker);
         let completion = recv(&worker);
-        assert!(matches!(
-            reopened,
-            IdeWorkerEvent::Running(ref observation)
-                if observation.audio_clips().len() == 1
-                    && observation.audio_clips()[0].name() == "Bass"
-        ), "unexpected reopened state: {reopened:?}; completion: {completion:?}");
+        assert!(
+            matches!(
+                reopened,
+                IdeWorkerEvent::Running(ref observation)
+                    if observation.audio_clips().len() == 1
+                        && observation.audio_clips()[0].name() == "Bass"
+            ),
+            "unexpected reopened state: {reopened:?}; completion: {completion:?}"
+        );
         assert!(matches!(
             completion,
             IdeWorkerEvent::CommandFailed {
@@ -18594,7 +19259,10 @@ mod tests {
                 && matches!(reason.reason(), IdeAudioImportError::UnsupportedContainer)
         ));
         assert_eq!(
-            verify_project_package(&project).unwrap().manifest().revision(),
+            verify_project_package(&project)
+                .unwrap()
+                .manifest()
+                .revision(),
             initial_revision + 1,
             "the first independent publication survives the later refusal"
         );
@@ -18663,7 +19331,10 @@ mod tests {
                 && matches!(source.as_ref(), IdeProjectOpenError::PlaybackSessionGenerationExhausted)
         ));
         assert_eq!(
-            verify_project_package(&project).unwrap().manifest().revision(),
+            verify_project_package(&project)
+                .unwrap()
+                .manifest()
+                .revision(),
             initial_revision + 1,
             "the committed import remains truthful when only the reload fails"
         );
@@ -18736,7 +19407,10 @@ mod tests {
                 && matches!(reopen.as_ref(), IdeProjectOpenError::PlaybackSessionGenerationExhausted)
         ));
         assert_eq!(
-            verify_project_package(&project).unwrap().manifest().revision(),
+            verify_project_package(&project)
+                .unwrap()
+                .manifest()
+                .revision(),
             initial_revision + 1,
             "the first publication remains committed despite both later failures"
         );
@@ -18776,8 +19450,7 @@ mod tests {
         std::fs::write(&unsupported, b"not an accepted container").unwrap();
 
         let worker =
-            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8)
-                .unwrap();
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project.clone()))
@@ -20068,7 +20741,10 @@ mod tests {
                 track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
             })
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::AudioTrackContentRemoving));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioTrackContentRemoving
+        ));
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         assert!(matches!(
             recv(&worker),
@@ -20211,7 +20887,10 @@ mod tests {
                 destination_index: 1,
             })
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::MixerStripsReordering));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::MixerStripsReordering
+        ));
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         assert!(matches!(
             recv(&worker),
@@ -20277,7 +20956,10 @@ mod tests {
                 name: "Copy".to_owned(),
             })
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::AudioTrackDuplicating));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioTrackDuplicating
+        ));
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         assert!(matches!(
             recv(&worker),
@@ -21553,12 +22235,7 @@ mod tests {
         let mut history = UndoHistory::default();
         history.record_edit(source);
 
-        observe_history(
-            &mut history,
-            &attempt,
-            IdeWorkerCommandKind::Undo,
-            &events,
-        );
+        observe_history(&mut history, &attempt, IdeWorkerCommandKind::Undo, &events);
 
         assert!(history.undo.is_empty());
         assert_eq!(history.redo.len(), 1);
@@ -21620,8 +22297,15 @@ mod tests {
             attempt,
             IdeProjectOpenError::PlaybackSessionGenerationExhausted,
         );
-        assert!(matches!(failure, IdeWorkerCommandFailure::AudioClipSourceTrim(_)));
-        assert_eq!(history.undo.len(), 1, "terminal mapping cannot rewrite history");
+        assert!(matches!(
+            failure,
+            IdeWorkerCommandFailure::AudioClipSourceTrim(_)
+        ));
+        assert_eq!(
+            history.undo.len(),
+            1,
+            "terminal mapping cannot rewrite history"
+        );
         assert_eq!(history.undo[0].operation(), inverse);
     }
 
@@ -21896,7 +22580,10 @@ mod tests {
         let (events, receiver) = sync_channel(1);
 
         assert!(begin_mixer_recovery_snapshot(&mut state, &events));
-        assert!(matches!(state, WorkerState::AutosaveFence { sequence: 1, .. }));
+        assert!(matches!(
+            state,
+            WorkerState::AutosaveFence { sequence: 1, .. }
+        ));
         assert!(receiver.try_recv().is_err());
     }
 
@@ -22163,7 +22850,10 @@ mod tests {
             )
         };
         let attempt = ProjectMutationAttempt::RemoveAudioClip(Err(committed_warning()));
-        assert!(matches!(history_effect(&attempt), HistoryEffect::Invalidate));
+        assert!(matches!(
+            history_effect(&attempt),
+            HistoryEffect::Invalidate
+        ));
 
         let (events, receiver) = std::sync::mpsc::sync_channel(8);
         let mut history = UndoHistory::default();
@@ -22225,7 +22915,10 @@ mod tests {
             )
         };
         let attempt = ProjectMutationAttempt::CleanUnusedSamples(Err(committed_warning()));
-        assert!(matches!(history_effect(&attempt), HistoryEffect::Invalidate));
+        assert!(matches!(
+            history_effect(&attempt),
+            HistoryEffect::Invalidate
+        ));
 
         let (events, receiver) = std::sync::mpsc::sync_channel(8);
         let mut history = UndoHistory::default();
@@ -22559,7 +23252,10 @@ mod tests {
             history.undo.is_empty(),
             "history was completed before authoritative reopen"
         );
-        assert_eq!(history.redo.last().unwrap().resource_id, displaced.resource_id);
+        assert_eq!(
+            history.redo.last().unwrap().resource_id,
+            displaced.resource_id
+        );
     }
 
     #[test]
@@ -22776,7 +23472,10 @@ mod tests {
                 block_frames: 1_024,
             })
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectStemExporting));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ProjectStemExporting
+        ));
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::CommandFailed {

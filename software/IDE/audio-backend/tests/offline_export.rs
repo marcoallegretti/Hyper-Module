@@ -93,7 +93,8 @@ fn session(arrangement: Option<&[u8]>, automation: Vec<Vec<u8>>) -> PreparedPlay
         },
         decoded_assets: vec![DecodedPlaybackAsset::new(
             "018f47a2-6b2d-7c11-8a44-001122337504".to_owned(),
-            DecodedAudio::from_mono(48_000, (0..100_i16).map(|n| f32::from(n) / 200.0).collect()).unwrap(),
+            DecodedAudio::from_mono(48_000, (0..100_i16).map(|n| f32::from(n) / 200.0).collect())
+                .unwrap(),
         )],
         limits: PlaybackSessionAssemblyLimits {
             documents: LoaderLimits::VERSION_1,
@@ -109,7 +110,10 @@ fn session(arrangement: Option<&[u8]>, automation: Vec<Vec<u8>>) -> PreparedPlay
 
 /// Drives the same runtime the desktop output uses, one block at a time, so the
 /// comparison is against playback rather than against a second renderer.
-fn render_through_playback(session: &PreparedPlaybackSession, block_frames: usize) -> Vec<(f32, f32)> {
+fn render_through_playback(
+    session: &PreparedPlaybackSession,
+    block_frames: usize,
+) -> Vec<(f32, f32)> {
     let (project, mixer, automation, media) = session.parts();
     let facts: Vec<_> = media.media_asset_facts().collect();
     let graph = project
@@ -157,7 +161,8 @@ fn render_through_playback(session: &PreparedPlaybackSession, block_frames: usiz
 #[test]
 fn offline_export_matches_the_playback_runtime_sample_for_sample() {
     let session = session(Some(ARRANGEMENT), vec![AUTOMATION.to_vec()]);
-    let rendered = render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
+    let rendered =
+        render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
 
     assert_eq!(rendered.sample_rate_hz(), 48_000);
     assert_eq!(rendered.frame_count(), 100);
@@ -182,7 +187,9 @@ fn offline_export_matches_the_playback_runtime_sample_for_sample() {
         "the export is not silent"
     );
     assert!(
-        left.iter().zip(right.iter()).any(|(l, r)| (l - r).abs() > f32::EPSILON),
+        left.iter()
+            .zip(right.iter())
+            .any(|(l, r)| (l - r).abs() > f32::EPSILON),
         "the panned fixture distinguishes the two channels"
     );
 }
@@ -191,9 +198,12 @@ fn offline_export_matches_the_playback_runtime_sample_for_sample() {
 fn track_stems_are_aligned_direct_channel_renders() {
     let session = session(Some(ARRANGEMENT), vec![AUTOMATION.to_vec()]);
     let main = render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
-    let stems =
-        render_project_track_stems_with_mixer(&session, OfflineExportSpec { block_frames: 32 }, None)
-            .unwrap();
+    let stems = render_project_track_stems_with_mixer(
+        &session,
+        OfflineExportSpec { block_frames: 32 },
+        None,
+    )
+    .unwrap();
 
     assert_eq!(stems.len(), 1);
     let stem = &stems[0];
@@ -484,7 +494,10 @@ fn re_exporting_to_the_same_destination_replaces_it_and_leaves_no_journal() {
 
     export_project_wav(&session, spec, &journal, &wav).unwrap();
     let first = std::fs::read(&wav).unwrap();
-    assert!(!journal.exists(), "a successful export leaves no staging journal");
+    assert!(
+        !journal.exists(),
+        "a successful export leaves no staging journal"
+    );
 
     // Tweak the mix, as a bounce-tweak-bounce loop does, so the second export
     // is genuinely different content rather than an idempotent republication.
@@ -499,15 +512,14 @@ fn re_exporting_to_the_same_destination_replaces_it_and_leaves_no_journal() {
         .compile_main_graph()
         .unwrap();
 
-    let second_report =
-        hyper_desktop_audio::export_project_wav_with_mixer(
-            &session,
-            spec,
-            Some(&tweaked),
-            &journal,
-            &wav,
-        )
-        .expect("bounce, tweak, bounce again must not fail on the second bounce");
+    let second_report = hyper_desktop_audio::export_project_wav_with_mixer(
+        &session,
+        spec,
+        Some(&tweaked),
+        &journal,
+        &wav,
+    )
+    .expect("bounce, tweak, bounce again must not fail on the second bounce");
     assert_eq!(second_report.frame_count, 100);
     assert_ne!(
         std::fs::read(&wav).unwrap(),
@@ -550,7 +562,6 @@ fn a_live_mixer_override_changes_the_render_and_must_match_the_prepared_layout()
             .any(|(live, prepared)| (live - prepared).abs() > f32::EPSILON),
         "a different live gain must produce a different render"
     );
-
 }
 
 const GROUP_TRACK: &[u8] = br#"{
@@ -634,7 +645,8 @@ fn a_grouped_and_sent_project_exports_exactly_as_it_plays() {
         "the fixture exercises more than one mixer slot"
     );
 
-    let rendered = render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
+    let rendered =
+        render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
     let expected = render_through_playback(&session, 32);
     let left = rendered.plane(0).unwrap();
     let right = rendered.plane(1).unwrap();
@@ -655,7 +667,9 @@ fn a_grouped_and_sent_project_exports_exactly_as_it_plays() {
         "the routed graph reaches the main output"
     );
     assert!(
-        left.iter().zip(right.iter()).any(|(l, r)| (l - r).abs() > f32::EPSILON),
+        left.iter()
+            .zip(right.iter())
+            .any(|(l, r)| (l - r).abs() > f32::EPSILON),
         "the send pan and channel pan distinguish the channels"
     );
 }
@@ -721,7 +735,8 @@ fn a_scene_launched_project_exports_exactly_as_it_plays() {
         "this project's audio comes from scene authority, not a placement"
     );
     assert_eq!(session.arrangement().scene_launches().len(), 1);
-    let rendered = render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
+    let rendered =
+        render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
     assert_eq!(rendered.frame_count(), 100);
     let expected = render_through_playback(&session, 32);
 

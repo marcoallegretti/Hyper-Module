@@ -1,24 +1,26 @@
 use core::error::Error;
 use core::fmt;
 
+use cap_std::fs::OpenOptions;
+use flac_codec::encode::{FlacSampleWriter, Options as FlacOptions};
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{
     StereoLoudnessError, StereoLoudnessMeter, StereoOutput, StereoTruePeakError,
     StereoTruePeakMeter,
 };
-use hyper_audio_source::{DecodeError, DecodedAudio};
 #[cfg(test)]
 use hyper_audio_source::{AudioContainer, DecodeLimits, decode_bytes, encode_float_wav};
+use hyper_audio_source::{DecodeError, DecodedAudio};
+#[cfg(windows)]
+use hyper_fs_authority::remove_file_if_identity;
 use hyper_fs_authority::{
     create_syncable_directory_at, open_syncable_directory_ambient, remove_directory_entry,
     sync_directory,
 };
-#[cfg(target_os = "linux")]
-use hyper_fs_authority::{publish_bytes_no_replace, rename_no_replace};
 #[cfg(windows)]
 use hyper_fs_authority::{identity, read_stable_file_snapshot, rename_no_replace};
-#[cfg(windows)]
-use hyper_fs_authority::remove_file_if_identity;
+#[cfg(target_os = "linux")]
+use hyper_fs_authority::{publish_bytes_no_replace, rename_no_replace};
 use hyper_media_cache::PreparePlaybackError;
 use hyper_mixer_runtime::{
     RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError, RuntimeProcessError,
@@ -38,8 +40,6 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
 };
-use cap_std::fs::OpenOptions;
-use flac_codec::encode::{FlacSampleWriter, Options as FlacOptions};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OfflineExportSpec {
@@ -110,7 +110,9 @@ pub enum OfflineExportError {
     TruePeak(StereoTruePeakError),
     Loudness(StereoLoudnessError),
     MixerLayoutMismatch,
-    StemTrackMetadataUnavailable { channel_index: usize },
+    StemTrackMetadataUnavailable {
+        channel_index: usize,
+    },
     NoMixerStems,
     Destination(std::io::Error),
     StemDestination(std::io::Error),
@@ -158,14 +160,19 @@ impl fmt::Display for OfflineExportError {
                 write!(formatter, "the export destination is unusable: {source}")
             }
             Self::StemDestination(source) => {
-                write!(formatter, "the stem export destination is unusable: {source}")
+                write!(
+                    formatter,
+                    "the stem export destination is unusable: {source}"
+                )
             }
             Self::StemPublicationCommittedWithWarning { source, .. } => write!(
                 formatter,
                 "the complete stem export was published but its parent durability barrier failed: {source}"
             ),
             Self::FlacEncoding(source) => write!(formatter, "FLAC encoding failed: {source}"),
-            Self::FlacVerification => formatter.write_str("the staged FLAC did not decode to its exact PCM"),
+            Self::FlacVerification => {
+                formatter.write_str("the staged FLAC did not decode to its exact PCM")
+            }
             Self::FlacMinimumFrames => {
                 formatter.write_str("a FLAC export requires at least 32 rendered frames")
             }
@@ -502,13 +509,15 @@ fn export_project_track_stems_to_directory_with_devices(
             .prepare_playback(&graph)
             .map_err(OfflineExportError::Media)?;
         let mut runtime = match automation {
-            Some(automation) => RoutedMainRuntime::try_new_prepared_playback_automated_with_devices(
-                &prepared,
-                mixer,
-                automation.clone(),
-                device_chains,
-                block_frames,
-            ),
+            Some(automation) => {
+                RoutedMainRuntime::try_new_prepared_playback_automated_with_devices(
+                    &prepared,
+                    mixer,
+                    automation.clone(),
+                    device_chains,
+                    block_frames,
+                )
+            }
             None => RoutedMainRuntime::try_new_prepared_playback_with_devices(
                 &prepared,
                 mixer,
@@ -666,9 +675,7 @@ fn stem_file_name(
     let mut encoded_name = String::new();
     for byte in track_name.bytes() {
         let encoded = match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => {
-                char::from(byte).to_string()
-            }
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => char::from(byte).to_string(),
             _ => format!("%{byte:02X}"),
         };
         if encoded_name.len().saturating_add(encoded.len()) > available {
@@ -722,9 +729,11 @@ fn encode_verified_wav(audio: &DecodedAudio) -> Result<Vec<u8>, OfflineExportErr
         || decoded.channels() != audio.channels()
         || !exact_planes
     {
-        return Err(OfflineExportError::Output(DecodeError::InvalidDecodedAudio(
-            "encoded WAV does not exactly reproduce its rendered samples",
-        )));
+        return Err(OfflineExportError::Output(
+            DecodeError::InvalidDecodedAudio(
+                "encoded WAV does not exactly reproduce its rendered samples",
+            ),
+        ));
     }
     Ok(encoded)
 }
@@ -837,8 +846,10 @@ impl WavStemWriter {
         let riff_bytes = data_bytes
             .checked_add(36)
             .ok_or(OfflineExportError::CapacityUnavailable)?;
-        let riff_bytes = u32::try_from(riff_bytes).map_err(|_| OfflineExportError::CapacityUnavailable)?;
-        let data_bytes = u32::try_from(data_bytes).map_err(|_| OfflineExportError::CapacityUnavailable)?;
+        let riff_bytes =
+            u32::try_from(riff_bytes).map_err(|_| OfflineExportError::CapacityUnavailable)?;
+        let data_bytes =
+            u32::try_from(data_bytes).map_err(|_| OfflineExportError::CapacityUnavailable)?;
         let byte_rate = sample_rate_hz
             .checked_mul(8)
             .ok_or(OfflineExportError::CapacityUnavailable)?;
@@ -882,9 +893,11 @@ impl WavStemWriter {
         }
         for (&left, &right) in left.iter().zip(right) {
             if !left.is_finite() || !right.is_finite() {
-                return Err(OfflineExportError::Output(DecodeError::InvalidDecodedAudio(
-                    "the rendered stem contains a non-finite sample",
-                )));
+                return Err(OfflineExportError::Output(
+                    DecodeError::InvalidDecodedAudio(
+                        "the rendered stem contains a non-finite sample",
+                    ),
+                ));
             }
             self.file
                 .write_all(&left.to_le_bytes())
@@ -970,7 +983,8 @@ impl FlacStemWriter {
     }
 
     fn finalize(&mut self) -> Result<(), OfflineExportError> {
-        if self.written_frames != self.expected_frames || self.written_frames < FLAC_MINIMUM_FRAMES {
+        if self.written_frames != self.expected_frames || self.written_frames < FLAC_MINIMUM_FRAMES
+        {
             return Err(OfflineExportError::FlacMinimumFrames);
         }
         self.writer
@@ -998,7 +1012,6 @@ fn wav_data_bytes(frame_count: usize) -> Result<u64, OfflineExportError> {
     Ok(data_bytes)
 }
 
-
 fn create_track_stem_file_writers(
     stage: &cap_std::fs::Dir,
     stems: &[StemDescriptor],
@@ -1024,18 +1037,15 @@ fn create_track_stem_file_writers(
             .open_with(&file.file_name, &options)
             .map_err(OfflineExportError::StemDestination)?
             .into_std();
-        let writer = match format {
-            OfflineTrackStemExportFormat::Wav => {
-                StemContainerWriter::Wav(WavStemWriter::create(output, sample_rate_hz, expected_frames)?)
-            }
-            OfflineTrackStemExportFormat::Flac => {
-                StemContainerWriter::Flac(Box::new(FlacStemWriter::create(
-                    output,
-                    sample_rate_hz,
-                    expected_frames,
-                )?))
-            }
-        };
+        let writer =
+            match format {
+                OfflineTrackStemExportFormat::Wav => StemContainerWriter::Wav(
+                    WavStemWriter::create(output, sample_rate_hz, expected_frames)?,
+                ),
+                OfflineTrackStemExportFormat::Flac => StemContainerWriter::Flac(Box::new(
+                    FlacStemWriter::create(output, sample_rate_hz, expected_frames)?,
+                )),
+            };
         writers.push(StemFileWriter {
             channel_index: stem.channel_index,
             writer,
@@ -1044,7 +1054,9 @@ fn create_track_stem_file_writers(
     Ok(writers)
 }
 
-fn preflight_track_stem_destination(destination_directory: &Path) -> Result<(), OfflineExportError> {
+fn preflight_track_stem_destination(
+    destination_directory: &Path,
+) -> Result<(), OfflineExportError> {
     let (parent_path, destination_name) = stem_destination_parts(destination_directory)?;
     let _ = open_track_stem_destination_parent(&parent_path, &destination_name)?;
     Ok(())
@@ -1103,11 +1115,7 @@ fn publish_stem_bytes(
 }
 
 #[cfg(all(test, not(any(target_os = "linux", windows))))]
-fn publish_stem_bytes(
-    _: &cap_std::fs::Dir,
-    _: &str,
-    _: &[u8],
-) -> Result<(), OfflineExportError> {
+fn publish_stem_bytes(_: &cap_std::fs::Dir, _: &str, _: &[u8]) -> Result<(), OfflineExportError> {
     Err(OfflineExportError::StemDestination(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "verified stem publication is supported only on Linux and Windows",
@@ -1349,10 +1357,7 @@ fn render_selected_track_stem_windows<R: TrackWindowRenderer>(
     Ok(())
 }
 
-fn same_mixer_layout(
-    prepared: &CompiledMixerGraph,
-    candidate: &CompiledMixerGraph,
-) -> bool {
+fn same_mixer_layout(prepared: &CompiledMixerGraph, candidate: &CompiledMixerGraph) -> bool {
     prepared.project_id() == candidate.project_id()
         && prepared.slots().len() == candidate.slots().len()
         && prepared
@@ -1386,10 +1391,7 @@ fn select_stem_buffers(
     Ok(stems)
 }
 
-fn allocate_planes(
-    count: usize,
-    frames: usize,
-) -> Result<Vec<Vec<f32>>, OfflineExportError> {
+fn allocate_planes(count: usize, frames: usize) -> Result<Vec<Vec<f32>>, OfflineExportError> {
     let mut planes = Vec::new();
     planes
         .try_reserve_exact(count)
@@ -1583,7 +1585,8 @@ fn encode_flac_pcm(pcm: &[i32], sample_rate_hz: u32) -> Result<Vec<u8>, OfflineE
     if !pcm.len().is_multiple_of(2) {
         return Err(OfflineExportError::FlacVerification);
     }
-    let total_samples = u64::try_from(pcm.len()).map_err(|_| OfflineExportError::CapacityUnavailable)?;
+    let total_samples =
+        u64::try_from(pcm.len()).map_err(|_| OfflineExportError::CapacityUnavailable)?;
     let sink = MemoryFlacSink::new();
     let mut writer = FlacSampleWriter::new(
         sink.clone(),
@@ -1647,7 +1650,8 @@ fn verify_flac_pcm(
     frame_count: usize,
     expected_pcm: &[i32],
 ) -> Result<(), OfflineExportError> {
-    let maximum_file_bytes = u64::try_from(encoded.len()).map_err(|_| OfflineExportError::CapacityUnavailable)?;
+    let maximum_file_bytes =
+        u64::try_from(encoded.len()).map_err(|_| OfflineExportError::CapacityUnavailable)?;
     let maximum_decoded_bytes = frame_count
         .checked_mul(2)
         .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
@@ -1668,7 +1672,9 @@ fn verify_flac_pcm(
     if decoded.frame_count() != frame_count {
         return Err(OfflineExportError::FlacVerification);
     }
-    let left = decoded.plane(0).ok_or(OfflineExportError::FlacVerification)?;
+    let left = decoded
+        .plane(0)
+        .ok_or(OfflineExportError::FlacVerification)?;
     let right = decoded.plane(1).unwrap_or(left);
     for ((&left, &right), expected) in left.iter().zip(right).zip(expected_pcm.chunks_exact(2)) {
         if rounded_flac_pcm(left * FLAC_DECODE_SCALE)? != expected[0]
@@ -1711,12 +1717,10 @@ fn publish_verified_flac(_: &Path, _: &[u8]) -> Result<(), OfflineExportError> {
 }
 
 #[cfg(target_os = "linux")]
-fn publish_verified_flac_linux(
-    flac_path: &Path,
-    encoded: &[u8],
-) -> Result<(), OfflineExportError> {
+fn publish_verified_flac_linux(flac_path: &Path, encoded: &[u8]) -> Result<(), OfflineExportError> {
     let (parent_path, destination_name) = flac_destination_parts(flac_path)?;
-    let parent = open_syncable_directory_ambient(&parent_path).map_err(OfflineExportError::Destination)?;
+    let parent =
+        open_syncable_directory_ambient(&parent_path).map_err(OfflineExportError::Destination)?;
     publish_bytes_no_replace(&parent, &destination_name, encoded)
         .map_err(OfflineExportError::Destination)?;
     sync_directory(&parent).map_err(OfflineExportError::Destination)
@@ -1729,7 +1733,8 @@ fn publish_verified_flac_observed(
     after_stage_verified: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<(), OfflineExportError> {
     let (parent_path, destination_name) = flac_destination_parts(flac_path)?;
-    let parent = open_syncable_directory_ambient(&parent_path).map_err(OfflineExportError::Destination)?;
+    let parent =
+        open_syncable_directory_ambient(&parent_path).map_err(OfflineExportError::Destination)?;
     match parent.symlink_metadata(&destination_name) {
         Ok(_) => {
             return Err(OfflineExportError::Destination(std::io::Error::new(
@@ -1747,24 +1752,23 @@ fn publish_verified_flac_observed(
         .open_with(&stage_name, &options)
         .map_err(OfflineExportError::Destination)?;
     #[cfg(windows)]
-    let stage_identity = identity(
-        &staged
-            .metadata()
-            .map_err(OfflineExportError::Destination)?,
-    );
+    let stage_identity = identity(&staged.metadata().map_err(OfflineExportError::Destination)?);
     let result = (|| {
-        staged.write_all(encoded).map_err(OfflineExportError::Destination)?;
+        staged
+            .write_all(encoded)
+            .map_err(OfflineExportError::Destination)?;
         staged.sync_all().map_err(OfflineExportError::Destination)?;
         drop(staged);
-        let maximum_stage_bytes = u64::try_from(encoded.len())
-            .map_err(|_| OfflineExportError::CapacityUnavailable)?;
+        let maximum_stage_bytes =
+            u64::try_from(encoded.len()).map_err(|_| OfflineExportError::CapacityUnavailable)?;
         let snapshot = read_stable_file_snapshot(&parent, &stage_name, maximum_stage_bytes)
             .map_err(OfflineExportError::Destination)?;
         let (staged_bytes, staged_evidence) = snapshot.into_parts();
         if staged_bytes != encoded {
             return Err(OfflineExportError::FlacVerification);
         }
-        after_stage_verified(&parent_path.join(&stage_name)).map_err(OfflineExportError::Destination)?;
+        after_stage_verified(&parent_path.join(&stage_name))
+            .map_err(OfflineExportError::Destination)?;
         rename_no_replace(
             &parent,
             &stage_name,
@@ -1911,8 +1915,8 @@ fn publish_rendered_wav(
     // than one block still exports.
     let block_frames = spec.block_frames.min(frame_count).max(1);
 
-    let max_chunk_frames = u32::try_from(block_frames)
-        .map_err(|_| OfflineExportError::InvalidBlockFrames)?;
+    let max_chunk_frames =
+        u32::try_from(block_frames).map_err(|_| OfflineExportError::InvalidBlockFrames)?;
     // A journal left by a failed export, and a destination from an earlier
     // one, both belong to this caller's chosen paths. Publication refuses to
     // replace existing media, so re-exporting has to clear them first.
@@ -1982,15 +1986,15 @@ fn publish_rendered_wav(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        OfflineExportError, OfflineExportSpec, OfflineTrackStem, OfflineTrackStemExportFormat,
-        OfflineTrackStemExportFile, StemDescriptor, create_track_stem_file_writers,
-        encode_flac_pcm, flac_destination_parts, publish_rendered_flac,
-        preflight_track_stem_destination, publish_rendered_track_stems, quantize_flac_pcm, verify_and_publish_flac,
-        verify_flac_pcm,
-    };
     #[cfg(windows)]
     use super::publish_verified_flac_observed;
+    use super::{
+        OfflineExportError, OfflineExportSpec, OfflineTrackStem, OfflineTrackStemExportFile,
+        OfflineTrackStemExportFormat, StemDescriptor, create_track_stem_file_writers,
+        encode_flac_pcm, flac_destination_parts, preflight_track_stem_destination,
+        publish_rendered_flac, publish_rendered_track_stems, quantize_flac_pcm,
+        verify_and_publish_flac, verify_flac_pcm,
+    };
     use hyper_audio_source::{AudioContainer, DecodeLimits, DecodedAudio, decode_bytes};
     use std::path::Path;
 
@@ -2018,15 +2022,9 @@ mod tests {
                 track_name: "Track".to_owned(),
                 file_name: name.to_owned(),
             }];
-            let mut writers = create_track_stem_file_writers(
-                &stage,
-                &stems,
-                &files,
-                format,
-                48_000,
-                left.len(),
-            )
-            .unwrap();
+            let mut writers =
+                create_track_stem_file_writers(&stage, &stems, &files, format, 48_000, left.len())
+                    .unwrap();
             writers[0].append(&left[..7], &right[..7]).unwrap();
             writers[0].append(&left[7..], &right[7..]).unwrap();
             writers[0].finalize().unwrap();
@@ -2073,26 +2071,22 @@ mod tests {
             OfflineTrackStem {
                 track_id: "track-drums".to_owned(),
                 track_name: "Drums".to_owned(),
-                audio: DecodedAudio::from_stereo(
-                    48_000,
-                    vec![0.25; 32],
-                    vec![-0.5; 32],
-                )
-                .unwrap(),
+                audio: DecodedAudio::from_stereo(48_000, vec![0.25; 32], vec![-0.5; 32]).unwrap(),
             },
         ];
 
-        let report = publish_rendered_track_stems(
-            &stems,
-            OfflineTrackStemExportFormat::Wav,
-            &destination,
-        )
-        .unwrap();
+        let report =
+            publish_rendered_track_stems(&stems, OfflineTrackStemExportFormat::Wav, &destination)
+                .unwrap();
 
         assert_eq!(report.frame_count, 32);
         assert_eq!(report.sample_rate_hz, 48_000);
         assert_eq!(
-            report.files.iter().map(|file| file.file_name.as_str()).collect::<Vec<_>>(),
+            report
+                .files
+                .iter()
+                .map(|file| file.file_name.as_str())
+                .collect::<Vec<_>>(),
             vec!["001-Lead%20%2F%20Voice.wav", "002-Drums.wav"]
         );
         for (stem, file) in stems.iter().zip(&report.files) {
@@ -2113,9 +2107,13 @@ mod tests {
             report.files.len(),
             "the activated directory contains only the complete ordered stem set"
         );
-        assert!(std::fs::read_dir(directory.path())
-            .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("hyper-stem-stage")));
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("hyper-stem-stage")
+        }));
     }
 
     #[test]
@@ -2130,17 +2128,24 @@ mod tests {
             audio: DecodedAudio::from_stereo(48_000, vec![0.0; 32], vec![0.0; 32]).unwrap(),
         }];
 
-        let refused = publish_rendered_track_stems(
-            &stems,
-            OfflineTrackStemExportFormat::Wav,
-            &destination,
-        );
+        let refused =
+            publish_rendered_track_stems(&stems, OfflineTrackStemExportFormat::Wav, &destination);
 
-        assert!(matches!(refused, Err(OfflineExportError::StemDestination(_))));
-        assert_eq!(std::fs::read(destination.join("preserve")).unwrap(), b"existing export");
-        assert!(std::fs::read_dir(directory.path())
-            .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("hyper-stem-stage")));
+        assert!(matches!(
+            refused,
+            Err(OfflineExportError::StemDestination(_))
+        ));
+        assert_eq!(
+            std::fs::read(destination.join("preserve")).unwrap(),
+            b"existing export"
+        );
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("hyper-stem-stage")
+        }));
     }
 
     #[test]
@@ -2152,8 +2157,13 @@ mod tests {
 
         let refusal = preflight_track_stem_destination(&destination);
 
-        assert!(matches!(refusal, Err(OfflineExportError::StemDestination(error)) if error.kind() == std::io::ErrorKind::AlreadyExists));
-        assert_eq!(std::fs::read(destination.join("preserve")).unwrap(), b"existing export");
+        assert!(
+            matches!(refusal, Err(OfflineExportError::StemDestination(error)) if error.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            std::fs::read(destination.join("preserve")).unwrap(),
+            b"existing export"
+        );
     }
 
     #[test]
@@ -2166,17 +2176,21 @@ mod tests {
             audio: DecodedAudio::from_stereo(48_000, vec![0.0; 31], vec![0.0; 31]).unwrap(),
         }];
 
-        let refused = publish_rendered_track_stems(
-            &stems,
-            OfflineTrackStemExportFormat::Flac,
-            &destination,
-        );
+        let refused =
+            publish_rendered_track_stems(&stems, OfflineTrackStemExportFormat::Flac, &destination);
 
-        assert!(matches!(refused, Err(OfflineExportError::FlacMinimumFrames)));
+        assert!(matches!(
+            refused,
+            Err(OfflineExportError::FlacMinimumFrames)
+        ));
         assert!(!destination.exists());
-        assert!(std::fs::read_dir(directory.path())
-            .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("hyper-stem-stage")));
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("hyper-stem-stage")
+        }));
     }
 
     #[test]
@@ -2190,30 +2204,33 @@ mod tests {
         )
         .unwrap();
 
-        let report = publish_rendered_flac(
-            &audio,
-            OfflineExportSpec { block_frames: 2 },
-            &destination,
-        )
-        .unwrap();
+        let report =
+            publish_rendered_flac(&audio, OfflineExportSpec { block_frames: 2 }, &destination)
+                .unwrap();
         assert_eq!(report.frame_count, 32);
         assert_eq!(report.sample_rate_hz, 48_000);
         let encoded = std::fs::read(&destination).unwrap();
         assert!(encoded.starts_with(b"fLaC"));
-        let expected = quantize_flac_pcm(
-            audio.plane(0).unwrap(),
-            audio.plane(1).unwrap(),
-        )
-        .unwrap();
+        let expected = quantize_flac_pcm(audio.plane(0).unwrap(), audio.plane(1).unwrap()).unwrap();
         verify_flac_pcm(&encoded, 48_000, 32, &expected).unwrap();
-        assert!(std::fs::read_dir(directory.path())
-            .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("flac-stage")));
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("flac-stage")
+        }));
     }
 
     #[test]
     fn flac_export_refuses_nonfinite_and_out_of_range_samples_before_publication() {
-        for sample in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.000_001, -1.000_001] {
+        for sample in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1.000_001,
+            -1.000_001,
+        ] {
             let refused = quantize_flac_pcm(&[sample], &[0.0]).unwrap_err();
             assert!(matches!(refused, OfflineExportError::FlacVerification));
         }
@@ -2225,12 +2242,9 @@ mod tests {
         let destination = directory.path().join("short.flac");
         std::fs::write(&destination, b"previous export").unwrap();
         let audio = DecodedAudio::from_stereo(48_000, vec![0.0; 31], vec![0.0; 31]).unwrap();
-        let refused = publish_rendered_flac(
-            &audio,
-            OfflineExportSpec { block_frames: 31 },
-            &destination,
-        )
-        .unwrap_err();
+        let refused =
+            publish_rendered_flac(&audio, OfflineExportSpec { block_frames: 31 }, &destination)
+                .unwrap_err();
         assert!(matches!(refused, OfflineExportError::FlacMinimumFrames));
         assert_eq!(std::fs::read(&destination).unwrap(), b"previous export");
     }
@@ -2242,17 +2256,18 @@ mod tests {
         std::fs::write(&destination, b"previous export").unwrap();
         let audio = DecodedAudio::from_stereo(48_000, vec![0.0; 32], vec![0.0; 32]).unwrap();
 
-        let refused = publish_rendered_flac(
-            &audio,
-            OfflineExportSpec { block_frames: 32 },
-            &destination,
-        );
+        let refused =
+            publish_rendered_flac(&audio, OfflineExportSpec { block_frames: 32 }, &destination);
 
         assert!(matches!(refused, Err(OfflineExportError::Destination(_))));
         assert_eq!(std::fs::read(&destination).unwrap(), b"previous export");
-        assert!(std::fs::read_dir(directory.path())
-            .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("flac-stage")));
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("flac-stage")
+        }));
     }
 
     #[test]
@@ -2260,14 +2275,7 @@ mod tests {
         let left = [-1.0, 0.0, 0.5, 0.25].repeat(8);
         let right = [1.0, -0.5, -0.25, 0.0].repeat(8);
         let expected_frame = [
-            -8_388_607,
-            8_388_607,
-            0,
-            -4_194_304,
-            4_194_304,
-            -2_097_152,
-            2_097_152,
-            0,
+            -8_388_607, 8_388_607, 0, -4_194_304, 4_194_304, -2_097_152, 2_097_152, 0,
         ];
         let expected = expected_frame.repeat(8);
         let quantized = quantize_flac_pcm(&left, &right).unwrap();
@@ -2354,9 +2362,13 @@ mod tests {
 
         assert!(matches!(refused, Err(OfflineExportError::Destination(_))));
         assert!(!destination.exists());
-        assert!(std::fs::read_dir(directory.path())
-            .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("flac-stage")));
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("flac-stage")
+        }));
     }
 
     #[test]
@@ -2366,16 +2378,20 @@ mod tests {
         std::fs::create_dir(&destination).unwrap();
         std::fs::write(destination.join("preserve"), b"existing directory").unwrap();
         let audio = DecodedAudio::from_stereo(48_000, vec![0.0; 32], vec![0.0; 32]).unwrap();
-        let refused = publish_rendered_flac(
-            &audio,
-            OfflineExportSpec { block_frames: 32 },
-            &destination,
-        );
+        let refused =
+            publish_rendered_flac(&audio, OfflineExportSpec { block_frames: 32 }, &destination);
         assert!(matches!(refused, Err(OfflineExportError::Destination(_))));
-        assert_eq!(std::fs::read(destination.join("preserve")).unwrap(), b"existing directory");
-        assert!(std::fs::read_dir(directory.path())
-            .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("flac-stage")));
+        assert_eq!(
+            std::fs::read(destination.join("preserve")).unwrap(),
+            b"existing directory"
+        );
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("flac-stage")
+        }));
     }
 
     #[test]
@@ -2394,14 +2410,21 @@ mod tests {
         );
         assert!(matches!(refused, Err(OfflineExportError::Output(_))));
         assert_eq!(std::fs::read(&destination).unwrap(), b"previous export");
-        assert!(std::fs::read_dir(directory.path())
-            .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("flac-stage")));
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("flac-stage")
+        }));
     }
 
     #[test]
     fn relative_flac_destination_uses_the_current_directory_parent() {
-        assert_eq!(flac_destination_parts(Path::new("export.flac")).unwrap().0, Path::new("."));
+        assert_eq!(
+            flac_destination_parts(Path::new("export.flac")).unwrap().0,
+            Path::new(".")
+        );
     }
 
     #[cfg(unix)]
@@ -2416,7 +2439,12 @@ mod tests {
             .join(OsString::from_vec(b"mix-\xFF.flac".to_vec()));
         let refused = flac_destination_parts(&destination).unwrap_err();
         assert!(matches!(refused, OfflineExportError::Destination(_)));
-        assert!(std::fs::read_dir(directory.path()).unwrap().next().is_none());
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     fn decode_flac_pcm_for_test(encoded: Vec<u8>, sample_rate_hz: u32, frames: usize) -> Vec<i32> {
@@ -2438,7 +2466,9 @@ mod tests {
             .unwrap()
             .iter()
             .zip(decoded.plane(1).unwrap())
-            .flat_map(|(&left, &right)| [decode_sample_for_test(left), decode_sample_for_test(right)])
+            .flat_map(|(&left, &right)| {
+                [decode_sample_for_test(left), decode_sample_for_test(right)]
+            })
             .collect()
     }
 

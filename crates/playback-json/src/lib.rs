@@ -17,10 +17,9 @@ pub use duplication::{
     AudioTrackContentRemovalSerializationError, AudioTrackContentRemovalSource,
     AudioTrackDuplicationDocument, AudioTrackDuplicationDocuments,
     AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
-    RoutingBusDuplicationSerializationError, RoutingBusDuplicationSource,
-    TrackDuplicationDocument, TrackDuplicationDocuments,
-    serialize_audio_track_content_removal, serialize_audio_track_duplication,
-    serialize_routing_bus_duplication,
+    RoutingBusDuplicationSerializationError, RoutingBusDuplicationSource, TrackDuplicationDocument,
+    TrackDuplicationDocuments, serialize_audio_track_content_removal,
+    serialize_audio_track_duplication, serialize_routing_bus_duplication,
 };
 
 use core::error::Error;
@@ -42,8 +41,8 @@ use hyper_playback_compiler::scene::{
 use hyper_playback_compiler::{
     ClipCompileSpec, CompileError, CompiledPlacement, CompiledSceneAudioClip, FrameTimeline,
     FrameTimelineError, MeterEvent, PlacementCompileSpec, TempoEvent, TickRange, Timeline,
-    TimelineError,
-    WarpMarker, compile_interactive_scene_audio_clip, compile_placement, compile_scene_audio_clip,
+    TimelineError, WarpMarker, compile_interactive_scene_audio_clip, compile_placement,
+    compile_scene_audio_clip,
 };
 use hyper_project_model::{is_valid_entity_id, is_valid_extension_key};
 use serde::de::{IgnoredAny, MapAccess, Visitor};
@@ -1277,7 +1276,9 @@ impl fmt::Display for RoutingBusRenameSerializationError {
             Self::NonCanonicalSource => {
                 formatter.write_str("source routing-bus track is not canonical RFC 8785 JSON")
             }
-            Self::TrackMissing => formatter.write_str("the routing bus is not present in the project"),
+            Self::TrackMissing => {
+                formatter.write_str("the routing bus is not present in the project")
+            }
             Self::TrackNotRoutingBus => {
                 formatter.write_str("the selected track is not a group or return routing bus")
             }
@@ -1346,20 +1347,41 @@ impl Error for AudioTrackDocumentSerializationError {
 impl fmt::Display for MixerStripReorderSerializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TrackMissing => formatter.write_str("the selected mixer strip is not present in the project"),
+            Self::TrackMissing => {
+                formatter.write_str("the selected mixer strip is not present in the project")
+            }
             Self::TrackNotReorderable => {
                 formatter.write_str("the selected track is not supported for mixer-strip reorder")
             }
-            Self::ParentTrackUnsupported => formatter.write_str("mixer-strip reorder requires a flat project topology"),
-            Self::DestinationOutOfRange => formatter.write_str("the requested mixer-strip destination is outside the project order"),
-            Self::NoChange => formatter.write_str("the requested mixer-strip order is already active"),
-            Self::SourceTrackCountMismatch => formatter.write_str("source track documents do not cover the loaded project"),
-            Self::SourceTrackDuplicate => formatter.write_str("source track documents contain a duplicate identity"),
-            Self::SourceTrackMissing => formatter.write_str("a loaded track has no matching source document"),
-            Self::SourceTrackMismatch => formatter.write_str("source track bytes do not match the loaded project structure"),
-            Self::SourceMixerMismatch => formatter.write_str("source mixer bytes do not match the loaded project structure"),
-            Self::MixerIdentityMismatch => formatter.write_str("source mixer identity does not match the reorder request"),
-            Self::InvalidDocumentShape => formatter.write_str("a source document shape changed after typed validation"),
+            Self::ParentTrackUnsupported => {
+                formatter.write_str("mixer-strip reorder requires a flat project topology")
+            }
+            Self::DestinationOutOfRange => formatter
+                .write_str("the requested mixer-strip destination is outside the project order"),
+            Self::NoChange => {
+                formatter.write_str("the requested mixer-strip order is already active")
+            }
+            Self::SourceTrackCountMismatch => {
+                formatter.write_str("source track documents do not cover the loaded project")
+            }
+            Self::SourceTrackDuplicate => {
+                formatter.write_str("source track documents contain a duplicate identity")
+            }
+            Self::SourceTrackMissing => {
+                formatter.write_str("a loaded track has no matching source document")
+            }
+            Self::SourceTrackMismatch => {
+                formatter.write_str("source track bytes do not match the loaded project structure")
+            }
+            Self::SourceMixerMismatch => {
+                formatter.write_str("source mixer bytes do not match the loaded project structure")
+            }
+            Self::MixerIdentityMismatch => {
+                formatter.write_str("source mixer identity does not match the reorder request")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("a source document shape changed after typed validation")
+            }
             Self::Source(source) => source.fmt(formatter),
             Self::ProjectCompilation(source) => source.fmt(formatter),
             Self::Serialization(source) => source.fmt(formatter),
@@ -1891,9 +1913,8 @@ impl fmt::Display for RoutingBusCreationSerializationError {
             Self::ReturnBusUnavailable => {
                 formatter.write_str("the project has no available version-1 return bus")
             }
-            Self::SendIdentityCountMismatch => {
-                formatter.write_str("the return-bus request does not provide one send identity per source")
-            }
+            Self::SendIdentityCountMismatch => formatter
+                .write_str("the return-bus request does not provide one send identity per source"),
             Self::InvalidSendIdentity => {
                 formatter.write_str("a return-send identity is invalid or already in use")
             }
@@ -1990,11 +2011,15 @@ impl fmt::Display for ReturnSendSerializationError {
             Self::InvalidSendIdentity => {
                 formatter.write_str("the return-send identity is invalid or already in use")
             }
-            Self::SourceTrackMissing => formatter.write_str("the return-send source track is not present"),
+            Self::SourceTrackMissing => {
+                formatter.write_str("the return-send source track is not present")
+            }
             Self::SourceTrackUnsupported => {
                 formatter.write_str("a return send can originate only from an audio or group track")
             }
-            Self::ReturnTrackMissing => formatter.write_str("the return-send target track is not present"),
+            Self::ReturnTrackMissing => {
+                formatter.write_str("the return-send target track is not present")
+            }
             Self::ReturnTrackNotReturn => {
                 formatter.write_str("the return-send target track is not a return track")
             }
@@ -2040,9 +2065,8 @@ impl fmt::Display for AudioPrimaryRouteSerializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Source(source) => source.fmt(formatter),
-            Self::MixerIdentityMismatch => {
-                formatter.write_str("source mixer identity does not match the primary-route request")
-            }
+            Self::MixerIdentityMismatch => formatter
+                .write_str("source mixer identity does not match the primary-route request"),
             Self::SourceTrackMissing => {
                 formatter.write_str("the primary-route source track is not present")
             }
@@ -2055,7 +2079,9 @@ impl fmt::Display for AudioPrimaryRouteSerializationError {
             Self::TargetTrackNotGroup => {
                 formatter.write_str("the primary-route target is not a group track")
             }
-            Self::NoChange => formatter.write_str("the audio track already uses that primary route"),
+            Self::NoChange => {
+                formatter.write_str("the audio track already uses that primary route")
+            }
             Self::InvalidDocumentShape => {
                 formatter.write_str("source mixer shape changed after typed validation")
             }
@@ -2191,8 +2217,9 @@ impl fmt::Display for AudioClipRemovalSerializationError {
                 blockers.arrangement_placements, blockers.scene_slots
             ),
             Self::Track(source) => source.fmt(formatter),
-            Self::InvalidDocumentShape => formatter
-                .write_str("the owning track changed shape after the clip was validated"),
+            Self::InvalidDocumentShape => {
+                formatter.write_str("the owning track changed shape after the clip was validated")
+            }
             Self::Source(source) => source.fmt(formatter),
             Self::Serialization(source) => source.fmt(formatter),
         }
@@ -2778,7 +2805,11 @@ pub fn serialize_routing_bus_creation(
         if !selected.insert(*source_track_id) {
             return Err(RoutingBusCreationSerializationError::DuplicateSourceTrack);
         }
-        let Some(source) = project.tracks.iter().find(|track| track.id == *source_track_id) else {
+        let Some(source) = project
+            .tracks
+            .iter()
+            .find(|track| track.id == *source_track_id)
+        else {
             return Err(RoutingBusCreationSerializationError::SourceTrackMissing);
         };
         if source.kind != TrackKind::Audio {
@@ -2889,7 +2920,13 @@ pub fn serialize_routing_bus_creation(
         .get_mut("channels")
         .and_then(Value::as_array_mut)
         .ok_or(RoutingBusCreationSerializationError::InvalidDocumentShape)?;
-    for (source_track_id, send_id) in source_track_ids.iter().zip(send_ids.iter().copied().map(Some).chain(std::iter::repeat(None))) {
+    for (source_track_id, send_id) in source_track_ids.iter().zip(
+        send_ids
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::repeat(None)),
+    ) {
         let channel = channels
             .iter_mut()
             .find(|channel| channel["track_id"].as_str() == Some(*source_track_id))
@@ -2906,8 +2943,8 @@ pub fn serialize_routing_bus_creation(
                 if sends.len() >= MAX_VERSION_1_SENDS_PER_CHANNEL {
                     return Err(RoutingBusCreationSerializationError::SourceSendCapacity);
                 }
-                let return_bus = return_bus
-                    .ok_or(RoutingBusCreationSerializationError::ReturnBusUnavailable)?;
+                let return_bus =
+                    return_bus.ok_or(RoutingBusCreationSerializationError::ReturnBusUnavailable)?;
                 sends.push(json!({
                     "id": send_id,
                     "bus": return_bus,
@@ -3259,9 +3296,9 @@ pub fn serialize_routing_bus_removal(
         .position(|channel| channel.track_id == track_id)
         .ok_or(RoutingBusRemovalSerializationError::InvalidDocumentShape)?;
     if kind == RoutingBusKind::Group
-        && loaded_mixer.channels.iter().any(|channel| {
-            matches!(&channel.destination, MixerDestination::Track(id) if id == track_id)
-        })
+        && loaded_mixer.channels.iter().any(
+            |channel| matches!(&channel.destination, MixerDestination::Track(id) if id == track_id),
+        )
     {
         return Err(RoutingBusRemovalSerializationError::PrimaryRouteInUse);
     }
@@ -3289,7 +3326,8 @@ pub fn serialize_routing_bus_removal(
 
     let mut reduced = project.clone();
     reduced.tracks.remove(track_index);
-    validate_track_hierarchy(&reduced.tracks).map_err(RoutingBusRemovalSerializationError::Source)?;
+    validate_track_hierarchy(&reduced.tracks)
+        .map_err(RoutingBusRemovalSerializationError::Source)?;
     validate_loaded_identities(&reduced).map_err(RoutingBusRemovalSerializationError::Source)?;
 
     let mut mixer_value: Value = serde_json::from_slice(source_mixer)
@@ -3312,12 +3350,15 @@ pub fn serialize_routing_bus_removal(
             .and_then(Value::as_array_mut)
             .ok_or(RoutingBusRemovalSerializationError::InvalidDocumentShape)?;
         let return_index = return_buses.iter().position(|mapping| {
-            mapping.get("bus").and_then(Value::as_str) == Some(match return_bus {
-                MixerBus::A => "a",
-                MixerBus::B => "b",
-            }) && mapping.get("track_id").and_then(Value::as_str) == Some(track_id)
+            mapping.get("bus").and_then(Value::as_str)
+                == Some(match return_bus {
+                    MixerBus::A => "a",
+                    MixerBus::B => "b",
+                })
+                && mapping.get("track_id").and_then(Value::as_str) == Some(track_id)
         });
-        let return_index = return_index.ok_or(RoutingBusRemovalSerializationError::InvalidDocumentShape)?;
+        let return_index =
+            return_index.ok_or(RoutingBusRemovalSerializationError::InvalidDocumentShape)?;
         return_buses.remove(return_index);
     }
     let mixer = serde_json_canonicalizer::to_vec(&mixer_value)
@@ -3909,7 +3950,8 @@ pub fn serialize_routing_bus_rename(
     renamed_project.tracks[track_index] = edited;
     validate_track_hierarchy(&renamed_project.tracks)
         .map_err(RoutingBusRenameSerializationError::Source)?;
-    validate_loaded_identities(&renamed_project).map_err(RoutingBusRenameSerializationError::Source)?;
+    validate_loaded_identities(&renamed_project)
+        .map_err(RoutingBusRenameSerializationError::Source)?;
     Ok(output)
 }
 
@@ -3994,12 +4036,14 @@ pub fn serialize_scene_removal(
     if !blockers.is_empty() {
         return Err(SceneRemovalSerializationError::Blocked(blockers));
     }
-    let canonical = serialize_scene_document_edit(project, source_scene, scene_id, limits, |_| Ok(()))
-        .map_err(SceneRemovalSerializationError::Document)?;
+    let canonical =
+        serialize_scene_document_edit(project, source_scene, scene_id, limits, |_| Ok(()))
+            .map_err(SceneRemovalSerializationError::Document)?;
     let mut reduced = project.clone();
     reduced.scenes.remove(scene_index);
-    validate_loaded_identities(&reduced)
-        .map_err(|source| SceneRemovalSerializationError::Document(SceneDocumentSerializationError::Source(source)))?;
+    validate_loaded_identities(&reduced).map_err(|source| {
+        SceneRemovalSerializationError::Document(SceneDocumentSerializationError::Source(source))
+    })?;
     reduced
         .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
         .map_err(SceneRemovalSerializationError::ProjectCompilation)?;
@@ -4888,9 +4932,9 @@ impl fmt::Display for TempoSerializationError {
             Self::TempoOutOfRange => formatter.write_str(
                 "tempo must convert to between 1 and 16777215 microseconds per quarter note",
             ),
-            Self::MeterOutOfRange => formatter.write_str(
-                "time signature is outside the version 1 domain",
-            ),
+            Self::MeterOutOfRange => {
+                formatter.write_str("time signature is outside the version 1 domain")
+            }
             Self::TimelineMissing => formatter.write_str("the project has no timeline"),
             Self::SourceTimelineMismatch => {
                 formatter.write_str("the source timeline is not the loaded one")
@@ -4997,8 +5041,7 @@ pub fn serialize_timeline_meter(
 /// Whether a time signature is one the version 1 contract accepts.
 #[must_use]
 pub fn meter_is_in_version_one_domain(numerator: u16, denominator: u16) -> bool {
-    (1..=255).contains(&numerator)
-        && [1_u16, 2, 4, 8, 16, 32, 64, 128, 256].contains(&denominator)
+    (1..=255).contains(&numerator) && [1_u16, 2, 4, 8, 16, 32, 64, 128, 256].contains(&denominator)
 }
 
 /// The shared timeline write path: verify the source is the loaded, canonical
@@ -5013,10 +5056,10 @@ fn serialize_timeline_origin_edit(
     map: &str,
     edit: impl FnOnce(&mut serde_json::Map<String, Value>),
 ) -> Result<Vec<u8>, TempoSerializationError> {
-    let mut value: Value = serde_json::from_slice(source_timeline)
-        .map_err(TempoSerializationError::Serialization)?;
-    let canonical_source = serde_json_canonicalizer::to_vec(&value)
-        .map_err(TempoSerializationError::Serialization)?;
+    let mut value: Value =
+        serde_json::from_slice(source_timeline).map_err(TempoSerializationError::Serialization)?;
+    let canonical_source =
+        serde_json_canonicalizer::to_vec(&value).map_err(TempoSerializationError::Serialization)?;
     if canonical_source != source_timeline {
         return Err(TempoSerializationError::NonCanonicalSource);
     }
@@ -6822,15 +6865,12 @@ impl LoadedPlaybackProject {
     #[must_use]
     pub fn supports_flat_mixer_strip_reorder(&self) -> bool {
         !self.tracks.is_empty()
-            && self
-                .tracks
-                .iter()
-                .all(|track| {
-                    matches!(
-                        track.kind,
-                        TrackKind::Audio | TrackKind::Group | TrackKind::Return
-                    ) && track.parent_track_id.is_none()
-                })
+            && self.tracks.iter().all(|track| {
+                matches!(
+                    track.kind,
+                    TrackKind::Audio | TrackKind::Group | TrackKind::Return
+                ) && track.parent_track_id.is_none()
+            })
     }
 
     /// Returns a validated structural track name by stable identity.
@@ -6910,10 +6950,7 @@ impl LoadedPlaybackProject {
     /// Returns the persisted playback references that prevent safe unused-clip
     /// removal. `None` means the clip identity is not part of this project.
     #[must_use]
-    pub fn audio_clip_removal_blockers(
-        &self,
-        clip_id: &str,
-    ) -> Option<AudioClipRemovalBlockers> {
+    pub fn audio_clip_removal_blockers(&self, clip_id: &str) -> Option<AudioClipRemovalBlockers> {
         self.clips.iter().any(|clip| clip.id == clip_id).then(|| {
             let arrangement_placements = self.arrangement.as_ref().map_or(0, |arrangement| {
                 arrangement
@@ -6944,18 +6981,22 @@ impl LoadedPlaybackProject {
     /// removal. `None` means the scene identity is not part of this project.
     #[must_use]
     pub fn scene_removal_blockers(&self, scene_id: &str) -> Option<SceneRemovalBlockers> {
-        self.scenes.iter().any(|scene| scene.id == scene_id).then(|| {
-            let arrangement_scene_launches = self.arrangement.as_ref().map_or(0, |arrangement| {
-                arrangement
-                    .scene_launches
-                    .iter()
-                    .filter(|launch| launch.scene_id == scene_id)
-                    .count()
-            });
-            SceneRemovalBlockers {
-                arrangement_scene_launches,
-            }
-        })
+        self.scenes
+            .iter()
+            .any(|scene| scene.id == scene_id)
+            .then(|| {
+                let arrangement_scene_launches =
+                    self.arrangement.as_ref().map_or(0, |arrangement| {
+                        arrangement
+                            .scene_launches
+                            .iter()
+                            .filter(|launch| launch.scene_id == scene_id)
+                            .count()
+                    });
+                SceneRemovalBlockers {
+                    arrangement_scene_launches,
+                }
+            })
     }
 
     /// Returns a validated audio-clip name by canonical project order.
@@ -10223,10 +10264,9 @@ mod tests {
         let mut track: Value = serde_json::from_slice(TRACK).unwrap();
         track["extensions"]["org.example.track"] = json!({"kept": [1, 2, 3]});
         let track = serde_json_canonicalizer::to_vec(&track).unwrap();
-        let clip = serde_json_canonicalizer::to_vec(
-            &serde_json::from_slice::<Value>(CLIP).unwrap(),
-        )
-        .unwrap();
+        let clip =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(CLIP).unwrap())
+                .unwrap();
         let tracks: [&[u8]; 1] = [&track];
         let clips: [&[u8]; 1] = [&clip];
         let loaded = load(
@@ -10243,14 +10283,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            removed.track_id(),
-            "018f47a2-6b2d-7c11-8a44-001122334456"
-        );
-        assert_eq!(
-            removed.asset_id(),
-            "018f47a2-6b2d-7c11-8a44-001122334457"
-        );
+        assert_eq!(removed.track_id(), "018f47a2-6b2d-7c11-8a44-001122334456");
+        assert_eq!(removed.asset_id(), "018f47a2-6b2d-7c11-8a44-001122334457");
         let reduced_track: Value = serde_json::from_slice(removed.track()).unwrap();
         assert_eq!(reduced_track["clip_ids"], json!([]));
         assert_eq!(
@@ -10269,18 +10303,15 @@ mod tests {
 
     #[test]
     fn audio_clip_removal_refuses_playback_references_and_stale_authority() {
-        let track = serde_json_canonicalizer::to_vec(
-            &serde_json::from_slice::<Value>(TRACK).unwrap(),
-        )
-        .unwrap();
-        let clip = serde_json_canonicalizer::to_vec(
-            &serde_json::from_slice::<Value>(CLIP).unwrap(),
-        )
-        .unwrap();
-        let scene = serde_json_canonicalizer::to_vec(
-            &serde_json::from_slice::<Value>(SCENE).unwrap(),
-        )
-        .unwrap();
+        let track =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(TRACK).unwrap())
+                .unwrap();
+        let clip =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(CLIP).unwrap())
+                .unwrap();
+        let scene =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(SCENE).unwrap())
+                .unwrap();
         let arrangement = serde_json_canonicalizer::to_vec(
             &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
         )
@@ -10289,13 +10320,7 @@ mod tests {
         let clips: [&[u8]; 1] = [&clip];
         let scenes: [&[u8]; 1] = [&scene];
         let loaded = load(
-            input_with_scenes(
-                TIMELINE,
-                &tracks,
-                &clips,
-                &scenes,
-                Some(&arrangement),
-            ),
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&arrangement)),
             LoaderLimits::VERSION_1,
         )
         .unwrap();
@@ -10596,11 +10621,7 @@ mod tests {
         )
         .unwrap();
         return_project
-            .load_mixer(
-                return_bus.mixer(),
-                &asset_facts(),
-                LoaderLimits::VERSION_1,
-            )
+            .load_mixer(return_bus.mixer(), &asset_facts(), LoaderLimits::VERSION_1)
             .unwrap();
     }
 
@@ -10677,7 +10698,10 @@ mod tests {
                 "gain_millionths":1_000_000, "pan_millionths":0, "enabled":true
             }])
         );
-        assert_eq!(value["return_buses"], json!([{ "bus":"a", "track_id":return_track_id }]));
+        assert_eq!(
+            value["return_buses"],
+            json!([{ "bus":"a", "track_id":return_track_id }])
+        );
         expanded_project
             .load_mixer(&with_send, &asset_facts(), LoaderLimits::VERSION_1)
             .unwrap();
@@ -10805,7 +10829,10 @@ mod tests {
             value["channels"][2]["destination"],
             json!({"kind": "track", "track_id": group_track_id})
         );
-        assert_eq!(value["main"], json!({"gain_millionths":1_000_000,"mute":true}));
+        assert_eq!(
+            value["main"],
+            json!({"gain_millionths":1_000_000,"mute":true})
+        );
         assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), routed);
         expanded_project
             .load_mixer(&routed, &asset_facts(), LoaderLimits::VERSION_1)
@@ -10945,7 +10972,11 @@ mod tests {
         assert_eq!(removed_group.kind(), RoutingBusKind::Group);
         assert_eq!(removed_group.mixer(), canonical_mixer);
         project
-            .load_mixer(removed_group.mixer(), &asset_facts(), LoaderLimits::VERSION_1)
+            .load_mixer(
+                removed_group.mixer(),
+                &asset_facts(),
+                LoaderLimits::VERSION_1,
+            )
             .unwrap();
 
         let group_return_track_id = "018f47a2-6b2d-7c11-8a44-00112233446c";
@@ -11011,15 +11042,17 @@ mod tests {
             LoaderLimits::VERSION_1,
         )
         .unwrap();
-        assert!(serialize_routing_bus_removal(
-            &group_return_project,
-            &asset_facts(),
-            &group_send_cleared,
-            mixer_id,
-            group_track_id,
-            LoaderLimits::VERSION_1,
-        )
-        .is_ok());
+        assert!(
+            serialize_routing_bus_removal(
+                &group_return_project,
+                &asset_facts(),
+                &group_send_cleared,
+                mixer_id,
+                group_track_id,
+                LoaderLimits::VERSION_1,
+            )
+            .is_ok()
+        );
 
         let return_track_id = "018f47a2-6b2d-7c11-8a44-00112233446a";
         let return_send_id = "018f47a2-6b2d-7c11-8a44-00112233446b";
@@ -11074,7 +11107,11 @@ mod tests {
         assert_eq!(removed_return.kind(), RoutingBusKind::Return);
         assert_eq!(removed_return.mixer(), canonical_mixer);
         project
-            .load_mixer(removed_return.mixer(), &asset_facts(), LoaderLimits::VERSION_1)
+            .load_mixer(
+                removed_return.mixer(),
+                &asset_facts(),
+                LoaderLimits::VERSION_1,
+            )
             .unwrap();
         assert!(matches!(
             serialize_routing_bus_removal(
@@ -11195,10 +11232,9 @@ mod tests {
             ),
             Err(RoutingBusRenameSerializationError::InvalidTrackName)
         ));
-        let noncanonical = serde_json::to_vec_pretty(
-            &serde_json::from_slice::<Value>(group.track()).unwrap(),
-        )
-        .unwrap();
+        let noncanonical =
+            serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(group.track()).unwrap())
+                .unwrap();
         assert!(matches!(
             serialize_routing_bus_rename(
                 &group_project,
@@ -11541,7 +11577,8 @@ mod tests {
             vec![second_id, first_id, third_id]
         );
         let reordered_first: Value = serde_json::from_slice(reordered.tracks()[1].bytes()).unwrap();
-        let reordered_second: Value = serde_json::from_slice(reordered.tracks()[0].bytes()).unwrap();
+        let reordered_second: Value =
+            serde_json::from_slice(reordered.tracks()[0].bytes()).unwrap();
         let reordered_third: Value = serde_json::from_slice(reordered.tracks()[2].bytes()).unwrap();
         assert_eq!(reordered_first["order"], 3);
         assert_eq!(reordered_second["order"], 0);
@@ -11552,7 +11589,11 @@ mod tests {
                 reordered_second["extensions"]["org.example.track"].clone(),
                 reordered_third["extensions"]["org.example.track"].clone(),
             ],
-            [json!({"first":true}), json!({"second":true}), json!({"third":true})]
+            [
+                json!({"first":true}),
+                json!({"second":true}),
+                json!({"third":true})
+            ]
         );
         let reordered_mixer: Value = serde_json::from_slice(reordered.mixer()).unwrap();
         assert_eq!(
@@ -11590,10 +11631,9 @@ mod tests {
         let return_track_id = "018f47a2-6b2d-7c11-8a44-001122334470";
         let mixer_id = "018f47a2-6b2d-7c11-8a44-001122334468";
         let clips: [&[u8]; 1] = [CLIP];
-        let audio = serde_json_canonicalizer::to_vec(
-            &serde_json::from_slice::<Value>(TRACK).unwrap(),
-        )
-        .unwrap();
+        let audio =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(TRACK).unwrap())
+                .unwrap();
         let source = load(
             input(TIMELINE, &[&audio], &clips, Some(ARRANGEMENT)),
             LoaderLimits::VERSION_1,
@@ -11613,7 +11653,12 @@ mod tests {
         )
         .unwrap();
         let with_group = load(
-            input(TIMELINE, &[&audio, group.track()], &clips, Some(ARRANGEMENT)),
+            input(
+                TIMELINE,
+                &[&audio, group.track()],
+                &clips,
+                Some(ARRANGEMENT),
+            ),
             LoaderLimits::VERSION_1,
         )
         .unwrap();
@@ -11672,7 +11717,10 @@ mod tests {
             mixer["channels"][1]["destination"],
             json!({"kind":"track", "track_id":group_track_id})
         );
-        assert_eq!(mixer["return_buses"], json!([{ "bus":"a", "track_id":return_track_id }]));
+        assert_eq!(
+            mixer["return_buses"],
+            json!([{ "bus":"a", "track_id":return_track_id }])
+        );
         assert_eq!(mixer["channels"][1]["sends"].as_array().unwrap().len(), 1);
 
         let tracks = reordered
@@ -11788,7 +11836,10 @@ mod tests {
         child["parent_track_id"] = second_id.into();
         let child = serde_json_canonicalizer::to_vec(&child).unwrap();
         let mut parented_mixer: Value = serde_json::from_slice(&mixer).unwrap();
-        parented_mixer["channels"].as_array_mut().unwrap().swap(0, 1);
+        parented_mixer["channels"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
         let parented_mixer = serde_json_canonicalizer::to_vec(&parented_mixer).unwrap();
         let parented_project = load(
             input(TIMELINE, &[&group, &child], &[], None),
@@ -12036,10 +12087,9 @@ mod tests {
 
     #[test]
     fn scene_removal_preserves_unrelated_scenes_and_their_playback_graph() {
-        let source = serde_json_canonicalizer::to_vec(
-            &serde_json::from_slice::<Value>(SCENE).unwrap(),
-        )
-        .unwrap();
+        let source =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(SCENE).unwrap())
+                .unwrap();
         let mut remaining: Value = serde_json::from_slice(SCENE).unwrap();
         remaining["id"] = "018f47a2-6b2d-7c11-8a44-001122334469".into();
         remaining["name"] = "Chorus".into();
@@ -12068,22 +12118,18 @@ mod tests {
         assert_eq!(removed, source);
         let surviving_scenes: [&[u8]; 1] = [&remaining];
         let reopened = load(
-            input_with_scenes(
-                TIMELINE,
-                &tracks,
-                &clips,
-                &surviving_scenes,
-                None,
-            ),
+            input_with_scenes(TIMELINE, &tracks, &clips, &surviving_scenes, None),
             LoaderLimits::VERSION_1,
         )
         .unwrap();
         assert_eq!(reopened.scene_count(), 1);
-        assert_eq!(reopened.scene_id(0), Some("018f47a2-6b2d-7c11-8a44-001122334469"));
+        assert_eq!(
+            reopened.scene_id(0),
+            Some("018f47a2-6b2d-7c11-8a44-001122334469")
+        );
         assert_eq!(reopened.scene_name(0), Some("Chorus"));
         assert_eq!(
-            serde_json::from_slice::<Value>(&remaining).unwrap()["extensions"]
-                ["org.example.scene"],
+            serde_json::from_slice::<Value>(&remaining).unwrap()["extensions"]["org.example.scene"],
             json!({"kept": true})
         );
     }
@@ -12116,9 +12162,11 @@ mod tests {
                 scene_id,
                 LoaderLimits::VERSION_1,
             ),
-            Err(SceneRemovalSerializationError::Blocked(SceneRemovalBlockers {
-                arrangement_scene_launches: 1,
-            }))
+            Err(SceneRemovalSerializationError::Blocked(
+                SceneRemovalBlockers {
+                    arrangement_scene_launches: 1,
+                }
+            ))
         ));
 
         let unreferenced = load(
@@ -16679,7 +16727,11 @@ mod tests {
         )
         .unwrap();
         let mixer = loaded
-            .load_mixer(AUTOMATION_SEND_MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .load_mixer(
+                AUTOMATION_SEND_MIXER,
+                &asset_facts(),
+                LoaderLimits::VERSION_1,
+            )
             .unwrap();
         (loaded, mixer)
     }
@@ -16705,7 +16757,11 @@ mod tests {
             AutomationPoint::new(0, AutomationValue::Boolean(false)),
             AutomationPoint::new(4, AutomationValue::Boolean(true)),
         ];
-        let cases: [(AutomationTargetSelection<'_>, &[AutomationPoint], AutomationTarget); 9] = [
+        let cases: [(
+            AutomationTargetSelection<'_>,
+            &[AutomationPoint],
+            AutomationTarget,
+        ); 9] = [
             (
                 AutomationTargetSelection::Main {
                     parameter: AutomationMainParameter::Gain,
@@ -16918,7 +16974,11 @@ mod tests {
         let reloaded = loaded
             .load_automation_takes(&mixer, &asset_facts(), &candidate, LoaderLimits::VERSION_1)
             .unwrap();
-        let enabled: Vec<bool> = reloaded.takes().iter().map(AutomationTake::enabled).collect();
+        let enabled: Vec<bool> = reloaded
+            .takes()
+            .iter()
+            .map(AutomationTake::enabled)
+            .collect();
         assert_eq!(enabled, vec![true, false, true]);
         let identities: Vec<&str> = reloaded.takes().iter().map(AutomationTake::id).collect();
         assert_eq!(
@@ -17241,7 +17301,10 @@ mod tests {
         );
 
         let rounded = microseconds_per_quarter_for_bpm(140.5).unwrap();
-        assert_eq!(rounded, 427_046, "conversion rounds to the nearest microsecond");
+        assert_eq!(
+            rounded, 427_046,
+            "conversion rounds to the nearest microsecond"
+        );
         assert!(
             (bpm_for_microseconds_per_quarter(rounded) - 140.5).abs() < 0.001,
             "and the displayed tempo stays within a thousandth of what was asked"
@@ -17292,14 +17355,9 @@ mod tests {
             frame_count: 100,
         }];
 
-        let doubled = serialize_timeline_tempo(
-            &project,
-            &assets,
-            &source,
-            500_000,
-            LoaderLimits::VERSION_1,
-        )
-        .unwrap();
+        let doubled =
+            serialize_timeline_tempo(&project, &assets, &source, 500_000, LoaderLimits::VERSION_1)
+                .unwrap();
         let faster = load(
             input_with_scenes(&doubled, &tracks, &clips, &scenes, None),
             LoaderLimits::VERSION_1,
@@ -17320,7 +17378,6 @@ mod tests {
             after * 2,
             "halving the microseconds per quarter halves the frame a tick lands on"
         );
-
     }
 
     #[test]
@@ -17343,15 +17400,9 @@ mod tests {
             frame_count: 100,
         }];
 
-        let three_four = serialize_timeline_meter(
-            &project,
-            &assets,
-            &source,
-            3,
-            4,
-            LoaderLimits::VERSION_1,
-        )
-        .unwrap();
+        let three_four =
+            serialize_timeline_meter(&project, &assets, &source, 3, 4, LoaderLimits::VERSION_1)
+                .unwrap();
         let edited = load(
             input_with_scenes(&three_four, &tracks, &clips, &scenes, None),
             LoaderLimits::VERSION_1,
@@ -17531,7 +17582,9 @@ mod tests {
             LoaderLimits::VERSION_1,
         )
         .unwrap();
-        let range = reloaded.arrangement_loop_range().expect("the loop persists");
+        let range = reloaded
+            .arrangement_loop_range()
+            .expect("the loop persists");
         assert_eq!((range.start_tick(), range.end_tick()), (1920, 7680));
         assert!(range.enabled());
 
@@ -17626,7 +17679,8 @@ mod tests {
             "arrangements written before this field keep loading"
         );
 
-        let with = arrangement(r#","loop_range":{"start_tick":1920,"end_tick":7680,"enabled":true}"#);
+        let with =
+            arrangement(r#","loop_range":{"start_tick":1920,"end_tick":7680,"enabled":true}"#);
         let loaded = load(
             input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&with)),
             LoaderLimits::VERSION_1,

@@ -85,13 +85,21 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
     ui.set_stop_interactive_scenes_enabled(true);
     dispatch_shift_space(&ui, false);
     dispatch_shift_space(&ui, true);
-    assert_eq!(*toggles.borrow(), 1, "Shift+Space must not toggle transport");
+    assert_eq!(
+        *toggles.borrow(),
+        1,
+        "Shift+Space must not toggle transport"
+    );
     assert_eq!(*scene_stops.borrow(), 1);
 
     ui.set_stop_interactive_scenes_enabled(false);
     dispatch_shift_space(&ui, false);
     assert_eq!(*toggles.borrow(), 1);
-    assert_eq!(*scene_stops.borrow(), 1, "revoked scene authority must refuse Shift+Space");
+    assert_eq!(
+        *scene_stops.borrow(),
+        1,
+        "revoked scene authority must refuse Shift+Space"
+    );
 
     ui.set_transport_start_enabled(false);
     ui.set_transport_stop_enabled(true);

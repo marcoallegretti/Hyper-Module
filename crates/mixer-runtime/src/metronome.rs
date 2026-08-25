@@ -122,7 +122,9 @@ pub enum MetronomeProcessError {
 impl fmt::Display for MetronomeProcessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::FrameTimeline(source) => write!(formatter, "metronome frame conversion failed: {source}"),
+            Self::FrameTimeline(source) => {
+                write!(formatter, "metronome frame conversion failed: {source}")
+            }
             Self::FrameRangeOverflow => formatter.write_str("metronome frame range overflowed"),
         }
     }
@@ -307,7 +309,9 @@ fn click_frame_count(sample_rate_hz: u32) -> Result<usize, MetronomePlanError> {
 
 fn try_copy<T: Copy>(source: &[T]) -> Result<Vec<T>, ()> {
     let mut destination = Vec::new();
-    destination.try_reserve_exact(source.len()).map_err(|_| ())?;
+    destination
+        .try_reserve_exact(source.len())
+        .map_err(|_| ())?;
     destination.extend_from_slice(source);
     Ok(destination)
 }
@@ -329,8 +333,8 @@ fn build_voice(
     for frame in 0..frame_count {
         // Half-sample phase places nonzero click energy in the first sample
         // selected by the transport timeline without a full-scale DC step.
-        let phase = core::f32::consts::TAU * frequency_hz * (frame as f32 + 0.5)
-            / sample_rate_hz as f32;
+        let phase =
+            core::f32::consts::TAU * frequency_hz * (frame as f32 + 0.5) / sample_rate_hz as f32;
         let envelope = 1.0 - frame as f32 / frame_count as f32;
         voice.push(amplitude * envelope * envelope * phase.sin());
     }
@@ -366,16 +370,18 @@ mod tests {
             .unwrap_err(),
             MetronomePlanError::FirstMeterNotAtOrigin
         );
-        assert!(MetronomePlan::try_new(
-            48_000,
-            &TEMPO,
-            &[MeterEvent {
-                tick: 0,
-                numerator: 255,
-                denominator: 256,
-            }],
-        )
-        .is_ok());
+        assert!(
+            MetronomePlan::try_new(
+                48_000,
+                &TEMPO,
+                &[MeterEvent {
+                    tick: 0,
+                    numerator: 255,
+                    denominator: 256,
+                }],
+            )
+            .is_ok()
+        );
         assert_eq!(
             MetronomePlan::try_new(
                 48_000,
@@ -393,17 +399,30 @@ mod tests {
 
     #[test]
     fn click_is_silent_until_enabled_and_accents_each_bar() {
-        let mut metronome = Metronome::new(MetronomePlan::try_new(48_000, &TEMPO, &FOUR_FOUR).unwrap());
+        let mut metronome =
+            Metronome::new(MetronomePlan::try_new(48_000, &TEMPO, &FOUR_FOUR).unwrap());
         let mut left = [0.0; 8];
         let mut right = [0.0; 8];
         metronome
-            .mix_window(0, StereoOutput { left: &mut left, right: &mut right })
+            .mix_window(
+                0,
+                StereoOutput {
+                    left: &mut left,
+                    right: &mut right,
+                },
+            )
             .unwrap();
         assert!(left.iter().all(|sample| sample.abs() <= f32::EPSILON));
 
         metronome.set_enabled(true);
         metronome
-            .mix_window(0, StereoOutput { left: &mut left, right: &mut right })
+            .mix_window(
+                0,
+                StereoOutput {
+                    left: &mut left,
+                    right: &mut right,
+                },
+            )
             .unwrap();
         assert!(
             left.iter()

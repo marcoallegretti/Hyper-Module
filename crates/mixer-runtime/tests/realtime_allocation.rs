@@ -31,8 +31,7 @@ fn native_filter_chain() -> DeviceChain {
             NativeDeviceInstance::try_new_filter(
                 "018f47a2-6b2d-7c11-8a44-001122336471".to_owned(),
                 true,
-                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107)
-                    .unwrap(),
+                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107).unwrap(),
             )
             .unwrap(),
         ],

@@ -10,54 +10,48 @@ use std::time::Duration;
 
 use hyper_desktop_ide::{
     AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
-    AutomationSendParameter, AutomationTarget, AutomationValue, DesktopAudioPreviewState,
-    DesktopIdeWorker, IdeApplicationConfig, IdeAudioClip, ProjectHistory, RecentProject,
-    IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
-    IdeInputSelection, IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
-    IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
-    IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerChannelKind, IdeMixerCommand,
-    IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice,
-    IdeNativeFilterEdit, NativeFilterMode, IdeOutputSelection,
-    IdeRoutingBusKind,
-    MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
-    MIN_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RATIO_MILLIONTHS,
-    MIN_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_ATTACK_MICROSECONDS,
-    MIN_COMPRESSOR_RELEASE_MICROSECONDS, MAX_COMPRESSOR_RELEASE_MICROSECONDS,
-    MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
-    ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
+    AutomationSendParameter, AutomationTarget, AutomationValue, ControlScope, ControlSource,
+    ControlTarget, ControlTransform, DesktopAudioPreviewState, DesktopIdeWorker, Edge,
+    IdeApplicationConfig, IdeAudioClip, IdeAudioInputInventory, IdeAudioOutputInventory,
+    IdeAudioPreviewControlCommand, IdeAutomationTakeRequest, IdeAutomationTarget,
     IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
-    IdeControlMappingEdit, IdeLoopRangeFrames, IdeResourceRestoreError, MeterEvent, SceneAction,
-    TempoEvent, meter_is_in_version_one_domain, musical_position_at_frame,
-    bpm_for_microseconds_per_quarter, microseconds_per_quarter_for_bpm,
-    TransportAction, TriggerBehavior,
-    IdeAutomationTakeRequest, IdeAutomationTarget, IdeOutputTestState, IdePlaybackArrangement,
-    OfflineExportReport, OfflineTrackStemExportFormat, IdeProjectExportFormat,
-    IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeRecordingAbortOutcome,
-    IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
-    IdeUnusedSampleCleanupSummary,
-    IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability, IdeSceneLaunchQuantization,
-    IdeSceneLaunchState, IdeSceneSlotEdit, IdeSceneTrackAction, IdeWorkerCommand,
-    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
-    IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState, MAX_IDE_SCENES,
-    MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS,
-    MIN_FILTER_CUTOFF_MILLIHERTZ, MIN_FILTER_RESONANCE_MILLIONTHS,
-    PlaybackRecoveryTransportState, TransportCommand, TransportLoopRange,
-    MAX_IDE_MIXER_SENDS_PER_CHANNEL,
-    desktop_ide_application_config,
-    ide_audio_clip_gain_is_supported,
+    IdeControlMappingEdit, IdeInputSelection, IdeLoopRangeFrames, IdeLoudnessCommand,
+    IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState, IdeLoudnessPresentationConfig,
+    IdeLoudnessScale, IdeLoudnessScaleRegion, IdeMaximumTruePeakDisplay, IdeMixerChannel,
+    IdeMixerChannelDestination, IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap,
+    IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice, IdeNativeFilterEdit,
+    IdeOutputSelection, IdeOutputTestState, IdePlaybackArrangement, IdePlaybackAutomation,
+    IdePlaybackAutomationLane, IdePlaybackExtent, IdeProjectExportFormat, IdeRecordingAbortOutcome,
+    IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeResourceRestoreError,
+    IdeRoutingBusKind, IdeRunningObservation, IdeScaledLoudnessValue, IdeScene,
+    IdeSceneAvailability, IdeSceneLaunchQuantization, IdeSceneLaunchState, IdeSceneSlotEdit,
+    IdeSceneTrackAction, IdeUnusedSampleCleanupSummary, IdeWorkerCommand, IdeWorkerCommandKind,
+    IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeWorkerShutdownReport, LocateState, MAX_COMPRESSOR_ATTACK_MICROSECONDS,
+    MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS, MAX_COMPRESSOR_RATIO_MILLIONTHS,
+    MAX_COMPRESSOR_RELEASE_MICROSECONDS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
+    MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL,
+    MAX_IDE_SCENES, MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
+    MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MIN_FILTER_CUTOFF_MILLIHERTZ,
+    MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, NativeFilterMode, OfflineExportReport,
+    OfflineTrackStemExportFormat, PlaybackRecoveryTransportState, ProjectHistory, RecentProject,
+    SceneAction, TempoEvent, TransportAction, TransportCommand, TransportLoopRange,
+    TriggerBehavior, bpm_for_microseconds_per_quarter, desktop_ide_application_config,
+    ide_audio_clip_gain_is_supported, meter_is_in_version_one_domain,
+    microseconds_per_quarter_for_bpm, musical_position_at_frame,
 };
-#[cfg(test)]
-use hyper_mixer_runtime::PlaybackRecoverySnapshot;
 #[cfg(test)]
 use hyper_desktop_ide::{
     IdeArrangementPlacementEditError, IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError,
     IdeAudioClipLoopEditError, IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
-    IdeAudioClipSourceTrimEditError, IdeSceneRemovalError,
-    IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome, IdeAudioImportError,
-    IdeAutomationTakeEditError,
-    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneRenameError, IdeSceneSlotEditError,
+    IdeAudioClipSourceTrimEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
+    IdeAudioImportError, IdeAutomationTakeEditError, IdeSceneCreationError,
+    IdeSceneDuplicationError, IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEditError,
     IdeWorkerCommandFailure,
 };
+#[cfg(test)]
+use hyper_mixer_runtime::PlaybackRecoverySnapshot;
 use slint::platform::PlatformError;
 use slint::{
     CloseRequestResponse, ComponentHandle, Model, ModelRc, ModelTracker, SharedString, Timer,
@@ -160,8 +154,14 @@ impl LoopMarks {
     fn summary(self, sample_rate_hz: u32) -> String {
         match (self.start, self.end) {
             (None, None) => String::new(),
-            (Some(start), None) => format!("LOOP IN {}", format_transport_clock_frames(start, sample_rate_hz)),
-            (None, Some(end)) => format!("LOOP OUT {}", format_transport_clock_frames(end, sample_rate_hz)),
+            (Some(start), None) => format!(
+                "LOOP IN {}",
+                format_transport_clock_frames(start, sample_rate_hz)
+            ),
+            (None, Some(end)) => format!(
+                "LOOP OUT {}",
+                format_transport_clock_frames(end, sample_rate_hz)
+            ),
             (Some(start), Some(end)) if end > start => format!(
                 "LOOP {} → {}",
                 format_transport_clock_frames(start, sample_rate_hz),
@@ -345,11 +345,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         )?,
         Err(error) => {
             ui.set_project_history_warning(format!("Recent projects unavailable: {error}").into());
-            DesktopIdeWorker::start(
-                application,
-                WORKER_COMMAND_CAPACITY,
-                WORKER_EVENT_CAPACITY,
-            )?
+            DesktopIdeWorker::start(application, WORKER_COMMAND_CAPACITY, WORKER_EVENT_CAPACITY)?
         }
     };
     let worker = Rc::new(RefCell::new(Some(worker)));
@@ -430,11 +426,7 @@ fn bind_callbacks(
     bind_audio_import_callback(ui, worker, &routes.audio_imports);
 }
 
-fn bind_audio_import_callback(
-    ui: &MainWindow,
-    worker: &WorkerCell,
-    routes: &AudioImportRoutes,
-) {
+fn bind_audio_import_callback(ui: &MainWindow, worker: &WorkerCell, routes: &AudioImportRoutes) {
     bind_audio_import_callback_with(ui, worker, routes, |weak, worker, track_id| {
         let weak_for_dialog = weak.clone();
         let spawn_result = slint::spawn_local(async move {
@@ -457,12 +449,7 @@ fn bind_audio_import_callback(
                         .collect(),
                 )
             });
-            complete_audio_import_choice(
-                &ui,
-                &worker,
-                track_id,
-                choice,
-            );
+            complete_audio_import_choice(&ui, &worker, track_id, choice);
         });
         if spawn_result.is_err()
             && let Some(ui) = weak.upgrade()
@@ -571,10 +558,7 @@ fn bind_recent_project_callback(
     });
 }
 
-fn recent_project_command(
-    routes: &RecentProjectRoutes,
-    index: i32,
-) -> Option<IdeWorkerCommand> {
+fn recent_project_command(routes: &RecentProjectRoutes, index: i32) -> Option<IdeWorkerCommand> {
     usize::try_from(index)
         .ok()
         .and_then(|index| routes.borrow().get(index).cloned())
@@ -1423,23 +1407,24 @@ fn bind_project_copy_callback_with(
 ) {
     let weak = ui.as_weak();
     let worker = Rc::clone(worker);
-    ui.global::<IdeActions>().on_save_project_as(move |project_name, switch_to| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        if ui.get_app_mode() != AppMode::Running || !ui.get_save_project_as_visible() {
-            return;
-        }
-        let project_name = project_name.trim().to_owned();
-        if project_name.is_empty() {
-            ui.set_error_text("Enter a project name before choosing its location".into());
-            return;
-        }
-        ui.set_app_mode(AppMode::Saving);
-        ui.set_error_text(SharedString::default());
-        ui.set_status_text("Waiting for the independent project destination…".into());
-        choose(weak.clone(), Rc::clone(&worker), project_name, switch_to);
-    });
+    ui.global::<IdeActions>()
+        .on_save_project_as(move |project_name, switch_to| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::Running || !ui.get_save_project_as_visible() {
+                return;
+            }
+            let project_name = project_name.trim().to_owned();
+            if project_name.is_empty() {
+                ui.set_error_text("Enter a project name before choosing its location".into());
+                return;
+            }
+            ui.set_app_mode(AppMode::Saving);
+            ui.set_error_text(SharedString::default());
+            ui.set_status_text("Waiting for the independent project destination…".into());
+            choose(weak.clone(), Rc::clone(&worker), project_name, switch_to);
+        });
 }
 
 fn bind_project_rename_callback(ui: &MainWindow, worker: &WorkerCell) {
@@ -1452,21 +1437,22 @@ fn bind_project_rename_callback(ui: &MainWindow, worker: &WorkerCell) {
 
 fn bind_project_rename_callback_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
     let weak = ui.as_weak();
-    ui.global::<IdeActions>().on_rename_project(move |project_name| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        if ui.get_app_mode() != AppMode::Running || !ui.get_rename_project_visible() {
-            return;
-        }
-        let project_name = project_name.trim().to_owned();
-        if project_name.is_empty() {
-            ui.set_error_text("Enter a project name before renaming".into());
-            return;
-        }
-        ui.set_error_text(SharedString::default());
-        submitter(&ui, IdeWorkerCommand::RenameProject { project_name });
-    });
+    ui.global::<IdeActions>()
+        .on_rename_project(move |project_name| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::Running || !ui.get_rename_project_visible() {
+                return;
+            }
+            let project_name = project_name.trim().to_owned();
+            if project_name.is_empty() {
+                ui.set_error_text("Enter a project name before renaming".into());
+                return;
+            }
+            ui.set_error_text(SharedString::default());
+            submitter(&ui, IdeWorkerCommand::RenameProject { project_name });
+        });
 }
 
 fn bind_native_filter_callbacks(
@@ -1538,23 +1524,50 @@ fn bind_native_filter_callbacks_with(
     let weak = ui.as_weak();
     let submit_add = Rc::clone(&submitter);
     let state_for_add = Rc::clone(project_state);
-    actions.on_add_native_compressor(move |track_index, threshold, ratio, attack, release, makeup| {
-        let Some(ui) = weak.upgrade() else { return; };
-        match native_compressor_addition(ui.get_app_mode(), &state_for_add.native_filter_tracks.borrow(), track_index, threshold.as_str(), ratio.as_str(), attack.as_str(), release.as_str(), makeup.as_str()) {
-            Ok(edit) => submit_add(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
-            Err(message) => ui.set_error_text(message.into()),
-        }
-    });
+    actions.on_add_native_compressor(
+        move |track_index, threshold, ratio, attack, release, makeup| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            match native_compressor_addition(
+                ui.get_app_mode(),
+                &state_for_add.native_filter_tracks.borrow(),
+                track_index,
+                threshold.as_str(),
+                ratio.as_str(),
+                attack.as_str(),
+                release.as_str(),
+                makeup.as_str(),
+            ) {
+                Ok(edit) => submit_add(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
+                Err(message) => ui.set_error_text(message.into()),
+            }
+        },
+    );
 
     let weak = ui.as_weak();
     let submit_update = Rc::clone(&submitter);
-    actions.on_update_native_compressor(move |index, enabled, threshold, ratio, attack, release, makeup| {
-        let Some(ui) = weak.upgrade() else { return; };
-        match native_compressor_update(ui.get_app_mode(), &ui.get_native_devices(), index, enabled, threshold.as_str(), ratio.as_str(), attack.as_str(), release.as_str(), makeup.as_str()) {
-            Ok(edit) => submit_update(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
-            Err(message) => ui.set_error_text(message.into()),
-        }
-    });
+    actions.on_update_native_compressor(
+        move |index, enabled, threshold, ratio, attack, release, makeup| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            match native_compressor_update(
+                ui.get_app_mode(),
+                &ui.get_native_devices(),
+                index,
+                enabled,
+                threshold.as_str(),
+                ratio.as_str(),
+                attack.as_str(),
+                release.as_str(),
+                makeup.as_str(),
+            ) {
+                Ok(edit) => submit_update(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
+                Err(message) => ui.set_error_text(message.into()),
+            }
+        },
+    );
 
     let weak = ui.as_weak();
     let submit_move = Rc::clone(&submitter);
@@ -1662,22 +1675,77 @@ fn native_filter_addition(
     clippy::too_many_arguments,
     reason = "the generated compressor form emits its five persisted parameters independently"
 )]
-fn native_compressor_addition(mode: AppMode, track_ids: &[String], track_index: i32, threshold: &str, ratio: &str, attack: &str, release: &str, makeup: &str) -> Result<IdeNativeFilterEdit, &'static str> {
-    if mode != AppMode::Running { return Err("Native Device editing is unavailable in the current state"); }
-    let track_id = usize::try_from(track_index).ok().and_then(|index| track_ids.get(index)).filter(|id| !id.is_empty()).ok_or("The selected mixer channel is no longer available")?;
-    let (threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels) = parse_native_compressor_state(threshold, ratio, attack, release, makeup)?;
-    Ok(IdeNativeFilterEdit::AddCompressor { track_id: track_id.clone(), threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels })
+fn native_compressor_addition(
+    mode: AppMode,
+    track_ids: &[String],
+    track_index: i32,
+    threshold: &str,
+    ratio: &str,
+    attack: &str,
+    release: &str,
+    makeup: &str,
+) -> Result<IdeNativeFilterEdit, &'static str> {
+    if mode != AppMode::Running {
+        return Err("Native Device editing is unavailable in the current state");
+    }
+    let track_id = usize::try_from(track_index)
+        .ok()
+        .and_then(|index| track_ids.get(index))
+        .filter(|id| !id.is_empty())
+        .ok_or("The selected mixer channel is no longer available")?;
+    let (
+        threshold_millidecibels,
+        ratio_millionths,
+        attack_microseconds,
+        release_microseconds,
+        makeup_millidecibels,
+    ) = parse_native_compressor_state(threshold, ratio, attack, release, makeup)?;
+    Ok(IdeNativeFilterEdit::AddCompressor {
+        track_id: track_id.clone(),
+        threshold_millidecibels,
+        ratio_millionths,
+        attack_microseconds,
+        release_microseconds,
+        makeup_millidecibels,
+    })
 }
 
 #[allow(
     clippy::too_many_arguments,
     reason = "the generated compressor form emits its persisted state as separate controls"
 )]
-fn native_compressor_update(mode: AppMode, devices: &ModelRc<NativeDeviceRow>, index: i32, enabled: bool, threshold: &str, ratio: &str, attack: &str, release: &str, makeup: &str) -> Result<IdeNativeFilterEdit, &'static str> {
+fn native_compressor_update(
+    mode: AppMode,
+    devices: &ModelRc<NativeDeviceRow>,
+    index: i32,
+    enabled: bool,
+    threshold: &str,
+    ratio: &str,
+    attack: &str,
+    release: &str,
+    makeup: &str,
+) -> Result<IdeNativeFilterEdit, &'static str> {
     let row = native_filter_row(mode, devices, index)?;
-    if row.kind_index != 1 { return Err("The selected Native Device is not a compressor"); }
-    let (threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels) = parse_native_compressor_state(threshold, ratio, attack, release, makeup)?;
-    Ok(IdeNativeFilterEdit::UpdateCompressor { chain_id: row.chain_id.to_string(), device_instance_id: row.device_instance_id.to_string(), enabled, threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels })
+    if row.kind_index != 1 {
+        return Err("The selected Native Device is not a compressor");
+    }
+    let (
+        threshold_millidecibels,
+        ratio_millionths,
+        attack_microseconds,
+        release_microseconds,
+        makeup_millidecibels,
+    ) = parse_native_compressor_state(threshold, ratio, attack, release, makeup)?;
+    Ok(IdeNativeFilterEdit::UpdateCompressor {
+        chain_id: row.chain_id.to_string(),
+        device_instance_id: row.device_instance_id.to_string(),
+        enabled,
+        threshold_millidecibels,
+        ratio_millionths,
+        attack_microseconds,
+        release_microseconds,
+        makeup_millidecibels,
+    })
 }
 
 fn native_filter_update(
@@ -1872,19 +1940,59 @@ fn parse_bounded_u32(
     }
 }
 
-fn parse_native_compressor_state(threshold: &str, ratio: &str, attack: &str, release: &str, makeup: &str) -> Result<(i32, u32, u32, u32, i32), &'static str> {
+fn parse_native_compressor_state(
+    threshold: &str,
+    ratio: &str,
+    attack: &str,
+    release: &str,
+    makeup: &str,
+) -> Result<(i32, u32, u32, u32, i32), &'static str> {
     Ok((
-        parse_bounded_i32(threshold, MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS, "Threshold must be whole millidecibels from -80000 through 0")?,
-        parse_bounded_u32(ratio, MIN_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RATIO_MILLIONTHS, "Ratio must be whole millionths from 1000000 through 100000000")?,
-        parse_bounded_u32(attack, MIN_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_ATTACK_MICROSECONDS, "Attack must be whole microseconds from 100 through 500000")?,
-        parse_bounded_u32(release, MIN_COMPRESSOR_RELEASE_MICROSECONDS, MAX_COMPRESSOR_RELEASE_MICROSECONDS, "Release must be whole microseconds from 100 through 2000000")?,
-        parse_bounded_i32(makeup, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS, "Makeup must be whole millidecibels from -24000 through 24000")?,
+        parse_bounded_i32(
+            threshold,
+            MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
+            MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
+            "Threshold must be whole millidecibels from -80000 through 0",
+        )?,
+        parse_bounded_u32(
+            ratio,
+            MIN_COMPRESSOR_RATIO_MILLIONTHS,
+            MAX_COMPRESSOR_RATIO_MILLIONTHS,
+            "Ratio must be whole millionths from 1000000 through 100000000",
+        )?,
+        parse_bounded_u32(
+            attack,
+            MIN_COMPRESSOR_ATTACK_MICROSECONDS,
+            MAX_COMPRESSOR_ATTACK_MICROSECONDS,
+            "Attack must be whole microseconds from 100 through 500000",
+        )?,
+        parse_bounded_u32(
+            release,
+            MIN_COMPRESSOR_RELEASE_MICROSECONDS,
+            MAX_COMPRESSOR_RELEASE_MICROSECONDS,
+            "Release must be whole microseconds from 100 through 2000000",
+        )?,
+        parse_bounded_i32(
+            makeup,
+            MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+            MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+            "Makeup must be whole millidecibels from -24000 through 24000",
+        )?,
     ))
 }
 
-fn parse_bounded_i32(value: &str, minimum: i32, maximum: i32, message: &'static str) -> Result<i32, &'static str> {
+fn parse_bounded_i32(
+    value: &str,
+    minimum: i32,
+    maximum: i32,
+    message: &'static str,
+) -> Result<i32, &'static str> {
     let value = value.parse::<i32>().map_err(|_| message)?;
-    if (minimum..=maximum).contains(&value) { Ok(value) } else { Err(message) }
+    if (minimum..=maximum).contains(&value) {
+        Ok(value)
+    } else {
+        Err(message)
+    }
 }
 
 fn bind_scene_creation_callbacks(
@@ -2154,7 +2262,10 @@ fn bind_scene_callbacks(ui: &MainWindow, worker: &WorkerCell, project_state: &Pr
             return;
         };
         if !scene.removable {
-            ui.set_error_text("Clear this scene's arrangement launches and control mappings before removing it".into());
+            ui.set_error_text(
+                "Clear this scene's arrangement launches and control mappings before removing it"
+                    .into(),
+            );
             return;
         }
         submit_to_ui(
@@ -2306,10 +2417,7 @@ fn bind_routing_bus_removal_callback_with(ui: &MainWindow, submitter: UiCommandS
             ui.set_error_text("The selected routing bus is no longer available".into());
             return;
         };
-        submitter(
-            &ui,
-            IdeWorkerCommand::RemoveRoutingBus { track_id },
-        );
+        submitter(&ui, IdeWorkerCommand::RemoveRoutingBus { track_id });
     });
 }
 
@@ -2515,7 +2623,9 @@ fn bind_audio_track_content_removal_callback(ui: &MainWindow, worker: &WorkerCel
             || !ui.get_remove_track_content_visible()
             || ui.get_remove_track_content_id() != track_id
         {
-            ui.set_error_text("Audio-track content removal confirmation is no longer current".into());
+            ui.set_error_text(
+                "Audio-track content removal confirmation is no longer current".into(),
+            );
             return;
         }
         let Ok(track_id) = validate_audio_track_content_removal(
@@ -2795,33 +2905,35 @@ fn bind_audio_primary_route_callbacks(ui: &MainWindow, worker: &WorkerCell) {
 fn bind_audio_primary_route_callbacks_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    actions.on_set_audio_primary_route(move |source_track_id, target_group_track_id, targets_main| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        if ui.get_app_mode() != AppMode::Running
-            || !ui.get_primary_route_candidates().iter().any(|candidate| {
-                candidate.source_track_id == source_track_id
-                    && candidate.target_group_track_id == target_group_track_id
-                    && candidate.targets_main == targets_main
-            })
-        {
-            ui.set_error_text("The selected primary route is no longer available".into());
-            return;
-        }
-        let target_group_track_id = if targets_main {
-            None
-        } else {
-            Some(target_group_track_id.to_string())
-        };
-        submitter(
-            &ui,
-            IdeWorkerCommand::SetAudioPrimaryRoute {
-                source_track_id: source_track_id.to_string(),
-                target_group_track_id,
-            },
-        );
-    });
+    actions.on_set_audio_primary_route(
+        move |source_track_id, target_group_track_id, targets_main| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::Running
+                || !ui.get_primary_route_candidates().iter().any(|candidate| {
+                    candidate.source_track_id == source_track_id
+                        && candidate.target_group_track_id == target_group_track_id
+                        && candidate.targets_main == targets_main
+                })
+            {
+                ui.set_error_text("The selected primary route is no longer available".into());
+                return;
+            }
+            let target_group_track_id = if targets_main {
+                None
+            } else {
+                Some(target_group_track_id.to_string())
+            };
+            submitter(
+                &ui,
+                IdeWorkerCommand::SetAudioPrimaryRoute {
+                    source_track_id: source_track_id.to_string(),
+                    target_group_track_id,
+                },
+            );
+        },
+    );
 }
 
 fn bind_arrangement_callback(
@@ -4389,12 +4501,7 @@ fn start_event_pump(
                     if completes_observation(&event) {
                         observation_pending = false;
                     }
-                    apply_event(
-                        &ui,
-                        &routes,
-                        &project_state,
-                        event,
-                    );
+                    apply_event(&ui, &routes, &project_state, event);
                 }
                 Ok(None) => break,
                 Err(error) => {
@@ -4511,8 +4618,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::AddAudioTrack => AppMode::AddingTrack,
         IdeWorkerCommandKind::AddRoutingBus => AppMode::AddingRoutingBus,
         IdeWorkerCommandKind::DuplicateAudioTrack => AppMode::DuplicatingTrack,
-        IdeWorkerCommandKind::RemoveAudioTrack
-        | IdeWorkerCommandKind::RemoveAudioTrackContent => AppMode::RemovingTrack,
+        IdeWorkerCommandKind::RemoveAudioTrack | IdeWorkerCommandKind::RemoveAudioTrackContent => {
+            AppMode::RemovingTrack
+        }
         IdeWorkerCommandKind::RenameAudioTrack | IdeWorkerCommandKind::RenameRoutingBus => {
             AppMode::RenamingTrack
         }
@@ -4530,9 +4638,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::AddArrangementPlacement => AppMode::AddingArrangementPlacement,
         IdeWorkerCommandKind::AddArrangementSceneLaunch => AppMode::AddingArrangementSceneLaunch,
         IdeWorkerCommandKind::AddAutomationTake => AppMode::AddingAutomationTake,
-        IdeWorkerCommandKind::SetAutomationTakeActive => {
-            AppMode::ChangingAutomationTakeActivation
-        }
+        IdeWorkerCommandKind::SetAutomationTakeActive => AppMode::ChangingAutomationTakeActivation,
         IdeWorkerCommandKind::RemoveAutomationTake => AppMode::RemovingAutomationTake,
         IdeWorkerCommandKind::EditControlMapping => AppMode::EditingControlMapping,
         IdeWorkerCommandKind::EditNativeFilter => AppMode::EditingNativeFilter,
@@ -4605,9 +4711,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
         IdeWorkerCommandKind::Monitoring => "Applying input cue control…",
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
-        IdeWorkerCommandKind::SaveProjectAs => {
-            "Saving and verifying an independent project copy…"
-        }
+        IdeWorkerCommandKind::SaveProjectAs => "Saving and verifying an independent project copy…",
         IdeWorkerCommandKind::RenameProject => {
             "Renaming the verified project package and reopening it…"
         }
@@ -4808,7 +4912,9 @@ fn apply_event(
         IdeWorkerEvent::MixerRecoveryAvailable => {
             ui.set_app_mode(AppMode::Closed);
             ui.set_mixer_recovery_available(true);
-            ui.set_status_text("Recovery data is available; choose Restore or Discard before opening".into());
+            ui.set_status_text(
+                "Recovery data is available; choose Restore or Discard before opening".into(),
+            );
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::Closed {
@@ -4816,7 +4922,12 @@ fn apply_event(
             native_failure,
             input_failure,
         } => {
-            apply_output_inventory(ui, &routes.outputs, snapshot.outputs(), snapshot.selection());
+            apply_output_inventory(
+                ui,
+                &routes.outputs,
+                snapshot.outputs(),
+                snapshot.selection(),
+            );
             apply_input_inventory(
                 ui,
                 &routes.inputs,
@@ -4868,9 +4979,7 @@ fn apply_event(
                     TransportCommand::SetLoopRange(None) => {
                         "Loop range cleared for the audio runtime"
                     }
-                    TransportCommand::SetLoopEnabled(true) => {
-                        "Loop queued for the audio runtime"
-                    }
+                    TransportCommand::SetLoopEnabled(true) => "Loop queued for the audio runtime",
                     TransportCommand::SetLoopEnabled(false) => {
                         "Loop release queued for the audio runtime"
                     }
@@ -4913,9 +5022,15 @@ fn apply_event(
         } => {
             ui.set_status_text(
                 if opened {
-                    format!("Independent project verified and opened at {}", project_path.display())
+                    format!(
+                        "Independent project verified and opened at {}",
+                        project_path.display()
+                    )
                 } else {
-                    format!("Independent project verified at {}; source project remains open", project_path.display())
+                    format!(
+                        "Independent project verified at {}; source project remains open",
+                        project_path.display()
+                    )
                 }
                 .into(),
             );
@@ -4977,7 +5092,9 @@ fn apply_event(
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::AudioPrimaryRouteChanged { revision } => {
-            ui.set_status_text(format!("Primary route changed in project revision {revision}").into());
+            ui.set_status_text(
+                format!("Primary route changed in project revision {revision}").into(),
+            );
             ui.set_error_text(SharedString::default());
         }
         event @ (IdeWorkerEvent::AudioTrackRemoved { .. } | IdeWorkerEvent::AudioTrackRemoving) => {
@@ -5305,7 +5422,9 @@ fn apply_event(
         }
         IdeWorkerEvent::ProjectRenaming => {
             ui.set_app_mode(AppMode::Saving);
-            ui.set_status_text("Waiting for native output before atomically renaming the project…".into());
+            ui.set_status_text(
+                "Waiting for native output before atomically renaming the project…".into(),
+            );
         }
         IdeWorkerEvent::Closing => {
             ui.set_app_mode(AppMode::Closing);
@@ -5337,15 +5456,11 @@ fn apply_recent_projects(
 ) {
     let presentation = recent_project_presentation(projects);
     *routes.borrow_mut() = presentation.routes;
-    ui.set_recent_project_names(ModelRc::from(Rc::new(VecModel::from(
-        presentation.names,
-    ))));
+    ui.set_recent_project_names(ModelRc::from(Rc::new(VecModel::from(presentation.names))));
     ui.set_recent_project_display_names(ModelRc::from(Rc::new(VecModel::from(
         presentation.display_names,
     ))));
-    ui.set_recent_project_paths(ModelRc::from(Rc::new(VecModel::from(
-        presentation.paths,
-    ))));
+    ui.set_recent_project_paths(ModelRc::from(Rc::new(VecModel::from(presentation.paths))));
     ui.set_project_history_warning(SharedString::default());
 }
 
@@ -5510,7 +5625,9 @@ fn apply_audio_track_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) 
         }
         IdeWorkerEvent::AudioTrackDuplicating => {
             ui.set_app_mode(AppMode::DuplicatingTrack);
-            ui.set_status_text("Waiting for native output before duplicating the mixer strip…".into());
+            ui.set_status_text(
+                "Waiting for native output before duplicating the mixer strip…".into(),
+            );
         }
         _ => unreachable!("audio-track duplication event dispatcher received another event"),
     }
@@ -5519,7 +5636,9 @@ fn apply_audio_track_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) 
 fn apply_mixer_strip_reorder_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::MixerStripsReordered { revision } => {
-            ui.set_status_text(format!("Mixer strips reordered in project revision {revision}").into());
+            ui.set_status_text(
+                format!("Mixer strips reordered in project revision {revision}").into(),
+            );
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::MixerStripsReordering => {
@@ -6135,7 +6254,9 @@ fn apply_scene_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::SceneRemoved { revision, scene_id } => {
             reset_scene_removal_form(ui);
-            ui.set_status_text(format!("Scene {scene_id} removed in project revision {revision}").into());
+            ui.set_status_text(
+                format!("Scene {scene_id} removed in project revision {revision}").into(),
+            );
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::SceneRemovalCommittedWithWarning { warning } => {
@@ -7697,7 +7818,9 @@ fn set_audio_import_targets(
     *routes.borrow_mut() = next_routes;
     ui.set_audio_import_track_names(ModelRc::from(Rc::new(VecModel::from(names))));
     ui.set_selected_audio_import_track_index(
-        selected.and_then(|index| i32::try_from(index).ok()).unwrap_or(-1),
+        selected
+            .and_then(|index| i32::try_from(index).ok())
+            .unwrap_or(-1),
     );
 }
 
@@ -7821,14 +7944,14 @@ fn set_native_filter_observation(
         .iter()
         .map(|channel| channel.id().to_owned())
         .collect();
-    set_native_devices(ui, observation.native_devices(), observation.mixer_channels());
+    set_native_devices(
+        ui,
+        observation.native_devices(),
+        observation.mixer_channels(),
+    );
 }
 
-fn set_native_devices(
-    ui: &MainWindow,
-    devices: &[IdeNativeDevice],
-    channels: &[IdeMixerChannel],
-) {
+fn set_native_devices(ui: &MainWindow, devices: &[IdeNativeDevice], channels: &[IdeMixerChannel]) {
     let track_names = channels
         .iter()
         .map(|channel| SharedString::from(channel.name()))
@@ -7847,19 +7970,102 @@ fn native_device_rows(
         .iter()
         .enumerate()
         .map(|(index, device)| {
-            let (chain_id, device_instance_id, track_id, enabled, kind_index, kind_name, detail, mode_index, mode_name, cutoff_millihertz, cutoff_label, resonance_millionths, resonance_label, threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels) = match device {
+            let (
+                chain_id,
+                device_instance_id,
+                track_id,
+                enabled,
+                kind_index,
+                kind_name,
+                detail,
+                mode_index,
+                mode_name,
+                cutoff_millihertz,
+                cutoff_label,
+                resonance_millionths,
+                resonance_label,
+                threshold_millidecibels,
+                ratio_millionths,
+                attack_microseconds,
+                release_microseconds,
+                makeup_millidecibels,
+            ) = match device {
                 IdeNativeDevice::Filter(filter) => (
-                    filter.chain_id(), filter.device_instance_id(), filter.track_id(), filter.enabled(), 0, "FILTER", format!("{} · Q {:.3}", format_millihertz(filter.cutoff_millihertz()), f64::from(filter.resonance_millionths()) / 1_000_000.0), match filter.mode() { NativeFilterMode::LowPass => 0, NativeFilterMode::HighPass => 1 }, match filter.mode() { NativeFilterMode::LowPass => "LOW-PASS", NativeFilterMode::HighPass => "HIGH-PASS" }, filter.cutoff_millihertz().to_string(), format_millihertz(filter.cutoff_millihertz()), filter.resonance_millionths().to_string(), format!("Q {:.3}", f64::from(filter.resonance_millionths()) / 1_000_000.0), String::new(), String::new(), String::new(), String::new(), String::new()),
+                    filter.chain_id(),
+                    filter.device_instance_id(),
+                    filter.track_id(),
+                    filter.enabled(),
+                    0,
+                    "FILTER",
+                    format!(
+                        "{} · Q {:.3}",
+                        format_millihertz(filter.cutoff_millihertz()),
+                        f64::from(filter.resonance_millionths()) / 1_000_000.0
+                    ),
+                    match filter.mode() {
+                        NativeFilterMode::LowPass => 0,
+                        NativeFilterMode::HighPass => 1,
+                    },
+                    match filter.mode() {
+                        NativeFilterMode::LowPass => "LOW-PASS",
+                        NativeFilterMode::HighPass => "HIGH-PASS",
+                    },
+                    filter.cutoff_millihertz().to_string(),
+                    format_millihertz(filter.cutoff_millihertz()),
+                    filter.resonance_millionths().to_string(),
+                    format!(
+                        "Q {:.3}",
+                        f64::from(filter.resonance_millionths()) / 1_000_000.0
+                    ),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
                 IdeNativeDevice::Compressor(compressor) => (
-                    compressor.chain_id(), compressor.device_instance_id(), compressor.track_id(), compressor.enabled(), 1, "COMPRESSOR", format!("{} dB · {:.3}:1 · {} / {} ms · {} dB", f64::from(compressor.threshold_millidecibels()) / 1_000.0, f64::from(compressor.ratio_millionths()) / 1_000_000.0, f64::from(compressor.attack_microseconds()) / 1_000.0, f64::from(compressor.release_microseconds()) / 1_000.0, f64::from(compressor.makeup_millidecibels()) / 1_000.0), 0, "", String::new(), String::new(), String::new(), String::new(), compressor.threshold_millidecibels().to_string(), compressor.ratio_millionths().to_string(), compressor.attack_microseconds().to_string(), compressor.release_microseconds().to_string(), compressor.makeup_millidecibels().to_string()),
+                    compressor.chain_id(),
+                    compressor.device_instance_id(),
+                    compressor.track_id(),
+                    compressor.enabled(),
+                    1,
+                    "COMPRESSOR",
+                    format!(
+                        "{} dB · {:.3}:1 · {} / {} ms · {} dB",
+                        f64::from(compressor.threshold_millidecibels()) / 1_000.0,
+                        f64::from(compressor.ratio_millionths()) / 1_000_000.0,
+                        f64::from(compressor.attack_microseconds()) / 1_000.0,
+                        f64::from(compressor.release_microseconds()) / 1_000.0,
+                        f64::from(compressor.makeup_millidecibels()) / 1_000.0
+                    ),
+                    0,
+                    "",
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    compressor.threshold_millidecibels().to_string(),
+                    compressor.ratio_millionths().to_string(),
+                    compressor.attack_microseconds().to_string(),
+                    compressor.release_microseconds().to_string(),
+                    compressor.makeup_millidecibels().to_string(),
+                ),
             };
             let track_name = channels
                 .iter()
                 .find(|channel| channel.id() == track_id)
                 .map_or(track_id, IdeMixerChannel::name);
             let (can_move_earlier, can_move_later, can_duplicate) = match device {
-                IdeNativeDevice::Filter(filter) => (filter.can_move_earlier(), filter.can_move_later(), filter.can_duplicate()),
-                IdeNativeDevice::Compressor(compressor) => (compressor.can_move_earlier(), compressor.can_move_later(), compressor.can_duplicate()),
+                IdeNativeDevice::Filter(filter) => (
+                    filter.can_move_earlier(),
+                    filter.can_move_later(),
+                    filter.can_duplicate(),
+                ),
+                IdeNativeDevice::Compressor(compressor) => (
+                    compressor.can_move_earlier(),
+                    compressor.can_move_later(),
+                    compressor.can_duplicate(),
+                ),
             };
             NativeDeviceRow {
                 index: i32::try_from(index).unwrap_or(-1),
@@ -8181,18 +8387,12 @@ fn reset_project(
     reset_loudness_observation(ui);
 }
 
-fn apply_transport_recovery_availability(
-    ui: &MainWindow,
-    state: PlaybackRecoveryTransportState,
-) {
+fn apply_transport_recovery_availability(ui: &MainWindow, state: PlaybackRecoveryTransportState) {
     ui.set_transport_start_available(state == PlaybackRecoveryTransportState::Stopped);
     ui.set_transport_stop_available(state == PlaybackRecoveryTransportState::Rolling);
 }
 
-fn apply_metronome_observation(
-    ui: &MainWindow,
-    observation: &IdeRunningObservation,
-) {
+fn apply_metronome_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
     let Some(snapshot) = observation.meter().snapshot() else {
         ui.set_metronome_available(false);
         ui.set_metronome_enabled(false);
@@ -9218,7 +9418,9 @@ fn mixer_rows(
                 solo_available: channel.kind() == IdeMixerChannelKind::Audio,
                 renameable: matches!(
                     channel.kind(),
-                    IdeMixerChannelKind::Audio | IdeMixerChannelKind::Group | IdeMixerChannelKind::Return
+                    IdeMixerChannelKind::Audio
+                        | IdeMixerChannelKind::Group
+                        | IdeMixerChannelKind::Return
                 ),
                 removable: channel.kind() == IdeMixerChannelKind::Audio,
                 can_move_earlier: flat_mixer_strip_reorder_available && index > 0,
@@ -9272,8 +9474,10 @@ fn return_send_candidate_rows(channels: &[IdeMixerChannel]) -> Vec<ReturnSendCan
     channels
         .iter()
         .filter(|source| {
-            matches!(source.kind(), IdeMixerChannelKind::Audio | IdeMixerChannelKind::Group)
-                && source.sends().len() < MAX_IDE_MIXER_SENDS_PER_CHANNEL
+            matches!(
+                source.kind(),
+                IdeMixerChannelKind::Audio | IdeMixerChannelKind::Group
+            ) && source.sends().len() < MAX_IDE_MIXER_SENDS_PER_CHANNEL
         })
         .flat_map(|source| {
             channels
@@ -9338,7 +9542,6 @@ const fn mixer_kind_name(kind: IdeMixerChannelKind) -> &'static str {
     }
 }
 
-
 const AUTOMATION_UNIT_DOMAIN: &str = "0-2000000 (1000000 = unity)";
 const AUTOMATION_PAN_DOMAIN: &str = "-1000000 to 1000000";
 const AUTOMATION_SWITCH_DOMAIN: &str = "on / off";
@@ -9376,41 +9579,41 @@ fn automation_channel_choices(
     choices: &mut Vec<AutomationTargetChoice>,
 ) {
     for (suffix, domain, boolean, parameter) in [
-            (
-                "gain",
-                AUTOMATION_UNIT_DOMAIN,
-                false,
-                AutomationChannelParameter::Gain,
-            ),
-            (
-                "pan",
-                AUTOMATION_PAN_DOMAIN,
-                false,
-                AutomationChannelParameter::Pan,
-            ),
-            (
-                "mute",
-                AUTOMATION_SWITCH_DOMAIN,
-                true,
-                AutomationChannelParameter::Mute,
-            ),
-            (
-                "solo",
-                AUTOMATION_SWITCH_DOMAIN,
-                true,
-                AutomationChannelParameter::Solo,
-            ),
-        ] {
-            choices.push(AutomationTargetChoice {
-                label: format!("{} {suffix}", channel.name),
-                domain: domain.to_owned(),
-                boolean,
-                target: IdeAutomationTarget::Channel {
-                    track_id: channel.track_id.clone(),
-                    parameter,
-                },
-                resolved: AutomationTarget::Channel { slot, parameter },
-            });
+        (
+            "gain",
+            AUTOMATION_UNIT_DOMAIN,
+            false,
+            AutomationChannelParameter::Gain,
+        ),
+        (
+            "pan",
+            AUTOMATION_PAN_DOMAIN,
+            false,
+            AutomationChannelParameter::Pan,
+        ),
+        (
+            "mute",
+            AUTOMATION_SWITCH_DOMAIN,
+            true,
+            AutomationChannelParameter::Mute,
+        ),
+        (
+            "solo",
+            AUTOMATION_SWITCH_DOMAIN,
+            true,
+            AutomationChannelParameter::Solo,
+        ),
+    ] {
+        choices.push(AutomationTargetChoice {
+            label: format!("{} {suffix}", channel.name),
+            domain: domain.to_owned(),
+            boolean,
+            target: IdeAutomationTarget::Channel {
+                track_id: channel.track_id.clone(),
+                parameter,
+            },
+            resolved: AutomationTarget::Channel { slot, parameter },
+        });
     }
 }
 
@@ -9421,33 +9624,33 @@ fn automation_send_choices(
 ) {
     for (send_index, send) in channel.sends.iter().enumerate() {
         for (suffix, domain, boolean, parameter) in [
-                (
-                    "send gain",
-                    AUTOMATION_UNIT_DOMAIN,
-                    false,
-                    AutomationSendParameter::Gain,
-                ),
-                (
-                    "send pan",
-                    AUTOMATION_PAN_DOMAIN,
-                    false,
-                    AutomationSendParameter::Pan,
-                ),
-                (
-                    "send enabled",
-                    AUTOMATION_SWITCH_DOMAIN,
-                    true,
-                    AutomationSendParameter::Enabled,
-                ),
-            ] {
-                choices.push(AutomationTargetChoice {
-                    label: format!("{} to {} {suffix}", channel.name, send.target_name),
-                    domain: domain.to_owned(),
-                    boolean,
-                    target: IdeAutomationTarget::Send {
-                        send_id: send.send_id.clone(),
-                        parameter,
-                    },
+            (
+                "send gain",
+                AUTOMATION_UNIT_DOMAIN,
+                false,
+                AutomationSendParameter::Gain,
+            ),
+            (
+                "send pan",
+                AUTOMATION_PAN_DOMAIN,
+                false,
+                AutomationSendParameter::Pan,
+            ),
+            (
+                "send enabled",
+                AUTOMATION_SWITCH_DOMAIN,
+                true,
+                AutomationSendParameter::Enabled,
+            ),
+        ] {
+            choices.push(AutomationTargetChoice {
+                label: format!("{} to {} {suffix}", channel.name, send.target_name),
+                domain: domain.to_owned(),
+                boolean,
+                target: IdeAutomationTarget::Send {
+                    send_id: send.send_id.clone(),
+                    parameter,
+                },
                 resolved: AutomationTarget::Send {
                     slot,
                     send: send_index,
@@ -9505,7 +9708,10 @@ fn set_automation_targets(
             .collect::<Vec<_>>(),
     ))));
     ui.set_automation_target_boolean(ModelRc::from(Rc::new(VecModel::from(
-        choices.iter().map(|choice| choice.boolean).collect::<Vec<_>>(),
+        choices
+            .iter()
+            .map(|choice| choice.boolean)
+            .collect::<Vec<_>>(),
     ))));
     ui.set_automation_target_domain(ModelRc::from(Rc::new(VecModel::from(
         choices
@@ -9933,7 +10139,6 @@ fn apply_automation_take_creation_event(ui: &MainWindow, event: &IdeWorkerEvent)
     }
 }
 
-
 const CONTROL_CV_DOMAIN: &str = "0-1000000";
 const CONTROL_PAN_DOMAIN: &str = "0-1000000 (500000 = centre)";
 
@@ -9977,14 +10182,20 @@ fn control_source_choices() -> Vec<ControlSourceChoice> {
         });
     }
     for (label, source) in [
-        ("Clock rising", ControlSource::ClockInput { edge: Edge::Rising }),
+        (
+            "Clock rising",
+            ControlSource::ClockInput { edge: Edge::Rising },
+        ),
         (
             "Clock falling",
             ControlSource::ClockInput {
                 edge: Edge::Falling,
             },
         ),
-        ("Reset rising", ControlSource::ResetInput { edge: Edge::Rising }),
+        (
+            "Reset rising",
+            ControlSource::ResetInput { edge: Edge::Rising },
+        ),
         (
             "Reset falling",
             ControlSource::ResetInput {
@@ -10150,7 +10361,8 @@ fn control_binding_request(
         .and_then(|index| targets.get(index))
         .ok_or("The selected control target is unavailable")?;
     let admitted = admitted_control_targets(source.kind, targets);
-    let selected = usize::try_from(target_index).map_err(|_| "The selected control target is unavailable")?;
+    let selected =
+        usize::try_from(target_index).map_err(|_| "The selected control target is unavailable")?;
     if !admitted.contains(&selected) {
         return Err("That source cannot drive that target");
     }
@@ -10448,7 +10660,9 @@ fn apply_track_stem_export_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::ProjectStemExporting => {
             ui.set_app_mode(AppMode::ExportingProject);
-            ui.set_status_text("Rendering aligned mixer stems through the playback runtime…".into());
+            ui.set_status_text(
+                "Rendering aligned mixer stems through the playback runtime…".into(),
+            );
         }
         IdeWorkerEvent::ProjectStemsExported { report } => {
             ui.set_app_mode(AppMode::Running);
@@ -10459,7 +10673,9 @@ fn apply_track_stem_export_event(ui: &MainWindow, event: &IdeWorkerEvent) {
         IdeWorkerEvent::ProjectStemsExportedWithWarning { report, warning } => {
             ui.set_app_mode(AppMode::Running);
             ui.set_export_summary(track_stem_export_summary(report).into());
-            ui.set_status_text("Mixer stems exported, but filesystem durability needs attention".into());
+            ui.set_status_text(
+                "Mixer stems exported, but filesystem durability needs attention".into(),
+            );
             ui.set_error_text(warning.to_string().into());
         }
         _ => unreachable!("track-stem export event dispatcher received another event"),
@@ -10645,7 +10861,9 @@ fn meter_command(typed: &str) -> Result<IdeWorkerCommand, String> {
             denominator,
         })
     } else {
-        Err(format!("{trimmed} is not a time signature this project can hold"))
+        Err(format!(
+            "{trimmed} is not a time signature this project can hold"
+        ))
     }
 }
 
@@ -10724,7 +10942,9 @@ fn set_tempo_and_loop(
         observation
             .meter_events()
             .first()
-            .map_or_else(String::new, |meter| format_meter(meter.numerator, meter.denominator))
+            .map_or_else(String::new, |meter| {
+                format_meter(meter.numerator, meter.denominator)
+            })
             .into(),
     );
     ui.set_meter_available(true);
@@ -10738,10 +10958,13 @@ fn set_tempo_and_loop(
 }
 
 fn format_tempo_bpm(microseconds_per_quarter: u32) -> String {
-    format!("{:.2}", bpm_for_microseconds_per_quarter(microseconds_per_quarter))
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_owned()
+    format!(
+        "{:.2}",
+        bpm_for_microseconds_per_quarter(microseconds_per_quarter)
+    )
+    .trim_end_matches('0')
+    .trim_end_matches('.')
+    .to_owned()
 }
 
 /// A typed tempo becomes a command only when it converts to a value the
@@ -10974,7 +11197,11 @@ fn bind_project_stem_export_callback(ui: &MainWindow, worker: &WorkerCell) {
                 } else {
                     "Name a new aligned WAV stem folder"
                 })
-                .set_file_name(if flac { "project-flac-stems" } else { "project-wav-stems" })
+                .set_file_name(if flac {
+                    "project-flac-stems"
+                } else {
+                    "project-wav-stems"
+                })
                 .save_file()
                 .await;
             let Some(ui) = weak.upgrade() else {
@@ -11079,8 +11306,7 @@ fn set_mixer(
                                 | IdeMixerChannelKind::Return
                         )
                     && actual.removable == (expected.kind() == IdeMixerChannelKind::Audio)
-                    && actual.can_move_earlier
-                        == (flat_mixer_strip_reorder_available && index > 0)
+                    && actual.can_move_earlier == (flat_mixer_strip_reorder_available && index > 0)
                     && actual.can_move_later
                         == (flat_mixer_strip_reorder_available && index + 1 < channels.len())
                     && actual.active == expected.active()
@@ -11463,7 +11689,8 @@ mod tests {
         } else {
             WindowEvent::KeyPressed { text: text.into() }
         });
-        ui.window().dispatch_event(WindowEvent::KeyReleased { text: text.into() });
+        ui.window()
+            .dispatch_event(WindowEvent::KeyReleased { text: text.into() });
         if shift {
             ui.window().dispatch_event(WindowEvent::KeyReleased {
                 text: Key::Shift.into(),
@@ -11629,7 +11856,10 @@ mod tests {
         dispatch_ide_shortcut(ui, "s", false, true);
         dispatch_ide_shortcut(ui, "S", true, false);
         assert!(
-            matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::SaveProject]),
+            matches!(
+                submitted.borrow().as_slice(),
+                [IdeWorkerCommand::SaveProject]
+            ),
             "only a non-repeating primary save shortcut submits the existing project save command"
         );
 
@@ -11653,7 +11883,10 @@ mod tests {
         ui.set_mixer_main_state_available(false);
         dispatch_ide_shortcut(ui, "s", false, false);
         assert!(
-            matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::SaveProject]),
+            matches!(
+                submitted.borrow().as_slice(),
+                [IdeWorkerCommand::SaveProject]
+            ),
             "pending or unavailable committed mixer state cannot queue another save"
         );
     }
@@ -11699,16 +11932,20 @@ mod tests {
                 && *switch_to
         ));
 
-        bind_project_copy_callback_with(ui, &worker, move |weak, worker, project_name, switch_to| {
-            let ui = weak.upgrade().unwrap();
-            complete_project_copy_choice(
-                &ui,
-                &worker,
-                project_name,
-                switch_to,
-                ProjectCopyChoice::Selected(PathBuf::from("parent")),
-            );
-        });
+        bind_project_copy_callback_with(
+            ui,
+            &worker,
+            move |weak, worker, project_name, switch_to| {
+                let ui = weak.upgrade().unwrap();
+                complete_project_copy_choice(
+                    &ui,
+                    &worker,
+                    project_name,
+                    switch_to,
+                    ProjectCopyChoice::Selected(PathBuf::from("parent")),
+                );
+            },
+        );
         ui.set_app_mode(AppMode::Running);
         ui.set_save_project_as_visible(true);
         ui.global::<IdeActions>()
@@ -11886,15 +12123,27 @@ mod tests {
         ui.set_new_project_visible(false);
         ui.set_new_track_visible(false);
         dispatch_ide_shortcut(ui, "o", false, false);
-        assert_eq!(opened.get(), 1, "the shortcut reaches the existing open action");
+        assert_eq!(
+            opened.get(),
+            1,
+            "the shortcut reaches the existing open action"
+        );
 
         dispatch_ide_shortcut(ui, "o", false, true);
         dispatch_ide_shortcut(ui, "O", true, false);
-        assert_eq!(opened.get(), 1, "repeat and Shift must not reopen the picker");
+        assert_eq!(
+            opened.get(),
+            1,
+            "repeat and Shift must not reopen the picker"
+        );
 
         ui.set_app_mode(AppMode::Running);
         dispatch_ide_shortcut(ui, "o", false, false);
-        assert_eq!(opened.get(), 1, "a running project cannot be replaced by a shortcut");
+        assert_eq!(
+            opened.get(),
+            1,
+            "a running project cannot be replaced by a shortcut"
+        );
 
         ui.set_app_mode(AppMode::Closed);
         ui.set_new_project_visible(true);
@@ -12032,7 +12281,10 @@ mod tests {
         ui.set_close_unsaved_mixer_confirming(false);
         ui.global::<IdeActions>().invoke_close_project();
         assert!(
-            matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::CloseProject]),
+            matches!(
+                submitted.borrow().as_slice(),
+                [IdeWorkerCommand::CloseProject]
+            ),
             "a clean running project may close through the existing worker command"
         );
 
@@ -12052,14 +12304,20 @@ mod tests {
         );
         ui.global::<IdeActions>().invoke_close_project();
         assert!(
-            matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::CloseProject]),
+            matches!(
+                submitted.borrow().as_slice(),
+                [IdeWorkerCommand::CloseProject]
+            ),
             "repeating the ordinary close action cannot silently confirm discard"
         );
         ui.global::<IdeActions>().invoke_cancel_close_project();
         assert!(
             matches!(
                 submitted.borrow().as_slice(),
-                [IdeWorkerCommand::CloseProject, IdeWorkerCommand::CancelCloseProject]
+                [
+                    IdeWorkerCommand::CloseProject,
+                    IdeWorkerCommand::CancelCloseProject
+                ]
             ),
             "keeping the project open must cancel the worker-owned discard authorization"
         );
@@ -12101,7 +12359,10 @@ mod tests {
         assert!(
             matches!(
                 submitted.borrow().as_slice(),
-                [IdeWorkerCommand::CloseProject, IdeWorkerCommand::DiscardCloseProject]
+                [
+                    IdeWorkerCommand::CloseProject,
+                    IdeWorkerCommand::DiscardCloseProject
+                ]
             ),
             "the explicit discard path remains available while auditioning"
         );
@@ -12139,7 +12400,10 @@ mod tests {
         assert!(
             matches!(
                 submitted.borrow().as_slice(),
-                [IdeWorkerCommand::RestoreMixerRecovery, IdeWorkerCommand::DiscardMixerRecovery]
+                [
+                    IdeWorkerCommand::RestoreMixerRecovery,
+                    IdeWorkerCommand::DiscardMixerRecovery
+                ]
             ),
             "the recovery controls preserve the worker-owned explicit restore-or-discard choice"
         );
@@ -12374,8 +12638,20 @@ mod tests {
             activation_toggleable: true,
         };
         ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![
-            row(0, "018f47a2-6b2d-7c11-8a44-001122334456", "Audio 1", false, true),
-            row(1, "018f47a2-6b2d-7c11-8a44-001122334457", "Target", true, false),
+            row(
+                0,
+                "018f47a2-6b2d-7c11-8a44-001122334456",
+                "Audio 1",
+                false,
+                true,
+            ),
+            row(
+                1,
+                "018f47a2-6b2d-7c11-8a44-001122334457",
+                "Target",
+                true,
+                false,
+            ),
         ]))));
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
@@ -12397,10 +12673,9 @@ mod tests {
             ElementHandle::find_by_accessible_label(&ui, "Move Audio 1 earlier")
                 .next()
                 .expect("the first row exposes its disabled earlier control");
-        let move_target_later =
-            ElementHandle::find_by_accessible_label(&ui, "Move Target later")
-                .next()
-                .expect("the final row exposes its disabled later control");
+        let move_target_later = ElementHandle::find_by_accessible_label(&ui, "Move Target later")
+            .next()
+            .expect("the final row exposes its disabled later control");
         assert_eq!(move_first_earlier.accessible_enabled(), Some(false));
         assert_eq!(move_target_later.accessible_enabled(), Some(false));
         move_first_earlier.mock_single_click(PointerEventButton::Left);
@@ -12450,7 +12725,9 @@ mod tests {
         let submitted_by_callback = Rc::clone(&submitted);
         ui.global::<IdeActions>()
             .on_duplicate_mixer_strip(move |index, name| {
-                submitted_by_callback.borrow_mut().push((index, name.to_string()));
+                submitted_by_callback
+                    .borrow_mut()
+                    .push((index, name.to_string()));
             });
         ui.show().unwrap();
 
@@ -12464,10 +12741,9 @@ mod tests {
         assert_eq!(ui.get_duplicate_track_source_name(), "Audio 1");
 
         ui.set_duplicate_track_name("Audio 1 copy".into());
-        let confirm =
-            ElementHandle::find_by_accessible_label(&ui, "Confirm duplicate mixer strip")
-                .next()
-                .expect("the visible form exposes one confirmation action");
+        let confirm = ElementHandle::find_by_accessible_label(&ui, "Confirm duplicate mixer strip")
+            .next()
+            .expect("the visible form exposes one confirmation action");
         assert_eq!(confirm.accessible_enabled(), Some(true));
         confirm.mock_single_click(PointerEventButton::Left);
         assert_eq!(
@@ -12497,7 +12773,10 @@ mod tests {
                 track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
             },
         );
-        assert_eq!(ui.get_status_text(), "Mixer strip duplicated in project revision 7");
+        assert_eq!(
+            ui.get_status_text(),
+            "Mixer strip duplicated in project revision 7"
+        );
     }
 
     #[test]
@@ -12527,7 +12806,9 @@ mod tests {
         let submitted_by_callback = Rc::clone(&submitted);
         ui.global::<IdeActions>()
             .on_add_routing_bus(move |kind, name| {
-                submitted_by_callback.borrow_mut().push((kind, name.to_string()));
+                submitted_by_callback
+                    .borrow_mut()
+                    .push((kind, name.to_string()));
             });
         ui.show().unwrap();
 
@@ -12592,12 +12873,10 @@ mod tests {
         assert!(ui.get_routing_bus_removal_visible());
         assert_eq!(ui.get_routing_bus_removal_id(), track_id);
 
-        let confirm = ElementHandle::find_by_accessible_label(
-            &ui,
-            "Confirm removal of routing bus Verb",
-        )
-        .next()
-        .expect("the confirmation exposes exactly one removal action");
+        let confirm =
+            ElementHandle::find_by_accessible_label(&ui, "Confirm removal of routing bus Verb")
+                .next()
+                .expect("the confirmation exposes exactly one removal action");
         assert_eq!(confirm.accessible_enabled(), Some(true));
         confirm.mock_single_click(PointerEventButton::Left);
         assert!(matches!(
@@ -12619,9 +12898,10 @@ mod tests {
         ui.global::<IdeActions>()
             .invoke_remove_routing_bus(track_id.into());
         assert_eq!(submitted.borrow().len(), 1);
-        assert!(ui
-            .get_error_text()
-            .contains("removal confirmation is no longer current"));
+        assert!(
+            ui.get_error_text()
+                .contains("removal confirmation is no longer current")
+        );
         ui.hide().unwrap();
     }
 
@@ -12717,10 +12997,11 @@ mod tests {
         ));
         set_routing_bus_sources(&ui, &changed);
         assert_eq!(ui.get_routing_bus_sources().row_count(), 2);
-        assert!(ui
-            .get_routing_bus_sources()
-            .iter()
-            .all(|source| !source.selected));
+        assert!(
+            ui.get_routing_bus_sources()
+                .iter()
+                .all(|source| !source.selected)
+        );
         assert_eq!(ui.get_routing_bus_selected_source_count(), 0);
     }
 
@@ -12759,10 +13040,11 @@ mod tests {
         assert_eq!(ui.get_routing_bus_kind_index(), 0);
         assert_eq!(ui.get_routing_bus_name(), "Group");
         assert_eq!(ui.get_routing_bus_selected_source_count(), 0);
-        assert!(ui
-            .get_routing_bus_sources()
-            .iter()
-            .all(|source| !source.selected));
+        assert!(
+            ui.get_routing_bus_sources()
+                .iter()
+                .all(|source| !source.selected)
+        );
     }
 
     #[test]
@@ -12844,11 +13126,15 @@ mod tests {
         );
         ui.show().unwrap();
 
-        let mut entries = ElementHandle::find_by_element_id(&ui, "MainWindow::rename-project-entry");
+        let mut entries =
+            ElementHandle::find_by_element_id(&ui, "MainWindow::rename-project-entry");
         let entry = entries
             .next()
             .expect("the generated Rename Project entry button must be present");
-        assert!(entries.next().is_none(), "the Rename Project entry id is unique");
+        assert!(
+            entries.next().is_none(),
+            "the Rename Project entry id is unique"
+        );
         entry.mock_single_click(PointerEventButton::Left);
         assert!(ui.get_rename_project_visible());
         assert_eq!(ui.get_rename_project_name(), "Source");
@@ -12864,7 +13150,10 @@ mod tests {
         let cancel = cancels
             .next()
             .expect("the visible Rename Project form must expose its cancel button");
-        assert!(cancels.next().is_none(), "the Rename Project cancel id is unique");
+        assert!(
+            cancels.next().is_none(),
+            "the Rename Project cancel id is unique"
+        );
         cancel.mock_single_click(PointerEventButton::Left);
         assert!(!ui.get_rename_project_visible());
 
@@ -12879,7 +13168,10 @@ mod tests {
         let submit = submits
             .next()
             .expect("the visible Rename Project form must expose its submission button");
-        assert!(submits.next().is_none(), "the Rename Project submission id is unique");
+        assert!(
+            submits.next().is_none(),
+            "the Rename Project submission id is unique"
+        );
         submit.mock_single_click(PointerEventButton::Left);
         assert!(matches!(
             submitted.borrow().as_slice(),
@@ -12889,7 +13181,11 @@ mod tests {
         ui.set_app_mode(AppMode::Saving);
         ui.global::<IdeActions>()
             .invoke_rename_project("Ignored while pending".into());
-        assert_eq!(submitted.borrow().len(), 1, "pending rename state is submission-inert");
+        assert_eq!(
+            submitted.borrow().len(),
+            1,
+            "pending rename state is submission-inert"
+        );
         ui.set_app_mode(AppMode::Running);
 
         apply_event(
@@ -12917,7 +13213,10 @@ mod tests {
                 name: "Renamed session".to_owned(),
             },
         );
-        assert!(ui.get_status_text().contains("live mixer changes were saved"));
+        assert!(
+            ui.get_status_text()
+                .contains("live mixer changes were saved")
+        );
     }
 
     #[test]
@@ -12935,7 +13234,10 @@ mod tests {
         let entry = entries
             .next()
             .expect("the generated Save As entry button must be present");
-        assert!(entries.next().is_none(), "the Save As entry button id is unique");
+        assert!(
+            entries.next().is_none(),
+            "the Save As entry button id is unique"
+        );
         entry.mock_single_click(PointerEventButton::Left);
         assert!(ui.get_save_project_as_visible());
         assert_eq!(ui.get_save_project_as_name(), "Source copy");
@@ -12945,7 +13247,10 @@ mod tests {
         let cancel = cancels
             .next()
             .expect("the generated Save As cancel button must be present");
-        assert!(cancels.next().is_none(), "the Save As cancel button id is unique");
+        assert!(
+            cancels.next().is_none(),
+            "the Save As cancel button id is unique"
+        );
         cancel.mock_single_click(PointerEventButton::Left);
         assert!(
             !ui.get_save_project_as_visible(),
@@ -12980,7 +13285,10 @@ mod tests {
         let submit = submits
             .next()
             .expect("the generated Save As submission button must be present");
-        assert!(submits.next().is_none(), "the Save As submission button id is unique");
+        assert!(
+            submits.next().is_none(),
+            "the Save As submission button id is unique"
+        );
         ui.set_save_project_as_switch_to(false);
         submit.mock_single_click(PointerEventButton::Left);
         assert!(matches!(
@@ -13106,14 +13414,54 @@ mod tests {
                 makeup_millidecibels: "".into(),
             },
             NativeDeviceRow {
-                index: 1, chain_id: "chain-a".into(), device_instance_id: "device-b".into(), track_id: "track-a".into(), track_name: "Audio".into(), enabled: true, can_move_earlier: true, can_move_later: false, can_duplicate: true,
-                kind_index: 1, kind_name: "COMPRESSOR".into(), detail: "-18 dB · 4:1".into(), mode_index: 0, mode_name: "".into(), cutoff_millihertz: "".into(), cutoff_label: "".into(), resonance_millionths: "".into(), resonance_label: "".into(),
-                threshold_millidecibels: "-18000".into(), ratio_millionths: "4000000".into(), attack_microseconds: "10000".into(), release_microseconds: "100000".into(), makeup_millidecibels: "0".into(),
+                index: 1,
+                chain_id: "chain-a".into(),
+                device_instance_id: "device-b".into(),
+                track_id: "track-a".into(),
+                track_name: "Audio".into(),
+                enabled: true,
+                can_move_earlier: true,
+                can_move_later: false,
+                can_duplicate: true,
+                kind_index: 1,
+                kind_name: "COMPRESSOR".into(),
+                detail: "-18 dB · 4:1".into(),
+                mode_index: 0,
+                mode_name: "".into(),
+                cutoff_millihertz: "".into(),
+                cutoff_label: "".into(),
+                resonance_millionths: "".into(),
+                resonance_label: "".into(),
+                threshold_millidecibels: "-18000".into(),
+                ratio_millionths: "4000000".into(),
+                attack_microseconds: "10000".into(),
+                release_microseconds: "100000".into(),
+                makeup_millidecibels: "0".into(),
             },
             NativeDeviceRow {
-                index: 2, chain_id: "chain-b".into(), device_instance_id: "device-c".into(), track_id: "track-b".into(), track_name: "Bass".into(), enabled: true, can_move_earlier: false, can_move_later: false, can_duplicate: true,
-                kind_index: 0, kind_name: "FILTER".into(), detail: "800 Hz · Q 1.0".into(), mode_index: 1, mode_name: "HIGH-PASS".into(), cutoff_millihertz: "800000".into(), cutoff_label: "800 Hz".into(), resonance_millionths: "1000000".into(), resonance_label: "Q 1.0".into(),
-                threshold_millidecibels: "".into(), ratio_millionths: "".into(), attack_microseconds: "".into(), release_microseconds: "".into(), makeup_millidecibels: "".into(),
+                index: 2,
+                chain_id: "chain-b".into(),
+                device_instance_id: "device-c".into(),
+                track_id: "track-b".into(),
+                track_name: "Bass".into(),
+                enabled: true,
+                can_move_earlier: false,
+                can_move_later: false,
+                can_duplicate: true,
+                kind_index: 0,
+                kind_name: "FILTER".into(),
+                detail: "800 Hz · Q 1.0".into(),
+                mode_index: 1,
+                mode_name: "HIGH-PASS".into(),
+                cutoff_millihertz: "800000".into(),
+                cutoff_label: "800 Hz".into(),
+                resonance_millionths: "1000000".into(),
+                resonance_label: "Q 1.0".into(),
+                threshold_millidecibels: "".into(),
+                ratio_millionths: "".into(),
+                attack_microseconds: "".into(),
+                release_microseconds: "".into(),
+                makeup_millidecibels: "".into(),
             },
         ]))));
         let submitted = Rc::new(RefCell::new(Vec::new()));
@@ -13135,8 +13483,23 @@ mod tests {
         actions.invoke_add_native_filter(0, 1, "80000".into(), "2000000".into());
         actions.invoke_update_native_filter(0, false, 1, "90000".into(), "1500000".into());
         actions.invoke_remove_native_filter(0);
-        actions.invoke_add_native_compressor(0, "-24000".into(), "2000000".into(), "5000".into(), "80000".into(), "3000".into());
-        actions.invoke_update_native_compressor(1, false, "-12000".into(), "6000000".into(), "2000".into(), "60000".into(), "1000".into());
+        actions.invoke_add_native_compressor(
+            0,
+            "-24000".into(),
+            "2000000".into(),
+            "5000".into(),
+            "80000".into(),
+            "3000".into(),
+        );
+        actions.invoke_update_native_compressor(
+            1,
+            false,
+            "-12000".into(),
+            "6000000".into(),
+            "2000".into(),
+            "60000".into(),
+            "1000".into(),
+        );
         actions.invoke_move_native_device(0, 1);
         actions.invoke_duplicate_native_device(1);
         actions.invoke_copy_native_device(1);
@@ -13835,10 +14198,7 @@ mod tests {
     fn saving_writes_the_loop_the_session_holds_and_marking_does_not() {
         let state: ProjectUiStateCell = Rc::new(ProjectUiState::default());
         assert!(
-            matches!(
-                project_save_command(&state),
-                IdeWorkerCommand::SaveProject
-            ),
+            matches!(project_save_command(&state), IdeWorkerCommand::SaveProject),
             "a project with no marks saves the mixer alone"
         );
 
@@ -14419,8 +14779,7 @@ mod tests {
             Err(MixerControlFailure::StaleSelection)
         );
         assert_eq!(
-            validate_audio_track_content_removal(AppMode::Running, track_a, &reordered)
-                .unwrap(),
+            validate_audio_track_content_removal(AppMode::Running, track_a, &reordered).unwrap(),
             track_a
         );
         assert_eq!(
@@ -14463,15 +14822,24 @@ mod tests {
             Err(MixerControlFailure::StateUnavailable)
         ));
         assert_eq!(
-            mode_after_successful_submission(AppMode::Running, IdeWorkerCommandKind::RenameRoutingBus),
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::RenameRoutingBus
+            ),
             AppMode::RenamingTrack
         );
         assert_eq!(
-            mode_after_failure(AppMode::RenamingTrack, IdeWorkerCommandKind::RenameRoutingBus),
+            mode_after_failure(
+                AppMode::RenamingTrack,
+                IdeWorkerCommandKind::RenameRoutingBus
+            ),
             AppMode::Running
         );
         assert_eq!(
-            mode_after_successful_submission(AppMode::Running, IdeWorkerCommandKind::RemoveRoutingBus),
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::RemoveRoutingBus
+            ),
             AppMode::Saving
         );
         assert_eq!(
@@ -15443,7 +15811,8 @@ mod tests {
 
     #[test]
     fn control_target_choices_offer_only_targets_the_compiler_accepts() {
-        let choices = control_target_choices(&automation_channel_fixture(), &control_scene_fixture());
+        let choices =
+            control_target_choices(&automation_channel_fixture(), &control_scene_fixture());
         let labels: Vec<&str> = choices.iter().map(|choice| choice.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -15497,7 +15866,8 @@ mod tests {
         let recording_routes: RecordingRoutes = Rc::new(RefCell::new(Vec::new()));
         let take_routes: TakeRoutes = Rc::new(RefCell::new(Vec::new()));
         let project_state = Rc::new(ProjectUiState::default());
-        let targets = control_target_choices(&automation_channel_fixture(), &control_scene_fixture());
+        let targets =
+            control_target_choices(&automation_channel_fixture(), &control_scene_fixture());
         *project_state.control_targets.borrow_mut() = targets.clone();
 
         reset_project(ui, &recording_routes, &take_routes, &project_state);
@@ -15579,8 +15949,12 @@ mod tests {
 
     #[test]
     fn only_a_bounded_non_empty_project_can_be_exported() {
-        assert!(export_available(IdePlaybackExtent::Bounded { end_frame: 1 }));
-        assert!(!export_available(IdePlaybackExtent::Bounded { end_frame: 0 }));
+        assert!(export_available(IdePlaybackExtent::Bounded {
+            end_frame: 1
+        }));
+        assert!(!export_available(IdePlaybackExtent::Bounded {
+            end_frame: 0
+        }));
         assert!(!export_available(IdePlaybackExtent::Unbounded));
     }
 
@@ -15633,7 +16007,11 @@ mod tests {
     #[test]
     fn control_binding_requests_follow_the_contract_domain_rules() {
         let sources = control_source_choices();
-        assert_eq!(sources.len(), 8, "four CV inputs plus clock and reset edges");
+        assert_eq!(
+            sources.len(),
+            8,
+            "four CV inputs plus clock and reset edges"
+        );
         let targets = vec![
             ControlTargetChoice {
                 label: "Main gain".to_owned(),
@@ -15879,8 +16257,8 @@ mod tests {
     #[test]
     fn automation_take_requests_coerce_interpolation_and_reject_invalid_forms() {
         let choices = automation_target_choices(&automation_channel_fixture());
-        let linear = automation_take_request(&choices, " Fade ", 2, 1, "0", "1920", "0=1000000")
-            .unwrap();
+        let linear =
+            automation_take_request(&choices, " Fade ", 2, 1, "0", "1920", "0=1000000").unwrap();
         assert_eq!(linear.name, "Fade");
         assert_eq!(linear.interpolation, AutomationInterpolation::Linear);
         assert_eq!(
@@ -15892,8 +16270,8 @@ mod tests {
         );
         assert_eq!((linear.start_tick, linear.end_tick), (0, 1_920));
 
-        let held = automation_take_request(&choices, "Hold", 2, 0, "0", "1920", "0=1000000")
-            .unwrap();
+        let held =
+            automation_take_request(&choices, "Hold", 2, 0, "0", "1920", "0=1000000").unwrap();
         assert_eq!(held.interpolation, AutomationInterpolation::Hold);
 
         let switch = automation_take_request(&choices, "Mute", 4, 1, "0", "1920", "0=on").unwrap();
@@ -15961,7 +16339,10 @@ mod tests {
                 enabled: false,
             },
         );
-        assert!(ui.get_status_text().contains("disabled in project revision 5"));
+        assert!(
+            ui.get_status_text()
+                .contains("disabled in project revision 5")
+        );
         assert!(!ui.get_status_text().contains("already"));
 
         apply_automation_take_activation_event(
@@ -16481,7 +16862,10 @@ mod tests {
         std::fs::create_dir_all(&second).unwrap();
         let history = ProjectHistory::at(&config);
         history
-            .remember("First project with a deliberately long visible name", &first)
+            .remember(
+                "First project with a deliberately long visible name",
+                &first,
+            )
             .unwrap();
         let projects = history.remember("Second", &second).unwrap();
         let routes = UiRoutes::default();
@@ -16493,7 +16877,14 @@ mod tests {
         let names = ui.get_recent_project_names();
         let display_names = ui.get_recent_project_display_names();
         let paths = ui.get_recent_project_paths();
-        assert_eq!((names.row_count(), display_names.row_count(), paths.row_count()), (2, 2, 2));
+        assert_eq!(
+            (
+                names.row_count(),
+                display_names.row_count(),
+                paths.row_count()
+            ),
+            (2, 2, 2)
+        );
         for (index, project) in projects.iter().enumerate() {
             assert_eq!(names.row_data(index).unwrap(), project.name());
             assert_eq!(
@@ -16592,7 +16983,10 @@ mod tests {
         ui.set_error_text(SharedString::default());
         ui.global::<IdeActions>()
             .invoke_remove_audio_track_content(track_id.into());
-        assert!(ui.get_error_text().contains("confirmation is no longer current"));
+        assert!(
+            ui.get_error_text()
+                .contains("confirmation is no longer current")
+        );
 
         ui.set_remove_track_content_visible(true);
         ui.set_remove_track_content_id(track_id.into());
@@ -16600,7 +16994,10 @@ mod tests {
         ui.set_error_text(SharedString::default());
         ui.global::<IdeActions>()
             .invoke_remove_audio_track_content(track_id.into());
-        assert!(ui.get_error_text().contains("worker is no longer available"));
+        assert!(
+            ui.get_error_text()
+                .contains("worker is no longer available")
+        );
 
         apply_audio_track_content_removal_event(ui, &IdeWorkerEvent::AudioTrackContentRemoving);
         assert_eq!(ui.get_app_mode(), AppMode::RemovingTrack);
@@ -16779,9 +17176,11 @@ mod tests {
         assert!(submitted.borrow().is_empty());
         assert!(ui.get_error_text().contains("no longer current"));
 
-        bind_unused_sample_cleanup_callback_with(ui, || None, |_, _| {
-            panic!("missing cleanup authority must not submit")
-        });
+        bind_unused_sample_cleanup_callback_with(
+            ui,
+            || None,
+            |_, _| panic!("missing cleanup authority must not submit"),
+        );
         ui.set_unused_sample_cleanup_confirming(true);
         ui.global::<IdeActions>().invoke_clean_unused_samples();
         assert!(ui.get_error_text().contains("authority is unavailable"));
@@ -16836,23 +17235,18 @@ mod tests {
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
         let worker: WorkerCell = Rc::new(RefCell::new(None));
-        bind_audio_import_callback_with(
-            ui,
-            &worker,
-            routes,
-            move |weak, _, track_id| {
-                let ui = weak.upgrade().unwrap();
-                complete_audio_import_choice_with(
-                    &ui,
-                    track_id,
-                    AudioImportChoice::Selected(vec![
-                        PathBuf::from("kick.wav"),
-                        PathBuf::from("snare.flac"),
-                    ]),
-                    |command| submitted_by_callback.borrow_mut().push(command),
-                );
-            },
-        );
+        bind_audio_import_callback_with(ui, &worker, routes, move |weak, _, track_id| {
+            let ui = weak.upgrade().unwrap();
+            complete_audio_import_choice_with(
+                &ui,
+                track_id,
+                AudioImportChoice::Selected(vec![
+                    PathBuf::from("kick.wav"),
+                    PathBuf::from("snare.flac"),
+                ]),
+                |command| submitted_by_callback.borrow_mut().push(command),
+            );
+        });
         ui.set_project_history_warning("retained history warning".into());
         ui.set_app_mode(AppMode::Running);
         ui.set_error_text("stale error".into());
@@ -16902,12 +17296,9 @@ mod tests {
 
         bind_audio_import_callback_with(ui, &worker, routes, move |weak, _, track_id| {
             let ui = weak.upgrade().unwrap();
-            complete_audio_import_choice_with(
-                &ui,
-                track_id,
-                AudioImportChoice::Cancelled,
-                |_| panic!("a cancelled chooser must not submit a command"),
-            );
+            complete_audio_import_choice_with(&ui, track_id, AudioImportChoice::Cancelled, |_| {
+                panic!("a cancelled chooser must not submit a command")
+            });
         });
         ui.set_app_mode(AppMode::Running);
         ui.global::<IdeActions>().invoke_choose_audio_import(0);

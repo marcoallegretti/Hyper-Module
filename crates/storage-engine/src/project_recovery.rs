@@ -4,15 +4,15 @@ use std::path::Path;
 
 use super::{
     AudioClipPublicationRecovery, AudioTrackContentRemovalPublicationRecovery,
-    AudioTrackDuplicationPublicationRecovery, AudioTrackPublicationRecovery, ControlMappingPublicationError,
-    ControlMappingPublicationRecovery, ProjectResourcePublicationError,
-    ProjectResourcePublicationRecovery, RecordingImportError, RecordingImportRecovery,
-    ProjectRenameError, ProjectRenameRecovery, SampleCleanupRecovery,
-    recover_audio_clip_publications, recover_audio_track_content_removals,
-    recover_audio_track_duplications, recover_audio_track_publications,
-    recover_control_mapping_publications, recover_project_resource_publications,
-    recover_project_renames, recover_recording_imports,
-    recover_sample_cleanups, TrackOrderPublicationRecovery, recover_track_order_publications,
+    AudioTrackDuplicationPublicationRecovery, AudioTrackPublicationRecovery,
+    ControlMappingPublicationError, ControlMappingPublicationRecovery, ProjectRenameError,
+    ProjectRenameRecovery, ProjectResourcePublicationError, ProjectResourcePublicationRecovery,
+    RecordingImportError, RecordingImportRecovery, SampleCleanupRecovery,
+    TrackOrderPublicationRecovery, recover_audio_clip_publications,
+    recover_audio_track_content_removals, recover_audio_track_duplications,
+    recover_audio_track_publications, recover_control_mapping_publications,
+    recover_project_renames, recover_project_resource_publications, recover_recording_imports,
+    recover_sample_cleanups, recover_track_order_publications,
 };
 
 /// Complete transaction-recovery evidence produced before an editable project
@@ -166,13 +166,21 @@ impl fmt::Display for ProjectTransactionRecoveryErrorSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Resource(source) => write!(formatter, "resource recovery failed: {source}"),
-            Self::SampleCleanup(source) => write!(formatter, "sample cleanup recovery failed: {source}"),
+            Self::SampleCleanup(source) => {
+                write!(formatter, "sample cleanup recovery failed: {source}")
+            }
             Self::AudioTrack(source) => write!(formatter, "audio-track recovery failed: {source}"),
             Self::AudioTrackDuplication(source) => {
-                write!(formatter, "audio-track duplication recovery failed: {source}")
+                write!(
+                    formatter,
+                    "audio-track duplication recovery failed: {source}"
+                )
             }
             Self::AudioTrackContentRemoval(source) => {
-                write!(formatter, "audio-track content removal recovery failed: {source}")
+                write!(
+                    formatter,
+                    "audio-track content removal recovery failed: {source}"
+                )
             }
             Self::TrackOrder(source) => write!(formatter, "track-order recovery failed: {source}"),
             Self::AudioClip(source) => write!(formatter, "audio-clip recovery failed: {source}"),
@@ -194,9 +202,7 @@ impl Error for ProjectTransactionRecoveryErrorSource {
             | Self::AudioTrackDuplication(source)
             | Self::AudioTrackContentRemoval(source)
             | Self::TrackOrder(source)
-            | Self::AudioClip(source) => {
-                Some(source)
-            }
+            | Self::AudioClip(source) => Some(source),
             Self::ControlMapping(source) => Some(source),
             Self::Recording(source) => Some(source),
             Self::Rename(source) => Some(source),
@@ -383,9 +389,9 @@ pub fn recover_project_transactions(
                     Vec::new(),
                     Vec::new(),
                 ),
-                source: Box::new(ProjectTransactionRecoveryErrorSource::AudioTrackDuplication(
-                    source,
-                )),
+                source: Box::new(
+                    ProjectTransactionRecoveryErrorSource::AudioTrackDuplication(source),
+                ),
             });
         }
     };
@@ -404,9 +410,9 @@ pub fn recover_project_transactions(
                     Vec::new(),
                 )
                 .with_audio_track_duplications(audio_track_duplications),
-                source: Box::new(ProjectTransactionRecoveryErrorSource::AudioTrackContentRemoval(
-                    source,
-                )),
+                source: Box::new(
+                    ProjectTransactionRecoveryErrorSource::AudioTrackContentRemoval(source),
+                ),
             });
         }
     };

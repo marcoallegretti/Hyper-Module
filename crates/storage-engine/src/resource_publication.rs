@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod audio_clip_publication;
-mod audio_track_duplication;
 mod audio_track_content_removal;
+mod audio_track_duplication;
 mod sample_cleanup;
 
 pub use audio_clip_publication::{
@@ -25,17 +25,17 @@ pub use audio_clip_publication::{
     AudioClipRemovalRequest, ImportedAudioClipPublicationRequest, publish_audio_clip,
     publish_imported_audio_clip, recover_audio_clip_publications, remove_audio_clip,
 };
-pub use audio_track_duplication::{
-    AudioTrackDuplicationPublicationOutcome, AudioTrackDuplicationPublicationRecovery,
-    AudioTrackDuplicationPublicationRecoveryDisposition, AudioTrackDuplicationPublicationRequest,
-    RoutingBusDuplicationPublicationRequest, publish_audio_track_duplication,
-    publish_routing_bus_duplication, recover_audio_track_duplications,
-};
 pub use audio_track_content_removal::{
     AudioTrackContentRemovalPublicationOutcome, AudioTrackContentRemovalPublicationRecovery,
     AudioTrackContentRemovalPublicationRecoveryDisposition,
     AudioTrackContentRemovalPublicationRequest, publish_audio_track_content_removal,
     recover_audio_track_content_removals,
+};
+pub use audio_track_duplication::{
+    AudioTrackDuplicationPublicationOutcome, AudioTrackDuplicationPublicationRecovery,
+    AudioTrackDuplicationPublicationRecoveryDisposition, AudioTrackDuplicationPublicationRequest,
+    RoutingBusDuplicationPublicationRequest, publish_audio_track_duplication,
+    publish_routing_bus_duplication, recover_audio_track_duplications,
 };
 pub use sample_cleanup::{
     SampleCleanupOutcome, SampleCleanupRecovery, SampleCleanupRecoveryDisposition,
@@ -44,8 +44,8 @@ pub use sample_cleanup::{
 
 use super::project_lock::{
     AUDIO_TRACK_TRANSACTION_PREFIX, PROJECT_RESOURCE_TRANSACTION_PREFIX as TRANSACTION_PREFIX,
-    TRACK_ORDER_TRANSACTION_PREFIX,
-    ProjectLock, ProjectTransactionFamily, find_unhandled_project_transaction,
+    ProjectLock, ProjectTransactionFamily, TRACK_ORDER_TRANSACTION_PREFIX,
+    find_unhandled_project_transaction,
 };
 use super::stable_file::read_open_stable;
 use super::{
@@ -602,7 +602,10 @@ struct AudioTrackTransactionRecord {
     track: TransactionFile,
     mixer: TransactionFile,
     previous_mixer: TransactionFile,
-    #[serde(default, skip_serializing_if = "AudioTrackTransactionContract::is_audio")]
+    #[serde(
+        default,
+        skip_serializing_if = "AudioTrackTransactionContract::is_audio"
+    )]
     contract: AudioTrackTransactionContract,
     #[serde(
         default,
@@ -1695,12 +1698,7 @@ fn publish_track_order_observed(
         )
     })?;
     let tracks = resolve_track_order_tracks(&verified, request)?;
-    validate_track_order_document_identity(
-        &verified,
-        request,
-        &tracks,
-        &previous_mixer,
-    )?;
+    validate_track_order_document_identity(&verified, request, &tracks, &previous_mixer)?;
     if previous_mixer == request.documents.mixer()
         && tracks
             .iter()
@@ -1727,7 +1725,9 @@ fn publish_track_order_observed(
         recover_audio_track_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
     let recovered_orders =
         recover_track_order_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
-    if !recovered_resources.is_empty() || !recovered_tracks.is_empty() || !recovered_orders.is_empty()
+    if !recovered_resources.is_empty()
+        || !recovered_tracks.is_empty()
+        || !recovered_orders.is_empty()
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::ProjectChanged,
@@ -1785,13 +1785,15 @@ fn publish_track_order_observed(
         )
     })?;
     sync_dir(&backups)?;
-    let transaction = backups.open_dir_nofollow(&transaction_name).map_err(|error| {
-        caused(
-            ProjectResourcePublicationErrorKind::Io,
-            "open track-order transaction",
-            error,
-        )
-    })?;
+    let transaction = backups
+        .open_dir_nofollow(&transaction_name)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "open track-order transaction",
+                error,
+            )
+        })?;
     let result = run_track_order_publication(
         &verified,
         &backups,
@@ -1823,7 +1825,11 @@ fn publish_track_order_observed(
                 Ok(tx) => tx,
                 Err(_) if missing_file(&transaction, TRANSACTION_NAME)? => {
                     validate_track_order_prepublication_residue(&transaction, &transaction_name)?;
-                    clear_and_remove_track_order_transaction(&backups, transaction, &transaction_name)?;
+                    clear_and_remove_track_order_transaction(
+                        &backups,
+                        transaction,
+                        &transaction_name,
+                    )?;
                     return Err(operation_error);
                 }
                 Err(source) => {
@@ -1843,18 +1849,27 @@ fn publish_track_order_observed(
                 &tx,
             ) {
                 Ok(TrackOrderPublicationRecoveryDisposition::RolledBack) => {
-                    clear_and_remove_track_order_transaction(&backups, transaction, &transaction_name)?;
+                    clear_and_remove_track_order_transaction(
+                        &backups,
+                        transaction,
+                        &transaction_name,
+                    )?;
                     Err(operation_error)
                 }
                 Ok(TrackOrderPublicationRecoveryDisposition::Committed) => {
                     let outcome = track_order_outcome(&tx)?;
-                    clear_and_remove_track_order_transaction(&backups, transaction, &transaction_name)
-                        .map_err(|error| ProjectResourcePublicationError {
-                            kind: ProjectResourcePublicationErrorKind::Recovery,
-                            message: "track order was published but transaction cleanup is incomplete".to_owned(),
-                            published: true,
-                            source: Some(Box::new(error)),
-                        })?;
+                    clear_and_remove_track_order_transaction(
+                        &backups,
+                        transaction,
+                        &transaction_name,
+                    )
+                    .map_err(|error| ProjectResourcePublicationError {
+                        kind: ProjectResourcePublicationErrorKind::Recovery,
+                        message: "track order was published but transaction cleanup is incomplete"
+                            .to_owned(),
+                        published: true,
+                        source: Some(Box::new(error)),
+                    })?;
                     Ok(outcome)
                 }
                 Err(recovery_error) => Err(publication_recovery_failure(
@@ -2015,11 +2030,8 @@ fn publish_project_resource_observed(
         ProjectResourcePublicationMode::SceneRemoval
         | ProjectResourcePublicationMode::AutomationTakeRemoval
         | ProjectResourcePublicationMode::DeviceChainRemoval => {
-            let descriptor = unique_resource(
-                &verified,
-                request.resource_id,
-                request.expected_role,
-            )?;
+            let descriptor =
+                unique_resource(&verified, request.resource_id, request.expected_role)?;
             let previous = verified
                 .read_resource(request.resource_id)
                 .map_err(|error| {
@@ -2029,11 +2041,8 @@ fn publish_project_resource_observed(
                         error,
                     )
                 })?;
-            let candidate = candidate_removal_manifest(
-                &active_project,
-                request.resource_id,
-                next_revision,
-            )?;
+            let candidate =
+                candidate_removal_manifest(&active_project, request.resource_id, next_revision)?;
             let removed_parent_directory = verified
                 .manifest()
                 .resources()
@@ -2070,12 +2079,8 @@ fn publish_project_resource_observed(
         }
         ProjectResourcePublicationMode::DeviceChainAddition => {
             let path = format!("devices/{}.json", request.resource_id);
-            let created_parent_directory = inspect_addition_destination(
-                &verified.root_dir,
-                "devices",
-                &path,
-                "device chain",
-            )?;
+            let created_parent_directory =
+                inspect_addition_destination(&verified.root_dir, "devices", &path, "device chain")?;
             let candidate =
                 candidate_addition_manifest(&active_project, request, &path, next_revision)?;
             (path, None, created_parent_directory, candidate)
@@ -2160,8 +2165,9 @@ fn publish_project_resource_observed(
                 Err(source) => {
                     return Err(ProjectResourcePublicationError {
                         kind: ProjectResourcePublicationErrorKind::Recovery,
-                        message: "resource change failed and its durable transaction could not be read"
-                            .to_owned(),
+                        message:
+                            "resource change failed and its durable transaction could not be read"
+                                .to_owned(),
                         published: false,
                         source: Some(Box::new(source)),
                     });
@@ -2184,8 +2190,9 @@ fn publish_project_resource_observed(
                     clear_and_remove_transaction(&backups, transaction, &transaction_name)
                         .map_err(|error| ProjectResourcePublicationError {
                             kind: ProjectResourcePublicationErrorKind::Recovery,
-                            message: "resource change committed but transaction cleanup is incomplete"
-                                .to_owned(),
+                            message:
+                                "resource change committed but transaction cleanup is incomplete"
+                                    .to_owned(),
                             published: true,
                             source: Some(Box::new(error)),
                         })?;
@@ -2417,7 +2424,13 @@ fn run_resource_removal(
     }
     parent
         .remove_file(file_name(resource_path)?)
-        .map_err(|error| caused(ProjectResourcePublicationErrorKind::Io, "remove project resource", error))?;
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "remove project resource",
+                error,
+            )
+        })?;
     sync_dir(&parent)?;
     observer(PublicationPhase::ResourceFile, verified.root())?;
     if removed_parent_directory {
@@ -2465,7 +2478,11 @@ fn run_resource_removal(
         "project manifest",
     )?;
     observer(PublicationPhase::Manifest, verified.root())?;
-    verify_committed(verified.root(), &verified.root_dir, digest(candidate_project))?;
+    verify_committed(
+        verified.root(),
+        &verified.root_dir,
+        digest(candidate_project),
+    )?;
     finish_removed_resource(&verified.root_dir, &tx)?;
     outcome_from_transaction(&tx, true)
 }
@@ -2751,8 +2768,16 @@ fn run_track_order_publication(
         &Path,
     ) -> Result<(), ProjectResourcePublicationError>,
 ) -> Result<TrackOrderPublicationOutcome, ProjectResourcePublicationError> {
-    write_track_order_intent(transaction, transaction_name, request.documents.tracks().len())?;
-    for (index, (active, replacement)) in active_tracks.iter().zip(request.documents.tracks()).enumerate() {
+    write_track_order_intent(
+        transaction,
+        transaction_name,
+        request.documents.tracks().len(),
+    )?;
+    for (index, (active, replacement)) in active_tracks
+        .iter()
+        .zip(request.documents.tracks())
+        .enumerate()
+    {
         write_exclusive_synced(
             transaction,
             &track_order_staging_name(index),
@@ -2769,20 +2794,18 @@ fn run_track_order_publication(
         TRACK_ORDER_MIXER_STAGING_NAME,
         request.documents.mixer(),
     )?;
-    write_exclusive_synced(
-        transaction,
-        TRACK_ORDER_PREVIOUS_MIXER_NAME,
-        previous_mixer,
-    )?;
+    write_exclusive_synced(transaction, TRACK_ORDER_PREVIOUS_MIXER_NAME, previous_mixer)?;
     write_exclusive_synced(transaction, PROJECT_STAGING_NAME, candidate_project)?;
     write_exclusive_synced(transaction, PREVIOUS_PROJECT_NAME, previous_project)?;
     let mut tracks = Vec::new();
-    tracks.try_reserve_exact(request.documents.tracks().len()).map_err(|_| {
-        failure(
-            ProjectResourcePublicationErrorKind::ResourceConflict,
-            "allocate track-order transaction records",
-        )
-    })?;
+    tracks
+        .try_reserve_exact(request.documents.tracks().len())
+        .map_err(|_| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "allocate track-order transaction records",
+            )
+        })?;
     for (active, replacement) in active_tracks.iter().zip(request.documents.tracks()) {
         tracks.push(TrackOrderTransactionTrack {
             track_id: replacement.track_id().to_owned(),
@@ -2856,14 +2879,16 @@ fn run_track_order_publication(
         "track-order mixer",
     )?;
     observer(TrackOrderPublicationPhase::Mixer, verified.root())?;
-    let candidate = verify_project_candidate(verified.root(), &verified.root_dir, candidate_project)
-        .map_err(|error| {
-            caused(
-                ProjectResourcePublicationErrorKind::Integrity,
-                "track-order publication candidate does not verify",
-                error,
-            )
-        })?;
+    let candidate =
+        verify_project_candidate(verified.root(), &verified.root_dir, candidate_project).map_err(
+            |error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "track-order publication candidate does not verify",
+                    error,
+                )
+            },
+        )?;
     if candidate.revision() != next_revision {
         return Err(failure(
             ProjectResourcePublicationErrorKind::Integrity,
@@ -2880,7 +2905,11 @@ fn run_track_order_publication(
         "track-order project manifest",
     )?;
     observer(TrackOrderPublicationPhase::Manifest, verified.root())?;
-    verify_committed(verified.root(), &verified.root_dir, digest(candidate_project))?;
+    verify_committed(
+        verified.root(),
+        &verified.root_dir,
+        digest(candidate_project),
+    )?;
     track_order_outcome(&tx)
 }
 
@@ -3265,7 +3294,9 @@ fn validate_routing_bus_document_identity(
         || track["project_id"].as_str() != Some(project_id)
         || track["kind"].as_str() != Some(track_kind)
         || track["active"].as_bool() != Some(true)
-        || track["clip_ids"].as_array().is_none_or(|clips| !clips.is_empty())
+        || track["clip_ids"]
+            .as_array()
+            .is_none_or(|clips| !clips.is_empty())
         || mixer["format"].as_str() != Some("hyper-mixer")
         || mixer["format_version"].as_u64() != Some(1)
         || mixer["id"].as_str() != Some(request.mixer_id)
@@ -3288,9 +3319,7 @@ fn validate_routing_bus_document_identity(
         || (kind == RoutingBusPublicationKind::Group && !send_ids.is_empty())
         || (kind == RoutingBusPublicationKind::Return
             && (send_ids.len() != source_track_ids.len()
-                || send_ids
-                    .iter()
-                    .any(|id| !is_valid_entity_id(id))))
+                || send_ids.iter().any(|id| !is_valid_entity_id(id))))
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
@@ -3334,8 +3363,7 @@ fn validate_routing_bus_document_identity(
                     error,
                 )
             })?;
-            if source["kind"].as_str() != Some("audio")
-                || source["active"].as_bool() != Some(true)
+            if source["kind"].as_str() != Some("audio") || source["active"].as_bool() != Some(true)
             {
                 return Err(failure(
                     ProjectResourcePublicationErrorKind::InvalidResource,
@@ -3351,11 +3379,9 @@ fn validate_routing_bus_document_identity(
         )
     })?;
     let mut expected = previous.clone();
-    if previous_channels.len().checked_add(1) != Some(
-        mixer["channels"]
-            .as_array()
-            .map_or(usize::MAX, Vec::len),
-    ) {
+    if previous_channels.len().checked_add(1)
+        != Some(mixer["channels"].as_array().map_or(usize::MAX, Vec::len))
+    {
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
             "routing-bus candidate must append exactly one matching channel",
@@ -3376,13 +3402,9 @@ fn validate_routing_bus_document_identity(
                     .as_str()
                     .is_some_and(|track_id| sources.contains(track_id))
             }) {
-                matched.insert(
-                    channel["track_id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_owned(),
-                );
-                channel["destination"] = serde_json::json!({"kind": "track", "track_id": request.track_id});
+                matched.insert(channel["track_id"].as_str().unwrap_or_default().to_owned());
+                channel["destination"] =
+                    serde_json::json!({"kind": "track", "track_id": request.track_id});
             }
             if sources.iter().any(|source| !matched.contains(*source)) {
                 return Err(failure(
@@ -3442,11 +3464,10 @@ fn validate_routing_bus_document_identity(
                     all_send_ids.insert(id);
                 }
             }
-            if send_ids.iter().any(|id| {
-                id == request.track_id
-                    || id == project_id
-                    || !all_send_ids.insert(id)
-            }) {
+            if send_ids
+                .iter()
+                .any(|id| id == request.track_id || id == project_id || !all_send_ids.insert(id))
+            {
                 return Err(failure(
                     ProjectResourcePublicationErrorKind::InvalidResource,
                     "routing-bus send identity conflicts with the active mixer",
@@ -3494,20 +3515,23 @@ fn validate_routing_bus_document_identity(
             return_buses.sort_by_key(|entry| entry["bus"].as_str().unwrap_or_default().to_owned());
         }
     }
-    expected["channels"].as_array_mut().ok_or_else(|| {
-        failure(
-            ProjectResourcePublicationErrorKind::Integrity,
-            "current mixer channel collection changed during validation",
-        )
-    })?.push(serde_json::json!({
-        "track_id": request.track_id,
-        "gain_millionths": 1_000_000,
-        "pan_millionths": 0,
-        "mute": false,
-        "solo": false,
-        "destination": {"kind": "main"},
-        "sends": []
-    }));
+    expected["channels"]
+        .as_array_mut()
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "current mixer channel collection changed during validation",
+            )
+        })?
+        .push(serde_json::json!({
+            "track_id": request.track_id,
+            "gain_millionths": 1_000_000,
+            "pan_millionths": 0,
+            "mute": false,
+            "solo": false,
+            "destination": {"kind": "main"},
+            "sends": []
+        }));
     if expected != mixer {
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
@@ -3649,21 +3673,25 @@ fn validate_audio_track_removal_documents(
             error,
         )
     })?;
-    let (expected_kind, removes_return_mapping, requires_empty_owned_sends) = match &request.contract {
-        AudioTrackTransactionContract::Audio => ("audio", false, false),
-        AudioTrackTransactionContract::RoutingGroup { source_track_ids }
-            if source_track_ids.is_empty() => ("group", false, true),
-        AudioTrackTransactionContract::RoutingReturn {
-            source_track_ids,
-            send_ids,
-        } if source_track_ids.is_empty() && send_ids.is_empty() => ("return", true, false),
-        _ => {
-            return Err(failure(
-                ProjectResourcePublicationErrorKind::InvalidResource,
-                "structural track-removal contract is invalid",
-            ));
-        }
-    };
+    let (expected_kind, removes_return_mapping, requires_empty_owned_sends) =
+        match &request.contract {
+            AudioTrackTransactionContract::Audio => ("audio", false, false),
+            AudioTrackTransactionContract::RoutingGroup { source_track_ids }
+                if source_track_ids.is_empty() =>
+            {
+                ("group", false, true)
+            }
+            AudioTrackTransactionContract::RoutingReturn {
+                source_track_ids,
+                send_ids,
+            } if source_track_ids.is_empty() && send_ids.is_empty() => ("return", true, false),
+            _ => {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::InvalidResource,
+                    "structural track-removal contract is invalid",
+                ));
+            }
+        };
     if track["format"].as_str() != Some("hyper-track")
         || track["id"].as_str() != Some(request.track_id)
         || track["kind"].as_str() != Some(expected_kind)
@@ -3785,9 +3813,11 @@ fn validate_audio_track_removal_documents(
             )
         })?;
         if previous_channels.iter().any(|channel| {
-            channel["sends"]
-                .as_array()
-                .is_some_and(|sends| sends.iter().any(|send| send["bus"].as_str() == Some(removed_bus)))
+            channel["sends"].as_array().is_some_and(|sends| {
+                sends
+                    .iter()
+                    .any(|send| send["bus"].as_str() == Some(removed_bus))
+            })
         }) {
             return Err(failure(
                 ProjectResourcePublicationErrorKind::ResourceConflict,
@@ -4028,12 +4058,14 @@ fn resolve_track_order_tracks(
         ));
     }
     let mut tracks = Vec::new();
-    tracks.try_reserve_exact(request.documents.tracks().len()).map_err(|_| {
-        failure(
-            ProjectResourcePublicationErrorKind::ResourceConflict,
-            "allocate track-order active-resource state",
-        )
-    })?;
+    tracks
+        .try_reserve_exact(request.documents.tracks().len())
+        .map_err(|_| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "allocate track-order active-resource state",
+            )
+        })?;
     for replacement in request.documents.tracks() {
         let descriptor = unique_resource(verified, replacement.track_id(), ResourceRole::Track)?;
         let expected_path = format!("tracks/{}.json", replacement.track_id());
@@ -4043,13 +4075,15 @@ fn resolve_track_order_tracks(
                 "track-order publication requires canonical track resource paths",
             ));
         }
-        let previous = verified.read_resource(replacement.track_id()).map_err(|error| {
-            caused(
-                ProjectResourcePublicationErrorKind::Integrity,
-                "read current track-order resource",
-                error,
-            )
-        })?;
+        let previous = verified
+            .read_resource(replacement.track_id())
+            .map_err(|error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "read current track-order resource",
+                    error,
+                )
+            })?;
         tracks.push(TrackOrderActiveTrack {
             path: descriptor.path().to_owned(),
             previous,
@@ -4093,13 +4127,14 @@ fn validate_track_order_document_identity(
                 error,
             )
         })?;
-        let mut candidate: Value = serde_json::from_slice(replacement.bytes()).map_err(|error| {
-            caused(
-                ProjectResourcePublicationErrorKind::InvalidResource,
-                "parse candidate track-order track",
-                error,
-            )
-        })?;
+        let mut candidate: Value =
+            serde_json::from_slice(replacement.bytes()).map_err(|error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::InvalidResource,
+                    "parse candidate track-order track",
+                    error,
+                )
+            })?;
         if previous["format"].as_str() != Some("hyper-track")
             || previous["format_version"].as_u64() != Some(1)
             || previous["id"].as_str() != Some(replacement.track_id())
@@ -4161,13 +4196,14 @@ fn validate_track_order_document_identity(
             error,
         )
     })?;
-    let mut candidate: Value = serde_json::from_slice(request.documents.mixer()).map_err(|error| {
-        caused(
-            ProjectResourcePublicationErrorKind::InvalidResource,
-            "parse candidate track-order mixer",
-            error,
-        )
-    })?;
+    let mut candidate: Value =
+        serde_json::from_slice(request.documents.mixer()).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "parse candidate track-order mixer",
+                error,
+            )
+        })?;
     if previous["format"].as_str() != Some("hyper-mixer")
         || previous["format_version"].as_u64() != Some(1)
         || previous["id"].as_str() != Some(request.mixer_id)
@@ -4221,9 +4257,7 @@ fn validate_track_order_document_identity(
         let Some((index, previous_channel)) = previous_channels
             .iter()
             .enumerate()
-            .find(|(index, channel)| {
-                !consumed[*index] && channel["track_id"].as_str() == Some(id)
-            })
+            .find(|(index, channel)| !consumed[*index] && channel["track_id"].as_str() == Some(id))
         else {
             return Err(failure(
                 ProjectResourcePublicationErrorKind::InvalidResource,
@@ -4486,13 +4520,15 @@ fn write_track_order_intent(
         )
     })?;
     write_exclusive_synced(transaction, INTENT_STAGING_NAME, &bytes)?;
-    transaction.rename(INTENT_STAGING_NAME, transaction, INTENT_NAME).map_err(|error| {
-        caused(
-            ProjectResourcePublicationErrorKind::Io,
-            "publish track-order transaction intent",
-            error,
-        )
-    })?;
+    transaction
+        .rename(INTENT_STAGING_NAME, transaction, INTENT_NAME)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "publish track-order transaction intent",
+                error,
+            )
+        })?;
     sync_dir(transaction)
 }
 
@@ -5062,8 +5098,9 @@ fn recover_track_order_transaction(
             .and_then(|()| verify_committed(root_path, root, after))
             .map_err(|source| ProjectResourcePublicationError {
                 kind: ProjectResourcePublicationErrorKind::Recovery,
-                message: "committed track-order transaction could not be verified or fully recovered"
-                    .to_owned(),
+                message:
+                    "committed track-order transaction could not be verified or fully recovered"
+                        .to_owned(),
                 published: true,
                 source: Some(Box::new(source)),
             })?;
@@ -5102,13 +5139,7 @@ fn validate_track_order_rollback_authority(
     root: &Dir,
     tx: &TrackOrderTransactionRecord,
 ) -> Result<(), ProjectResourcePublicationError> {
-    validate_track_order_active_file(
-        root,
-        &tx.mixer.path,
-        &tx.previous_mixer,
-        &tx.mixer,
-        "mixer",
-    )?;
+    validate_track_order_active_file(root, &tx.mixer.path, &tx.previous_mixer, &tx.mixer, "mixer")?;
     for track in &tx.tracks {
         validate_track_order_active_file(
             root,
@@ -5153,7 +5184,10 @@ fn rollback_track_order_mixer(
     let parent = open_relative_parent(root, &tx.mixer.path)?;
     let current = read_optional_file(&parent, file_name(&tx.mixer.path)?)?;
     let previous = decode_digest(&tx.previous_mixer.sha256)?;
-    if current.as_deref().is_some_and(|bytes| digest(bytes) == previous) {
+    if current
+        .as_deref()
+        .is_some_and(|bytes| digest(bytes) == previous)
+    {
         return Ok(());
     }
     publish_staged_file(
@@ -5177,7 +5211,10 @@ fn rollback_track_order_track(
     let parent = open_relative_parent(root, &track.track.path)?;
     let current = read_optional_file(&parent, file_name(&track.track.path)?)?;
     let previous = decode_digest(&track.previous_track.sha256)?;
-    if current.as_deref().is_some_and(|bytes| digest(bytes) == previous) {
+    if current
+        .as_deref()
+        .is_some_and(|bytes| digest(bytes) == previous)
+    {
         return Ok(());
     }
     publish_staged_file(
@@ -5273,14 +5310,20 @@ fn validate_staged_track_order_transaction(
         ));
     }
     let mut replacements = Vec::new();
-    replacements.try_reserve_exact(tx.tracks.len()).map_err(|_| {
-        failure(
-            ProjectResourcePublicationErrorKind::Recovery,
-            "allocate staged track-order resources",
-        )
-    })?;
+    replacements
+        .try_reserve_exact(tx.tracks.len())
+        .map_err(|_| {
+            failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "allocate staged track-order resources",
+            )
+        })?;
     for (index, track) in tx.tracks.iter().enumerate() {
-        let bytes = read_bounded(transaction, &track_order_staging_name(index), MAX_JSON_BYTES)?;
+        let bytes = read_bounded(
+            transaction,
+            &track_order_staging_name(index),
+            MAX_JSON_BYTES,
+        )?;
         let previous = read_bounded(
             transaction,
             &track_order_previous_staging_name(index),
@@ -5360,12 +5403,14 @@ fn validate_staged_track_order_transaction(
         &tx.mixer,
     )?;
     let mut request_tracks = Vec::new();
-    request_tracks.try_reserve_exact(tx.tracks.len()).map_err(|_| {
-        failure(
-            ProjectResourcePublicationErrorKind::Recovery,
-            "allocate track-order candidate request",
-        )
-    })?;
+    request_tracks
+        .try_reserve_exact(tx.tracks.len())
+        .map_err(|_| {
+            failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "allocate track-order candidate request",
+            )
+        })?;
     for (entry, (bytes, _)) in tx.tracks.iter().zip(&replacements) {
         validate_track_order_manifest_descriptor(
             &previous_manifest,
@@ -5758,9 +5803,7 @@ fn validate_recovered_routing_bus_sources(
                 error,
             )
         })?;
-        if source["kind"].as_str() != Some("audio")
-            || source["active"].as_bool() != Some(true)
-        {
+        if source["kind"].as_str() != Some("audio") || source["active"].as_bool() != Some(true) {
             return Err(failure(
                 ProjectResourcePublicationErrorKind::Recovery,
                 "routing-bus transaction source is not an active audio track",
@@ -5838,13 +5881,14 @@ fn read_track_order_transaction(
 ) -> Result<TrackOrderTransactionRecord, ProjectResourcePublicationError> {
     let intent_bytes = read_bounded(transaction, INTENT_NAME, MAX_JSON_BYTES)?;
     require_canonical(&intent_bytes, "track-order transaction intent")?;
-    let intent: TrackOrderTransactionIntent = serde_json::from_slice(&intent_bytes).map_err(|error| {
-        caused(
-            ProjectResourcePublicationErrorKind::Recovery,
-            "parse track-order transaction intent",
-            error,
-        )
-    })?;
+    let intent: TrackOrderTransactionIntent =
+        serde_json::from_slice(&intent_bytes).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "parse track-order transaction intent",
+                error,
+            )
+        })?;
     let bytes = read_bounded(transaction, TRANSACTION_NAME, MAX_JSON_BYTES)?;
     require_canonical(&bytes, "track-order transaction")?;
     let tx: TrackOrderTransactionRecord = serde_json::from_slice(&bytes).map_err(|error| {
@@ -5861,13 +5905,14 @@ fn read_track_order_transaction(
             && is_valid_entity_id(&track.track_id)
             && track.track.path == format!("tracks/{}.json", track.track_id)
             && track.track.path == track.previous_track.path
-            && ["current", "previous"].iter().zip([&track.track, &track.previous_track]).all(
-                |(_, file)| {
+            && ["current", "previous"]
+                .iter()
+                .zip([&track.track, &track.previous_track])
+                .all(|(_, file)| {
                     file.byte_length > 0
                         && file.byte_length <= MAX_JSON_FILE_BYTES
                         && decode_digest(&file.sha256).is_ok()
-                },
-            )
+                })
     });
     if intent.format != "hyper-track-order-publication-intent"
         || intent.format_version != 1
@@ -5909,13 +5954,14 @@ fn validate_track_order_prepublication_residue(
     if !missing_file(transaction, INTENT_NAME)? {
         let bytes = read_bounded(transaction, INTENT_NAME, MAX_JSON_BYTES)?;
         require_canonical(&bytes, "track-order transaction intent")?;
-        let intent: TrackOrderTransactionIntent = serde_json::from_slice(&bytes).map_err(|error| {
-            caused(
-                ProjectResourcePublicationErrorKind::Recovery,
-                "parse incomplete track-order transaction intent",
-                error,
-            )
-        })?;
+        let intent: TrackOrderTransactionIntent =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "parse incomplete track-order transaction intent",
+                    error,
+                )
+            })?;
         if intent.format != "hyper-track-order-publication-intent"
             || intent.format_version != 1
             || intent.id != id
@@ -6460,12 +6506,10 @@ fn validate_transaction_descriptors(
                 .any(|descriptor| descriptor.id() == tx.resource_id)
             || previous_manifest.resources().len()
                 != candidate_manifest.resources().len().saturating_add(1)
-            || !candidate_manifest.resources().iter().eq(
-                previous_manifest
-                    .resources()
-                    .iter()
-                    .filter(|descriptor| descriptor.id() != tx.resource_id),
-            )
+            || !candidate_manifest.resources().iter().eq(previous_manifest
+                .resources()
+                .iter()
+                .filter(|descriptor| descriptor.id() != tx.resource_id))
             || previous_bytes.is_some()
             || tx.previous_resource.is_some()
         {
@@ -6608,7 +6652,9 @@ fn read_transaction(
     Ok(tx)
 }
 
-fn removal_directory(tx: &TransactionRecord) -> Result<&'static str, ProjectResourcePublicationError> {
+fn removal_directory(
+    tx: &TransactionRecord,
+) -> Result<&'static str, ProjectResourcePublicationError> {
     match tx.resource_role.as_str() {
         "scene" if addition_path_matches(tx, "scenes") => Ok("scenes"),
         "automation-take" if addition_path_matches(tx, "takes") => Ok("takes"),
@@ -7256,12 +7302,14 @@ fn clear_track_order_transaction(
         PREVIOUS_PROJECT_NAME.to_owned(),
         TRANSACTION_NAME.to_owned(),
     ];
-    names.try_reserve(track_count.saturating_mul(2)).map_err(|_| {
-        failure(
-            ProjectResourcePublicationErrorKind::Recovery,
-            "allocate track-order transaction cleanup names",
-        )
-    })?;
+    names
+        .try_reserve(track_count.saturating_mul(2))
+        .map_err(|_| {
+            failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "allocate track-order transaction cleanup names",
+            )
+        })?;
     for index in 0..track_count {
         names.push(track_order_staging_name(index));
         names.push(track_order_previous_staging_name(index));
@@ -7411,13 +7459,15 @@ fn clear_and_remove_track_order_transaction(
     name: &str,
 ) -> Result<(), ProjectResourcePublicationError> {
     let quarantine = format!(".track-order-cleanup-{}", Uuid::new_v4());
-    backups.rename(name, backups, &quarantine).map_err(|error| {
-        caused(
-            ProjectResourcePublicationErrorKind::Recovery,
-            "quarantine track-order transaction",
-            error,
-        )
-    })?;
+    backups
+        .rename(name, backups, &quarantine)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "quarantine track-order transaction",
+                error,
+            )
+        })?;
     let moved = backups.open_dir_nofollow(&quarantine).map_err(|error| {
         caused(
             ProjectResourcePublicationErrorKind::Recovery,
@@ -7888,8 +7938,7 @@ mod tests {
         mixer: &[u8],
     ) -> ([u8; 32], hyper_playback_json::MixerStripReorderDocuments) {
         use hyper_playback_json::{
-            LoaderLimits, PlaybackJsonInput, load as load_playback,
-            serialize_mixer_strip_reorder,
+            LoaderLimits, PlaybackJsonInput, load as load_playback, serialize_mixer_strip_reorder,
         };
 
         let package = verify_project_package(&fixture.root).unwrap();
@@ -7959,8 +8008,7 @@ mod tests {
         hyper_playback_json::RoutingBusCreationDocuments,
     ) {
         use hyper_playback_json::{
-            LoaderLimits, PlaybackJsonInput, load as load_playback,
-            serialize_routing_bus_creation,
+            LoaderLimits, PlaybackJsonInput, load as load_playback, serialize_routing_bus_creation,
         };
 
         let package = verify_project_package(&fixture.root).unwrap();
@@ -8062,7 +8110,9 @@ mod tests {
         )
         .unwrap();
         let mixer = package.read_resource(mixer_id).unwrap();
-        project.load_mixer(&mixer, &[], LoaderLimits::VERSION_1).unwrap();
+        project
+            .load_mixer(&mixer, &[], LoaderLimits::VERSION_1)
+            .unwrap();
     }
 
     struct ArrangementFixture {
@@ -8603,8 +8653,14 @@ mod tests {
                 },
             )
             .unwrap_err();
-            assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::InvalidResource);
-            assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), initial_manifest);
+            assert_eq!(
+                error.kind(),
+                ProjectResourcePublicationErrorKind::InvalidResource
+            );
+            assert_eq!(
+                fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(),
+                initial_manifest
+            );
             assert!(!fixture.root.join("devices").exists());
         }
 
@@ -8635,8 +8691,14 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::InvalidResource);
-        assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), manifest_after_addition);
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+        assert_eq!(
+            fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(),
+            manifest_after_addition
+        );
         let mut replacement: Value = serde_json::from_slice(&valid).unwrap();
         replacement["devices"][0]["state"]["parameters"]["threshold_millidecibels"] =
             json!(-17_000);
@@ -8724,9 +8786,16 @@ mod tests {
                 }
             );
             let verified = verify_project_package(&fixture.root).unwrap();
-            assert_eq!(verified.manifest().revision(), if committed { 3 } else { 2 });
             assert_eq!(
-                fixture.root.join("devices").join(format!("{DEVICE_CHAIN_ID}.json")).exists(),
+                verified.manifest().revision(),
+                if committed { 3 } else { 2 }
+            );
+            assert_eq!(
+                fixture
+                    .root
+                    .join("devices")
+                    .join(format!("{DEVICE_CHAIN_ID}.json"))
+                    .exists(),
                 !committed
             );
             assert_eq!(fixture.root.join("devices").exists(), !committed);
@@ -8837,7 +8906,10 @@ mod tests {
                 }
             );
             let verified = verify_project_package(&fixture.root).unwrap();
-            assert_eq!(verified.manifest().revision(), if committed { 3 } else { 2 });
+            assert_eq!(
+                verified.manifest().revision(),
+                if committed { 3 } else { 2 }
+            );
             assert_eq!(
                 fixture
                     .root
@@ -8899,7 +8971,10 @@ mod tests {
             let error = recover_project_resource_publications(&fixture.root).unwrap_err();
             assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
             assert_eq!(fs::read(&active_path).unwrap(), fixture.take);
-            assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), manifest_before);
+            assert_eq!(
+                fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(),
+                manifest_before
+            );
             assert_eq!(fixture.transaction_count(), 1);
         }
     }
@@ -9201,7 +9276,10 @@ mod tests {
                 }
             );
             let verified = verify_project_package(&fixture.root).unwrap();
-            assert_eq!(verified.manifest().revision(), if committed { 3 } else { 2 });
+            assert_eq!(
+                verified.manifest().revision(),
+                if committed { 3 } else { 2 }
+            );
             assert_eq!(
                 fixture
                     .root
@@ -9975,7 +10053,10 @@ mod tests {
             return_mixer["return_buses"],
             json!([{"bus":"a", "track_id":RETURN_BUS_ID}])
         );
-        assert_eq!(return_mixer["channels"][0]["sends"][0]["id"], RETURN_SEND_ID);
+        assert_eq!(
+            return_mixer["channels"][0]["sends"][0]["id"],
+            RETURN_SEND_ID
+        );
         assert_active_mixer_loads(&return_fixture.root, &return_fixture.mixer_id);
     }
 
@@ -10032,11 +10113,13 @@ mod tests {
             let package = verify_project_package(&fixture.root).unwrap();
             if crash_phase == AudioTrackPublicationPhase::Manifest {
                 assert_active_mixer_loads(&fixture.root, &fixture.mixer_id);
-                assert!(package
-                    .manifest()
-                    .resources()
-                    .iter()
-                    .any(|resource| resource.id() == GROUP_BUS_ID));
+                assert!(
+                    package
+                        .manifest()
+                        .resources()
+                        .iter()
+                        .any(|resource| resource.id() == GROUP_BUS_ID)
+                );
             } else {
                 assert_eq!(*package.manifest_sha256(), identity);
             }
@@ -10072,9 +10155,17 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::InvalidResource);
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
         assert_eq!(fixture.transaction_count(), 0);
-        assert_eq!(*verify_project_package(&fixture.root).unwrap().manifest_sha256(), identity);
+        assert_eq!(
+            *verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest_sha256(),
+            identity
+        );
     }
 
     #[test]
@@ -10182,7 +10273,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(group.project_revision(), 4);
-        assert!(!group_fixture.root.join(format!("tracks/{GROUP_BUS_ID}.json")).exists());
+        assert!(
+            !group_fixture
+                .root
+                .join(format!("tracks/{GROUP_BUS_ID}.json"))
+                .exists()
+        );
         assert_active_mixer_loads(&group_fixture.root, &group_fixture.mixer_id);
 
         let return_fixture = AudioTrackFixture::new();
@@ -10253,7 +10349,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(returned.project_revision(), 4);
-        assert!(!return_fixture.root.join(format!("tracks/{RETURN_BUS_ID}.json")).exists());
+        assert!(
+            !return_fixture
+                .root
+                .join(format!("tracks/{RETURN_BUS_ID}.json"))
+                .exists()
+        );
         assert_active_mixer_loads(&return_fixture.root, &return_fixture.mixer_id);
     }
 
@@ -10298,7 +10399,10 @@ mod tests {
 
         let error = validate_audio_track_removal_documents(&request, documents.track(), &previous)
             .expect_err("storage must refuse a candidate that drops a Group-owned send");
-        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::ResourceConflict);
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::ResourceConflict
+        );
     }
 
     #[test]
@@ -10328,12 +10432,8 @@ mod tests {
                 AudioTrackPublicationPhase::Manifest,
             ] {
                 let fixture = AudioTrackFixture::new();
-                let (identity, source_track_id, documents) = prepared_routing_bus_documents(
-                    &fixture,
-                    playback_kind,
-                    track_id,
-                    send_id,
-                );
+                let (identity, source_track_id, documents) =
+                    prepared_routing_bus_documents(&fixture, playback_kind, track_id, send_id);
                 let source_track_ids = [source_track_id.as_str()];
                 let send_ids = send_id.map_or_else(Vec::new, |id| vec![id]);
                 publish_routing_bus(
@@ -10423,18 +10523,22 @@ mod tests {
                 );
                 let package = verify_project_package(&fixture.root).unwrap();
                 if crash_phase == AudioTrackPublicationPhase::Manifest {
-                    assert!(package
-                        .manifest()
-                        .resources()
-                        .iter()
-                        .all(|resource| resource.id() != track_id));
+                    assert!(
+                        package
+                            .manifest()
+                            .resources()
+                            .iter()
+                            .all(|resource| resource.id() != track_id)
+                    );
                     assert_active_mixer_loads(&fixture.root, &fixture.mixer_id);
                 } else {
-                    assert!(package
-                        .manifest()
-                        .resources()
-                        .iter()
-                        .any(|resource| resource.id() == track_id));
+                    assert!(
+                        package
+                            .manifest()
+                            .resources()
+                            .iter()
+                            .any(|resource| resource.id() == track_id)
+                    );
                 }
             }
         }
@@ -10443,8 +10547,7 @@ mod tests {
     #[test]
     fn reorders_every_track_and_the_matching_mixer_in_one_publication() {
         use hyper_playback_json::{
-            LoaderLimits, PlaybackJsonInput, load as load_playback,
-            serialize_mixer_strip_reorder,
+            LoaderLimits, PlaybackJsonInput, load as load_playback, serialize_mixer_strip_reorder,
         };
 
         let fixture = AudioTrackFixture::new();
@@ -10516,10 +10619,8 @@ mod tests {
         assert_eq!(outcome.project_revision(), 3);
         let reopened = verify_project_package(&fixture.root).unwrap();
         assert_eq!(*reopened.manifest_sha256(), *outcome.project_identity());
-        let mixer: Value = serde_json::from_slice(
-            &reopened.read_resource(&fixture.mixer_id).unwrap(),
-        )
-        .unwrap();
+        let mixer: Value =
+            serde_json::from_slice(&reopened.read_resource(&fixture.mixer_id).unwrap()).unwrap();
         assert_eq!(
             mixer["channels"]
                 .as_array()
@@ -10564,7 +10665,10 @@ mod tests {
             error.kind(),
             ProjectResourcePublicationErrorKind::InvalidResource
         );
-        assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), previous_manifest);
+        assert_eq!(
+            fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(),
+            previous_manifest
+        );
         assert_eq!(
             fs::read(fixture.root.join("mixer/main.json")).unwrap(),
             previous_mixer
@@ -10612,10 +10716,9 @@ mod tests {
             );
             let package = verify_project_package(&fixture.root).unwrap();
             if crash_phase == TrackOrderPublicationPhase::Manifest {
-                let mixer: Value = serde_json::from_slice(
-                    &package.read_resource(&fixture.mixer_id).unwrap(),
-                )
-                .unwrap();
+                let mixer: Value =
+                    serde_json::from_slice(&package.read_resource(&fixture.mixer_id).unwrap())
+                        .unwrap();
                 assert_eq!(
                     mixer["channels"][0]["track_id"].as_str(),
                     Some(NEW_TRACK_ID)

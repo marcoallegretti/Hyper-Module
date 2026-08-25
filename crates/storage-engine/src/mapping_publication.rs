@@ -2243,9 +2243,7 @@ mod tests {
         let published = publish_control_mapping(
             &root,
             ControlMappingPublicationRequest {
-                expected_project_sha256: *verify_project_package(&root)
-                    .unwrap()
-                    .manifest_sha256(),
+                expected_project_sha256: *verify_project_package(&root).unwrap().manifest_sha256(),
                 mapping_bytes: &mapping,
             },
         )
@@ -2350,8 +2348,16 @@ mod tests {
     #[test]
     fn publication_raises_each_edge_source_capability_independently() {
         for (source, expect_clock, expect_reset) in [
-            (json!({"kind": "clock-input", "edge": "rising"}), true, false),
-            (json!({"kind": "reset-input", "edge": "falling"}), false, true),
+            (
+                json!({"kind": "clock-input", "edge": "rising"}),
+                true,
+                false,
+            ),
+            (
+                json!({"kind": "reset-input", "edge": "falling"}),
+                false,
+                true,
+            ),
         ] {
             let parent = std::env::temp_dir().join(format!(
                 "hyper-mapping-edge-capability-{}-{}",
@@ -2425,7 +2431,12 @@ mod tests {
             "an under-declared capability is not an unchanged project"
         );
         let verified = verify_project_package(&fixture.root).unwrap();
-        assert!(verified.manifest().required_capabilities().has_clock_input());
+        assert!(
+            verified
+                .manifest()
+                .required_capabilities()
+                .has_clock_input()
+        );
         assert_eq!(
             verified.read_resource(MAPPING_ID).unwrap(),
             identical,

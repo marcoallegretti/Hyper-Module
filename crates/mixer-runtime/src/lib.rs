@@ -18,8 +18,8 @@ use hyper_audio_engine::{
 };
 use hyper_media_cache::{PreparedPlayback, PreparedSceneAvailability, PreparedSchedule};
 use hyper_native_device::{
-    DeviceChain, NativeDeviceChainProcessor, NativeDeviceCreationError,
-    NativeDeviceProcessError, NativeDeviceState, MAX_DEVICES_PER_CHAIN, PROJECT_SAMPLE_RATE_HZ,
+    DeviceChain, MAX_DEVICES_PER_CHAIN, NativeDeviceChainProcessor, NativeDeviceCreationError,
+    NativeDeviceProcessError, NativeDeviceState, PROJECT_SAMPLE_RATE_HZ,
 };
 use hyper_playback_compiler::FrameTimelineError;
 use hyper_playback_compiler::scene::{SceneRuntimeCheckpoint, SceneRuntimeError};
@@ -34,8 +34,8 @@ use sha2::{Digest, Sha256};
 use crate::metronome::Metronome;
 
 mod loudness_presentation;
-mod metronome;
 mod meter_ballistics;
+mod metronome;
 mod recovery;
 pub use hyper_playback_compiler::scene::SceneLaunchState;
 pub use loudness_presentation::{
@@ -168,15 +168,26 @@ impl Error for RuntimeCreationError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeProcessError {
-    OutputLengthMismatch { left: usize, right: usize },
+    OutputLengthMismatch {
+        left: usize,
+        right: usize,
+    },
     ChannelTapOutputLengthMismatch {
         output_frames: usize,
         left: usize,
         right: usize,
     },
-    ChannelTapUnavailable { channel_index: usize, channel_count: usize },
-    DuplicateChannelTap { channel_index: usize },
-    BlockLimit { actual: usize, maximum: usize },
+    ChannelTapUnavailable {
+        channel_index: usize,
+        channel_count: usize,
+    },
+    DuplicateChannelTap {
+        channel_index: usize,
+    },
+    BlockLimit {
+        actual: usize,
+        maximum: usize,
+    },
     FrameRangeOverflow,
     Scene(SceneRuntimeError),
     TransportCommand(TransportCommandApplyError),
@@ -215,7 +226,10 @@ impl fmt::Display for RuntimeProcessError {
                 "runtime channel tap {channel_index} is outside {channel_count} compiled channels"
             ),
             Self::DuplicateChannelTap { channel_index } => {
-                write!(formatter, "runtime channel tap {channel_index} was requested more than once")
+                write!(
+                    formatter,
+                    "runtime channel tap {channel_index} was requested more than once"
+                )
             }
             Self::BlockLimit { actual, maximum } => write!(
                 formatter,
@@ -344,7 +358,10 @@ impl TransportLoopRange {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportLoopRangeError {
-    EmptyRange { start_frame: usize, end_frame: usize },
+    EmptyRange {
+        start_frame: usize,
+        end_frame: usize,
+    },
 }
 
 impl fmt::Display for TransportLoopRangeError {
@@ -1169,7 +1186,8 @@ impl NativeDeviceLayout {
             NativeDeviceCommand::SetEnabled { device, .. }
             | NativeDeviceCommand::SetState { device, .. } => device,
         };
-        let resolved = self.slots
+        let resolved = self
+            .slots
             .get(device.slot)
             .and_then(|slot| slot.devices.get(device.device))
             .filter(|resolved| self.id == device.layout_id && resolved.handle == device)
@@ -1180,7 +1198,10 @@ impl NativeDeviceLayout {
                 if matches!(
                     (resolved.state, state),
                     (NativeDeviceState::Filter(_), NativeDeviceState::Filter(_))
-                        | (NativeDeviceState::Compressor(_), NativeDeviceState::Compressor(_))
+                        | (
+                            NativeDeviceState::Compressor(_),
+                            NativeDeviceState::Compressor(_)
+                        )
                 ) =>
             {
                 Ok(())
@@ -1215,9 +1236,10 @@ impl NativeDeviceStateSnapshot {
         if device_counts
             .iter()
             .all(|count| *count <= MAX_DEVICES_PER_CHAIN)
-            && device_counts.iter().enumerate().all(|(slot, count)| {
-                states[slot][..*count].iter().all(Option::is_some)
-            })
+            && device_counts
+                .iter()
+                .enumerate()
+                .all(|(slot, count)| states[slot][..*count].iter().all(Option::is_some))
         {
             Some(Self {
                 layout_signature,
@@ -1704,8 +1726,7 @@ impl TransportCommandSender {
                 return Err(TransportCommandSendError::SceneUnavailable { command, reason });
             }
         }
-        if matches!(command, TransportCommand::SetMetronomeEnabled(_))
-            && !self.metronome_available
+        if matches!(command, TransportCommand::SetMetronomeEnabled(_)) && !self.metronome_available
         {
             return Err(TransportCommandSendError::MetronomeUnavailable { command });
         }
@@ -2999,11 +3020,8 @@ fn build_routed_main_runtime<R>(
             .find(|chain| chain.track_id() == compiled_slot.track_id())
             .map(|chain| {
                 Ok(GraphDeviceRuntime {
-                    processor: NativeDeviceChainProcessor::try_new(
-                        chain,
-                        PROJECT_SAMPLE_RATE_HZ,
-                    )
-                    .map_err(RuntimeCreationError::NativeDevice)?,
+                    processor: NativeDeviceChainProcessor::try_new(chain, PROJECT_SAMPLE_RATE_HZ)
+                        .map_err(RuntimeCreationError::NativeDevice)?,
                     output: StereoBuffer::try_new(max_block_frames)?,
                 })
             })
@@ -3330,7 +3348,9 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
             .expect("a validated native device command targets a prepared chain");
         match command {
             NativeDeviceCommand::SetEnabled { enabled, .. } => assert!(
-                processor.processor.set_device_enabled(device.device, enabled),
+                processor
+                    .processor
+                    .set_device_enabled(device.device, enabled),
                 "a validated native device command targets a prepared device"
             ),
             NativeDeviceCommand::SetState { state, .. } => assert!(
@@ -3600,9 +3620,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 });
             }
             if channel_indices[..tap_index].contains(&channel_index) {
-                return Err(RuntimeProcessError::DuplicateChannelTap {
-                    channel_index,
-                });
+                return Err(RuntimeProcessError::DuplicateChannelTap { channel_index });
             }
         }
         let rendered =
@@ -4125,7 +4143,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         Self,
     ) {
         let layout = runtime.take_native_device_layout();
-        let (transport_commands, mixer_commands, mut transport) = Self::with_command_queues(runtime);
+        let (transport_commands, mixer_commands, mut transport) =
+            Self::with_command_queues(runtime);
         let (producer, consumer) = RingBuffer::new(MAX_QUEUED_NATIVE_DEVICE_COMMANDS);
         transport.native_device_command_consumer = Some(consumer);
         (
@@ -4377,7 +4396,6 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             None
         }
     }
-
 
     /// Processes the next transport-owned callback window.
     ///

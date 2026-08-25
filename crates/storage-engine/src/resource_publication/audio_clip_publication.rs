@@ -2383,9 +2383,7 @@ fn read_audio_clip_transaction(
             )
         )
         || (tx.format_version == 1
-            && (tx.sample.is_some()
-                || tx.created_sample_directory
-                || tx.created_asset_directory))
+            && (tx.sample.is_some() || tx.created_sample_directory || tx.created_asset_directory))
         || (tx.format_version == 2 && (tx.sample.is_none() || tx.created_asset_directory))
         || (tx.format_version == 3
             && (tx.sample.is_none()
@@ -2395,8 +2393,7 @@ fn read_audio_clip_transaction(
                 || tx.created_clip_directory
                 || tx.created_sample_directory
                 || tx.created_asset_directory))
-        || (tx.operation == AudioClipTransactionOperation::Publication
-            && tx.removed_clip_directory)
+        || (tx.operation == AudioClipTransactionOperation::Publication && tx.removed_clip_directory)
         || !tx.extensions.is_empty()
         || tx.id != expected_id
         || !is_valid_entity_id(&tx.clip_id)
@@ -2929,7 +2926,13 @@ mod tests {
                 .iter()
                 .all(|descriptor| descriptor.id() != CLIP_ID)
         );
-        assert!(verified.manifest().assets().iter().any(|asset| asset.id() == ASSET_ID));
+        assert!(
+            verified
+                .manifest()
+                .assets()
+                .iter()
+                .any(|asset| asset.id() == ASSET_ID)
+        );
         assert!(fixture.transaction_names().is_empty());
     }
 
@@ -2950,7 +2953,9 @@ mod tests {
         let mut request = fixture.removal_request();
         request.track_bytes = &changed;
         assert_eq!(
-            remove_audio_clip(&fixture.root, request).unwrap_err().kind(),
+            remove_audio_clip(&fixture.root, request)
+                .unwrap_err()
+                .kind(),
             ProjectResourcePublicationErrorKind::InvalidResource
         );
         assert_eq!(
@@ -3004,7 +3009,10 @@ mod tests {
                 fs::read(fixture.root.join(format!("tracks/{TRACK_ID}.json"))).unwrap(),
                 fixture.track
             );
-            assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), manifest_before);
+            assert_eq!(
+                fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(),
+                manifest_before
+            );
             assert_eq!(fs::read(asset_path).unwrap(), asset_before);
             assert_eq!(
                 verify_project_package(&fixture.root)
@@ -3022,18 +3030,15 @@ mod tests {
         let fixture = Fixture::new();
         fixture.publish_clip();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let _ = remove_audio_clip_observed(
-                &fixture.root,
-                fixture.removal_request(),
-                |phase, _| {
+            let _ =
+                remove_audio_clip_observed(&fixture.root, fixture.removal_request(), |phase, _| {
                     assert_ne!(
                         phase,
                         AudioClipPublicationPhase::Manifest,
                         "simulated process crash"
                     );
                     Ok(())
-                },
-            );
+                });
         }));
         assert!(result.is_err());
 
@@ -3067,10 +3072,8 @@ mod tests {
             .root
             .join(format!("assets/recordings/{ASSET_ID}.wav"));
         let asset_before = fs::read(&asset_path).unwrap();
-        let error = remove_audio_clip_observed(
-            &fixture.root,
-            fixture.removal_request(),
-            |phase, _| {
+        let error =
+            remove_audio_clip_observed(&fixture.root, fixture.removal_request(), |phase, _| {
                 if phase != AudioClipPublicationPhase::Manifest {
                     return Ok(());
                 }
@@ -3088,9 +3091,8 @@ mod tests {
                     ProjectResourcePublicationErrorKind::Io,
                     "simulated post-manifest removal failure",
                 ))
-            },
-        )
-        .unwrap_err();
+            })
+            .unwrap_err();
 
         assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
         assert!(error.published());
@@ -3283,19 +3285,15 @@ mod tests {
             asset_id: IMPORT_ASSET_ID,
         };
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let _ = publish_audio_clip_observed(
-                &fixture.root,
-                request,
-                Some(&sample),
-                |phase, _| {
+            let _ =
+                publish_audio_clip_observed(&fixture.root, request, Some(&sample), |phase, _| {
                     assert_ne!(
                         phase,
                         AudioClipPublicationPhase::Manifest,
                         "simulated process crash"
                     );
                     Ok(())
-                },
-            );
+                });
         }));
         assert!(result.is_err());
 

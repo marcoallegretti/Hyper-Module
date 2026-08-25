@@ -11,9 +11,9 @@ use hyper_control_runtime::{
 use hyper_mixer_runtime::{
     LocateState, MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSendError,
     MixerParameterCommandSender, MixerParameterResolveError, MixerParameterStateSnapshot,
-    MixerParameterTargetError, MixerSendHandle, PlaybackRecoveryCheckpoint,
-    PlaybackRecoveryTransportState, NativeDeviceCommand, NativeDeviceCommandSendError,
-    NativeDeviceCommandSender, TransportCommand, TransportCommandSendError, TransportCommandSender,
+    MixerParameterTargetError, MixerSendHandle, NativeDeviceCommand, NativeDeviceCommandSendError,
+    NativeDeviceCommandSender, PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState,
+    TransportCommand, TransportCommandSendError, TransportCommandSender,
 };
 
 pub type DesktopControlMappingRuntime = ControlRuntime<DesktopControlSink>;
@@ -638,7 +638,9 @@ impl RuntimeControlSink for DesktopControlSink {
                     | TransportCommand::StopInteractiveScenes
                     | TransportCommand::SetLoopRange(_)
                     | TransportCommand::SetLoopEnabled(_)
-                    | TransportCommand::SetMetronomeEnabled(_) => DirectControlStateUpdate::Unchanged,
+                    | TransportCommand::SetMetronomeEnabled(_) => {
+                        DirectControlStateUpdate::Unchanged
+                    }
                 })
             }
         }

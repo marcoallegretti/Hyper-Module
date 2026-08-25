@@ -36,11 +36,9 @@ pub const NATIVE_COMPRESSOR_THRESHOLD_PARAMETER: &str =
     "org.hyper-module.native-compressor/threshold";
 pub const NATIVE_COMPRESSOR_RATIO_PARAMETER: &str = "org.hyper-module.native-compressor/ratio";
 pub const NATIVE_COMPRESSOR_ATTACK_PARAMETER: &str = "org.hyper-module.native-compressor/attack";
-pub const NATIVE_COMPRESSOR_RELEASE_PARAMETER: &str =
-    "org.hyper-module.native-compressor/release";
+pub const NATIVE_COMPRESSOR_RELEASE_PARAMETER: &str = "org.hyper-module.native-compressor/release";
 pub const NATIVE_COMPRESSOR_MAKEUP_PARAMETER: &str = "org.hyper-module.native-compressor/makeup";
-pub const NATIVE_COMPRESSOR_ENABLED_PARAMETER: &str =
-    "org.hyper-module.native-compressor/enabled";
+pub const NATIVE_COMPRESSOR_ENABLED_PARAMETER: &str = "org.hyper-module.native-compressor/enabled";
 pub const MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS: i32 = -80_000;
 pub const MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS: i32 = 0;
 pub const MIN_COMPRESSOR_RATIO_MILLIONTHS: u32 = 1_000_000;
@@ -677,7 +675,9 @@ impl DeviceChain {
         state: NativeCompressorState,
     ) -> Result<Self, DeviceChainError> {
         let mut devices = self.devices.clone();
-        devices.push(NativeDeviceInstance::try_new_compressor(id, enabled, state)?);
+        devices.push(NativeDeviceInstance::try_new_compressor(
+            id, enabled, state,
+        )?);
         self.try_with_devices(devices)
     }
 
@@ -704,13 +704,12 @@ impl DeviceChain {
             ));
         };
         if device.filter_state().is_none() {
-            return Err(invalid_domain("native device kind does not match the requested edit"));
+            return Err(invalid_domain(
+                "native device kind does not match the requested edit",
+            ));
         }
-        *device = NativeDeviceInstance::try_new_filter(
-            device_instance_id.to_owned(),
-            enabled,
-            state,
-        )?;
+        *device =
+            NativeDeviceInstance::try_new_filter(device_instance_id.to_owned(), enabled, state)?;
         self.try_with_devices(devices)
     }
 
@@ -737,7 +736,9 @@ impl DeviceChain {
             ));
         };
         if device.compressor_state().is_none() {
-            return Err(invalid_domain("native device kind does not match the requested edit"));
+            return Err(invalid_domain(
+                "native device kind does not match the requested edit",
+            ));
         }
         *device = NativeDeviceInstance::try_new_compressor(
             device_instance_id.to_owned(),
@@ -1229,11 +1230,8 @@ impl NativeFilterProcessor {
             let left_input = f64::from(*left);
             let right_input = f64::from(*right);
             let (next_left, next_right) = if let Some(active) = &mut transition {
-                let old_left = process_biquad_sample(
-                    active.coefficients,
-                    &mut active.channels[0],
-                    left_input,
-                );
+                let old_left =
+                    process_biquad_sample(active.coefficients, &mut active.channels[0], left_input);
                 let old_right = process_biquad_sample(
                     active.coefficients,
                     &mut active.channels[1],
@@ -1242,9 +1240,8 @@ impl NativeFilterProcessor {
                 let new_left = process_biquad_sample(self.coefficients, &mut states[0], left_input);
                 let new_right =
                     process_biquad_sample(self.coefficients, &mut states[1], right_input);
-                let progress = f64::from(
-                    PARAMETER_TRANSITION_FRAMES - active.frames_remaining + 1,
-                ) / f64::from(PARAMETER_TRANSITION_FRAMES);
+                let progress = f64::from(PARAMETER_TRANSITION_FRAMES - active.frames_remaining + 1)
+                    / f64::from(PARAMETER_TRANSITION_FRAMES);
                 active.frames_remaining -= 1;
                 if active.frames_remaining == 0 {
                     transition = None;
@@ -1263,9 +1260,14 @@ impl NativeFilterProcessor {
             let next_right = next_right as f32;
             if !next_left.is_finite()
                 || !next_right.is_finite()
-                || !states.iter().all(|state| state.z1.is_finite() && state.z2.is_finite())
+                || !states
+                    .iter()
+                    .all(|state| state.z1.is_finite() && state.z2.is_finite())
                 || transition.is_some_and(|active| {
-                    active.channels.iter().any(|state| !state.z1.is_finite() || !state.z2.is_finite())
+                    active
+                        .channels
+                        .iter()
+                        .any(|state| !state.z1.is_finite() || !state.z2.is_finite())
                 })
             {
                 self.reset();
@@ -1431,8 +1433,7 @@ impl NativeCompressorProcessor {
         let rate = f64::from(PROJECT_SAMPLE_RATE_HZ);
         let attack_seconds = f64::from(state.attack_microseconds()) / 1_000_000.0;
         let release_seconds = f64::from(state.release_microseconds()) / 1_000_000.0;
-        let makeup_gain =
-            10.0_f64.powf(f64::from(state.makeup_millidecibels()) / 1_000.0 / 20.0);
+        let makeup_gain = 10.0_f64.powf(f64::from(state.makeup_millidecibels()) / 1_000.0 / 20.0);
         if self.enabled {
             self.transition = Some(CompressorTransition {
                 threshold_decibels: self.threshold_decibels,
@@ -1505,9 +1506,8 @@ impl NativeCompressorProcessor {
                     self.makeup_gain,
                     &mut gain_reduction_decibels,
                 );
-                let progress = f64::from(
-                    PARAMETER_TRANSITION_FRAMES - active.frames_remaining + 1,
-                ) / f64::from(PARAMETER_TRANSITION_FRAMES);
+                let progress = f64::from(PARAMETER_TRANSITION_FRAMES - active.frames_remaining + 1)
+                    / f64::from(PARAMETER_TRANSITION_FRAMES);
                 active.frames_remaining -= 1;
                 if active.frames_remaining == 0 {
                     transition = None;
@@ -1547,7 +1547,10 @@ impl NativeCompressorProcessor {
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "the callback path keeps both crossfade states explicit and allocation-free")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the callback path keeps both crossfade states explicit and allocation-free"
+)]
 fn process_compressor_sample(
     left: f64,
     right: f64,
@@ -1661,20 +1664,12 @@ impl NativeDeviceChainProcessor {
             .map_err(|_| NativeDeviceCreationError::CapacityUnavailable)?;
         for device in &chain.devices {
             devices.push(match device.state() {
-                NativeDeviceState::Filter(state) => {
-                    NativeDeviceProcessor::Filter(NativeFilterProcessor::try_new(
-                        *state,
-                        device.enabled,
-                        sample_rate_hz,
-                    )?)
-                }
-                NativeDeviceState::Compressor(state) => {
-                    NativeDeviceProcessor::Compressor(NativeCompressorProcessor::try_new(
-                        *state,
-                        device.enabled,
-                        sample_rate_hz,
-                    )?)
-                }
+                NativeDeviceState::Filter(state) => NativeDeviceProcessor::Filter(
+                    NativeFilterProcessor::try_new(*state, device.enabled, sample_rate_hz)?,
+                ),
+                NativeDeviceState::Compressor(state) => NativeDeviceProcessor::Compressor(
+                    NativeCompressorProcessor::try_new(*state, device.enabled, sample_rate_hz)?,
+                ),
             });
         }
         Ok(Self { devices })
@@ -1838,9 +1833,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(upgraded.format_version(), CURRENT_FORMAT_VERSION);
-        assert_eq!(upgraded.devices()[0].filter_state(), Some(state(NativeFilterMode::LowPass)));
-        assert_eq!(upgraded.devices()[1].compressor_state(), Some(compressor_state()));
-        let upgraded_wire: Value = serde_json::from_slice(&upgraded.to_canonical_vec().unwrap()).unwrap();
+        assert_eq!(
+            upgraded.devices()[0].filter_state(),
+            Some(state(NativeFilterMode::LowPass))
+        );
+        assert_eq!(
+            upgraded.devices()[1].compressor_state(),
+            Some(compressor_state())
+        );
+        let upgraded_wire: Value =
+            serde_json::from_slice(&upgraded.to_canonical_vec().unwrap()).unwrap();
         assert_eq!(upgraded_wire["devices"][0]["state"]["kind"], "filter");
         assert_eq!(upgraded_wire["devices"][1]["state"]["kind"], "compressor");
     }
@@ -1882,16 +1884,35 @@ mod tests {
             .unwrap();
         let moved = chain.try_with_moved_device(DEVICE_ID, 1).unwrap();
         assert_eq!(
-            moved.devices().iter().map(NativeDeviceInstance::id).collect::<Vec<_>>(),
+            moved
+                .devices()
+                .iter()
+                .map(NativeDeviceInstance::id)
+                .collect::<Vec<_>>(),
             [second_id, DEVICE_ID]
         );
-        assert_eq!(moved.devices()[0].compressor_state(), Some(compressor_state()));
+        assert_eq!(
+            moved.devices()[0].compressor_state(),
+            Some(compressor_state())
+        );
         assert!(!moved.devices()[0].enabled());
-        assert_eq!(moved.devices()[1].filter_state(), Some(state(NativeFilterMode::LowPass)));
+        assert_eq!(
+            moved.devices()[1].filter_state(),
+            Some(state(NativeFilterMode::LowPass))
+        );
         assert!(moved.devices()[1].enabled());
-        assert_eq!(moved.to_canonical_vec().unwrap(), DeviceChain::parse(&moved.to_canonical_vec().unwrap()).unwrap().to_canonical_vec().unwrap());
+        assert_eq!(
+            moved.to_canonical_vec().unwrap(),
+            DeviceChain::parse(&moved.to_canonical_vec().unwrap())
+                .unwrap()
+                .to_canonical_vec()
+                .unwrap()
+        );
         let restored = moved.try_with_moved_device(DEVICE_ID, 0).unwrap();
-        assert_eq!(restored.to_canonical_vec().unwrap(), chain.to_canonical_vec().unwrap());
+        assert_eq!(
+            restored.to_canonical_vec().unwrap(),
+            chain.to_canonical_vec().unwrap()
+        );
         assert!(chain.try_with_moved_device(second_id, 1).is_err());
         assert!(chain.try_with_moved_device("missing", 0).is_err());
         assert!(chain.try_with_moved_device(second_id, 2).is_err());
@@ -1904,7 +1925,8 @@ mod tests {
         let source_chain = chain(true)
             .try_with_appended_compressor(source_id.to_owned(), false, compressor_state())
             .unwrap();
-        let mut source_wire: Value = serde_json::from_slice(&source_chain.to_canonical_vec().unwrap()).unwrap();
+        let mut source_wire: Value =
+            serde_json::from_slice(&source_chain.to_canonical_vec().unwrap()).unwrap();
         source_wire["devices"][1]["extensions"] = serde_json::json!({
             "org.example.fixture": { "retained": true }
         });
@@ -1922,10 +1944,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             [DEVICE_ID, source_id, duplicate_id]
         );
-        assert_eq!(duplicated.devices()[1].device_id(), duplicated.devices()[2].device_id());
-        assert_eq!(duplicated.devices()[1].state(), duplicated.devices()[2].state());
-        assert_eq!(duplicated.devices()[1].enabled(), duplicated.devices()[2].enabled());
-        assert_eq!(duplicated.devices()[1].extensions(), duplicated.devices()[2].extensions());
+        assert_eq!(
+            duplicated.devices()[1].device_id(),
+            duplicated.devices()[2].device_id()
+        );
+        assert_eq!(
+            duplicated.devices()[1].state(),
+            duplicated.devices()[2].state()
+        );
+        assert_eq!(
+            duplicated.devices()[1].enabled(),
+            duplicated.devices()[2].enabled()
+        );
+        assert_eq!(
+            duplicated.devices()[1].extensions(),
+            duplicated.devices()[2].extensions()
+        );
         assert_eq!(
             duplicated.devices()[2].extensions()["org.example.fixture"],
             serde_json::json!({ "retained": true })
@@ -1935,9 +1969,11 @@ mod tests {
             DeviceChain::parse(&duplicated.to_canonical_vec().unwrap()).unwrap(),
             duplicated
         );
-        assert!(source_chain
-            .try_with_duplicated_device(source_id, source_id.to_owned())
-            .is_err());
+        assert!(
+            source_chain
+                .try_with_duplicated_device(source_id, source_id.to_owned())
+                .is_err()
+        );
         assert_eq!(source_chain.to_canonical_vec().unwrap(), source_bytes);
         assert_eq!(
             source_chain
@@ -1947,9 +1983,11 @@ mod tests {
             DeviceChainErrorKind::InvalidDomain
         );
         assert_eq!(source_chain.to_canonical_vec().unwrap(), source_bytes);
-        assert!(source_chain
-            .try_with_duplicated_device("missing", duplicate_id.to_owned())
-            .is_err());
+        assert!(
+            source_chain
+                .try_with_duplicated_device("missing", duplicate_id.to_owned())
+                .is_err()
+        );
 
         let mut full = chain(true);
         for id in [
@@ -1966,12 +2004,13 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(full.devices().len(), MAX_DEVICES_PER_CHAIN);
-        assert!(full
-            .try_with_duplicated_device(
+        assert!(
+            full.try_with_duplicated_device(
                 DEVICE_ID,
                 "018f47a2-6b2d-7c11-8a44-001122338013".to_owned(),
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]
@@ -1998,7 +2037,11 @@ mod tests {
         assert_eq!(cloned.id(), "018f47a2-6b2d-7c11-8a44-001122338041");
         assert_eq!(cloned.track_id(), "018f47a2-6b2d-7c11-8a44-001122338042");
         assert_eq!(
-            cloned.devices().iter().map(NativeDeviceInstance::id).collect::<Vec<_>>(),
+            cloned
+                .devices()
+                .iter()
+                .map(NativeDeviceInstance::id)
+                .collect::<Vec<_>>(),
             [
                 "018f47a2-6b2d-7c11-8a44-001122338043",
                 "018f47a2-6b2d-7c11-8a44-001122338044",
@@ -2006,7 +2049,10 @@ mod tests {
         );
         assert_eq!(cloned.format_version(), source.format_version());
         assert_eq!(cloned.devices()[1].state(), source.devices()[1].state());
-        assert_eq!(DeviceChain::parse(&cloned.to_canonical_vec().unwrap()).unwrap(), cloned);
+        assert_eq!(
+            DeviceChain::parse(&cloned.to_canonical_vec().unwrap()).unwrap(),
+            cloned
+        );
         assert_eq!(source.to_canonical_vec().unwrap(), source_bytes);
         assert_eq!(
             source
@@ -2068,7 +2114,8 @@ mod tests {
         let source_chain = chain(true)
             .try_with_appended_compressor(source_id.to_owned(), false, compressor_state())
             .unwrap();
-        let mut source_wire: Value = serde_json::from_slice(&source_chain.to_canonical_vec().unwrap()).unwrap();
+        let mut source_wire: Value =
+            serde_json::from_slice(&source_chain.to_canonical_vec().unwrap()).unwrap();
         source_wire["devices"][1]["extensions"] = serde_json::json!({
             "org.example.fixture": { "copied": true }
         });
@@ -2094,7 +2141,11 @@ mod tests {
             .try_with_copied_device_after(source, target.devices()[0].id(), copied_id.to_owned())
             .unwrap();
         assert_eq!(
-            copied.devices().iter().map(NativeDeviceInstance::id).collect::<Vec<_>>(),
+            copied
+                .devices()
+                .iter()
+                .map(NativeDeviceInstance::id)
+                .collect::<Vec<_>>(),
             [target.devices()[0].id(), copied_id]
         );
         assert_eq!(copied.devices()[1].device_id(), source.device_id());
@@ -2260,7 +2311,8 @@ mod tests {
             DeviceChainErrorKind::InvalidDomain
         );
 
-        let mut legacy = serde_json::from_slice::<Value>(&chain(true).to_canonical_vec().unwrap()).unwrap();
+        let mut legacy =
+            serde_json::from_slice::<Value>(&chain(true).to_canonical_vec().unwrap()).unwrap();
         legacy["devices"][0]["state"] = base["devices"][0]["state"].clone();
         let legacy_bytes = serde_json_canonicalizer::to_vec(&legacy).unwrap();
         assert!(matches!(
@@ -2319,7 +2371,8 @@ mod tests {
             vec![filter, compressor],
         )
         .unwrap();
-        let mut processor = NativeDeviceChainProcessor::try_new(&chain, PROJECT_SAMPLE_RATE_HZ).unwrap();
+        let mut processor =
+            NativeDeviceChainProcessor::try_new(&chain, PROJECT_SAMPLE_RATE_HZ).unwrap();
 
         assert_eq!(processor.device_enabled(0), Some(true));
         assert_eq!(processor.device_enabled(1), Some(true));
@@ -2347,7 +2400,8 @@ mod tests {
             .process_in_place(&mut replay_left, &mut replay_right)
             .unwrap();
 
-        let mut fresh = NativeDeviceChainProcessor::try_new(&chain, PROJECT_SAMPLE_RATE_HZ).unwrap();
+        let mut fresh =
+            NativeDeviceChainProcessor::try_new(&chain, PROJECT_SAMPLE_RATE_HZ).unwrap();
         let mut fresh_left = [0.0_f32; 64];
         fresh_left[0] = 1.0;
         let mut fresh_right = fresh_left;
@@ -2355,7 +2409,10 @@ mod tests {
             .process_in_place(&mut fresh_left, &mut fresh_right)
             .unwrap();
         assert_eq!(replay_left.map(f32::to_bits), fresh_left.map(f32::to_bits));
-        assert_eq!(replay_right.map(f32::to_bits), fresh_right.map(f32::to_bits));
+        assert_eq!(
+            replay_right.map(f32::to_bits),
+            fresh_right.map(f32::to_bits)
+        );
     }
 
     #[test]
@@ -2443,10 +2500,7 @@ mod tests {
             NativeDeviceChainProcessor::try_new(&chain, PROJECT_SAMPLE_RATE_HZ).unwrap();
         let before = processor.device_state(0);
 
-        assert!(!processor.set_device_state(
-            0,
-            NativeDeviceState::Compressor(compressor_state()),
-        ));
+        assert!(!processor.set_device_state(0, NativeDeviceState::Compressor(compressor_state()),));
 
         assert_eq!(processor.device_state(0), before);
     }
@@ -2589,7 +2643,10 @@ mod tests {
             .process_in_place(&mut replay_left, &mut replay_right)
             .unwrap();
         assert_eq!(whole_left.map(f32::to_bits), replay_left.map(f32::to_bits));
-        assert_eq!(whole_right.map(f32::to_bits), replay_right.map(f32::to_bits));
+        assert_eq!(
+            whole_right.map(f32::to_bits),
+            replay_right.map(f32::to_bits)
+        );
     }
 
     #[test]
@@ -2615,10 +2672,22 @@ mod tests {
         unity
             .process_in_place(&mut unity_left, &mut unity_right)
             .unwrap();
-        assert_eq!(bypass_left.map(f32::to_bits), expected_left.map(f32::to_bits));
-        assert_eq!(bypass_right.map(f32::to_bits), expected_right.map(f32::to_bits));
-        assert_eq!(unity_left.map(f32::to_bits), expected_left.map(f32::to_bits));
-        assert_eq!(unity_right.map(f32::to_bits), expected_right.map(f32::to_bits));
+        assert_eq!(
+            bypass_left.map(f32::to_bits),
+            expected_left.map(f32::to_bits)
+        );
+        assert_eq!(
+            bypass_right.map(f32::to_bits),
+            expected_right.map(f32::to_bits)
+        );
+        assert_eq!(
+            unity_left.map(f32::to_bits),
+            expected_left.map(f32::to_bits)
+        );
+        assert_eq!(
+            unity_right.map(f32::to_bits),
+            expected_right.map(f32::to_bits)
+        );
     }
 
     fn compressor_threshold_and_ratio_are_directional() {
@@ -2659,10 +2728,14 @@ mod tests {
         assert!(lower_threshold.gain_reduction_decibels > higher_threshold.gain_reduction_decibels);
         let mut source = [1.0_f32; 512];
         let mut right = source;
-        higher_ratio.process_in_place(&mut source, &mut right).unwrap();
+        higher_ratio
+            .process_in_place(&mut source, &mut right)
+            .unwrap();
         let mut source = [1.0_f32; 512];
         let mut right = source;
-        lower_ratio.process_in_place(&mut source, &mut right).unwrap();
+        lower_ratio
+            .process_in_place(&mut source, &mut right)
+            .unwrap();
         assert!(higher_ratio.gain_reduction_decibels > lower_ratio.gain_reduction_decibels);
     }
 
@@ -2704,10 +2777,14 @@ mod tests {
         let mut slow_release = release_state(2_000_000);
         let mut high_left = [1.0_f32; 512];
         let mut high_right = high_left;
-        fast_release.process_in_place(&mut high_left, &mut high_right).unwrap();
+        fast_release
+            .process_in_place(&mut high_left, &mut high_right)
+            .unwrap();
         let mut high_left = [1.0_f32; 512];
         let mut high_right = high_left;
-        slow_release.process_in_place(&mut high_left, &mut high_right).unwrap();
+        slow_release
+            .process_in_place(&mut high_left, &mut high_right)
+            .unwrap();
         let mut fast_release_left = [0.01_f32; 32];
         let mut fast_release_right = fast_release_left;
         fast_release
@@ -2741,7 +2818,9 @@ mod tests {
             .unwrap();
         let mut makeup_left = [0.25_f32];
         let mut makeup_right = makeup_left;
-        makeup.process_in_place(&mut makeup_left, &mut makeup_right).unwrap();
+        makeup
+            .process_in_place(&mut makeup_left, &mut makeup_right)
+            .unwrap();
         assert!(makeup_left[0] > no_makeup_left[0]);
     }
 

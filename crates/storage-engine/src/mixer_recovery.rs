@@ -13,7 +13,9 @@ use uuid::Uuid;
 
 use super::project_lock::{ProjectLock, ProjectLockError};
 use super::stable_file::read_open_stable;
-use super::{MAX_JSON_FILE_BYTES, StructurallyVerifiedProject, decode_sha256, verify_project_package};
+use super::{
+    MAX_JSON_FILE_BYTES, StructurallyVerifiedProject, decode_sha256, verify_project_package,
+};
 
 const BACKUPS_DIRECTORY: &str = "backups";
 const SNAPSHOT_DIRECTORY: &str = "mixer-recovery";
@@ -195,13 +197,14 @@ pub fn load_mixer_recovery_snapshot(
     };
     let record = parse_record(&record_bytes)?;
     let mixer_file = mixer_payload_name(&record)?;
-    let manifest_sha256 = decode_sha256(&record.manifest_sha256, RECORD_NAME).map_err(|source| {
-        caused(
-            MixerRecoverySnapshotErrorKind::SnapshotInvalid,
-            "decode mixer recovery project digest",
-            source,
-        )
-    })?;
+    let manifest_sha256 =
+        decode_sha256(&record.manifest_sha256, RECORD_NAME).map_err(|source| {
+            caused(
+                MixerRecoverySnapshotErrorKind::SnapshotInvalid,
+                "decode mixer recovery project digest",
+                source,
+            )
+        })?;
     if record.project_id != verified.manifest().project_id()
         || manifest_sha256 != *verified.manifest_sha256()
     {
@@ -342,13 +345,14 @@ fn mixer_payload_name(record: &SnapshotRecord) -> Result<&str, MixerRecoverySnap
 }
 
 fn parse_record(bytes: &[u8]) -> Result<SnapshotRecord, MixerRecoverySnapshotError> {
-    let value: serde_json::Value = hyper_strict_json::parse(bytes, MAX_SNAPSHOT_BYTES).map_err(|source| {
-        caused(
-            MixerRecoverySnapshotErrorKind::SnapshotInvalid,
-            "parse mixer recovery snapshot record",
-            source,
-        )
-    })?;
+    let value: serde_json::Value =
+        hyper_strict_json::parse(bytes, MAX_SNAPSHOT_BYTES).map_err(|source| {
+            caused(
+                MixerRecoverySnapshotErrorKind::SnapshotInvalid,
+                "parse mixer recovery snapshot record",
+                source,
+            )
+        })?;
     let canonical = serde_json_canonicalizer::to_vec(&value).map_err(|source| {
         caused(
             MixerRecoverySnapshotErrorKind::SnapshotInvalid,
@@ -374,12 +378,12 @@ fn parse_record(bytes: &[u8]) -> Result<SnapshotRecord, MixerRecoverySnapshotErr
 fn validate_canonical_json(bytes: &[u8]) -> Result<(), MixerRecoverySnapshotError> {
     let value: serde_json::Value =
         hyper_strict_json::parse(bytes, MAX_SNAPSHOT_BYTES).map_err(|source| {
-        caused(
-            MixerRecoverySnapshotErrorKind::SnapshotInvalid,
-            "parse mixer recovery bytes",
-            source,
-        )
-    })?;
+            caused(
+                MixerRecoverySnapshotErrorKind::SnapshotInvalid,
+                "parse mixer recovery bytes",
+                source,
+            )
+        })?;
     let canonical = serde_json_canonicalizer::to_vec(&value).map_err(|source| {
         caused(
             MixerRecoverySnapshotErrorKind::SnapshotInvalid,
@@ -397,27 +401,58 @@ fn validate_canonical_json(bytes: &[u8]) -> Result<(), MixerRecoverySnapshotErro
     }
 }
 
-fn publish_bytes(directory: &Dir, name: &str, bytes: &[u8]) -> Result<(), MixerRecoverySnapshotError> {
+fn publish_bytes(
+    directory: &Dir,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), MixerRecoverySnapshotError> {
     let temporary = format!(".{name}-{}.tmp", Uuid::new_v4());
     let result = (|| {
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true).follow(FollowSymlinks::No);
-        let mut file = directory.open_with(&temporary, &options).map_err(|source| {
-            caused(MixerRecoverySnapshotErrorKind::Io, "create mixer recovery staging file", source)
-        })?;
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut file = directory
+            .open_with(&temporary, &options)
+            .map_err(|source| {
+                caused(
+                    MixerRecoverySnapshotErrorKind::Io,
+                    "create mixer recovery staging file",
+                    source,
+                )
+            })?;
         file.write_all(bytes).map_err(|source| {
-            caused(MixerRecoverySnapshotErrorKind::Io, "write mixer recovery staging file", source)
+            caused(
+                MixerRecoverySnapshotErrorKind::Io,
+                "write mixer recovery staging file",
+                source,
+            )
         })?;
         file.sync_all().map_err(|source| {
-            caused(MixerRecoverySnapshotErrorKind::Io, "sync mixer recovery staging file", source)
+            caused(
+                MixerRecoverySnapshotErrorKind::Io,
+                "sync mixer recovery staging file",
+                source,
+            )
         })?;
         let staged_identity = identity(&file.metadata().map_err(|source| {
-            caused(MixerRecoverySnapshotErrorKind::Io, "inspect mixer recovery staging file", source)
+            caused(
+                MixerRecoverySnapshotErrorKind::Io,
+                "inspect mixer recovery staging file",
+                source,
+            )
         })?);
         drop(file);
-        rename_replace(directory, &temporary, staged_identity, directory, name).map_err(|source| {
-            caused(MixerRecoverySnapshotErrorKind::Io, "publish mixer recovery snapshot", source)
-        })?;
+        rename_replace(directory, &temporary, staged_identity, directory, name).map_err(
+            |source| {
+                caused(
+                    MixerRecoverySnapshotErrorKind::Io,
+                    "publish mixer recovery snapshot",
+                    source,
+                )
+            },
+        )?;
         sync_dir(directory)
     })();
     if result.is_err() {
@@ -431,13 +466,24 @@ fn read_bounded(directory: &Dir, name: &str) -> Result<Vec<u8>, MixerRecoverySna
     options.read(true).follow(FollowSymlinks::No);
     let file = directory.open_with(name, &options).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
-            failure(MixerRecoverySnapshotErrorKind::SnapshotUnavailable, "mixer recovery snapshot is absent")
+            failure(
+                MixerRecoverySnapshotErrorKind::SnapshotUnavailable,
+                "mixer recovery snapshot is absent",
+            )
         } else {
-            caused(MixerRecoverySnapshotErrorKind::Io, "open mixer recovery snapshot", source)
+            caused(
+                MixerRecoverySnapshotErrorKind::Io,
+                "open mixer recovery snapshot",
+                source,
+            )
         }
     })?;
     read_open_stable(file.into_std(), name, MAX_JSON_FILE_BYTES).map_err(|source| {
-        caused(MixerRecoverySnapshotErrorKind::SnapshotInvalid, "read mixer recovery snapshot", source)
+        caused(
+            MixerRecoverySnapshotErrorKind::SnapshotInvalid,
+            "read mixer recovery snapshot",
+            source,
+        )
     })
 }
 
@@ -445,10 +491,20 @@ fn open_or_create_dir(parent: &Dir, name: &str) -> Result<Dir, MixerRecoverySnap
     match parent.create_dir(name) {
         Ok(()) => sync_dir(parent)?,
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(source) => return Err(caused(MixerRecoverySnapshotErrorKind::Io, "create mixer recovery directory", source)),
+        Err(source) => {
+            return Err(caused(
+                MixerRecoverySnapshotErrorKind::Io,
+                "create mixer recovery directory",
+                source,
+            ));
+        }
     }
     parent.open_dir_nofollow(name).map_err(|source| {
-        caused(MixerRecoverySnapshotErrorKind::Io, "open mixer recovery directory", source)
+        caused(
+            MixerRecoverySnapshotErrorKind::Io,
+            "open mixer recovery directory",
+            source,
+        )
     })
 }
 
@@ -456,7 +512,11 @@ fn open_optional_dir(parent: &Dir, name: &str) -> Result<Option<Dir>, MixerRecov
     match parent.open_dir_nofollow(name) {
         Ok(directory) => Ok(Some(directory)),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(caused(MixerRecoverySnapshotErrorKind::Io, "open mixer recovery directory", source)),
+        Err(source) => Err(caused(
+            MixerRecoverySnapshotErrorKind::Io,
+            "open mixer recovery directory",
+            source,
+        )),
     }
 }
 
@@ -464,7 +524,11 @@ fn remove_optional_file(directory: &Dir, name: &str) -> Result<(), MixerRecovery
     match directory.remove_file(name) {
         Ok(()) => Ok(()),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(caused(MixerRecoverySnapshotErrorKind::Io, "remove mixer recovery snapshot", source)),
+        Err(source) => Err(caused(
+            MixerRecoverySnapshotErrorKind::Io,
+            "remove mixer recovery snapshot",
+            source,
+        )),
     }
 }
 
@@ -473,11 +537,23 @@ fn sync_dir(directory: &Dir) -> Result<(), MixerRecoverySnapshotError> {
     options.read(true).maybe_dir(true);
     #[cfg(windows)]
     options.write(true);
-    directory.open_with(".", &options).map_err(|source| {
-        caused(MixerRecoverySnapshotErrorKind::Io, "open mixer recovery directory for synchronization", source)
-    })?.sync_all().map_err(|source| {
-        caused(MixerRecoverySnapshotErrorKind::Io, "sync mixer recovery directory", source)
-    })
+    directory
+        .open_with(".", &options)
+        .map_err(|source| {
+            caused(
+                MixerRecoverySnapshotErrorKind::Io,
+                "open mixer recovery directory for synchronization",
+                source,
+            )
+        })?
+        .sync_all()
+        .map_err(|source| {
+            caused(
+                MixerRecoverySnapshotErrorKind::Io,
+                "sync mixer recovery directory",
+                source,
+            )
+        })
 }
 
 fn lock_error(source: ProjectLockError) -> MixerRecoverySnapshotError {
@@ -486,7 +562,11 @@ fn lock_error(source: ProjectLockError) -> MixerRecoverySnapshotError {
     } else {
         MixerRecoverySnapshotErrorKind::Io
     };
-    caused(kind, "acquire project storage lock for mixer recovery", source)
+    caused(
+        kind,
+        "acquire project storage lock for mixer recovery",
+        source,
+    )
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -502,8 +582,15 @@ fn hex_digest(value: [u8; 32]) -> String {
     output
 }
 
-fn failure(kind: MixerRecoverySnapshotErrorKind, message: impl Into<String>) -> MixerRecoverySnapshotError {
-    MixerRecoverySnapshotError { kind, message: message.into(), source: None }
+fn failure(
+    kind: MixerRecoverySnapshotErrorKind,
+    message: impl Into<String>,
+) -> MixerRecoverySnapshotError {
+    MixerRecoverySnapshotError {
+        kind,
+        message: message.into(),
+        source: None,
+    }
 }
 
 fn caused(
@@ -511,7 +598,11 @@ fn caused(
     message: impl Into<String>,
     source: impl Error + Send + Sync + 'static,
 ) -> MixerRecoverySnapshotError {
-    MixerRecoverySnapshotError { kind, message: message.into(), source: Some(Box::new(source)) }
+    MixerRecoverySnapshotError {
+        kind,
+        message: message.into(),
+        source: Some(Box::new(source)),
+    }
 }
 
 #[cfg(test)]
@@ -533,10 +624,8 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let parent = std::env::temp_dir().join(format!(
-                "hyper-mixer-recovery-{}",
-                Uuid::new_v4()
-            ));
+            let parent =
+                std::env::temp_dir().join(format!("hyper-mixer-recovery-{}", Uuid::new_v4()));
             fs::create_dir(&parent).unwrap();
             let created = create_project(
                 &parent,
@@ -567,7 +656,9 @@ mod tests {
         }
 
         fn snapshot_directory(&self) -> std::path::PathBuf {
-            self.project.join(BACKUPS_DIRECTORY).join(SNAPSHOT_DIRECTORY)
+            self.project
+                .join(BACKUPS_DIRECTORY)
+                .join(SNAPSHOT_DIRECTORY)
         }
 
         fn rewrite_record(&self, mutate: impl FnOnce(&mut serde_json::Value)) {
@@ -609,7 +700,10 @@ mod tests {
         assert_eq!(after.manifest_sha256(), original.manifest_sha256());
 
         clear_mixer_recovery_snapshot(&fixture.project).unwrap();
-        assert_eq!(load_mixer_recovery_snapshot(&fixture.project).unwrap(), None);
+        assert_eq!(
+            load_mixer_recovery_snapshot(&fixture.project).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -699,7 +793,9 @@ mod tests {
             record["format"] = serde_json::Value::String("foreign-recovery".to_owned());
         });
         assert_eq!(
-            load_mixer_recovery_snapshot(&fixture.project).unwrap_err().kind(),
+            load_mixer_recovery_snapshot(&fixture.project)
+                .unwrap_err()
+                .kind(),
             MixerRecoverySnapshotErrorKind::SnapshotInvalid
         );
 
@@ -709,7 +805,9 @@ mod tests {
             record["format_version"] = serde_json::Value::from(99_u8);
         });
         assert_eq!(
-            load_mixer_recovery_snapshot(&fixture.project).unwrap_err().kind(),
+            load_mixer_recovery_snapshot(&fixture.project)
+                .unwrap_err()
+                .kind(),
             MixerRecoverySnapshotErrorKind::SnapshotInvalid
         );
     }
@@ -734,7 +832,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(load_mixer_recovery_snapshot(&fixture.project).unwrap(), None);
+        assert_eq!(
+            load_mixer_recovery_snapshot(&fixture.project).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -747,17 +848,21 @@ mod tests {
             mixer_bytes: &mixer_bytes,
         };
         store_mixer_recovery_snapshot(&fixture.project, request).unwrap();
-        let record = parse_record(
-            &fs::read(fixture.snapshot_directory().join(RECORD_NAME)).unwrap(),
-        )
-        .unwrap();
+        let record =
+            parse_record(&fs::read(fixture.snapshot_directory().join(RECORD_NAME)).unwrap())
+                .unwrap();
         fs::write(
-            fixture.snapshot_directory().join(mixer_payload_name(&record).unwrap()),
+            fixture
+                .snapshot_directory()
+                .join(mixer_payload_name(&record).unwrap()),
             b"{}",
         )
         .unwrap();
 
         let error = load_mixer_recovery_snapshot(&fixture.project).unwrap_err();
-        assert_eq!(error.kind(), MixerRecoverySnapshotErrorKind::SnapshotInvalid);
+        assert_eq!(
+            error.kind(),
+            MixerRecoverySnapshotErrorKind::SnapshotInvalid
+        );
     }
 }

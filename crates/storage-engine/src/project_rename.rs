@@ -6,15 +6,17 @@ use std::path::Path;
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::fs::{Dir, OpenOptions};
-use hyper_project_model::{ProjectManifest, is_valid_interactive_project_name, is_valid_project_name};
+use hyper_project_model::{
+    ProjectManifest, is_valid_interactive_project_name, is_valid_project_name,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::project_lock::{
-    PROJECT_RENAME_TRANSACTION_PREFIX as TRANSACTION_PREFIX, ProjectLock,
-    ProjectTransactionFamily, find_unhandled_project_transaction,
+    PROJECT_RENAME_TRANSACTION_PREFIX as TRANSACTION_PREFIX, ProjectLock, ProjectTransactionFamily,
+    find_unhandled_project_transaction,
 };
 use super::stable_file::read_open_stable;
 use super::{
@@ -226,14 +228,15 @@ fn rename_project_observed(
     }
     let backups = open_or_create_dir(&verified.root_dir, "backups")?;
     let _lock = ProjectLock::acquire(&backups).map_err(lock_error)?;
-    let unhandled = find_unhandled_project_transaction(&backups, &[ProjectTransactionFamily::ProjectRename])
-        .map_err(|error| {
-            caused(
-                ProjectRenameErrorKind::TransactionUnavailable,
-                "inspect project transactions before project rename",
-                error,
-            )
-        })?;
+    let unhandled =
+        find_unhandled_project_transaction(&backups, &[ProjectTransactionFamily::ProjectRename])
+            .map_err(|error| {
+                caused(
+                    ProjectRenameErrorKind::TransactionUnavailable,
+                    "inspect project transactions before project rename",
+                    error,
+                )
+            })?;
     if unhandled.is_some() {
         return Err(failure(
             ProjectRenameErrorKind::ProjectChanged,
@@ -290,13 +293,15 @@ fn rename_project_observed(
         )
     })?;
     sync_dir(&backups)?;
-    let transaction = backups.open_dir_nofollow(&transaction_name).map_err(|error| {
-        caused(
-            ProjectRenameErrorKind::Io,
-            "open project-name transaction",
-            error,
-        )
-    })?;
+    let transaction = backups
+        .open_dir_nofollow(&transaction_name)
+        .map_err(|error| {
+            caused(
+                ProjectRenameErrorKind::Io,
+                "open project-name transaction",
+                error,
+            )
+        })?;
     let result = run_publication(
         &verified,
         &backups,
@@ -355,8 +360,9 @@ fn rename_project_observed(
                     clear_and_remove_transaction(&backups, transaction, &transaction_name)
                         .map_err(|error| ProjectRenameError {
                             kind: ProjectRenameErrorKind::Recovery,
-                            message: "project name was changed but transaction cleanup is incomplete"
-                                .to_owned(),
+                            message:
+                                "project name was changed but transaction cleanup is incomplete"
+                                    .to_owned(),
                             published: true,
                             source: Some(Box::new(error)),
                         })?;
@@ -418,14 +424,16 @@ fn run_publication(
     sync_dir(transaction)?;
     sync_dir(backups)?;
     observer(PublicationPhase::Transaction, verified.root())?;
-    let candidate_manifest = verify_project_candidate(verified.root(), &verified.root_dir, candidate)
-        .map_err(|error| {
-            caused(
-                ProjectRenameErrorKind::Integrity,
-                "project-name candidate does not verify",
-                error,
-            )
-        })?;
+    let candidate_manifest =
+        verify_project_candidate(verified.root(), &verified.root_dir, candidate).map_err(
+            |error| {
+                caused(
+                    ProjectRenameErrorKind::Integrity,
+                    "project-name candidate does not verify",
+                    error,
+                )
+            },
+        )?;
     if candidate_manifest.revision() != next_revision || candidate_manifest.name() != project_name {
         return Err(failure(
             ProjectRenameErrorKind::Integrity,
@@ -482,11 +490,16 @@ fn recover_transactions_locked(
     backups: &Dir,
 ) -> Result<Vec<ProjectRenameRecovery>, ProjectRenameError> {
     let mut names = Vec::new();
-    for entry in backups.entries().map_err(|error| {
-        caused(ProjectRenameErrorKind::Io, "read project backups", error)
-    })? {
+    for entry in backups
+        .entries()
+        .map_err(|error| caused(ProjectRenameErrorKind::Io, "read project backups", error))?
+    {
         let entry = entry.map_err(|error| {
-            caused(ProjectRenameErrorKind::Io, "read project backup entry", error)
+            caused(
+                ProjectRenameErrorKind::Io,
+                "read project backup entry",
+                error,
+            )
         })?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
@@ -801,9 +814,15 @@ fn publish_staged_manifest(
     let bytes = read_bounded(transaction, staged_name, MAX_JSON_BYTES)?;
     write_exclusive_synced(backups, temporary, &bytes)?;
     sync_dir(backups)?;
-    backups.rename(temporary, root, MANIFEST_NAME).map_err(|error| {
-        caused(ProjectRenameErrorKind::Io, format!("publish {label}"), error)
-    })?;
+    backups
+        .rename(temporary, root, MANIFEST_NAME)
+        .map_err(|error| {
+            caused(
+                ProjectRenameErrorKind::Io,
+                format!("publish {label}"),
+                error,
+            )
+        })?;
     sync_dir(root)
 }
 
@@ -886,14 +905,22 @@ fn validate_name(name: &str) -> Result<(), ProjectRenameError> {
     Ok(())
 }
 
-fn read_bounded(directory: &Dir, name: &str, maximum: usize) -> Result<Vec<u8>, ProjectRenameError> {
+fn read_bounded(
+    directory: &Dir,
+    name: &str,
+    maximum: usize,
+) -> Result<Vec<u8>, ProjectRenameError> {
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
-    let file = directory.open_with(name, &options).map_err(|error| {
-        caused(ProjectRenameErrorKind::Io, format!("open {name}"), error)
-    })?;
+    let file = directory
+        .open_with(name, &options)
+        .map_err(|error| caused(ProjectRenameErrorKind::Io, format!("open {name}"), error))?;
     read_open_stable(file.into_std(), name, maximum as u64).map_err(|error| {
-        caused(ProjectRenameErrorKind::Integrity, format!("read stable {name}"), error)
+        caused(
+            ProjectRenameErrorKind::Integrity,
+            format!("read stable {name}"),
+            error,
+        )
     })
 }
 
@@ -918,21 +945,23 @@ fn read_optional_file(directory: &Dir, name: &str) -> Result<Option<Vec<u8>>, Pr
     read_bounded(directory, name, MAX_JSON_BYTES).map(Some)
 }
 
-fn write_exclusive_synced(directory: &Dir, name: &str, bytes: &[u8]) -> Result<(), ProjectRenameError> {
+fn write_exclusive_synced(
+    directory: &Dir,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), ProjectRenameError> {
     let mut options = OpenOptions::new();
     options
         .write(true)
         .create_new(true)
         .follow(FollowSymlinks::No);
-    let mut file = directory.open_with(name, &options).map_err(|error| {
-        caused(ProjectRenameErrorKind::Io, format!("create {name}"), error)
-    })?;
-    file.write_all(bytes).map_err(|error| {
-        caused(ProjectRenameErrorKind::Io, format!("write {name}"), error)
-    })?;
-    file.sync_all().map_err(|error| {
-        caused(ProjectRenameErrorKind::Io, format!("sync {name}"), error)
-    })
+    let mut file = directory
+        .open_with(name, &options)
+        .map_err(|error| caused(ProjectRenameErrorKind::Io, format!("create {name}"), error))?;
+    file.write_all(bytes)
+        .map_err(|error| caused(ProjectRenameErrorKind::Io, format!("write {name}"), error))?;
+    file.sync_all()
+        .map_err(|error| caused(ProjectRenameErrorKind::Io, format!("sync {name}"), error))
 }
 
 fn open_or_create_dir(parent: &Dir, name: &str) -> Result<Dir, ProjectRenameError> {
@@ -975,18 +1004,26 @@ fn sync_dir(directory: &Dir) -> Result<(), ProjectRenameError> {
     options.write(true);
     directory
         .open_with(".", &options)
-        .map_err(|error| caused(ProjectRenameErrorKind::Io, "open directory for synchronization", error))?
+        .map_err(|error| {
+            caused(
+                ProjectRenameErrorKind::Io,
+                "open directory for synchronization",
+                error,
+            )
+        })?
         .sync_all()
         .map_err(|error| caused(ProjectRenameErrorKind::Io, "sync directory", error))
 }
 
 fn transaction_id(directory_name: &str) -> Result<String, ProjectRenameError> {
-    let id = directory_name.strip_prefix(TRANSACTION_PREFIX).ok_or_else(|| {
-        failure(
-            ProjectRenameErrorKind::Recovery,
-            "project-name transaction directory name is invalid",
-        )
-    })?;
+    let id = directory_name
+        .strip_prefix(TRANSACTION_PREFIX)
+        .ok_or_else(|| {
+            failure(
+                ProjectRenameErrorKind::Recovery,
+                "project-name transaction directory name is invalid",
+            )
+        })?;
     Uuid::parse_str(id).map_err(|error| {
         caused(
             ProjectRenameErrorKind::Recovery,
@@ -999,7 +1036,11 @@ fn transaction_id(directory_name: &str) -> Result<String, ProjectRenameError> {
 
 fn require_canonical(bytes: &[u8], label: &str) -> Result<(), ProjectRenameError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|error| {
-        caused(ProjectRenameErrorKind::Recovery, format!("parse {label}"), error)
+        caused(
+            ProjectRenameErrorKind::Recovery,
+            format!("parse {label}"),
+            error,
+        )
     })?;
     let canonical = serde_json_canonicalizer::to_vec(&value).map_err(|error| {
         caused(
@@ -1072,13 +1113,15 @@ fn clear_and_remove_transaction(
     name: &str,
 ) -> Result<(), ProjectRenameError> {
     let quarantine = format!(".project-rename-cleanup-{}", Uuid::new_v4());
-    backups.rename(name, backups, &quarantine).map_err(|error| {
-        caused(
-            ProjectRenameErrorKind::Recovery,
-            "quarantine project-name transaction",
-            error,
-        )
-    })?;
+    backups
+        .rename(name, backups, &quarantine)
+        .map_err(|error| {
+            caused(
+                ProjectRenameErrorKind::Recovery,
+                "quarantine project-name transaction",
+                error,
+            )
+        })?;
     let moved = backups.open_dir_nofollow(&quarantine).map_err(|error| {
         caused(
             ProjectRenameErrorKind::Recovery,
@@ -1152,10 +1195,18 @@ fn decode_digest(value: &str) -> Result<[u8; 32], ProjectRenameError> {
     let mut output = [0_u8; 32];
     for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(pair).map_err(|error| {
-            caused(ProjectRenameErrorKind::Recovery, "SHA-256 digest is invalid", error)
+            caused(
+                ProjectRenameErrorKind::Recovery,
+                "SHA-256 digest is invalid",
+                error,
+            )
         })?;
         output[index] = u8::from_str_radix(text, 16).map_err(|error| {
-            caused(ProjectRenameErrorKind::Recovery, "SHA-256 digest is invalid", error)
+            caused(
+                ProjectRenameErrorKind::Recovery,
+                "SHA-256 digest is invalid",
+                error,
+            )
         })?;
     }
     Ok(output)
@@ -1163,7 +1214,9 @@ fn decode_digest(value: &str) -> Result<[u8; 32], ProjectRenameError> {
 
 fn lock_error(error: super::project_lock::ProjectLockError) -> ProjectRenameError {
     let kind = match error {
-        super::project_lock::ProjectLockError::Active => ProjectRenameErrorKind::TransactionUnavailable,
+        super::project_lock::ProjectLockError::Active => {
+            ProjectRenameErrorKind::TransactionUnavailable
+        }
         super::project_lock::ProjectLockError::Io { .. } => ProjectRenameErrorKind::Io,
     };
     caused(kind, "acquire project-name transaction lock", error)
@@ -1339,7 +1392,10 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(stale.kind(), ProjectRenameErrorKind::ProjectChanged);
-        assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), fixture.original_manifest);
+        assert_eq!(
+            fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(),
+            fixture.original_manifest
+        );
         assert_eq!(fixture.transactions(), 0);
     }
 
@@ -1347,20 +1403,27 @@ mod tests {
     fn no_op_does_not_bypass_an_incomplete_rename_transaction() {
         let fixture = Fixture::new();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            rename_project_observed(&fixture.root, fixture.request("Pending rename"), |phase, _| {
-                assert!(
-                    phase != PublicationPhase::Transaction,
-                    "simulate process loss after durable rename staging"
-                );
-                Ok(())
-            })
+            rename_project_observed(
+                &fixture.root,
+                fixture.request("Pending rename"),
+                |phase, _| {
+                    assert!(
+                        phase != PublicationPhase::Transaction,
+                        "simulate process loss after durable rename staging"
+                    );
+                    Ok(())
+                },
+            )
         }));
         assert!(result.is_err());
         assert_eq!(fixture.transactions(), 1);
 
-        let recovery_required = rename_project(&fixture.root, fixture.request("Original project"))
-            .unwrap_err();
-        assert_eq!(recovery_required.kind(), ProjectRenameErrorKind::ProjectChanged);
+        let recovery_required =
+            rename_project(&fixture.root, fixture.request("Original project")).unwrap_err();
+        assert_eq!(
+            recovery_required.kind(),
+            ProjectRenameErrorKind::ProjectChanged
+        );
         assert_eq!(fixture.transactions(), 0);
         assert_eq!(
             fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(),
@@ -1372,13 +1435,17 @@ mod tests {
     fn recovery_rolls_back_before_manifest_publication_and_commits_after_it() {
         let before_manifest = Fixture::new();
         let before_result = catch_unwind(AssertUnwindSafe(|| {
-            rename_project_observed(&before_manifest.root, before_manifest.request("Unpublished"), |phase, _| {
-                assert!(
-                    phase != PublicationPhase::Transaction,
-                    "simulate process loss before manifest publication"
-                );
-                Ok(())
-            })
+            rename_project_observed(
+                &before_manifest.root,
+                before_manifest.request("Unpublished"),
+                |phase, _| {
+                    assert!(
+                        phase != PublicationPhase::Transaction,
+                        "simulate process loss before manifest publication"
+                    );
+                    Ok(())
+                },
+            )
         }));
         assert!(before_result.is_err());
         assert_eq!(before_manifest.transactions(), 1);
@@ -1396,13 +1463,17 @@ mod tests {
 
         let after_manifest = Fixture::new();
         let after_result = catch_unwind(AssertUnwindSafe(|| {
-            rename_project_observed(&after_manifest.root, after_manifest.request("Published"), |phase, _| {
-                assert!(
-                    phase != PublicationPhase::Manifest,
-                    "simulate process loss after manifest publication"
-                );
-                Ok(())
-            })
+            rename_project_observed(
+                &after_manifest.root,
+                after_manifest.request("Published"),
+                |phase, _| {
+                    assert!(
+                        phase != PublicationPhase::Manifest,
+                        "simulate process loss after manifest publication"
+                    );
+                    Ok(())
+                },
+            )
         }));
         assert!(after_result.is_err());
         assert_eq!(after_manifest.transactions(), 1);

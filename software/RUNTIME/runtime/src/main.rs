@@ -27,19 +27,20 @@ use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
     ChannelSamplePeakBallistics, EbuLoudnessPresentationConfig, LocateState,
     LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay, MixerChannelHandle,
-    MixerParameterCommand, MixerParameterStateSnapshot, MixerSendHandle, OutputMeterReceiver,
-    NativeDeviceCommand, NativeDeviceHandle, NativeDeviceStateSnapshot,
-    PlaybackCycleObservation, PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
-    PlaybackRecoveryTransportState, SamplePeakBallisticsConfig, ScaledLoudnessValue,
-    StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot, TransportCommand,
-    TransportLoopRange,
+    MixerParameterCommand, MixerParameterStateSnapshot, MixerSendHandle, NativeDeviceCommand,
+    NativeDeviceHandle, NativeDeviceStateSnapshot, OutputMeterReceiver, PlaybackCycleObservation,
+    PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot, PlaybackRecoveryTransportState,
+    SamplePeakBallisticsConfig, ScaledLoudnessValue, StereoSamplePeakBallistics,
+    StereoSamplePeakBallisticsSnapshot, TransportCommand, TransportLoopRange,
+};
+use hyper_native_device::{
+    NativeCompressorState, NativeDeviceState, NativeFilterMode, NativeFilterState,
 };
 use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_compiler::{FrameTimeline, MeterEvent, TempoEvent, musical_position};
 use hyper_playback_json::LoaderLimits;
 use hyper_playback_session::{PlaybackExtent, PlaybackSessionAssemblyLimits};
 use hyper_project_loader::ProjectPlaybackLimits;
-use hyper_native_device::{NativeCompressorState, NativeDeviceState, NativeFilterMode, NativeFilterState};
 use hyper_runtime_deployment::resolve_runtime_deployment;
 use hyper_runtime_host::{PanelHost, RuntimeArguments, ServedPanel, serve_panels_with_idle};
 use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
@@ -818,7 +819,8 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
                 drain_operator_mixer_boolean_command(host, command, diagnostic);
             }
             OperatorCommand::SetNativeDeviceEnabled { device, enabled } => {
-                match host.queue_native_device(NativeDeviceCommand::SetEnabled { device, enabled }) {
+                match host.queue_native_device(NativeDeviceCommand::SetEnabled { device, enabled })
+                {
                     Ok(()) => diagnostic(if enabled {
                         "native device enable queued".to_owned()
                     } else {
@@ -830,7 +832,9 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
             OperatorCommand::SetNativeDeviceState { device, state } => {
                 match host.queue_native_device(NativeDeviceCommand::SetState { device, state }) {
                     Ok(()) => diagnostic("native device parameter update queued".to_owned()),
-                    Err(error) => diagnostic(format!("native device parameter update refused: {error}")),
+                    Err(error) => {
+                        diagnostic(format!("native device parameter update refused: {error}"))
+                    }
                 }
             }
             OperatorCommand::Quit => stop.store(true, Ordering::Release),
@@ -1069,7 +1073,9 @@ fn operator_native_device_catalog(
     for index in 0..count {
         let device = session
             .native_device(index)
-            .map_err(|error| format!("prepared native device {index} cannot be controlled: {error}"))?
+            .map_err(|error| {
+                format!("prepared native device {index} cannot be controlled: {error}")
+            })?
             .ok_or_else(|| format!("prepared native device {index} has no retained facts"))?;
         devices.push(operator_native_device(device));
     }
@@ -1311,12 +1317,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_peak_reset(&ui, &meter_observer, &loudness_authority);
     wire_operator_loudness_controls(&ui, &commands_tx, &diagnostic, &loudness_authority);
     wire_operator_mixer_controls(&ui, &commands_tx, &diagnostic, &mixer_authority);
-    wire_operator_native_device_controls(
-        &ui,
-        &commands_tx,
-        &diagnostic,
-        &native_device_authority,
-    );
+    wire_operator_native_device_controls(&ui, &commands_tx, &diagnostic, &native_device_authority);
     wire_operator_scene_launch(
         &ui,
         &commands_tx,
@@ -2019,7 +2020,10 @@ fn wire_operator_native_device_controls(
     let bypass_authority = Rc::clone(authority);
     ui.on_toggle_native_device_requested(move |row| {
         let Ok(row) = usize::try_from(row) else {
-            set_diagnostic(&bypass_diagnostic, "native device bypass refused: invalid row".to_owned());
+            set_diagnostic(
+                &bypass_diagnostic,
+                "native device bypass refused: invalid row".to_owned(),
+            );
             return;
         };
         let Some(current) = bypass_authority
@@ -2049,11 +2053,17 @@ fn wire_operator_native_device_controls(
     let mode_authority = Rc::clone(authority);
     ui.on_toggle_native_filter_mode_requested(move |row| {
         let Some(current) = operator_native_device_authority(&mode_authority, row) else {
-            set_diagnostic(&mode_diagnostic, "native filter mode refused: accepted state is unavailable".to_owned());
+            set_diagnostic(
+                &mode_diagnostic,
+                "native filter mode refused: accepted state is unavailable".to_owned(),
+            );
             return;
         };
         let NativeDeviceState::Filter(state) = current.state else {
-            set_diagnostic(&mode_diagnostic, "native filter mode refused: accepted device kind changed".to_owned());
+            set_diagnostic(
+                &mode_diagnostic,
+                "native filter mode refused: accepted device kind changed".to_owned(),
+            );
             return;
         };
         let state = NativeFilterState::try_new(
@@ -2065,7 +2075,14 @@ fn wire_operator_native_device_controls(
             state.resonance_millionths(),
         )
         .expect("an accepted filter state remains in the declared domain");
-        send_operator_command(&mode_sender, OperatorCommand::SetNativeDeviceState { device: current.handle, state: NativeDeviceState::Filter(state) }, &mode_diagnostic);
+        send_operator_command(
+            &mode_sender,
+            OperatorCommand::SetNativeDeviceState {
+                device: current.handle,
+                state: NativeDeviceState::Filter(state),
+            },
+            &mode_diagnostic,
+        );
     });
 
     wire_operator_native_filter_value_controls(ui, sender, diagnostic, authority);
@@ -2076,9 +2093,13 @@ fn operator_native_device_authority(
     authority: &Rc<RefCell<Option<Vec<OperatorNativeDeviceAuthority>>>>,
     row: i32,
 ) -> Option<OperatorNativeDeviceAuthority> {
-    usize::try_from(row)
-        .ok()
-        .and_then(|row| authority.borrow().as_ref().and_then(|devices| devices.get(row)).copied())
+    usize::try_from(row).ok().and_then(|row| {
+        authority
+            .borrow()
+            .as_ref()
+            .and_then(|devices| devices.get(row))
+            .copied()
+    })
 }
 
 fn wire_operator_native_filter_value_controls(
@@ -2091,36 +2112,55 @@ fn wire_operator_native_filter_value_controls(
     let cutoff_diagnostic = Arc::clone(diagnostic);
     let cutoff_authority = Rc::clone(authority);
     ui.on_set_native_filter_cutoff_requested(move |row, hertz| {
-        let Some((device, state)) = operator_native_filter_update(&cutoff_authority, row, |state: NativeFilterState| {
-            NativeFilterState::try_new(
-                state.mode(),
-                operator_scaled_u32(hertz, 20.0, 20_000.0, 1_000.0)?,
-                state.resonance_millionths(),
-            )
-            .ok()
-        }) else {
-            set_diagnostic(&cutoff_diagnostic, "native filter cutoff refused: accepted state or value is unavailable".to_owned());
+        let Some((device, state)) =
+            operator_native_filter_update(&cutoff_authority, row, |state: NativeFilterState| {
+                NativeFilterState::try_new(
+                    state.mode(),
+                    operator_scaled_u32(hertz, 20.0, 20_000.0, 1_000.0)?,
+                    state.resonance_millionths(),
+                )
+                .ok()
+            })
+        else {
+            set_diagnostic(
+                &cutoff_diagnostic,
+                "native filter cutoff refused: accepted state or value is unavailable".to_owned(),
+            );
             return;
         };
-        send_operator_command(&cutoff_sender, OperatorCommand::SetNativeDeviceState { device, state }, &cutoff_diagnostic);
+        send_operator_command(
+            &cutoff_sender,
+            OperatorCommand::SetNativeDeviceState { device, state },
+            &cutoff_diagnostic,
+        );
     });
 
     let resonance_sender = sender.clone();
     let resonance_diagnostic = Arc::clone(diagnostic);
     let resonance_authority = Rc::clone(authority);
     ui.on_set_native_filter_resonance_requested(move |row, resonance| {
-        let Some((device, state)) = operator_native_filter_update(&resonance_authority, row, |state: NativeFilterState| {
-            NativeFilterState::try_new(
-                state.mode(),
-                state.cutoff_millihertz(),
-                operator_scaled_u32(resonance, 0.1, 20.0, 1_000_000.0)?,
-            )
-            .ok()
-        }) else {
-            set_diagnostic(&resonance_diagnostic, "native filter resonance refused: accepted state or value is unavailable".to_owned());
+        let Some((device, state)) =
+            operator_native_filter_update(&resonance_authority, row, |state: NativeFilterState| {
+                NativeFilterState::try_new(
+                    state.mode(),
+                    state.cutoff_millihertz(),
+                    operator_scaled_u32(resonance, 0.1, 20.0, 1_000_000.0)?,
+                )
+                .ok()
+            })
+        else {
+            set_diagnostic(
+                &resonance_diagnostic,
+                "native filter resonance refused: accepted state or value is unavailable"
+                    .to_owned(),
+            );
             return;
         };
-        send_operator_command(&resonance_sender, OperatorCommand::SetNativeDeviceState { device, state }, &resonance_diagnostic);
+        send_operator_command(
+            &resonance_sender,
+            OperatorCommand::SetNativeDeviceState { device, state },
+            &resonance_diagnostic,
+        );
     });
 }
 
@@ -2154,26 +2194,101 @@ fn wire_operator_native_compressor_value_controls(
     diagnostic: &Arc<Mutex<String>>,
     authority: &Rc<RefCell<Option<Vec<OperatorNativeDeviceAuthority>>>>,
 ) {
-    wire_operator_native_compressor_value_control(ui, sender, diagnostic, authority, |ui, callback| {
-        ui.on_set_native_compressor_threshold_requested(callback);
-    }, |state: NativeCompressorState, value| NativeCompressorState::try_new(
-        operator_scaled_i32(value, -80.0, 0.0, 1_000.0)?, state.ratio_millionths(), state.attack_microseconds(), state.release_microseconds(), state.makeup_millidecibels()).ok());
-    wire_operator_native_compressor_value_control(ui, sender, diagnostic, authority, |ui, callback| {
-        ui.on_set_native_compressor_ratio_requested(callback);
-    }, |state: NativeCompressorState, value| NativeCompressorState::try_new(
-        state.threshold_millidecibels(), operator_scaled_u32(value, 1.0, 100.0, 1_000_000.0)?, state.attack_microseconds(), state.release_microseconds(), state.makeup_millidecibels()).ok());
-    wire_operator_native_compressor_value_control(ui, sender, diagnostic, authority, |ui, callback| {
-        ui.on_set_native_compressor_attack_requested(callback);
-    }, |state: NativeCompressorState, value| NativeCompressorState::try_new(
-        state.threshold_millidecibels(), state.ratio_millionths(), operator_scaled_u32(value, 0.1, 500.0, 1_000.0)?, state.release_microseconds(), state.makeup_millidecibels()).ok());
-    wire_operator_native_compressor_value_control(ui, sender, diagnostic, authority, |ui, callback| {
-        ui.on_set_native_compressor_release_requested(callback);
-    }, |state: NativeCompressorState, value| NativeCompressorState::try_new(
-        state.threshold_millidecibels(), state.ratio_millionths(), state.attack_microseconds(), operator_scaled_u32(value, 0.1, 2_000.0, 1_000.0)?, state.makeup_millidecibels()).ok());
-    wire_operator_native_compressor_value_control(ui, sender, diagnostic, authority, |ui, callback| {
-        ui.on_set_native_compressor_makeup_requested(callback);
-    }, |state: NativeCompressorState, value| NativeCompressorState::try_new(
-        state.threshold_millidecibels(), state.ratio_millionths(), state.attack_microseconds(), state.release_microseconds(), operator_scaled_i32(value, -24.0, 24.0, 1_000.0)?).ok());
+    wire_operator_native_compressor_value_control(
+        ui,
+        sender,
+        diagnostic,
+        authority,
+        |ui, callback| {
+            ui.on_set_native_compressor_threshold_requested(callback);
+        },
+        |state: NativeCompressorState, value| {
+            NativeCompressorState::try_new(
+                operator_scaled_i32(value, -80.0, 0.0, 1_000.0)?,
+                state.ratio_millionths(),
+                state.attack_microseconds(),
+                state.release_microseconds(),
+                state.makeup_millidecibels(),
+            )
+            .ok()
+        },
+    );
+    wire_operator_native_compressor_value_control(
+        ui,
+        sender,
+        diagnostic,
+        authority,
+        |ui, callback| {
+            ui.on_set_native_compressor_ratio_requested(callback);
+        },
+        |state: NativeCompressorState, value| {
+            NativeCompressorState::try_new(
+                state.threshold_millidecibels(),
+                operator_scaled_u32(value, 1.0, 100.0, 1_000_000.0)?,
+                state.attack_microseconds(),
+                state.release_microseconds(),
+                state.makeup_millidecibels(),
+            )
+            .ok()
+        },
+    );
+    wire_operator_native_compressor_value_control(
+        ui,
+        sender,
+        diagnostic,
+        authority,
+        |ui, callback| {
+            ui.on_set_native_compressor_attack_requested(callback);
+        },
+        |state: NativeCompressorState, value| {
+            NativeCompressorState::try_new(
+                state.threshold_millidecibels(),
+                state.ratio_millionths(),
+                operator_scaled_u32(value, 0.1, 500.0, 1_000.0)?,
+                state.release_microseconds(),
+                state.makeup_millidecibels(),
+            )
+            .ok()
+        },
+    );
+    wire_operator_native_compressor_value_control(
+        ui,
+        sender,
+        diagnostic,
+        authority,
+        |ui, callback| {
+            ui.on_set_native_compressor_release_requested(callback);
+        },
+        |state: NativeCompressorState, value| {
+            NativeCompressorState::try_new(
+                state.threshold_millidecibels(),
+                state.ratio_millionths(),
+                state.attack_microseconds(),
+                operator_scaled_u32(value, 0.1, 2_000.0, 1_000.0)?,
+                state.makeup_millidecibels(),
+            )
+            .ok()
+        },
+    );
+    wire_operator_native_compressor_value_control(
+        ui,
+        sender,
+        diagnostic,
+        authority,
+        |ui, callback| {
+            ui.on_set_native_compressor_makeup_requested(callback);
+        },
+        |state: NativeCompressorState, value| {
+            NativeCompressorState::try_new(
+                state.threshold_millidecibels(),
+                state.ratio_millionths(),
+                state.attack_microseconds(),
+                state.release_microseconds(),
+                operator_scaled_i32(value, -24.0, 24.0, 1_000.0)?,
+            )
+            .ok()
+        },
+    );
 }
 
 fn wire_operator_native_compressor_value_control(
@@ -2187,13 +2302,26 @@ fn wire_operator_native_compressor_value_control(
     let sender = sender.clone();
     let diagnostic = Arc::clone(diagnostic);
     let authority = Rc::clone(authority);
-    bind(ui, Box::new(move |row, value| {
-        let Some((device, state)) = operator_native_compressor_update(&authority, row, |state| update(state, value)) else {
-            set_diagnostic(&diagnostic, "native compressor parameter refused: accepted state or value is unavailable".to_owned());
-            return;
-        };
-        send_operator_command(&sender, OperatorCommand::SetNativeDeviceState { device, state }, &diagnostic);
-    }));
+    bind(
+        ui,
+        Box::new(move |row, value| {
+            let Some((device, state)) =
+                operator_native_compressor_update(&authority, row, |state| update(state, value))
+            else {
+                set_diagnostic(
+                    &diagnostic,
+                    "native compressor parameter refused: accepted state or value is unavailable"
+                        .to_owned(),
+                );
+                return;
+            };
+            send_operator_command(
+                &sender,
+                OperatorCommand::SetNativeDeviceState { device, state },
+                &diagnostic,
+            );
+        }),
+    );
 }
 
 fn operator_native_compressor_update(
@@ -2205,7 +2333,10 @@ fn operator_native_compressor_update(
     let NativeDeviceState::Compressor(state) = current.state else {
         return None;
     };
-    Some((current.handle, NativeDeviceState::Compressor(update(state)?)))
+    Some((
+        current.handle,
+        NativeDeviceState::Compressor(update(state)?),
+    ))
 }
 
 #[allow(
@@ -2911,7 +3042,9 @@ fn apply_operator_native_device_observation(
         apply_operator_native_device_row_state(&mut model_row, device.state);
         model.set_row_data(row, model_row);
     }
-    ui.set_native_device_state(format!("Committed cycle {}", snapshot.committed_cycle_count()).into());
+    ui.set_native_device_state(
+        format!("Committed cycle {}", snapshot.committed_cycle_count()).into(),
+    );
     *authority.borrow_mut() = Some(next);
 }
 
@@ -4040,12 +4173,18 @@ mod tests {
 
     #[test]
     fn operator_native_device_value_conversion_is_bounded_finite_and_rounded() {
-        assert_eq!(operator_scaled_u32(20.0, 20.0, 20_000.0, 1_000.0), Some(20_000));
+        assert_eq!(
+            operator_scaled_u32(20.0, 20.0, 20_000.0, 1_000.0),
+            Some(20_000)
+        );
         assert_eq!(
             operator_scaled_u32(12.345_67, 0.1, 20.0, 1_000_000.0),
             Some(12_345_670)
         );
-        assert_eq!(operator_scaled_i32(-12.345_67, -80.0, 0.0, 1_000.0), Some(-12_346));
+        assert_eq!(
+            operator_scaled_i32(-12.345_67, -80.0, 0.0, 1_000.0),
+            Some(-12_346)
+        );
 
         for value in [
             f32::from_bits(20.0_f32.to_bits() - 1),
@@ -7650,12 +7789,7 @@ mod tests {
             compressor_makeup_decibels: 0.0,
         }]));
         ui.set_native_devices(ModelRc::from(rows));
-        wire_operator_native_device_controls(
-            &ui,
-            &sender,
-            &diagnostic,
-            &native_device_authority,
-        );
+        wire_operator_native_device_controls(&ui, &sender, &diagnostic, &native_device_authority);
 
         ui.invoke_toggle_native_device_requested(0);
 

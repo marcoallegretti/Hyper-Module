@@ -3,15 +3,15 @@ use super::{
     MixerParameterStateSnapshot, MixerSendParameterState, NativeDeviceStateSnapshot,
     TransportCommand, TransportCycle, TransportLoopRange, TransportState,
 };
-use hyper_native_device::{
-    MAX_DEVICES_PER_CHAIN, NativeCompressorState, NativeDeviceState, NativeFilterMode,
-    NativeFilterState,
-};
 use core::hint::spin_loop;
 use core::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
 };
 use hyper_audio_engine::{ChannelParameters, LinearGain, Pan};
+use hyper_native_device::{
+    MAX_DEVICES_PER_CHAIN, NativeCompressorState, NativeDeviceState, NativeFilterMode,
+    NativeFilterState,
+};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -367,22 +367,20 @@ impl AtomicNativeDeviceParameters {
                     .store(NATIVE_DEVICE_STATE_FILTER, Ordering::Relaxed);
             }
             NativeDeviceState::Compressor(state) => {
-                self.compressor_threshold_millidecibels
-                    .store(
-                        u32::from_ne_bytes(state.threshold_millidecibels().to_ne_bytes()),
-                        Ordering::Relaxed,
-                    );
+                self.compressor_threshold_millidecibels.store(
+                    u32::from_ne_bytes(state.threshold_millidecibels().to_ne_bytes()),
+                    Ordering::Relaxed,
+                );
                 self.compressor_ratio_millionths
                     .store(state.ratio_millionths(), Ordering::Relaxed);
                 self.compressor_attack_microseconds
                     .store(state.attack_microseconds(), Ordering::Relaxed);
                 self.compressor_release_microseconds
                     .store(state.release_microseconds(), Ordering::Relaxed);
-                self.compressor_makeup_millidecibels
-                    .store(
-                        u32::from_ne_bytes(state.makeup_millidecibels().to_ne_bytes()),
-                        Ordering::Relaxed,
-                    );
+                self.compressor_makeup_millidecibels.store(
+                    u32::from_ne_bytes(state.makeup_millidecibels().to_ne_bytes()),
+                    Ordering::Relaxed,
+                );
                 self.kind
                     .store(NATIVE_DEVICE_STATE_COMPRESSOR, Ordering::Relaxed);
             }
@@ -438,9 +436,7 @@ impl Default for AtomicNativeDeviceState {
         Self {
             present: AtomicBool::new(false),
             layout_signature: std::array::from_fn(|_| AtomicU64::new(0)),
-            enabled: std::array::from_fn(|_| {
-                std::array::from_fn(|_| AtomicBool::new(false))
-            }),
+            enabled: std::array::from_fn(|_| std::array::from_fn(|_| AtomicBool::new(false))),
             states: std::array::from_fn(|_| {
                 std::array::from_fn(|_| AtomicNativeDeviceParameters::default())
             }),
@@ -778,8 +774,8 @@ impl PlaybackRecoveryPublisher {
         self.publish_observation(
             PlaybackCyclePublication {
                 state: match cycle.state() {
-                TransportState::Stopped => PlaybackRecoveryTransportState::Stopped,
-                TransportState::Rolling => PlaybackRecoveryTransportState::Rolling,
+                    TransportState::Stopped => PlaybackRecoveryTransportState::Stopped,
+                    TransportState::Rolling => PlaybackRecoveryTransportState::Rolling,
                 },
                 position_frame: cycle.position_frame(),
                 loop_range: cycle.loop_range(),
@@ -836,9 +832,10 @@ impl PlaybackRecoveryPublisher {
         self.inner
             .loop_observation
             .store(publication.loop_range, publication.loop_enabled);
-        self.inner
-            .metronome_observation
-            .store(publication.metronome_available, publication.metronome_enabled);
+        self.inner.metronome_observation.store(
+            publication.metronome_available,
+            publication.metronome_enabled,
+        );
         self.inner.scene_launch.store(
             publication.queued_scene_index,
             publication.queued_scene_launch_frame,
@@ -953,10 +950,10 @@ pub fn playback_recovery_channel_with_initial_loop_metronome_and_native_device_s
         ),
         loop_observation: {
             let observation = AtomicLoopObservation::default();
-            let (range, enabled) = snapshot.map_or(
-                (initial_loop_range, initial_loop_enabled),
-                |snapshot| (snapshot.loop_range, snapshot.loop_enabled),
-            );
+            let (range, enabled) = snapshot
+                .map_or((initial_loop_range, initial_loop_enabled), |snapshot| {
+                    (snapshot.loop_range, snapshot.loop_enabled)
+                });
             observation.store(range, enabled);
             observation
         },
@@ -1143,12 +1140,7 @@ mod tests {
     #[test]
     fn zero_cycle_observation_exposes_session_only_metronome_capability() {
         let (_publisher, checkpoint) = playback_recovery_channel_with_initial_loop_and_metronome(
-            None,
-            None,
-            None,
-            false,
-            true,
-            false,
+            None, None, None, false, true, false,
         );
 
         let observation = checkpoint.observe_cycle();
@@ -1222,8 +1214,7 @@ mod tests {
         let initial = native_device_state(
             true,
             NativeDeviceState::Filter(
-                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107)
-                    .unwrap(),
+                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107).unwrap(),
             ),
         );
         let (mut publisher, checkpoint) =
@@ -1241,8 +1232,7 @@ mod tests {
         let changed = native_device_state(
             false,
             NativeDeviceState::Compressor(
-                NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 6_000)
-                    .unwrap(),
+                NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 6_000).unwrap(),
             ),
         );
         publisher.publish_cycle_with_native_device_state(
@@ -1320,7 +1310,10 @@ mod tests {
                     observation.metronome_available(),
                     !generation.is_multiple_of(3)
                 );
-                assert_eq!(observation.metronome_enabled(), generation.is_multiple_of(5));
+                assert_eq!(
+                    observation.metronome_enabled(),
+                    generation.is_multiple_of(5)
+                );
                 let expected_scene = (!generation.is_multiple_of(2)).then_some((
                     generation % 8,
                     generation * 2,
