@@ -302,6 +302,63 @@ pub struct AudioTrackRemovalRequest<'a> {
     pub mixer_bytes: &'a [u8],
 }
 
+/// The exact routing-bus kind addressed by a removal request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutingBusRemovalKind {
+    Group,
+    Return,
+}
+
+/// Removes one verified, unreferenced Group or Return track and its matching
+/// mixer state through the structural-track removal transaction.
+#[derive(Clone, Copy, Debug)]
+pub struct RoutingBusRemovalRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub track_id: &'a str,
+    pub mixer_id: &'a str,
+    pub mixer_bytes: &'a [u8],
+    pub kind: RoutingBusRemovalKind,
+}
+
+#[derive(Clone, Debug)]
+struct StructuralTrackRemovalRequest<'a> {
+    expected_project_sha256: [u8; 32],
+    track_id: &'a str,
+    mixer_id: &'a str,
+    mixer_bytes: &'a [u8],
+    contract: AudioTrackTransactionContract,
+}
+
+impl<'a> StructuralTrackRemovalRequest<'a> {
+    fn audio(request: AudioTrackRemovalRequest<'a>) -> Self {
+        Self {
+            expected_project_sha256: request.expected_project_sha256,
+            track_id: request.track_id,
+            mixer_id: request.mixer_id,
+            mixer_bytes: request.mixer_bytes,
+            contract: AudioTrackTransactionContract::Audio,
+        }
+    }
+
+    fn routing_bus(request: RoutingBusRemovalRequest<'a>) -> Self {
+        Self {
+            expected_project_sha256: request.expected_project_sha256,
+            track_id: request.track_id,
+            mixer_id: request.mixer_id,
+            mixer_bytes: request.mixer_bytes,
+            contract: match request.kind {
+                RoutingBusRemovalKind::Group => AudioTrackTransactionContract::RoutingGroup {
+                    source_track_ids: Vec::new(),
+                },
+                RoutingBusRemovalKind::Return => AudioTrackTransactionContract::RoutingReturn {
+                    source_track_ids: Vec::new(),
+                    send_ids: Vec::new(),
+                },
+            },
+        }
+    }
+}
+
 /// Replaces every structural track document and the matching mixer through one
 /// manifest-last transaction.  The request is intentionally complete: a track
 /// order is a project-wide permutation, never a sequence of independently
@@ -369,6 +426,9 @@ pub struct AudioTrackRemovalOutcome {
     project_revision: u64,
     track_id: String,
 }
+
+/// The durable outcome of one routing-bus removal.
+pub type RoutingBusRemovalOutcome = AudioTrackRemovalOutcome;
 
 impl AudioTrackRemovalOutcome {
     #[must_use]
@@ -591,17 +651,22 @@ impl AudioTrackTransactionContract {
         match self {
             Self::Audio => true,
             Self::RoutingGroup { source_track_ids } => {
-                operation == AudioTrackTransactionOperation::Publication
-                    && source_track_ids_are_valid(source_track_ids)
+                (operation == AudioTrackTransactionOperation::Publication
+                    && source_track_ids_are_valid(source_track_ids))
+                    || (operation == AudioTrackTransactionOperation::Removal
+                        && source_track_ids.is_empty())
             }
             Self::RoutingReturn {
                 source_track_ids,
                 send_ids,
             } => {
-                operation == AudioTrackTransactionOperation::Publication
+                (operation == AudioTrackTransactionOperation::Publication
                     && source_track_ids_are_valid(source_track_ids)
                     && send_ids.len() == source_track_ids.len()
-                    && send_ids_are_valid(send_ids)
+                    && send_ids_are_valid(send_ids))
+                    || (operation == AudioTrackTransactionOperation::Removal
+                        && source_track_ids.is_empty()
+                        && send_ids.is_empty())
             }
         }
     }
@@ -999,6 +1064,21 @@ pub fn remove_audio_track(
     remove_audio_track_observed(project_path.as_ref(), request, |_, _| Ok(()))
 }
 
+/// Removes one unreferenced Group or Return bus through the same durable
+/// structural-track transaction used by Audio-track removal.
+///
+/// # Errors
+///
+/// Returns a classified validation, conflict, integrity, I/O, or recovery
+/// error. The request is rejected unless its exact routing-bus kind and mixer
+/// reduction agree with the verified project package.
+pub fn remove_routing_bus(
+    project_path: impl AsRef<Path>,
+    request: RoutingBusRemovalRequest<'_>,
+) -> Result<RoutingBusRemovalOutcome, ProjectResourcePublicationError> {
+    remove_routing_bus_observed(project_path.as_ref(), request, |_, _| Ok(()))
+}
+
 /// Publishes a complete audio-track order permutation and its matching mixer
 /// through one serialized, recoverable manifest-last transaction.
 ///
@@ -1305,6 +1385,40 @@ fn publish_track_addition_observed(
 fn remove_audio_track_observed(
     project_path: &Path,
     request: AudioTrackRemovalRequest<'_>,
+    observer: impl FnMut(
+        AudioTrackPublicationPhase,
+        &Path,
+    ) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<AudioTrackRemovalOutcome, ProjectResourcePublicationError> {
+    remove_structural_track_observed(
+        project_path,
+        &StructuralTrackRemovalRequest::audio(request),
+        observer,
+    )
+}
+
+fn remove_routing_bus_observed(
+    project_path: &Path,
+    request: RoutingBusRemovalRequest<'_>,
+    observer: impl FnMut(
+        AudioTrackPublicationPhase,
+        &Path,
+    ) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<RoutingBusRemovalOutcome, ProjectResourcePublicationError> {
+    remove_structural_track_observed(
+        project_path,
+        &StructuralTrackRemovalRequest::routing_bus(request),
+        observer,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the coordinator keeps lock, recovery, staging, and disposition ordering visible as one fail-closed operation"
+)]
+fn remove_structural_track_observed(
+    project_path: &Path,
+    request: &StructuralTrackRemovalRequest<'_>,
     mut observer: impl FnMut(
         AudioTrackPublicationPhase,
         &Path,
@@ -2464,7 +2578,7 @@ fn run_audio_track_removal(
     backups: &Dir,
     transaction: &Dir,
     transaction_name: &str,
-    request: AudioTrackRemovalRequest<'_>,
+    request: &StructuralTrackRemovalRequest<'_>,
     mixer_path: &str,
     track_path: &str,
     track: &[u8],
@@ -2512,7 +2626,7 @@ fn run_audio_track_removal(
             byte_length: previous_mixer.len() as u64,
             sha256: hex_digest(digest(previous_mixer)),
         },
-        contract: AudioTrackTransactionContract::Audio,
+        contract: request.contract.clone(),
         operation: AudioTrackTransactionOperation::Removal,
         extensions: serde_json::Map::new(),
     };
@@ -3470,7 +3584,7 @@ fn validate_audio_track_document_identity(
     reason = "the exact track and mixer removal shape is validated together before any transaction staging"
 )]
 fn validate_audio_track_removal_documents(
-    request: AudioTrackRemovalRequest<'_>,
+    request: &StructuralTrackRemovalRequest<'_>,
     track_bytes: &[u8],
     previous_mixer_bytes: &[u8],
 ) -> Result<(), ProjectResourcePublicationError> {
@@ -3496,16 +3610,31 @@ fn validate_audio_track_removal_documents(
             error,
         )
     })?;
+    let (expected_kind, removes_return_mapping) = match &request.contract {
+        AudioTrackTransactionContract::Audio => ("audio", false),
+        AudioTrackTransactionContract::RoutingGroup { source_track_ids }
+            if source_track_ids.is_empty() => ("group", false),
+        AudioTrackTransactionContract::RoutingReturn {
+            source_track_ids,
+            send_ids,
+        } if source_track_ids.is_empty() && send_ids.is_empty() => ("return", true),
+        _ => {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "structural track-removal contract is invalid",
+            ));
+        }
+    };
     if track["format"].as_str() != Some("hyper-track")
         || track["id"].as_str() != Some(request.track_id)
-        || track["kind"].as_str() != Some("audio")
+        || track["kind"].as_str() != Some(expected_kind)
         || track["clip_ids"]
             .as_array()
             .is_none_or(|clips| !clips.is_empty())
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
-            "audio-track removal requires the matching empty audio-track resource",
+            "structural track removal requires the matching empty track resource",
         ));
     }
     if previous["format"].as_str() != Some("hyper-mixer")
@@ -3569,10 +3698,67 @@ fn validate_audio_track_removal_documents(
             )
         })?
         .insert(removed_index, previous_channels[removed_index].clone());
+    if removes_return_mapping {
+        let previous_return_buses = previous["return_buses"].as_array().ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "current mixer return-bus collection is invalid",
+            )
+        })?;
+        let candidate_return_buses = candidate["return_buses"].as_array().ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "candidate mixer return-bus collection is invalid",
+            )
+        })?;
+        let mut matching = previous_return_buses
+            .iter()
+            .enumerate()
+            .filter(|(_, mapping)| mapping["track_id"].as_str() == Some(request.track_id));
+        let Some((removed_return_index, removed_return)) = matching.next() else {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "current mixer has no return-bus mapping for the removed track",
+            ));
+        };
+        if matching.next().is_some()
+            || candidate_return_buses.len().checked_add(1) != Some(previous_return_buses.len())
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "return routing-bus removal must remove exactly one return-bus mapping",
+            ));
+        }
+        let removed_bus = removed_return["bus"].as_str().ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "current return-bus mapping is invalid",
+            )
+        })?;
+        if previous_channels.iter().any(|channel| {
+            channel["sends"]
+                .as_array()
+                .is_some_and(|sends| sends.iter().any(|send| send["bus"].as_str() == Some(removed_bus)))
+        }) {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "return routing bus is still a mixer send target",
+            ));
+        }
+        restored["return_buses"]
+            .as_array_mut()
+            .ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::InvalidResource,
+                    "candidate mixer return-bus collection changed during validation",
+                )
+            })?
+            .insert(removed_return_index, removed_return.clone());
+    }
     if restored != previous {
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
-            "audio-track removal must preserve every unrelated mixer field",
+            "structural track removal must preserve every unrelated mixer field",
         ));
     }
     Ok(())
@@ -3684,7 +3870,7 @@ fn candidate_track_addition_manifest(
 
 fn candidate_audio_track_removal_manifest(
     active: &[u8],
-    request: AudioTrackRemovalRequest<'_>,
+    request: &StructuralTrackRemovalRequest<'_>,
     track_path: &str,
     revision: u64,
 ) -> Result<Vec<u8>, ProjectResourcePublicationError> {
@@ -5422,11 +5608,12 @@ fn validate_staged_audio_track_transaction(
             }
             candidate_audio_track_removal_manifest(
                 &previous_project,
-                AudioTrackRemovalRequest {
+                &StructuralTrackRemovalRequest {
                     expected_project_sha256: digest(&previous_project),
                     track_id: &tx.track_id,
                     mixer_id: &tx.mixer_id,
                     mixer_bytes: &mixer,
+                    contract: tx.contract.clone(),
                 },
                 &tx.track.path,
                 tx.after_project_revision,
@@ -5454,11 +5641,12 @@ fn validate_staged_audio_track_transaction(
             &previous_mixer,
         ),
         AudioTrackTransactionOperation::Removal => validate_audio_track_removal_documents(
-            AudioTrackRemovalRequest {
+            &StructuralTrackRemovalRequest {
                 expected_project_sha256: digest(&previous_project),
                 track_id: &tx.track_id,
                 mixer_id: &tx.mixer_id,
                 mixer_bytes: &mixer,
+                contract: tx.contract.clone(),
             },
             &track,
             &previous_mixer,
@@ -9779,6 +9967,285 @@ mod tests {
                 .all(|descriptor| descriptor.id() != NEW_TRACK_ID)
         );
         assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
+    fn removes_unreferenced_group_and_return_buses_atomically() {
+        let group_fixture = AudioTrackFixture::new();
+        let (identity, source_track_id, documents) = prepared_routing_bus_documents(
+            &group_fixture,
+            hyper_playback_json::RoutingBusKind::Group,
+            GROUP_BUS_ID,
+            None,
+        );
+        let source_track_ids = [source_track_id.as_str()];
+        let no_send_ids: [&str; 0] = [];
+        publish_routing_bus(
+            &group_fixture.root,
+            RoutingBusPublicationRequest {
+                expected_project_sha256: identity,
+                track_id: GROUP_BUS_ID,
+                track_bytes: documents.track(),
+                mixer_id: &group_fixture.mixer_id,
+                mixer_bytes: documents.mixer(),
+                kind: RoutingBusPublicationKind::Group,
+                source_track_ids: &source_track_ids,
+                send_ids: &no_send_ids,
+            },
+        )
+        .unwrap();
+        let mut group_mixer: Value = serde_json::from_slice(documents.mixer()).unwrap();
+        let channels = group_mixer["channels"].as_array_mut().unwrap();
+        channels
+            .iter_mut()
+            .find(|channel| channel["track_id"].as_str() == Some(source_track_id.as_str()))
+            .unwrap()["destination"] = json!({"kind":"main"});
+        let group_mixer = serde_json_canonicalizer::to_vec(&group_mixer).unwrap();
+        let group_identity = *verify_project_package(&group_fixture.root)
+            .unwrap()
+            .manifest_sha256();
+        publish_project_resource(
+            &group_fixture.root,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: group_identity,
+                resource_id: &group_fixture.mixer_id,
+                expected_role: ResourceRole::Mixer,
+                resource_bytes: &group_mixer,
+            },
+        )
+        .unwrap();
+        let mut group_removal: Value = serde_json::from_slice(&group_mixer).unwrap();
+        let channels = group_removal["channels"].as_array_mut().unwrap();
+        channels.remove(
+            channels
+                .iter()
+                .position(|channel| channel["track_id"].as_str() == Some(GROUP_BUS_ID))
+                .unwrap(),
+        );
+        let group_removal = serde_json_canonicalizer::to_vec(&group_removal).unwrap();
+        let group_identity = *verify_project_package(&group_fixture.root)
+            .unwrap()
+            .manifest_sha256();
+        let group = remove_routing_bus(
+            &group_fixture.root,
+            RoutingBusRemovalRequest {
+                expected_project_sha256: group_identity,
+                track_id: GROUP_BUS_ID,
+                mixer_id: &group_fixture.mixer_id,
+                mixer_bytes: &group_removal,
+                kind: RoutingBusRemovalKind::Group,
+            },
+        )
+        .unwrap();
+        assert_eq!(group.project_revision(), 4);
+        assert!(!group_fixture.root.join(format!("tracks/{GROUP_BUS_ID}.json")).exists());
+        assert_active_mixer_loads(&group_fixture.root, &group_fixture.mixer_id);
+
+        let return_fixture = AudioTrackFixture::new();
+        let (identity, source_track_id, documents) = prepared_routing_bus_documents(
+            &return_fixture,
+            hyper_playback_json::RoutingBusKind::Return,
+            RETURN_BUS_ID,
+            Some(RETURN_SEND_ID),
+        );
+        let source_track_ids = [source_track_id.as_str()];
+        let send_ids = [RETURN_SEND_ID];
+        publish_routing_bus(
+            &return_fixture.root,
+            RoutingBusPublicationRequest {
+                expected_project_sha256: identity,
+                track_id: RETURN_BUS_ID,
+                track_bytes: documents.track(),
+                mixer_id: &return_fixture.mixer_id,
+                mixer_bytes: documents.mixer(),
+                kind: RoutingBusPublicationKind::Return,
+                source_track_ids: &source_track_ids,
+                send_ids: &send_ids,
+            },
+        )
+        .unwrap();
+        let mut return_mixer: Value = serde_json::from_slice(documents.mixer()).unwrap();
+        let channels = return_mixer["channels"].as_array_mut().unwrap();
+        channels
+            .iter_mut()
+            .find(|channel| channel["track_id"].as_str() == Some(source_track_id.as_str()))
+            .unwrap()["sends"] = json!([]);
+        let return_mixer = serde_json_canonicalizer::to_vec(&return_mixer).unwrap();
+        let return_identity = *verify_project_package(&return_fixture.root)
+            .unwrap()
+            .manifest_sha256();
+        publish_project_resource(
+            &return_fixture.root,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: return_identity,
+                resource_id: &return_fixture.mixer_id,
+                expected_role: ResourceRole::Mixer,
+                resource_bytes: &return_mixer,
+            },
+        )
+        .unwrap();
+        let mut return_removal: Value = serde_json::from_slice(&return_mixer).unwrap();
+        let channels = return_removal["channels"].as_array_mut().unwrap();
+        channels.remove(
+            channels
+                .iter()
+                .position(|channel| channel["track_id"].as_str() == Some(RETURN_BUS_ID))
+                .unwrap(),
+        );
+        return_removal["return_buses"] = json!([]);
+        let return_removal = serde_json_canonicalizer::to_vec(&return_removal).unwrap();
+        let return_identity = *verify_project_package(&return_fixture.root)
+            .unwrap()
+            .manifest_sha256();
+        let returned = remove_routing_bus(
+            &return_fixture.root,
+            RoutingBusRemovalRequest {
+                expected_project_sha256: return_identity,
+                track_id: RETURN_BUS_ID,
+                mixer_id: &return_fixture.mixer_id,
+                mixer_bytes: &return_removal,
+                kind: RoutingBusRemovalKind::Return,
+            },
+        )
+        .unwrap();
+        assert_eq!(returned.project_revision(), 4);
+        assert!(!return_fixture.root.join(format!("tracks/{RETURN_BUS_ID}.json")).exists());
+        assert_active_mixer_loads(&return_fixture.root, &return_fixture.mixer_id);
+    }
+
+    #[test]
+    fn routing_bus_removal_crashes_recover_to_one_complete_project_identity() {
+        for (playback_kind, removal_kind, track_id, send_id) in [
+            (
+                hyper_playback_json::RoutingBusKind::Group,
+                RoutingBusRemovalKind::Group,
+                GROUP_BUS_ID,
+                None,
+            ),
+            (
+                hyper_playback_json::RoutingBusKind::Return,
+                RoutingBusRemovalKind::Return,
+                RETURN_BUS_ID,
+                Some(RETURN_SEND_ID),
+            ),
+        ] {
+            for crash_phase in [
+                AudioTrackPublicationPhase::Transaction,
+                AudioTrackPublicationPhase::Track,
+                AudioTrackPublicationPhase::Mixer,
+                AudioTrackPublicationPhase::Manifest,
+            ] {
+                let fixture = AudioTrackFixture::new();
+                let (identity, source_track_id, documents) = prepared_routing_bus_documents(
+                    &fixture,
+                    playback_kind,
+                    track_id,
+                    send_id,
+                );
+                let source_track_ids = [source_track_id.as_str()];
+                let send_ids = send_id.map_or_else(Vec::new, |id| vec![id]);
+                publish_routing_bus(
+                    &fixture.root,
+                    RoutingBusPublicationRequest {
+                        expected_project_sha256: identity,
+                        track_id,
+                        track_bytes: documents.track(),
+                        mixer_id: &fixture.mixer_id,
+                        mixer_bytes: documents.mixer(),
+                        kind: match removal_kind {
+                            RoutingBusRemovalKind::Group => RoutingBusPublicationKind::Group,
+                            RoutingBusRemovalKind::Return => RoutingBusPublicationKind::Return,
+                        },
+                        source_track_ids: &source_track_ids,
+                        send_ids: &send_ids,
+                    },
+                )
+                .unwrap();
+                let mut cleaned: Value = serde_json::from_slice(documents.mixer()).unwrap();
+                let channels = cleaned["channels"].as_array_mut().unwrap();
+                let source = channels
+                    .iter_mut()
+                    .find(|channel| channel["track_id"].as_str() == Some(source_track_id.as_str()))
+                    .unwrap();
+                match removal_kind {
+                    RoutingBusRemovalKind::Group => {
+                        source["destination"] = json!({"kind":"main"});
+                    }
+                    RoutingBusRemovalKind::Return => source["sends"] = json!([]),
+                }
+                let cleaned = serde_json_canonicalizer::to_vec(&cleaned).unwrap();
+                let cleanup_identity = *verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest_sha256();
+                publish_project_resource(
+                    &fixture.root,
+                    ProjectResourcePublicationRequest {
+                        expected_project_sha256: cleanup_identity,
+                        resource_id: &fixture.mixer_id,
+                        expected_role: ResourceRole::Mixer,
+                        resource_bytes: &cleaned,
+                    },
+                )
+                .unwrap();
+                let mut removal: Value = serde_json::from_slice(&cleaned).unwrap();
+                let channels = removal["channels"].as_array_mut().unwrap();
+                channels.remove(
+                    channels
+                        .iter()
+                        .position(|channel| channel["track_id"].as_str() == Some(track_id))
+                        .unwrap(),
+                );
+                if removal_kind == RoutingBusRemovalKind::Return {
+                    removal["return_buses"] = json!([]);
+                }
+                let removal = serde_json_canonicalizer::to_vec(&removal).unwrap();
+                let removal_identity = *verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest_sha256();
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let _ = remove_routing_bus_observed(
+                        &fixture.root,
+                        RoutingBusRemovalRequest {
+                            expected_project_sha256: removal_identity,
+                            track_id,
+                            mixer_id: &fixture.mixer_id,
+                            mixer_bytes: &removal,
+                            kind: removal_kind,
+                        },
+                        |phase, _| {
+                            assert_ne!(phase, crash_phase, "simulated process crash");
+                            Ok(())
+                        },
+                    );
+                }));
+                assert!(result.is_err());
+                let recovered = recover_audio_track_publications(&fixture.root).unwrap();
+                assert_eq!(recovered.len(), 1);
+                assert_eq!(
+                    recovered[0].disposition(),
+                    if crash_phase == AudioTrackPublicationPhase::Manifest {
+                        AudioTrackPublicationRecoveryDisposition::Committed
+                    } else {
+                        AudioTrackPublicationRecoveryDisposition::RolledBack
+                    }
+                );
+                let package = verify_project_package(&fixture.root).unwrap();
+                if crash_phase == AudioTrackPublicationPhase::Manifest {
+                    assert!(package
+                        .manifest()
+                        .resources()
+                        .iter()
+                        .all(|resource| resource.id() != track_id));
+                    assert_active_mixer_loads(&fixture.root, &fixture.mixer_id);
+                } else {
+                    assert!(package
+                        .manifest()
+                        .resources()
+                        .iter()
+                        .any(|resource| resource.id() == track_id));
+                }
+            }
+        }
     }
 
     #[test]
