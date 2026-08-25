@@ -131,6 +131,14 @@ export struct ReturnSendCandidateRow {
     return-name: string,
 }
 
+export struct PrimaryRouteCandidateRow {
+    source-track-id: string,
+    source-name: string,
+    target-group-track-id: string,
+    target-name: string,
+    targets-main: bool,
+}
+
 export struct RoutingBusSourceRow {
     index: int,
     track-id: string,
@@ -310,6 +318,7 @@ export global IdeActions {
     callback mixer-send-enabled(int);
     callback add-return-send(string, string);
     callback remove-return-send(string);
+    callback set-audio-primary-route(string, string, bool);
     callback add-native-filter(int, int, string, string);
     callback update-native-filter(int, bool, int, string, string);
     callback add-native-compressor(int, string, string, string, string, string);
@@ -675,6 +684,7 @@ export component MainWindow inherits Window {
     in property <[MixerChannelRow]> mixer-channels: [];
     in property <[MixerSendRow]> mixer-sends: [];
     in property <[ReturnSendCandidateRow]> return-send-candidates: [];
+    in property <[PrimaryRouteCandidateRow]> primary-route-candidates: [];
     in property <[NativeDeviceRow]> native-devices: [];
     in property <[string]> native-filter-track-names: [];
     in-out property <bool> native-device-copy-available: false;
@@ -3113,6 +3123,41 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle { height: 1px; background: #27313d; }
+
+                    if root.primary-route-candidates.length > 0 : Rectangle {
+                        height: 54px;
+                        background: #0e141b;
+                        border-color: #27313d;
+                        border-width: 1px;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding: 6px;
+                            spacing: 6px;
+                            Text {
+                                width: 92px;
+                                text: "PRIMARY ROUTING";
+                                color: #6f8197;
+                                font-size: 8px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            Flickable {
+                                horizontal-stretch: 1;
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    for candidate in root.primary-route-candidates : Button {
+                                        min-width: 132px;
+                                        text: candidate.source-name + " → " + candidate.target-name;
+                                        accessible-label: "Route " + candidate.source-name + " to " + candidate.target-name;
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => {
+                                            IdeActions.set-audio-primary-route(candidate.source-track-id, candidate.target-group-track-id, candidate.targets-main);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     if root.return-send-candidates.length > 0 : Rectangle {
                         height: 54px;

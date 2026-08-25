@@ -15,7 +15,7 @@ use hyper_desktop_ide::{
     IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
     IdeInputSelection, IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
     IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
-    IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelKind, IdeMixerCommand,
+    IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerChannelKind, IdeMixerCommand,
     IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice,
     IdeNativeFilterEdit, NativeFilterMode, IdeOutputSelection,
     IdeRoutingBusKind,
@@ -2564,6 +2564,7 @@ fn bind_send_callbacks(ui: &MainWindow, worker: &WorkerCell) {
     });
 
     bind_return_send_callbacks(ui, worker);
+    bind_audio_primary_route_callbacks(ui, worker);
 }
 
 fn bind_return_send_callbacks(ui: &MainWindow, worker: &WorkerCell) {
@@ -2623,6 +2624,50 @@ fn bind_return_send_callbacks_with(ui: &MainWindow, submitter: UiCommandSubmitte
             &ui,
             IdeWorkerCommand::RemoveReturnSend {
                 send_id: send_id.to_string(),
+            },
+        );
+    });
+}
+
+fn bind_audio_primary_route_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let worker = Rc::clone(worker);
+    bind_audio_primary_route_callbacks_with(
+        ui,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker, command)),
+    );
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the generated callback retains the shared command submitter for the window lifetime"
+)]
+fn bind_audio_primary_route_callbacks_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    actions.on_set_audio_primary_route(move |source_track_id, target_group_track_id, targets_main| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_primary_route_candidates().iter().any(|candidate| {
+                candidate.source_track_id == source_track_id
+                    && candidate.target_group_track_id == target_group_track_id
+                    && candidate.targets_main == targets_main
+            })
+        {
+            ui.set_error_text("The selected primary route is no longer available".into());
+            return;
+        }
+        let target_group_track_id = if targets_main {
+            None
+        } else {
+            Some(target_group_track_id.to_string())
+        };
+        submitter(
+            &ui,
+            IdeWorkerCommand::SetAudioPrimaryRoute {
+                source_track_id: source_track_id.to_string(),
+                target_group_track_id,
             },
         );
     });
@@ -4305,6 +4350,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         | IdeWorkerCommandKind::ReorderAudioTracks
         | IdeWorkerCommandKind::AddReturnSend
         | IdeWorkerCommandKind::RemoveReturnSend
+        | IdeWorkerCommandKind::SetAudioPrimaryRoute
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
@@ -4442,6 +4488,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::AddReturnSend | IdeWorkerCommandKind::RemoveReturnSend => {
             "Preserving mixer state, editing the return send, and reopening project…"
+        }
+        IdeWorkerCommandKind::SetAudioPrimaryRoute => {
+            "Preserving mixer state, changing the primary route, and reopening project…"
         }
         IdeWorkerCommandKind::DuplicateAudioTrack => {
             "Preserving mixer state, duplicating the audio track, and reopening project…"
@@ -4727,6 +4776,10 @@ fn apply_event(
         }
         IdeWorkerEvent::ReturnSendEdited { revision } => {
             ui.set_status_text(format!("Return send edited in project revision {revision}").into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioPrimaryRouteChanged { revision } => {
+            ui.set_status_text(format!("Primary route changed in project revision {revision}").into());
             ui.set_error_text(SharedString::default());
         }
         event @ (IdeWorkerEvent::AudioTrackRemoved { .. } | IdeWorkerEvent::AudioTrackRemoving) => {
@@ -7774,6 +7827,7 @@ fn reset_project(
     ui.set_mixer_channels(ModelRc::default());
     ui.set_mixer_sends(ModelRc::default());
     ui.set_return_send_candidates(ModelRc::default());
+    ui.set_primary_route_candidates(ModelRc::default());
     reset_native_filter_ui(ui, project_state);
     ui.set_mixer_main_state_available(false);
     ui.set_mixer_main_gain_percent(0.0);
@@ -7934,6 +7988,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         | IdeWorkerCommandKind::ReorderAudioTracks
         | IdeWorkerCommandKind::AddReturnSend
         | IdeWorkerCommandKind::RemoveReturnSend
+        | IdeWorkerCommandKind::SetAudioPrimaryRoute
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
@@ -8895,6 +8950,41 @@ fn return_send_candidate_rows(channels: &[IdeMixerChannel]) -> Vec<ReturnSendCan
                     return_track_id: target.id().into(),
                     return_name: target.name().into(),
                 })
+        })
+        .collect()
+}
+
+fn primary_route_candidate_rows(channels: &[IdeMixerChannel]) -> Vec<PrimaryRouteCandidateRow> {
+    channels
+        .iter()
+        .filter(|source| source.kind() == IdeMixerChannelKind::Audio)
+        .flat_map(|source| {
+            let main = matches!(source.destination(), IdeMixerChannelDestination::Group { .. })
+                .then(|| PrimaryRouteCandidateRow {
+                    source_track_id: source.id().into(),
+                    source_name: source.name().into(),
+                    target_group_track_id: SharedString::default(),
+                    target_name: "Main".into(),
+                    targets_main: true,
+                });
+            let groups = channels.iter().filter_map(move |target| {
+                if target.kind() != IdeMixerChannelKind::Group
+                    || matches!(
+                        source.destination(),
+                        IdeMixerChannelDestination::Group { track_id, .. } if track_id == target.id()
+                    )
+                {
+                    return None;
+                }
+                Some(PrimaryRouteCandidateRow {
+                    source_track_id: source.id().into(),
+                    source_name: source.name().into(),
+                    target_group_track_id: target.id().into(),
+                    target_name: target.name().into(),
+                    targets_main: false,
+                })
+            });
+            main.into_iter().chain(groups)
         })
         .collect()
 }
@@ -10665,6 +10755,9 @@ fn set_mixer(
     }
     ui.set_return_send_candidates(ModelRc::from(Rc::new(VecModel::from(
         return_send_candidate_rows(channels),
+    ))));
+    ui.set_primary_route_candidates(ModelRc::from(Rc::new(VecModel::from(
+        primary_route_candidate_rows(channels),
     ))));
 }
 
@@ -13904,6 +13997,85 @@ mod tests {
         assert_eq!(
             ui.get_error_text(),
             "The selected return send is no longer available"
+        );
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn primary_route_actions_forward_only_current_generated_rows() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_visible(true);
+        ui.set_mixer_sends_visible(true);
+        ui.set_primary_route_candidates(ModelRc::from(Rc::new(VecModel::from(vec![
+            PrimaryRouteCandidateRow {
+                source_track_id: "018f47a2-6b2d-7c11-8a44-001122334456".into(),
+                source_name: "Drums".into(),
+                target_group_track_id: "018f47a2-6b2d-7c11-8a44-001122334457".into(),
+                target_name: "Music".into(),
+                targets_main: false,
+            },
+            PrimaryRouteCandidateRow {
+                source_track_id: "018f47a2-6b2d-7c11-8a44-001122334458".into(),
+                source_name: "Bass".into(),
+                target_group_track_id: SharedString::default(),
+                target_name: "Main".into(),
+                targets_main: true,
+            },
+        ]))));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_audio_primary_route_callbacks_with(
+            &ui,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+        ui.show().unwrap();
+
+        let route = ElementHandle::find_by_accessible_label(&ui, "Route Drums to Music")
+            .next()
+            .expect("the generated primary-route candidate is reachable");
+        assert_eq!(route.accessible_enabled(), Some(true));
+        route.mock_single_click(PointerEventButton::Left);
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::SetAudioPrimaryRoute {
+                source_track_id,
+                target_group_track_id: Some(target_group_track_id),
+            }] if source_track_id == "018f47a2-6b2d-7c11-8a44-001122334456"
+                && target_group_track_id == "018f47a2-6b2d-7c11-8a44-001122334457"
+        ));
+
+        let main = ElementHandle::find_by_accessible_label(&ui, "Route Bass to Main")
+            .next()
+            .expect("the generated Main-route candidate is reachable");
+        assert_eq!(main.accessible_enabled(), Some(true));
+        main.mock_single_click(PointerEventButton::Left);
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [
+                IdeWorkerCommand::SetAudioPrimaryRoute { .. },
+                IdeWorkerCommand::SetAudioPrimaryRoute {
+                    source_track_id,
+                    target_group_track_id: None,
+                },
+            ] if source_track_id == "018f47a2-6b2d-7c11-8a44-001122334458"
+        ));
+
+        ui.global::<IdeActions>().invoke_set_audio_primary_route(
+            "018f47a2-6b2d-7c11-8a44-001122334499".into(),
+            "018f47a2-6b2d-7c11-8a44-001122334457".into(),
+            false,
+        );
+        assert_eq!(
+            submitted.borrow().len(),
+            2,
+            "stale primary-route identities must not enqueue a mutation"
+        );
+        assert_eq!(
+            ui.get_error_text(),
+            "The selected primary route is no longer available"
         );
         ui.hide().unwrap();
     }

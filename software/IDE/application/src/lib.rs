@@ -93,11 +93,13 @@ use hyper_playback_json::{
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
     AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
     AudioTrackReorderSerializationError,
+    AudioPrimaryRouteSerializationError, AudioPrimaryRouteTarget,
     ReturnSendSerializationError, RoutingBusCreationSerializationError,
     RoutingBusKind as PlaybackRoutingBusKind,
     AutomationTakeAddition, AutomationTakeAdditionSerializationError,
-    AutomationTakeEditSerializationError, AutomationTargetSelection, CompiledMixerGraph,
-    CompiledMixerTap, CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits,
+    AutomationTakeEditSerializationError, AutomationTargetSelection, CompiledMixerDestination,
+    CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
+    LoadError as PlaybackDocumentLoadError, LoaderLimits,
     MediaAssetFact, MixerBaseState, MixerChannelBaseState, MixerSendBaseState,
     MixerStateSerializationError, SceneAdditionSerializationError, SceneDocumentSerializationError,
     SceneDuplicationSerializationError, SceneRenameSerializationError, SceneSlotEdit,
@@ -116,7 +118,8 @@ use hyper_playback_json::{
     serialize_audio_track_content_removal,
     serialize_audio_track_removal, serialize_audio_track_rename,
     serialize_audio_track_duplication, serialize_audio_track_reorder,
-    serialize_return_send_addition, serialize_return_send_removal,
+    serialize_audio_primary_route_change, serialize_return_send_addition,
+    serialize_return_send_removal,
     serialize_routing_bus_creation,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_mixer_base_state, serialize_recording_audio_clip_addition,
@@ -191,7 +194,7 @@ pub use recording::{
 pub use worker::{
     DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeAudioClip,
     IdeAudioClipEditCommittedWarning, IdeAudioPreviewObservation, IdeClosedSnapshot,
-    IdeMixerChannel, IdeMixerSend, IdeNativeCompressor, IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError, IdeRecordingCaptureKind,
+    IdeMixerChannel, IdeMixerChannelDestination, IdeMixerSend, IdeNativeCompressor, IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError, IdeRecordingCaptureKind,
     IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeRuntimePreparationError,
     IdeScene, IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure,
     IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
@@ -2290,6 +2293,93 @@ impl Error for IdeReturnSendEditError {
             | Self::Blocked { .. }
             | Self::CapacityUnavailable
             | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+/// A durable reassignment of one audio channel's primary mixer destination.
+#[derive(Debug)]
+pub enum IdeAudioPrimaryRouteError {
+    InvalidRouteIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    Serialization(AudioPrimaryRouteSerializationError),
+    CapacityUnavailable,
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAudioPrimaryRouteError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: Box<ProjectResourcePublicationOutcome>,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeAudioPrimaryRouteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRouteIdentity => {
+                formatter.write_str("primary-route identity is invalid")
+            }
+            Self::MixerSave(source) => {
+                write!(formatter, "live mixer state could not be preserved: {source}")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("primary-route edit capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before editing the primary route: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before editing the primary route ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "primary-route preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "primary route was edited in project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "primary-route publication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioPrimaryRouteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidRouteIdentity | Self::CapacityUnavailable | Self::NativeClose(_) => None,
         }
     }
 }
@@ -8145,6 +8235,13 @@ pub enum IdeMixerChannelKind {
     Return,
 }
 
+/// One verified primary destination exposed with a mixer channel observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeMixerPrimaryDestination<'a> {
+    Main,
+    Group { track_id: &'a str, name: &'a str },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IdeMixerChannelState {
     pub gain: f32,
@@ -8206,6 +8303,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub mixer_channel_names: [&'a str; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_kinds: [IdeMixerChannelKind; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_active: [bool; MAX_IDE_MIXER_CHANNELS],
+    pub mixer_channel_destinations: [IdeMixerPrimaryDestination<'a>; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_states: [Option<IdeMixerChannelState>; MAX_IDE_MIXER_CHANNELS],
     pub mixer_send_counts: [usize; MAX_IDE_MIXER_CHANNELS],
     pub mixer_send_ids:
@@ -8710,6 +8808,39 @@ impl RunningDesktopIdeApplication {
             application.config.project_limits.session.documents,
         )
         .map_err(IdeReturnSendEditError::Serialization)?;
+        Ok(mixer)
+    }
+
+    fn prepare_audio_primary_route_change(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        source_track_id: &str,
+        target_group_track_id: Option<&str>,
+    ) -> Result<IdeMixerSavePlan, IdeAudioPrimaryRouteError> {
+        let mut mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioPrimaryRouteError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioPrimaryRouteError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAudioPrimaryRouteError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let target = target_group_track_id.map_or(AudioPrimaryRouteTarget::Main, AudioPrimaryRouteTarget::Group);
+        mixer.resource_bytes = serialize_audio_primary_route_change(
+            project,
+            &assets,
+            &mixer.resource_bytes,
+            &mixer.resource_id,
+            source_track_id,
+            target,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeAudioPrimaryRouteError::Serialization)?;
         Ok(mixer)
     }
 
@@ -12221,6 +12352,7 @@ impl RunningDesktopIdeApplication {
         let mut mixer_channel_names = [""; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_kinds = [IdeMixerChannelKind::Audio; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_active = [false; MAX_IDE_MIXER_CHANNELS];
+        let mut mixer_channel_destinations = [IdeMixerPrimaryDestination::Main; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_states = [None; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_send_counts = [0; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_send_ids =
@@ -12242,6 +12374,16 @@ impl RunningDesktopIdeApplication {
                 CompiledMixerTrackKind::Audio => IdeMixerChannelKind::Audio,
                 CompiledMixerTrackKind::Group => IdeMixerChannelKind::Group,
                 CompiledMixerTrackKind::Return => IdeMixerChannelKind::Return,
+            };
+            mixer_channel_destinations[channel_index] = match slot.destination() {
+                CompiledMixerDestination::Main => IdeMixerPrimaryDestination::Main,
+                CompiledMixerDestination::Slot(target) => {
+                    let target = mixer.slots().get(target)?;
+                    IdeMixerPrimaryDestination::Group {
+                        track_id: target.track_id(),
+                        name: loaded.track_name(target.track_id())?,
+                    }
+                }
             };
             mixer_channel_states[channel_index] = mixer_parameters
                 .and_then(|state| state.channel(channel_index))
@@ -12301,6 +12443,7 @@ impl RunningDesktopIdeApplication {
             mixer_channel_names,
             mixer_channel_kinds,
             mixer_channel_active,
+            mixer_channel_destinations,
             mixer_channel_states,
             mixer_send_counts,
             mixer_send_ids,
