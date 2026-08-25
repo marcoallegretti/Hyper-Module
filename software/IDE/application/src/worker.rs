@@ -166,7 +166,7 @@ pub enum IdeWorkerCommandKind {
     SetAudioPrimaryRoute,
     RemoveAudioTrack,
     RemoveAudioTrackContent,
-    ReorderAudioTracks,
+    ReorderMixerStrips,
     DuplicateAudioTrack,
     RenameAudioTrack,
     SetAudioTrackActive,
@@ -305,7 +305,7 @@ pub enum IdeWorkerCommand {
     RemoveAudioTrackContent {
         track_id: String,
     },
-    ReorderAudioTracks {
+    ReorderMixerStrips {
         track_id: String,
         destination_index: usize,
     },
@@ -542,7 +542,7 @@ impl IdeWorkerCommand {
             Self::RemoveAudioTrackContent { .. } => {
                 IdeWorkerCommandKind::RemoveAudioTrackContent
             }
-            Self::ReorderAudioTracks { .. } => IdeWorkerCommandKind::ReorderAudioTracks,
+            Self::ReorderMixerStrips { .. } => IdeWorkerCommandKind::ReorderMixerStrips,
             Self::DuplicateAudioTrack { .. } => IdeWorkerCommandKind::DuplicateAudioTrack,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
             Self::SetAudioTrackActive { .. } => IdeWorkerCommandKind::SetAudioTrackActive,
@@ -1960,7 +1960,7 @@ pub enum IdeWorkerCommandFailure {
     AudioPrimaryRoute(Box<super::IdeAudioPrimaryRouteError>),
     AudioTrackRemoval(Box<super::IdeAudioTrackRemovalError>),
     AudioTrackContentRemoval(Box<super::IdeAudioTrackContentRemovalError>),
-    AudioTrackReorder(Box<super::IdeMixerStripReorderError>),
+    MixerStripReorder(Box<super::IdeMixerStripReorderError>),
     AudioTrackDuplication(Box<super::IdeAudioTrackDuplicationError>),
     AudioTrackRename(Box<super::IdeAudioTrackEditError>),
     AudioTrackActivation(Box<super::IdeAudioTrackEditError>),
@@ -2107,7 +2107,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioPrimaryRoute(source) => source.fmt(formatter),
             Self::AudioTrackRemoval(source) => source.fmt(formatter),
             Self::AudioTrackContentRemoval(source) => source.fmt(formatter),
-            Self::AudioTrackReorder(source) => source.fmt(formatter),
+            Self::MixerStripReorder(source) => source.fmt(formatter),
             Self::AudioTrackDuplication(source) => source.fmt(formatter),
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => {
                 source.fmt(formatter)
@@ -2209,7 +2209,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioPrimaryRoute(source) => Some(source),
             Self::AudioTrackRemoval(source) => Some(source),
             Self::AudioTrackContentRemoval(source) => Some(source),
-            Self::AudioTrackReorder(source) => Some(source),
+            Self::MixerStripReorder(source) => Some(source),
             Self::AudioTrackDuplication(source) => Some(source),
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => Some(source),
             Self::AudioImport(source) => Some(source),
@@ -2389,7 +2389,7 @@ pub enum IdeWorkerEvent {
     AudioTrackContentRemovalCommittedWithWarning {
         warning: Box<IdeAudioTrackContentRemovalError>,
     },
-    AudioTracksReordered {
+    MixerStripsReordered {
         revision: u64,
     },
     AudioTrackDuplicated {
@@ -2688,7 +2688,7 @@ pub enum IdeWorkerEvent {
     AudioTrackAdding,
     AudioTrackRemoving,
     AudioTrackContentRemoving,
-    AudioTracksReordering,
+    MixerStripsReordering,
     AudioTrackDuplicating,
     AudioTrackRenaming,
     RoutingBusRenaming,
@@ -3206,7 +3206,7 @@ enum ProjectMutation {
     RemoveAudioTrackContent {
         track_id: String,
     },
-    ReorderAudioTracks {
+    ReorderMixerStrips {
         track_id: String,
         destination_index: usize,
     },
@@ -3399,7 +3399,7 @@ impl ProjectMutation {
             Self::RemoveAudioTrackContent { .. } => {
                 IdeWorkerCommandKind::RemoveAudioTrackContent
             }
-            Self::ReorderAudioTracks { .. } => IdeWorkerCommandKind::ReorderAudioTracks,
+            Self::ReorderMixerStrips { .. } => IdeWorkerCommandKind::ReorderMixerStrips,
             Self::DuplicateAudioTrack { .. } => IdeWorkerCommandKind::DuplicateAudioTrack,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
             Self::SetAudioTrackActive { .. } => IdeWorkerCommandKind::SetAudioTrackActive,
@@ -3482,7 +3482,7 @@ impl ProjectMutation {
             Self::AddRoutingBus { kind, .. } => IdeWorkerEvent::RoutingBusAdding { kind: *kind },
             Self::RemoveAudioTrack { .. } => IdeWorkerEvent::AudioTrackRemoving,
             Self::RemoveAudioTrackContent { .. } => IdeWorkerEvent::AudioTrackContentRemoving,
-            Self::ReorderAudioTracks { .. } => IdeWorkerEvent::AudioTracksReordering,
+            Self::ReorderMixerStrips { .. } => IdeWorkerEvent::MixerStripsReordering,
             Self::DuplicateAudioTrack { .. } => IdeWorkerEvent::AudioTrackDuplicating,
             Self::RenameAudioTrack { .. } => IdeWorkerEvent::AudioTrackRenaming,
             Self::RenameRoutingBus { .. } => IdeWorkerEvent::RoutingBusRenaming,
@@ -3845,7 +3845,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::AddRoutingBus
         | IdeWorkerCommandKind::RemoveAudioTrack
         | IdeWorkerCommandKind::RemoveAudioTrackContent
-        | IdeWorkerCommandKind::ReorderAudioTracks
+        | IdeWorkerCommandKind::ReorderMixerStrips
         | IdeWorkerCommandKind::DuplicateAudioTrack
         | IdeWorkerCommandKind::ImportAudio
         | IdeWorkerCommandKind::CreateAudioClipFromTake
@@ -4152,7 +4152,7 @@ fn process_command(
         | IdeWorkerCommand::AddAudioTrack { .. }
         | IdeWorkerCommand::RemoveAudioTrack { .. }
         | IdeWorkerCommand::RemoveAudioTrackContent { .. }
-        | IdeWorkerCommand::ReorderAudioTracks { .. }
+        | IdeWorkerCommand::ReorderMixerStrips { .. }
         | IdeWorkerCommand::DuplicateAudioTrack { .. }
         | IdeWorkerCommand::RenameAudioTrack { .. }
         | IdeWorkerCommand::SetAudioTrackActive { .. }
@@ -4357,10 +4357,10 @@ fn process_project_mutation_command(
         IdeWorkerCommand::RemoveAudioTrackContent { track_id } => {
             remove_audio_track_content(state, events, &track_id)
         }
-        IdeWorkerCommand::ReorderAudioTracks {
+        IdeWorkerCommand::ReorderMixerStrips {
             track_id,
             destination_index,
-        } => reorder_audio_tracks(state, events, &track_id, destination_index),
+        } => reorder_mixer_strips(state, events, &track_id, destination_index),
         IdeWorkerCommand::DuplicateAudioTrack { track_id, name } => {
             duplicate_audio_track(state, events, &track_id, &name)
         }
@@ -5966,7 +5966,7 @@ fn remove_audio_track_content(
     )
 }
 
-fn reorder_audio_tracks(
+fn reorder_mixer_strips(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
     track_id: &str,
@@ -5975,8 +5975,8 @@ fn reorder_audio_tracks(
     if track_id.is_empty() {
         return publish_failure(
             events,
-            IdeWorkerCommandKind::ReorderAudioTracks,
-            IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
+            IdeWorkerCommandKind::ReorderMixerStrips,
+            IdeWorkerCommandFailure::MixerStripReorder(Box::new(
                 IdeMixerStripReorderError::TrackResourceMissing,
             )),
         );
@@ -5985,8 +5985,8 @@ fn reorder_audio_tracks(
     if owned_track_id.try_reserve_exact(track_id.len()).is_err() {
         return publish_failure(
             events,
-            IdeWorkerCommandKind::ReorderAudioTracks,
-            IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
+            IdeWorkerCommandKind::ReorderMixerStrips,
+            IdeWorkerCommandFailure::MixerStripReorder(Box::new(
                 IdeMixerStripReorderError::CapacityUnavailable,
             )),
         );
@@ -5995,7 +5995,7 @@ fn reorder_audio_tracks(
     begin_project_mutation_request(
         state,
         events,
-        ProjectMutation::ReorderAudioTracks {
+        ProjectMutation::ReorderMixerStrips {
             track_id: owned_track_id,
             destination_index,
         },
@@ -7402,7 +7402,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::RemoveRoutingBus(Ok(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Ok(_))
         | ProjectMutationAttempt::RemoveAudioTrackContent(Ok(_))
-        | ProjectMutationAttempt::ReorderAudioTracks(Ok(_))
+        | ProjectMutationAttempt::ReorderMixerStrips(Ok(_))
         | ProjectMutationAttempt::DuplicateAudioTrack(Ok(_))
         | ProjectMutationAttempt::ImportAudio(
             Ok(_)
@@ -7436,7 +7436,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         {
             HistoryEffect::Invalidate
         }
-        ProjectMutationAttempt::ReorderAudioTracks(Err(reason))
+        ProjectMutationAttempt::ReorderMixerStrips(Err(reason))
             if reason.publication_committed() =>
         {
             HistoryEffect::Invalidate
@@ -7462,7 +7462,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::AddRoutingBus(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrackContent(Err(_))
-        | ProjectMutationAttempt::ReorderAudioTracks(Err(_))
+        | ProjectMutationAttempt::ReorderMixerStrips(Err(_))
         | ProjectMutationAttempt::DuplicateAudioTrack(Err(_))
         | ProjectMutationAttempt::ImportAudio(Err(IdeAudioImportBatchFailure {
             completed: 0,
@@ -8184,7 +8184,7 @@ fn project_mutation_save_failure(
                 IdeAudioTrackContentRemovalError::MixerSave(Box::new(reason)),
             ))
         }
-        ProjectMutation::ReorderAudioTracks { .. } => IdeWorkerCommandFailure::AudioTrackReorder(
+        ProjectMutation::ReorderMixerStrips { .. } => IdeWorkerCommandFailure::MixerStripReorder(
             Box::new(IdeMixerStripReorderError::MixerSave(Box::new(reason))),
         ),
         ProjectMutation::DuplicateAudioTrack { .. } => {
@@ -8489,7 +8489,7 @@ fn project_mutation_native_close_failure(
                 IdeAudioTrackContentRemovalError::NativeClose(failure),
             ))
         }
-        ProjectMutation::ReorderAudioTracks { .. } => IdeWorkerCommandFailure::AudioTrackReorder(
+        ProjectMutation::ReorderMixerStrips { .. } => IdeWorkerCommandFailure::MixerStripReorder(
             Box::new(IdeMixerStripReorderError::NativeClose(failure)),
         ),
         ProjectMutation::DuplicateAudioTrack { .. } => {
@@ -8731,7 +8731,7 @@ enum ProjectMutationAttempt {
             IdeAudioTrackContentRemovalError,
         >,
     ),
-    ReorderAudioTracks(
+    ReorderMixerStrips(
         Result<hyper_storage_engine::TrackOrderPublicationOutcome, IdeMixerStripReorderError>,
     ),
     DuplicateAudioTrack(
@@ -9503,16 +9503,16 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::RemoveAudioTrackContent(Err(reason)) => {
                     send_event(events, audio_track_content_removal_failure_event(reason))
                 }
-                ProjectMutationAttempt::ReorderAudioTracks(Ok(outcome)) => send_event(
+                ProjectMutationAttempt::ReorderMixerStrips(Ok(outcome)) => send_event(
                     events,
-                    IdeWorkerEvent::AudioTracksReordered {
+                    IdeWorkerEvent::MixerStripsReordered {
                         revision: outcome.project_revision(),
                     },
                 ),
-                ProjectMutationAttempt::ReorderAudioTracks(Err(reason)) => publish_failure(
+                ProjectMutationAttempt::ReorderMixerStrips(Err(reason)) => publish_failure(
                     events,
-                    IdeWorkerCommandKind::ReorderAudioTracks,
-                    IdeWorkerCommandFailure::AudioTrackReorder(Box::new(reason)),
+                    IdeWorkerCommandKind::ReorderMixerStrips,
+                    IdeWorkerCommandFailure::MixerStripReorder(Box::new(reason)),
                 ),
                 ProjectMutationAttempt::DuplicateAudioTrack(Ok(outcome)) => send_event(
                     events,
@@ -10715,10 +10715,10 @@ fn attempt_project_mutation(
                 })
             })
         }
-        ProjectMutation::ReorderAudioTracks {
+        ProjectMutation::ReorderMixerStrips {
             track_id,
             destination_index,
-        } => ProjectMutationAttempt::ReorderAudioTracks(if let Some(failure) = native_failure {
+        } => ProjectMutationAttempt::ReorderMixerStrips(if let Some(failure) = native_failure {
             Err(IdeMixerStripReorderError::NativeClose(failure))
         } else {
             RunningDesktopIdeApplication::prepare_mixer_strip_reorder(
@@ -12184,32 +12184,32 @@ fn project_mutation_reopen_failure(
                 },
             ))
         }
-        ProjectMutationAttempt::ReorderAudioTracks(Ok(outcome)) => {
-            IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
+        ProjectMutationAttempt::ReorderMixerStrips(Ok(outcome)) => {
+            IdeWorkerCommandFailure::MixerStripReorder(Box::new(
                 IdeMixerStripReorderError::ReopenAfterPublication {
                     outcome,
                     source: Box::new(reopen),
                 },
             ))
         }
-        ProjectMutationAttempt::ReorderAudioTracks(Err(
+        ProjectMutationAttempt::ReorderMixerStrips(Err(
             IdeMixerStripReorderError::Publication(publication),
-        )) => IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
+        )) => IdeWorkerCommandFailure::MixerStripReorder(Box::new(
             IdeMixerStripReorderError::PublicationAndReopen {
                 publication,
                 reopen: Box::new(reopen),
             },
         )),
-        ProjectMutationAttempt::ReorderAudioTracks(Err(
+        ProjectMutationAttempt::ReorderMixerStrips(Err(
             IdeMixerStripReorderError::NativeClose(close),
-        )) => IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
+        )) => IdeWorkerCommandFailure::MixerStripReorder(Box::new(
             IdeMixerStripReorderError::NativeCloseAndReopen {
                 close,
                 reopen: Box::new(reopen),
             },
         )),
-        ProjectMutationAttempt::ReorderAudioTracks(Err(preparation)) => {
-            IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
+        ProjectMutationAttempt::ReorderMixerStrips(Err(preparation)) => {
+            IdeWorkerCommandFailure::MixerStripReorder(Box::new(
                 IdeMixerStripReorderError::ReopenAfterPreparation {
                     preparation: Box::new(preparation),
                     reopen: Box::new(reopen),
@@ -15093,14 +15093,14 @@ mod tests {
         while worker.events.as_ref().unwrap().try_recv().is_ok() {}
 
         worker
-            .try_send(IdeWorkerCommand::ReorderAudioTracks {
+            .try_send(IdeWorkerCommand::ReorderMixerStrips {
                 track_id: return_track_id.clone(),
                 destination_index: 0,
             })
             .unwrap();
         assert!(matches!(
             recv_native_mutation(&worker),
-            IdeWorkerEvent::AudioTracksReordering
+            IdeWorkerEvent::MixerStripsReordering
         ));
         loop {
             match recv_native_mutation(&worker) {
@@ -15138,7 +15138,7 @@ mod tests {
         ));
         assert!(matches!(
             recv_native_mutation(&worker),
-            IdeWorkerEvent::AudioTracksReordered { revision } if revision > 3
+            IdeWorkerEvent::MixerStripsReordered { revision } if revision > 3
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
@@ -15149,7 +15149,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "one real-worker scenario proves the complete structural track-order lifecycle, including the fenced mixer state and history invalidation"
     )]
-    fn audio_track_reorder_is_durable_through_the_real_worker() {
+    fn mixer_strip_reorder_is_durable_through_the_real_worker() {
         let fixture = std::env::temp_dir().join(format!(
             "hyper-desktop-ide-track-reorder-{}",
             uuid::Uuid::new_v4()
@@ -15240,14 +15240,14 @@ mod tests {
         }
 
         worker
-            .try_send(IdeWorkerCommand::ReorderAudioTracks {
+            .try_send(IdeWorkerCommand::ReorderMixerStrips {
                 track_id: source_track_id.clone(),
                 destination_index: 1,
             })
             .unwrap();
         assert!(matches!(
             recv_native_mutation(&worker),
-            IdeWorkerEvent::AudioTracksReordering
+            IdeWorkerEvent::MixerStripsReordering
         ));
         loop {
             match recv_native_mutation(&worker) {
@@ -15292,7 +15292,7 @@ mod tests {
         );
         assert!(matches!(
             recv_native_mutation(&worker),
-            IdeWorkerEvent::AudioTracksReordered { revision: 4 }
+            IdeWorkerEvent::MixerStripsReordered { revision: 4 }
         ));
 
         let package = verify_project_package(&project).unwrap();
@@ -19513,7 +19513,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_track_reorder_validates_identity_and_waits_for_the_mixer_fence() {
+    fn mixer_strip_reorder_validates_identity_and_waits_for_the_mixer_fence() {
         let running = RunningDesktopIdeApplication {
             application: closed_application(),
             session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
@@ -19532,7 +19532,7 @@ mod tests {
         ));
 
         worker
-            .try_send(IdeWorkerCommand::ReorderAudioTracks {
+            .try_send(IdeWorkerCommand::ReorderMixerStrips {
                 track_id: String::new(),
                 destination_index: 0,
             })
@@ -19540,24 +19540,24 @@ mod tests {
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::CommandFailed {
-                command: IdeWorkerCommandKind::ReorderAudioTracks,
-                reason: IdeWorkerCommandFailure::AudioTrackReorder(reason),
+                command: IdeWorkerCommandKind::ReorderMixerStrips,
+                reason: IdeWorkerCommandFailure::MixerStripReorder(reason),
             } if matches!(reason.as_ref(), IdeMixerStripReorderError::TrackResourceMissing)
         ));
 
         worker
-            .try_send(IdeWorkerCommand::ReorderAudioTracks {
+            .try_send(IdeWorkerCommand::ReorderMixerStrips {
                 track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
                 destination_index: 1,
             })
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::AudioTracksReordering));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::MixerStripsReordering));
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::CommandFailed {
-                command: IdeWorkerCommandKind::ReorderAudioTracks,
-                reason: IdeWorkerCommandFailure::AudioTrackReorder(reason),
+                command: IdeWorkerCommandKind::ReorderMixerStrips,
+                reason: IdeWorkerCommandFailure::MixerStripReorder(reason),
             } if matches!(reason.as_ref(), IdeMixerStripReorderError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));

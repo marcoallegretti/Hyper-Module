@@ -2124,7 +2124,7 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
     bind_audio_track_duplication_callback(ui, worker);
     bind_audio_track_rename_callback(ui, worker);
     bind_routing_bus_rename_callback(ui, worker);
-    bind_audio_track_reorder_callback(ui, worker);
+    bind_mixer_strip_reorder_callback(ui, worker);
     bind_audio_track_activation_callback(ui, worker);
     bind_audio_track_removal_callback(ui, worker);
     bind_audio_track_content_removal_callback(ui, worker);
@@ -2381,7 +2381,7 @@ fn bind_routing_bus_rename_callback_with(ui: &MainWindow, submitter: UiCommandSu
     });
 }
 
-fn bind_audio_track_reorder_callback(ui: &MainWindow, worker: &WorkerCell) {
+fn bind_mixer_strip_reorder_callback(ui: &MainWindow, worker: &WorkerCell) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_reorder = Rc::clone(worker);
@@ -4449,7 +4449,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::SaveProject
         | IdeWorkerCommandKind::SaveProjectAs
         | IdeWorkerCommandKind::RenameProject
-        | IdeWorkerCommandKind::ReorderAudioTracks
+        | IdeWorkerCommandKind::ReorderMixerStrips
         | IdeWorkerCommandKind::AddReturnSend
         | IdeWorkerCommandKind::RemoveReturnSend
         | IdeWorkerCommandKind::SetAudioPrimaryRoute
@@ -4610,7 +4610,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::RemoveAudioTrackContent => {
             "Preserving mixer state, removing the audio track and its content, and reopening project…"
         }
-        IdeWorkerCommandKind::ReorderAudioTracks => {
+        IdeWorkerCommandKind::ReorderMixerStrips => {
             "Preserving mixer state, reordering mixer strips, and reopening project…"
         }
         IdeWorkerCommandKind::RenameAudioTrack => {
@@ -4910,9 +4910,9 @@ fn apply_event(
         | IdeWorkerEvent::AudioTrackDuplicating) => {
             apply_audio_track_duplication_event(ui, &event);
         }
-        event @ (IdeWorkerEvent::AudioTracksReordered { .. }
-        | IdeWorkerEvent::AudioTracksReordering) => {
-            apply_audio_track_reorder_event(ui, &event);
+        event @ (IdeWorkerEvent::MixerStripsReordered { .. }
+        | IdeWorkerEvent::MixerStripsReordering) => {
+            apply_mixer_strip_reorder_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioTrackRenamed { .. } | IdeWorkerEvent::AudioTrackRenaming) => {
             apply_audio_track_rename_event(ui, &event);
@@ -5434,16 +5434,16 @@ fn apply_audio_track_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) 
     }
 }
 
-fn apply_audio_track_reorder_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+fn apply_mixer_strip_reorder_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
-        IdeWorkerEvent::AudioTracksReordered { revision } => {
+        IdeWorkerEvent::MixerStripsReordered { revision } => {
             ui.set_status_text(format!("Mixer strips reordered in project revision {revision}").into());
             ui.set_error_text(SharedString::default());
         }
-        IdeWorkerEvent::AudioTracksReordering => {
+        IdeWorkerEvent::MixerStripsReordering => {
             ui.set_status_text("Waiting for native output before reordering mixer strips…".into());
         }
-        _ => unreachable!("audio-track reorder event dispatcher received another event"),
+        _ => unreachable!("mixer-strip reorder event dispatcher received another event"),
     }
 }
 
@@ -8175,7 +8175,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::Observe if current == AppMode::Opening => AppMode::Running,
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
         IdeWorkerCommandKind::SaveProject
-        | IdeWorkerCommandKind::ReorderAudioTracks
+        | IdeWorkerCommandKind::ReorderMixerStrips
         | IdeWorkerCommandKind::AddReturnSend
         | IdeWorkerCommandKind::RemoveReturnSend
         | IdeWorkerCommandKind::SetAudioPrimaryRoute
@@ -8895,7 +8895,7 @@ fn mixer_strip_reorder_command(
         current_index.checked_add(1)
     }
     .ok_or(MixerControlFailure::InvalidSelection)?;
-    Ok(IdeWorkerCommand::ReorderAudioTracks {
+    Ok(IdeWorkerCommand::ReorderMixerStrips {
         track_id: row.track_id.to_string(),
         destination_index,
     })
@@ -14120,7 +14120,7 @@ mod tests {
         ])));
         assert!(matches!(
             mixer_strip_reorder_command(AppMode::Running, 1, true, &reordered),
-            Ok(IdeWorkerCommand::ReorderAudioTracks { track_id, destination_index })
+            Ok(IdeWorkerCommand::ReorderMixerStrips { track_id, destination_index })
                 if track_id == track_a && destination_index == 0
         ));
         assert!(matches!(
@@ -14134,12 +14134,12 @@ mod tests {
         assert_eq!(
             mode_after_successful_submission(
                 AppMode::Running,
-                IdeWorkerCommandKind::ReorderAudioTracks,
+                IdeWorkerCommandKind::ReorderMixerStrips,
             ),
             AppMode::Saving
         );
         assert_eq!(
-            mode_after_failure(AppMode::Saving, IdeWorkerCommandKind::ReorderAudioTracks),
+            mode_after_failure(AppMode::Saving, IdeWorkerCommandKind::ReorderMixerStrips),
             AppMode::Running
         );
         let mut group = audio_track_mixer_row(1, "018f47a2-6b2d-7c11-8a44-001122334458");
@@ -14162,7 +14162,7 @@ mod tests {
         ])));
         assert!(matches!(
             mixer_strip_reorder_command(AppMode::Running, 1, true, &mixed),
-            Ok(IdeWorkerCommand::ReorderAudioTracks { track_id, destination_index })
+            Ok(IdeWorkerCommand::ReorderMixerStrips { track_id, destination_index })
                 if track_id == "018f47a2-6b2d-7c11-8a44-001122334458" && destination_index == 0
         ));
         assert!(matches!(
