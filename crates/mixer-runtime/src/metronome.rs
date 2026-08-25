@@ -278,6 +278,7 @@ fn validate_meter_events(events: &[MeterEvent]) -> Result<(), MetronomePlanError
     let mut previous_tick = None;
     for event in events {
         if event.numerator == 0
+            || event.numerator > 255
             || event.denominator == 0
             || event.denominator > 256
             || !event.denominator.is_power_of_two()
@@ -326,7 +327,10 @@ fn build_voice(
         .try_reserve_exact(frame_count)
         .map_err(|_| MetronomePlanError::Capacity)?;
     for frame in 0..frame_count {
-        let phase = core::f32::consts::TAU * frequency_hz * frame as f32 / sample_rate_hz as f32;
+        // Half-sample phase places nonzero click energy in the first sample
+        // selected by the transport timeline without a full-scale DC step.
+        let phase = core::f32::consts::TAU * frequency_hz * (frame as f32 + 0.5)
+            / sample_rate_hz as f32;
         let envelope = 1.0 - frame as f32 / frame_count as f32;
         voice.push(amplitude * envelope * envelope * phase.sin());
     }
@@ -362,6 +366,29 @@ mod tests {
             .unwrap_err(),
             MetronomePlanError::FirstMeterNotAtOrigin
         );
+        assert!(MetronomePlan::try_new(
+            48_000,
+            &TEMPO,
+            &[MeterEvent {
+                tick: 0,
+                numerator: 255,
+                denominator: 256,
+            }],
+        )
+        .is_ok());
+        assert_eq!(
+            MetronomePlan::try_new(
+                48_000,
+                &TEMPO,
+                &[MeterEvent {
+                    tick: 0,
+                    numerator: 256,
+                    denominator: 4,
+                }],
+            )
+            .unwrap_err(),
+            MetronomePlanError::MeterOutsideVersionOneDomain
+        );
     }
 
     #[test]
@@ -383,6 +410,7 @@ mod tests {
                 .zip(&right)
                 .all(|(left, right)| (*left - *right).abs() <= f32::EPSILON)
         );
+        assert!(left[0].abs() > f32::EPSILON);
         assert!(left.iter().any(|sample| sample.abs() > f32::EPSILON));
     }
 

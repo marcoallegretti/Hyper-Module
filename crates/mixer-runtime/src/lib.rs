@@ -167,6 +167,7 @@ pub enum RuntimeProcessError {
     BlockLimit { actual: usize, maximum: usize },
     FrameRangeOverflow,
     Scene(SceneRuntimeError),
+    TransportCommand(TransportCommandApplyError),
     Metronome(MetronomeProcessError),
     Automation(FrameTimelineError),
     AutomationValueMismatch,
@@ -210,6 +211,9 @@ impl fmt::Display for RuntimeProcessError {
             ),
             Self::FrameRangeOverflow => formatter.write_str("runtime frame range overflowed"),
             Self::Scene(source) => write!(formatter, "interactive scene launch failed: {source}"),
+            Self::TransportCommand(source) => {
+                write!(formatter, "transport command application failed: {source}")
+            }
             Self::Metronome(source) => write!(formatter, "metronome rendering failed: {source}"),
             Self::Automation(source) => write!(formatter, "automation evaluation failed: {source}"),
             Self::AutomationValueMismatch => {
@@ -236,6 +240,7 @@ impl Error for RuntimeProcessError {
             Self::Automation(source) => Some(source),
             Self::Parameter(source) => Some(source),
             Self::Scene(source) => Some(source),
+            Self::TransportCommand(source) => Some(source),
             Self::Metronome(source) => Some(source),
             Self::OutputLengthMismatch { .. }
             | Self::ChannelTapOutputLengthMismatch { .. }
@@ -415,6 +420,37 @@ impl fmt::Display for TransportCommandSendError {
 }
 
 impl Error for TransportCommandSendError {}
+
+/// A synchronous transport-command application failure.
+///
+/// This is distinct from [`TransportCommandSendError`]: direct callers do not
+/// cross the bounded command queue, but they receive the same availability
+/// refusal rather than an unobservable no-op.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportCommandApplyError {
+    Scene(SceneRuntimeError),
+    MetronomeUnavailable { command: TransportCommand },
+}
+
+impl fmt::Display for TransportCommandApplyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Scene(source) => write!(formatter, "scene command failed: {source}"),
+            Self::MetronomeUnavailable { .. } => {
+                formatter.write_str("metronome is unavailable for this transport")
+            }
+        }
+    }
+}
+
+impl Error for TransportCommandApplyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Scene(source) => Some(source),
+            Self::MetronomeUnavailable { .. } => None,
+        }
+    }
+}
 
 /// Opaque channel target bound to one prepared mixer runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3606,9 +3642,12 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     ///
     /// # Errors
     ///
-    /// Returns [`SceneRuntimeError`] when a synchronous scene command targets
-    /// an unknown/disabled scene or cannot resolve its launch boundary.
-    pub fn apply_command(&mut self, command: TransportCommand) -> Result<(), SceneRuntimeError> {
+    /// Returns [`TransportCommandApplyError`] when a synchronous scene command
+    /// cannot resolve its launch boundary or the metronome was not prepared.
+    pub fn apply_command(
+        &mut self,
+        command: TransportCommand,
+    ) -> Result<(), TransportCommandApplyError> {
         match command {
             TransportCommand::Start => self.state = TransportState::Rolling,
             TransportCommand::Stop => {
@@ -3630,15 +3669,18 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 }
             }
             TransportCommand::LaunchScene { scene_index } => {
-                self.runtime.queue_scene_launch(scene_index)?;
+                self.runtime
+                    .queue_scene_launch(scene_index)
+                    .map_err(TransportCommandApplyError::Scene)?;
             }
             TransportCommand::StopInteractiveScenes => self.runtime.stop_interactive_scenes(),
             TransportCommand::SetLoopRange(range) => self.loop_range = range,
             TransportCommand::SetLoopEnabled(enabled) => self.loop_enabled = enabled,
             TransportCommand::SetMetronomeEnabled(enabled) => {
-                if let Some(metronome) = &mut self.metronome {
-                    metronome.set_enabled(enabled);
-                }
+                let Some(metronome) = &mut self.metronome else {
+                    return Err(TransportCommandApplyError::MetronomeUnavailable { command });
+                };
+                metronome.set_enabled(enabled);
             }
         }
         Ok(())
@@ -3793,7 +3835,12 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 self.runtime.restore_renderer(committed_renderer);
                 self.runtime
                     .restore_parameter_state_unchecked(&committed_parameters);
-                return Err(RuntimeProcessError::Scene(source));
+                return Err(match source {
+                    TransportCommandApplyError::Scene(source) => RuntimeProcessError::Scene(source),
+                    source @ TransportCommandApplyError::MetronomeUnavailable { .. } => {
+                        RuntimeProcessError::TransportCommand(source)
+                    }
+                });
             }
         };
         let command_sender_disconnected = self.command_sender_disconnected();
@@ -3975,7 +4022,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         })
     }
 
-    fn drain_commands(&mut self) -> Result<usize, SceneRuntimeError> {
+    fn drain_commands(&mut self) -> Result<usize, TransportCommandApplyError> {
         let mut applied = 0;
         for _ in 0..MAX_QUEUED_TRANSPORT_COMMANDS {
             let command = self

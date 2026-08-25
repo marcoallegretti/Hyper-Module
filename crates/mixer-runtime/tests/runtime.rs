@@ -18,8 +18,9 @@ use hyper_mixer_runtime::{
     OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
     PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, RuntimeCreationError,
     RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig, SceneLaunchState,
-    StereoSamplePeakBallistics, TransportCommand, TransportCommandSendError, TransportCycle,
-    TransportLoopRange, TransportLoopRangeError, TransportOutputCreationError,
+    StereoSamplePeakBallistics, TransportCommand, TransportCommandApplyError,
+    TransportCommandSendError, TransportCycle, TransportLoopRange, TransportLoopRangeError,
+    TransportOutputCreationError,
     TransportOutputProcessor, TransportState, loudness_command_channel, output_meter_channel,
     playback_recovery_channel,
 };
@@ -2407,6 +2408,119 @@ fn metronome_commands_commit_at_the_transport_boundary_and_mix_into_output() {
     assert!(!disabled.metronome_enabled());
     assert_constant(&left, 0.0);
     assert_constant(&right, 0.0);
+}
+
+#[test]
+fn direct_metronome_command_reports_unprepared_transport() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let mut transport = GraphTransportRuntime::new(runtime);
+    let command = TransportCommand::SetMetronomeEnabled(true);
+
+    assert_eq!(
+        transport.apply_command(command),
+        Err(TransportCommandApplyError::MetronomeUnavailable { command })
+    );
+    assert!(!transport.metronome_available());
+    assert!(!transport.metronome_enabled());
+}
+
+#[test]
+fn metronome_starts_at_the_tempo_boundary_and_retriggers_after_a_loop_wrap() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let tempo_plan = MetronomePlan::try_new(
+        48_000,
+        &[
+            TempoEvent {
+                tick: 0,
+                microseconds_per_quarter: 1_000_000,
+            },
+            TempoEvent {
+                tick: 1_920,
+                microseconds_per_quarter: 500_000,
+            },
+        ],
+        &[MeterEvent {
+            tick: 0,
+            numerator: 4,
+            denominator: 4,
+        }],
+    )
+    .unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let baseline_runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (mut sender, mut transport) =
+        GraphTransportRuntime::with_command_queue_and_metronome(runtime, tempo_plan);
+    let mut baseline = GraphTransportRuntime::new(baseline_runtime);
+
+    sender
+        .try_send(TransportCommand::Locate {
+            frame: 71_996,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    sender
+        .try_send(TransportCommand::SetMetronomeEnabled(true))
+        .unwrap();
+    baseline
+        .apply_command(TransportCommand::Locate {
+            frame: 71_996,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    let mut left = [0.0_f32; 8];
+    let mut right = [0.0_f32; 8];
+    let mut baseline_left = [0.0_f32; 8];
+    let mut baseline_right = [0.0_f32; 8];
+    process_transport(&mut baseline, &mut baseline_left, &mut baseline_right).unwrap();
+    process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert!(
+        left[..4]
+            .iter()
+            .zip(&baseline_left[..4])
+            .all(|(actual, baseline)| (*actual - *baseline).abs() <= f32::EPSILON)
+    );
+    assert!((left[4] - baseline_left[4]).abs() > f32::EPSILON);
+
+    sender
+        .try_send(TransportCommand::Locate {
+            frame: 0,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    sender
+        .try_send(TransportCommand::SetLoopRange(Some(
+            TransportLoopRange::new(0, 8).unwrap(),
+        )))
+        .unwrap();
+    sender
+        .try_send(TransportCommand::SetLoopEnabled(true))
+        .unwrap();
+    baseline
+        .apply_command(TransportCommand::Locate {
+            frame: 0,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    baseline
+        .apply_command(TransportCommand::SetLoopRange(Some(
+            TransportLoopRange::new(0, 8).unwrap(),
+        )))
+        .unwrap();
+    baseline
+        .apply_command(TransportCommand::SetLoopEnabled(true))
+        .unwrap();
+    let first = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    process_transport(&mut baseline, &mut baseline_left, &mut baseline_right).unwrap();
+    assert_eq!(first.loop_wrap_count(), 1);
+    assert!((left[0] - baseline_left[0]).abs() > f32::EPSILON);
+
+    let second = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    process_transport(&mut baseline, &mut baseline_left, &mut baseline_right).unwrap();
+    assert_eq!(second.loop_wrap_count(), 1);
+    assert!((left[0] - baseline_left[0]).abs() > f32::EPSILON);
 }
 
 #[test]

@@ -1152,23 +1152,11 @@ fn bind_playback_callbacks(
         );
     });
 
-    let weak = ui.as_weak();
     let worker_for_metronome = Rc::clone(worker);
-    actions.on_metronome_toggle(move || {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        if ui.get_app_mode() != AppMode::Running || !ui.get_metronome_available() {
-            return;
-        }
-        submit_to_ui(
-            &ui,
-            &worker_for_metronome,
-            IdeWorkerCommand::Transport(TransportCommand::SetMetronomeEnabled(
-                !ui.get_metronome_enabled(),
-            )),
-        );
-    });
+    bind_metronome_toggle_callback_with(
+        ui,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker_for_metronome, command)),
+    );
 
     let weak = ui.as_weak();
     let worker_for_return = Rc::clone(worker);
@@ -1218,6 +1206,25 @@ fn bind_playback_callbacks(
     bind_window_close_callback(ui);
 }
 
+fn bind_metronome_toggle_callback_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    actions.on_metronome_toggle(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_metronome_available() {
+            return;
+        }
+        submitter(
+            &ui,
+            IdeWorkerCommand::Transport(TransportCommand::SetMetronomeEnabled(
+                !ui.get_metronome_enabled(),
+            )),
+        );
+    });
+}
+
 fn bind_project_close_callback(ui: &MainWindow, worker: &WorkerCell) {
     let worker = Rc::clone(worker);
     bind_project_close_callback_with(
@@ -1240,7 +1247,7 @@ fn bind_project_close_callback_with(ui: &MainWindow, submitter: UiCommandSubmitt
         close_submitter(&ui, IdeWorkerCommand::CloseProject);
     });
     let weak = ui.as_weak();
-    let cancel_submitter = Rc::clone(&submitter);
+    let confirm_submitter = Rc::clone(&submitter);
     actions.on_confirm_close_project(move || {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -1250,9 +1257,10 @@ fn bind_project_close_callback_with(ui: &MainWindow, submitter: UiCommandSubmitt
         {
             return;
         }
-        submitter(&ui, IdeWorkerCommand::DiscardCloseProject);
+        confirm_submitter(&ui, IdeWorkerCommand::DiscardCloseProject);
     });
     let weak = ui.as_weak();
+    let cancel_submitter = Rc::clone(&submitter);
     actions.on_cancel_close_project(move || {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -7061,7 +7069,7 @@ fn apply_running_event(
     set_playhead(ui, project_state, position_frame);
     let transport_state = observation.recovery().state();
     apply_transport_recovery_availability(ui, transport_state);
-    apply_metronome_observation(ui, observation.recovery());
+    apply_metronome_observation(ui, observation);
     ui.set_transport_clock(
         format_transport_clock(
             u64::try_from(position_frame).unwrap_or(u64::MAX),
@@ -8183,10 +8191,16 @@ fn apply_transport_recovery_availability(
 
 fn apply_metronome_observation(
     ui: &MainWindow,
-    observation: hyper_mixer_runtime::PlaybackCycleObservation,
+    observation: &IdeRunningObservation,
 ) {
-    ui.set_metronome_available(observation.metronome_available());
-    ui.set_metronome_enabled(observation.metronome_enabled());
+    let Some(snapshot) = observation.meter().snapshot() else {
+        ui.set_metronome_available(false);
+        ui.set_metronome_enabled(false);
+        return;
+    };
+    let cycle = snapshot.cycle();
+    ui.set_metronome_available(cycle.metronome_available());
+    ui.set_metronome_enabled(cycle.metronome_enabled());
 }
 
 fn reset_arrangement_ui(ui: &MainWindow) {
@@ -11350,6 +11364,43 @@ mod tests {
     use super::*;
     use i_slint_backend_testing::ElementHandle;
     use slint::platform::{Key, PointerEventButton, WindowEvent};
+
+    #[test]
+    fn metronome_toggle_callback_submits_only_the_authoritative_next_state() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_metronome_toggle_callback_with(
+            &ui,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_metronome_available(false);
+        ui.global::<IdeActions>().invoke_metronome_toggle();
+        assert!(submitted.borrow().is_empty());
+
+        ui.set_metronome_available(true);
+        ui.set_metronome_enabled(false);
+        ui.global::<IdeActions>().invoke_metronome_toggle();
+        ui.set_metronome_enabled(true);
+        ui.global::<IdeActions>().invoke_metronome_toggle();
+        assert!(
+            matches!(
+                submitted.borrow().as_slice(),
+                [
+                    IdeWorkerCommand::Transport(TransportCommand::SetMetronomeEnabled(true)),
+                    IdeWorkerCommand::Transport(TransportCommand::SetMetronomeEnabled(false)),
+                ]
+            ),
+            "the generated callback must submit only the inverse of the worker-observed metronome state"
+        );
+
+        ui.set_app_mode(AppMode::Previewing);
+        ui.global::<IdeActions>().invoke_metronome_toggle();
+        assert_eq!(submitted.borrow().len(), 2);
+    }
 
     fn audio_track_mixer_row(index: i32, track_id: &str) -> MixerChannelRow {
         MixerChannelRow {
