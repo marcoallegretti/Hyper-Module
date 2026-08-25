@@ -843,6 +843,7 @@ pub enum RoutingBusRemovalSerializationError {
     TrackNotRoutingBus,
     Blocked(AudioTrackRemovalBlockers),
     PrimaryRouteInUse,
+    GroupSendInUse,
     ReturnSendInUse,
     MixerIdentityMismatch,
     InvalidDocumentShape,
@@ -1842,6 +1843,9 @@ impl fmt::Display for RoutingBusRemovalSerializationError {
             Self::PrimaryRouteInUse => {
                 formatter.write_str("an audio channel still targets the group routing bus")
             }
+            Self::GroupSendInUse => {
+                formatter.write_str("the group routing bus still owns a mixer send")
+            }
             Self::ReturnSendInUse => {
                 formatter.write_str("a mixer send still targets the return routing bus")
             }
@@ -1865,6 +1869,7 @@ impl Error for RoutingBusRemovalSerializationError {
             | Self::TrackNotRoutingBus
             | Self::Blocked(_)
             | Self::PrimaryRouteInUse
+            | Self::GroupSendInUse
             | Self::ReturnSendInUse
             | Self::MixerIdentityMismatch
             | Self::InvalidDocumentShape => None,
@@ -3156,6 +3161,9 @@ pub fn serialize_routing_bus_removal(
         })
     {
         return Err(RoutingBusRemovalSerializationError::PrimaryRouteInUse);
+    }
+    if kind == RoutingBusKind::Group && !loaded_mixer.channels[channel_index].sends.is_empty() {
+        return Err(RoutingBusRemovalSerializationError::GroupSendInUse);
     }
     let return_bus = if kind == RoutingBusKind::Return {
         let bus = loaded_mixer
@@ -10670,6 +10678,79 @@ mod tests {
         project
             .load_mixer(removed_group.mixer(), &asset_facts(), LoaderLimits::VERSION_1)
             .unwrap();
+
+        let group_return_track_id = "018f47a2-6b2d-7c11-8a44-00112233446c";
+        let group_return_send_id = "018f47a2-6b2d-7c11-8a44-00112233446d";
+        let group_return_source_send_id = "018f47a2-6b2d-7c11-8a44-00112233446e";
+        let group_return = serialize_routing_bus_creation(
+            &group_project,
+            &asset_facts(),
+            group.mixer(),
+            mixer_id,
+            RoutingBusKind::Return,
+            group_return_track_id,
+            "Group Verb",
+            &[source_track_id],
+            &[group_return_source_send_id],
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let group_return_tracks: [&[u8]; 3] = [TRACK, group.track(), group_return.track()];
+        let group_return_project = load(
+            input(TIMELINE, &group_return_tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let with_group_send = serialize_return_send_addition(
+            &group_return_project,
+            &asset_facts(),
+            group_return.mixer(),
+            mixer_id,
+            group_track_id,
+            group_return_track_id,
+            group_return_send_id,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let group_return_cleared = serialize_audio_primary_route_change(
+            &group_return_project,
+            &asset_facts(),
+            &with_group_send,
+            mixer_id,
+            source_track_id,
+            AudioPrimaryRouteTarget::Main,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_routing_bus_removal(
+                &group_return_project,
+                &asset_facts(),
+                &group_return_cleared,
+                mixer_id,
+                group_track_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(RoutingBusRemovalSerializationError::GroupSendInUse)
+        ));
+        let group_send_cleared = serialize_return_send_removal(
+            &group_return_project,
+            &asset_facts(),
+            &group_return_cleared,
+            mixer_id,
+            group_return_send_id,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(serialize_routing_bus_removal(
+            &group_return_project,
+            &asset_facts(),
+            &group_send_cleared,
+            mixer_id,
+            group_track_id,
+            LoaderLimits::VERSION_1,
+        )
+        .is_ok());
 
         let return_track_id = "018f47a2-6b2d-7c11-8a44-00112233446a";
         let return_send_id = "018f47a2-6b2d-7c11-8a44-00112233446b";

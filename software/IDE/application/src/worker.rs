@@ -13875,7 +13875,7 @@ mod tests {
     };
     use hyper_audio_source::{AudioContainer, DecodeLimits, decode_bytes};
     use hyper_media_cache::CacheLimits;
-    use hyper_playback_json::LoaderLimits;
+    use hyper_playback_json::{LoaderLimits, RoutingBusRemovalSerializationError};
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
     use hyper_project_loader::ProjectPlaybackLimits;
     use hyper_storage_engine::{ProjectCreationErrorKind, verify_project_package};
@@ -15025,35 +15025,6 @@ mod tests {
         ));
 
         worker
-            .try_send(IdeWorkerCommand::RemoveReturnSend { send_id })
-            .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::Saving));
-        assert!(matches!(
-            recv(&worker),
-            IdeWorkerEvent::UndoStateChanged {
-                undo_label: Some("return-send removal"),
-                redo_label: None,
-            }
-        ));
-        let IdeWorkerEvent::Running(with_removed_send) = recv(&worker) else {
-            panic!("removing the return send must reopen the project");
-        };
-        assert!(
-            with_removed_send
-                .mixer_channels()
-                .iter()
-                .find(|channel| channel.id() == group_id)
-                .expect("the group remains present after send removal")
-                .sends()
-                .is_empty(),
-            "the exact return send was removed"
-        );
-        assert!(matches!(
-            recv(&worker),
-            IdeWorkerEvent::ReturnSendEdited { revision: 6 }
-        ));
-
-        worker
             .try_send(IdeWorkerCommand::SetAudioPrimaryRoute {
                 source_track_id: source_track_id.clone(),
                 target_group_track_id: None,
@@ -15081,7 +15052,7 @@ mod tests {
         ));
         assert!(matches!(
             recv(&worker),
-            IdeWorkerEvent::AudioPrimaryRouteChanged { revision: 7 }
+            IdeWorkerEvent::AudioPrimaryRouteChanged { revision: 6 }
         ));
 
         worker
@@ -15112,7 +15083,7 @@ mod tests {
         ));
         assert!(matches!(
             recv(&worker),
-            IdeWorkerEvent::AudioPrimaryRouteChanged { revision: 8 }
+            IdeWorkerEvent::AudioPrimaryRouteChanged { revision: 7 }
         ));
         let source_return_send_id = with_group_route
             .mixer_channels()
@@ -15150,31 +15121,7 @@ mod tests {
             .is_empty());
         assert!(matches!(
             recv(&worker),
-            IdeWorkerEvent::ReturnSendEdited { revision: 9 }
-        ));
-        worker
-            .try_send(IdeWorkerCommand::RemoveRoutingBus {
-                track_id: return_id,
-            })
-            .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::Saving));
-        assert!(matches!(
-            recv(&worker),
-            IdeWorkerEvent::UndoStateChanged {
-                undo_label: None,
-                redo_label: None,
-            }
-        ));
-        let IdeWorkerEvent::Running(without_return) = recv(&worker) else {
-            panic!("removing the cleared return bus must reopen the project");
-        };
-        assert!(without_return
-            .mixer_channels()
-            .iter()
-            .all(|channel| channel.kind() != IdeMixerChannelKind::Return));
-        assert!(matches!(
-            recv(&worker),
-            IdeWorkerEvent::RoutingBusRemoved { revision: 10, .. }
+            IdeWorkerEvent::ReturnSendEdited { revision: 8 }
         ));
         for track_id in [&source_track_id, &target_track_id] {
             worker
@@ -15199,7 +15146,54 @@ mod tests {
         }
         worker
             .try_send(IdeWorkerCommand::RemoveRoutingBus {
-                track_id: group_id,
+                track_id: group_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Saving));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RemoveRoutingBus,
+                reason: IdeWorkerCommandFailure::RoutingBusRemoval(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeRoutingBusRemovalError::Serialization(
+                    RoutingBusRemovalSerializationError::GroupSendInUse
+                )
+            )
+        ));
+        worker
+            .try_send(IdeWorkerCommand::RemoveReturnSend { send_id })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Saving));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("return-send removal"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(with_removed_group_send) = recv(&worker) else {
+            panic!("removing the Group return send must reopen the project");
+        };
+        assert!(
+            with_removed_group_send
+                .mixer_channels()
+                .iter()
+                .find(|channel| channel.id() == group_id)
+                .expect("the group remains present after send removal")
+                .sends()
+                .is_empty(),
+            "the exact Group-owned return send was removed"
+        );
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ReturnSendEdited { revision: 11 }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::RemoveRoutingBus {
+                track_id: return_id,
             })
             .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Saving));
@@ -15210,6 +15204,23 @@ mod tests {
                 redo_label: None,
             }
         ));
+        let IdeWorkerEvent::Running(without_return) = recv(&worker) else {
+            panic!("removing the cleared return bus must reopen the project");
+        };
+        assert!(without_return
+            .mixer_channels()
+            .iter()
+            .all(|channel| channel.kind() != IdeMixerChannelKind::Return));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusRemoved { revision: 12, .. }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::RemoveRoutingBus {
+                track_id: group_id,
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Saving));
         let IdeWorkerEvent::Running(without_group) = recv(&worker) else {
             panic!("removing the cleared group bus must reopen the project");
         };

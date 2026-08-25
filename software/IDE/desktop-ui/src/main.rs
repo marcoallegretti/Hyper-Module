@@ -2195,9 +2195,20 @@ fn bind_routing_bus_callbacks(ui: &MainWindow, worker: &WorkerCell) {
 }
 
 fn bind_routing_bus_removal_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let worker = Rc::clone(worker);
+    bind_routing_bus_removal_callback_with(
+        ui,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker, command)),
+    );
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the generated callback retains the shared command submitter for the window lifetime"
+)]
+fn bind_routing_bus_removal_callback_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker = Rc::clone(worker);
     actions.on_remove_routing_bus(move |track_id| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -2217,9 +2228,8 @@ fn bind_routing_bus_removal_callback(ui: &MainWindow, worker: &WorkerCell) {
             ui.set_error_text("The selected routing bus is no longer available".into());
             return;
         };
-        submit_to_ui(
+        submitter(
             &ui,
-            &worker,
             IdeWorkerCommand::RemoveRoutingBus { track_id },
         );
     });
@@ -12217,9 +12227,10 @@ mod tests {
         ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![routing_bus]))));
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
-        ui.global::<IdeActions>().on_remove_routing_bus(move |track_id| {
-            submitted_by_callback.borrow_mut().push(track_id.to_string());
-        });
+        bind_routing_bus_removal_callback_with(
+            &ui,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
         ui.show().unwrap();
 
         let remove = ElementHandle::find_by_accessible_label(&ui, "Remove routing bus Verb")
@@ -12238,7 +12249,11 @@ mod tests {
         .expect("the confirmation exposes exactly one removal action");
         assert_eq!(confirm.accessible_enabled(), Some(true));
         confirm.mock_single_click(PointerEventButton::Left);
-        assert_eq!(submitted.borrow().as_slice(), &[track_id.to_owned()]);
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::RemoveRoutingBus { track_id: submitted_track_id }]
+                if submitted_track_id == track_id
+        ));
 
         apply_routing_bus_event(
             &ui,
@@ -12250,6 +12265,12 @@ mod tests {
         assert!(!ui.get_routing_bus_removal_visible());
         assert!(ui.get_routing_bus_removal_id().is_empty());
         assert!(ui.get_status_text().contains("project revision 7"));
+        ui.global::<IdeActions>()
+            .invoke_remove_routing_bus(track_id.into());
+        assert_eq!(submitted.borrow().len(), 1);
+        assert!(ui
+            .get_error_text()
+            .contains("removal confirmation is no longer current"));
         ui.hide().unwrap();
     }
 

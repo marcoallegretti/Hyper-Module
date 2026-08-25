@@ -3610,14 +3610,14 @@ fn validate_audio_track_removal_documents(
             error,
         )
     })?;
-    let (expected_kind, removes_return_mapping) = match &request.contract {
-        AudioTrackTransactionContract::Audio => ("audio", false),
+    let (expected_kind, removes_return_mapping, requires_empty_owned_sends) = match &request.contract {
+        AudioTrackTransactionContract::Audio => ("audio", false, false),
         AudioTrackTransactionContract::RoutingGroup { source_track_ids }
-            if source_track_ids.is_empty() => ("group", false),
+            if source_track_ids.is_empty() => ("group", false, true),
         AudioTrackTransactionContract::RoutingReturn {
             source_track_ids,
             send_ids,
-        } if source_track_ids.is_empty() && send_ids.is_empty() => ("return", true),
+        } if source_track_ids.is_empty() && send_ids.is_empty() => ("return", true, false),
         _ => {
             return Err(failure(
                 ProjectResourcePublicationErrorKind::InvalidResource,
@@ -3686,6 +3686,16 @@ fn validate_audio_track_removal_documents(
         return Err(failure(
             ProjectResourcePublicationErrorKind::ResourceConflict,
             "audio track is still a mixer routing destination",
+        ));
+    }
+    if requires_empty_owned_sends
+        && previous_channels[removed_index]["sends"]
+            .as_array()
+            .is_none_or(|sends| !sends.is_empty())
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "group routing bus still owns mixer sends",
         ));
     }
     let mut restored = candidate.clone();
@@ -10111,6 +10121,50 @@ mod tests {
         assert_eq!(returned.project_revision(), 4);
         assert!(!return_fixture.root.join(format!("tracks/{RETURN_BUS_ID}.json")).exists());
         assert_active_mixer_loads(&return_fixture.root, &return_fixture.mixer_id);
+    }
+
+    #[test]
+    fn group_removal_rejects_a_forged_reduction_that_discards_owned_sends() {
+        let fixture = AudioTrackFixture::new();
+        let (_, source_track_id, documents) = prepared_routing_bus_documents(
+            &fixture,
+            hyper_playback_json::RoutingBusKind::Group,
+            GROUP_BUS_ID,
+            None,
+        );
+        let mut previous: Value = serde_json::from_slice(documents.mixer()).unwrap();
+        let channels = previous["channels"].as_array_mut().unwrap();
+        channels
+            .iter_mut()
+            .find(|channel| channel["track_id"].as_str() == Some(source_track_id.as_str()))
+            .unwrap()["destination"] = json!({"kind":"main"});
+        channels
+            .iter_mut()
+            .find(|channel| channel["track_id"].as_str() == Some(GROUP_BUS_ID))
+            .unwrap()["sends"] = json!([{"id":"018f47a2-6b2d-7c11-8a44-00112233446f"}]);
+        let previous = serde_json_canonicalizer::to_vec(&previous).unwrap();
+        let mut candidate: Value = serde_json::from_slice(&previous).unwrap();
+        let channels = candidate["channels"].as_array_mut().unwrap();
+        channels.remove(
+            channels
+                .iter()
+                .position(|channel| channel["track_id"].as_str() == Some(GROUP_BUS_ID))
+                .unwrap(),
+        );
+        let candidate = serde_json_canonicalizer::to_vec(&candidate).unwrap();
+        let request = StructuralTrackRemovalRequest {
+            expected_project_sha256: [0; 32],
+            track_id: GROUP_BUS_ID,
+            mixer_id: &fixture.mixer_id,
+            mixer_bytes: &candidate,
+            contract: AudioTrackTransactionContract::RoutingGroup {
+                source_track_ids: Vec::new(),
+            },
+        };
+
+        let error = validate_audio_track_removal_documents(&request, documents.track(), &previous)
+            .expect_err("storage must refuse a candidate that drops a Group-owned send");
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::ResourceConflict);
     }
 
     #[test]
