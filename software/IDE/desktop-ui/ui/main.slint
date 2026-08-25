@@ -352,6 +352,7 @@ export global IdeActions {
     callback remove-audio-track-content(string);
     callback reorder-audio-track(int, bool);
     callback rename-audio-track(int, string);
+    callback rename-routing-bus(int, string);
     callback set-audio-track-active(int, bool);
     callback start-recording();
     callback stop-recording();
@@ -509,6 +510,7 @@ export component MainWindow inherits Window {
     in-out property <int> rename-track-index: -1;
     in-out property <string> rename-track-original-name: "";
     in-out property <string> rename-track-name: "";
+    in-out property <string> rename-track-kind: "";
     in-out property <bool> remove-track-visible: false;
     in-out property <string> remove-track-id: "";
     in-out property <string> remove-track-name: "";
@@ -2220,14 +2222,14 @@ export component MainWindow inherits Window {
                     VerticalLayout {
                         padding: 22px;
                         spacing: 14px;
-                        Text { text: "RENAME AUDIO TRACK"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.rename-track-kind == "AUDIO" ? "RENAME AUDIO TRACK" : "RENAME ROUTING BUS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
                         Text { text: root.rename-track-original-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
                         Rectangle { height: 1px; background: #27313d; }
                         Text { text: "New display name"; color: #aebccc; font-size: 12px; }
                         IdeLineEdit {
                             text <=> root.rename-track-name;
                             enabled: root.app-mode == AppMode.running;
-                            accessible-label: "New audio track name";
+                            accessible-label: root.rename-track-kind == "AUDIO" ? "New audio track name" : "New routing bus name";
                         }
                         Text {
                             text: "The committed live mixer is preserved first. The structural track is then replaced through a recoverable project transaction.";
@@ -2244,12 +2246,18 @@ export component MainWindow inherits Window {
                             }
                             Button {
                                 horizontal-stretch: 1;
-                                text: root.app-mode == AppMode.renaming-track ? "Renaming track..." : "Rename audio track";
+                                text: root.app-mode == AppMode.renaming-track ? "Renaming track..." : root.rename-track-kind == "AUDIO" ? "Rename audio track" : "Rename routing bus";
                                 enabled: root.app-mode == AppMode.running
                                     && root.rename-track-index >= 0
                                     && root.rename-track-name != ""
                                     && root.rename-track-name != root.rename-track-original-name;
-                                clicked => { IdeActions.rename-audio-track(root.rename-track-index, root.rename-track-name); }
+                                clicked => {
+                                    if (root.rename-track-kind == "AUDIO") {
+                                        IdeActions.rename-audio-track(root.rename-track-index, root.rename-track-name);
+                                    } else {
+                                        IdeActions.rename-routing-bus(root.rename-track-index, root.rename-track-name);
+                                    }
+                                }
                             }
                         }
                         Rectangle { vertical-stretch: 1; background: transparent; }
@@ -2374,6 +2382,7 @@ export component MainWindow inherits Window {
                                         root.rename-track-index = channel.index;
                                         root.rename-track-original-name = channel.name;
                                         root.rename-track-name = channel.name;
+                                        root.rename-track-kind = channel.kind;
                                         root.rename-track-visible = true;
                                     }
                                 }

@@ -2095,6 +2095,7 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
     bind_routing_bus_callbacks(ui, worker);
     bind_audio_track_duplication_callback(ui, worker);
     bind_audio_track_rename_callback(ui, worker);
+    bind_routing_bus_rename_callback(ui, worker);
     bind_audio_track_reorder_callback(ui, worker);
     bind_audio_track_activation_callback(ui, worker);
     bind_audio_track_removal_callback(ui, worker);
@@ -2318,6 +2319,26 @@ fn bind_audio_track_rename_callback(ui: &MainWindow, worker: &WorkerCell) {
                 name: name.to_owned(),
             },
         );
+    });
+}
+
+fn bind_routing_bus_rename_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_rename = Rc::clone(worker);
+    actions.on_rename_routing_bus(move |index, name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        match routing_bus_rename_command(
+            ui.get_app_mode(),
+            index,
+            name.as_str(),
+            &ui.get_mixer_channels(),
+        ) {
+            Ok(command) => submit_to_ui(&ui, &worker_for_rename, command),
+            Err(reason) => ui.set_error_text(reason.message().into()),
+        }
     });
 }
 
@@ -4404,7 +4425,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::DuplicateAudioTrack => AppMode::DuplicatingTrack,
         IdeWorkerCommandKind::RemoveAudioTrack
         | IdeWorkerCommandKind::RemoveAudioTrackContent => AppMode::RemovingTrack,
-        IdeWorkerCommandKind::RenameAudioTrack => AppMode::RenamingTrack,
+        IdeWorkerCommandKind::RenameAudioTrack | IdeWorkerCommandKind::RenameRoutingBus => {
+            AppMode::RenamingTrack
+        }
         IdeWorkerCommandKind::SetAudioTrackActive => AppMode::ChangingTrackActivation,
         IdeWorkerCommandKind::ImportAudio => AppMode::ImportingAudio,
         IdeWorkerCommandKind::SetArrangementPlacementActive => {
@@ -4552,6 +4575,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::RenameAudioTrack => {
             "Preserving mixer state, renaming the audio track, and reopening project…"
+        }
+        IdeWorkerCommandKind::RenameRoutingBus => {
+            "Preserving mixer state, renaming the routing bus, and reopening project…"
         }
         IdeWorkerCommandKind::SetAudioTrackActive => {
             "Preserving mixer state, updating the audio track, and reopening project…"
@@ -4847,6 +4873,9 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::AudioTrackRenamed { .. } | IdeWorkerEvent::AudioTrackRenaming) => {
             apply_audio_track_rename_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::RoutingBusRenamed { .. } | IdeWorkerEvent::RoutingBusRenaming) => {
+            apply_routing_bus_rename_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioTrackActivationChanged { .. }
         | IdeWorkerEvent::AudioTrackActivationChanging { .. }) => {
@@ -5379,6 +5408,7 @@ fn apply_audio_track_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_rename_track_index(-1);
             ui.set_rename_track_original_name(SharedString::default());
             ui.set_rename_track_name(SharedString::default());
+            ui.set_rename_track_kind(SharedString::default());
             ui.set_status_text(
                 if *changed {
                     format!("Audio track renamed in project revision {revision}")
@@ -5394,6 +5424,32 @@ fn apply_audio_track_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_status_text("Waiting for native output before renaming the audio track…".into());
         }
         _ => unreachable!("audio-track rename event dispatcher received another event"),
+    }
+}
+
+fn apply_routing_bus_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::RoutingBusRenamed { revision, changed } => {
+            ui.set_rename_track_visible(false);
+            ui.set_rename_track_index(-1);
+            ui.set_rename_track_original_name(SharedString::default());
+            ui.set_rename_track_name(SharedString::default());
+            ui.set_rename_track_kind(SharedString::default());
+            ui.set_status_text(
+                if *changed {
+                    format!("Routing bus renamed in project revision {revision}")
+                } else {
+                    format!("Routing bus already had that name in project revision {revision}")
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RoutingBusRenaming => {
+            ui.set_app_mode(AppMode::RenamingTrack);
+            ui.set_status_text("Waiting for native output before renaming the routing bus…".into());
+        }
+        _ => unreachable!("routing-bus rename event dispatcher received another event"),
     }
 }
 
@@ -7876,6 +7932,7 @@ fn reset_project(
     ui.set_rename_track_index(-1);
     ui.set_rename_track_original_name(SharedString::default());
     ui.set_rename_track_name(SharedString::default());
+    ui.set_rename_track_kind(SharedString::default());
     ui.set_scenes(ModelRc::default());
     ui.set_scene_names(ModelRc::default());
     reset_scene_rename_form(ui);
@@ -8070,7 +8127,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         {
             AppMode::Running
         }
-        IdeWorkerCommandKind::RenameAudioTrack if current == AppMode::RenamingTrack => {
+        IdeWorkerCommandKind::RenameAudioTrack | IdeWorkerCommandKind::RenameRoutingBus
+            if current == AppMode::RenamingTrack =>
+        {
             AppMode::Running
         }
         IdeWorkerCommandKind::SetAudioTrackActive
@@ -8827,6 +8886,26 @@ fn validate_routing_bus_removal(
     Ok(row.track_id.to_string())
 }
 
+fn routing_bus_rename_command(
+    mode: AppMode,
+    index: i32,
+    name: &str,
+    channels: &ModelRc<MixerChannelRow>,
+) -> Result<IdeWorkerCommand, MixerControlFailure> {
+    let (_, row) = validate_mixer_channel(mode, index, channels)?;
+    if !matches!(row.kind.as_str(), "GROUP" | "RETURN") {
+        return Err(MixerControlFailure::StateUnavailable);
+    }
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err(MixerControlFailure::InvalidValue);
+    }
+    Ok(IdeWorkerCommand::RenameRoutingBus {
+        track_id: row.track_id.to_string(),
+        name: name.to_owned(),
+    })
+}
+
 fn validate_audio_track_content_removal(
     mode: AppMode,
     track_id: &str,
@@ -8959,7 +9038,10 @@ fn mixer_rows(
                 muted: state.is_some_and(|state| state.muted),
                 solo: state.is_some_and(|state| state.solo),
                 solo_available: channel.kind() == IdeMixerChannelKind::Audio,
-                renameable: channel.kind() == IdeMixerChannelKind::Audio,
+                renameable: matches!(
+                    channel.kind(),
+                    IdeMixerChannelKind::Audio | IdeMixerChannelKind::Group | IdeMixerChannelKind::Return
+                ),
                 removable: channel.kind() == IdeMixerChannelKind::Audio,
                 can_move_earlier: flat_audio_track_reorder_available && index > 0,
                 can_move_later: flat_audio_track_reorder_available && index + 1 < channels.len(),
@@ -10811,7 +10893,13 @@ fn set_mixer(
                     && actual.muted == state.is_some_and(|state| state.muted)
                     && actual.solo == state.is_some_and(|state| state.solo)
                     && actual.solo_available == (expected.kind() == IdeMixerChannelKind::Audio)
-                    && actual.renameable == (expected.kind() == IdeMixerChannelKind::Audio)
+                    && actual.renameable
+                        == matches!(
+                            expected.kind(),
+                            IdeMixerChannelKind::Audio
+                                | IdeMixerChannelKind::Group
+                                | IdeMixerChannelKind::Return
+                        )
                     && actual.removable == (expected.kind() == IdeMixerChannelKind::Audio)
                     && actual.can_move_earlier
                         == (flat_audio_track_reorder_available && index > 0)
@@ -13993,7 +14081,7 @@ mod tests {
         );
         let mut routing_bus = audio_track_mixer_row(0, track_a);
         routing_bus.kind = "GROUP".into();
-        routing_bus.renameable = false;
+        routing_bus.renameable = true;
         routing_bus.removable = false;
         routing_bus.activation_toggleable = false;
         let routing_bus = ModelRc::from(Rc::new(VecModel::from(vec![routing_bus])));
@@ -14008,6 +14096,31 @@ mod tests {
         assert_eq!(
             validate_routing_bus_removal(AppMode::Running, track_a, &reordered),
             Err(MixerControlFailure::StateUnavailable)
+        );
+        assert!(matches!(
+            routing_bus_rename_command(AppMode::Running, 0, " Percussion ", &routing_bus),
+            Ok(IdeWorkerCommand::RenameRoutingBus { track_id, name })
+                if track_id == track_a && name == "Percussion"
+        ));
+        assert!(matches!(
+            routing_bus_rename_command(AppMode::Closed, 0, "Percussion", &routing_bus),
+            Err(MixerControlFailure::StateUnavailable)
+        ));
+        assert!(matches!(
+            routing_bus_rename_command(AppMode::Running, 0, "   ", &routing_bus),
+            Err(MixerControlFailure::InvalidValue)
+        ));
+        assert!(matches!(
+            routing_bus_rename_command(AppMode::Running, 0, "Percussion", &reordered),
+            Err(MixerControlFailure::StateUnavailable)
+        ));
+        assert_eq!(
+            mode_after_successful_submission(AppMode::Running, IdeWorkerCommandKind::RenameRoutingBus),
+            AppMode::RenamingTrack
+        );
+        assert_eq!(
+            mode_after_failure(AppMode::RenamingTrack, IdeWorkerCommandKind::RenameRoutingBus),
+            AppMode::Running
         );
         assert_eq!(
             mode_after_successful_submission(AppMode::Running, IdeWorkerCommandKind::RemoveRoutingBus),

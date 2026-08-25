@@ -95,7 +95,7 @@ use hyper_playback_json::{
     AudioTrackReorderSerializationError,
     AudioPrimaryRouteSerializationError, AudioPrimaryRouteTarget,
     ReturnSendSerializationError, RoutingBusCreationSerializationError,
-    RoutingBusRemovalSerializationError,
+    RoutingBusRemovalSerializationError, RoutingBusRenameSerializationError,
     RoutingBusKind as PlaybackRoutingBusKind,
     AutomationTakeAddition, AutomationTakeAdditionSerializationError,
     AutomationTakeEditSerializationError, AutomationTargetSelection, CompiledMixerDestination,
@@ -122,6 +122,7 @@ use hyper_playback_json::{
     serialize_audio_primary_route_change, serialize_return_send_addition,
     serialize_return_send_removal,
     serialize_routing_bus_creation, serialize_routing_bus_removal,
+    serialize_routing_bus_rename,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_mixer_base_state, serialize_recording_audio_clip_addition,
     serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
@@ -3090,6 +3091,71 @@ impl Error for IdeAudioTrackEditError {
             | Self::TrackResourceRoleMismatch
             | Self::CapacityUnavailable
             | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeRoutingBusRenameError {
+    InvalidName,
+    MixerSave(Box<IdeProjectSaveError>),
+    TrackResourceMissing,
+    TrackResourceRoleMismatch,
+    Storage(StorageError),
+    Serialization(RoutingBusRenameSerializationError),
+    CapacityUnavailable,
+    Publication(Box<IdeAudioTrackEditPublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeRoutingBusRenameError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: Box<ProjectResourcePublicationOutcome>,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeAudioTrackEditPublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeRoutingBusRenameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidName => formatter.write_str("routing-bus name must contain 1 through 120 characters"),
+            Self::MixerSave(source) => write!(formatter, "live mixer state could not be preserved: {source}"),
+            Self::TrackResourceMissing => formatter.write_str("the selected routing-bus resource is no longer present"),
+            Self::TrackResourceRoleMismatch => formatter.write_str("the selected project resource is not a structural track"),
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => formatter.write_str("routing-bus rename capacity is unavailable"),
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(formatter, "native playback did not close cleanly before renaming the routing bus: {source:?}"),
+            Self::NativeCloseAndReopen { close, reopen } => write!(formatter, "native playback did not close cleanly before renaming the routing bus ({close:?}) and the unchanged project could not be reopened ({reopen})"),
+            Self::ReopenAfterPreparation { preparation, reopen } => write!(formatter, "routing-bus rename preparation failed ({preparation}) and the project could not be reopened ({reopen})"),
+            Self::ReopenAfterPublication { outcome, source } => write!(formatter, "routing bus was renamed in project revision {} but the project could not be reopened: {source}", outcome.project_revision()),
+            Self::PublicationAndReopen { publication, reopen } => write!(formatter, "routing-bus rename publication failed ({publication}) and the project could not be reopened ({reopen})"),
+        }
+    }
+}
+
+impl Error for IdeRoutingBusRenameError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidName | Self::TrackResourceMissing | Self::TrackResourceRoleMismatch | Self::CapacityUnavailable | Self::NativeClose(_) => None,
         }
     }
 }
@@ -9293,6 +9359,57 @@ impl RunningDesktopIdeApplication {
                 )
             },
         )
+    }
+
+    fn prepare_routing_bus_rename(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        track_id: &str,
+        track_name: &str,
+    ) -> Result<IdeAudioTrackEditPlan, IdeRoutingBusRenameError> {
+        let name_length = track_name.chars().count();
+        if track_name.trim() != track_name || !(1..=120).contains(&name_length) {
+            return Err(IdeRoutingBusRenameError::InvalidName);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeRoutingBusRenameError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeRoutingBusRenameError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == track_id)
+            .ok_or(IdeRoutingBusRenameError::TrackResourceMissing)?;
+        if descriptor.role() != ResourceRole::Track {
+            return Err(IdeRoutingBusRenameError::TrackResourceRoleMismatch);
+        }
+        let source = package
+            .read_resource(track_id)
+            .map_err(IdeRoutingBusRenameError::Storage)?;
+        let (project, _, _, _) = prepared.session().parts();
+        let track_bytes = serialize_routing_bus_rename(
+            project,
+            &source,
+            track_id,
+            track_name,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeRoutingBusRenameError::Serialization)?;
+        let mut owned_track_id = String::new();
+        owned_track_id
+            .try_reserve_exact(track_id.len())
+            .map_err(|_| IdeRoutingBusRenameError::CapacityUnavailable)?;
+        owned_track_id.push_str(track_id);
+        Ok(IdeAudioTrackEditPlan {
+            mixer,
+            track_id: owned_track_id,
+            track_bytes,
+        })
     }
 
     fn prepare_audio_track_reorder(

@@ -951,6 +951,18 @@ pub enum AudioTrackRenameSerializationError {
 }
 
 #[derive(Debug)]
+pub enum RoutingBusRenameSerializationError {
+    InvalidTrackName,
+    Source(LoadError),
+    NonCanonicalSource,
+    TrackMissing,
+    TrackNotRoutingBus,
+    SourceTrackMismatch,
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+}
+
+#[derive(Debug)]
 pub enum SceneRenameSerializationError {
     InvalidSceneName,
     Document(SceneDocumentSerializationError),
@@ -1226,6 +1238,45 @@ impl Error for AudioTrackRenameSerializationError {
         match self {
             Self::Document(source) => Some(source),
             Self::InvalidTrackName => None,
+        }
+    }
+}
+
+impl fmt::Display for RoutingBusRenameSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTrackName => {
+                formatter.write_str("the routing-bus name is outside the version-1 domain")
+            }
+            Self::Source(source) => source.fmt(formatter),
+            Self::NonCanonicalSource => {
+                formatter.write_str("source routing-bus track is not canonical RFC 8785 JSON")
+            }
+            Self::TrackMissing => formatter.write_str("the routing bus is not present in the project"),
+            Self::TrackNotRoutingBus => {
+                formatter.write_str("the selected track is not a group or return routing bus")
+            }
+            Self::SourceTrackMismatch => formatter
+                .write_str("source routing-bus bytes do not match the loaded project structure"),
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source routing-bus shape changed after typed validation")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for RoutingBusRenameSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::InvalidTrackName
+            | Self::NonCanonicalSource
+            | Self::TrackMissing
+            | Self::TrackNotRoutingBus
+            | Self::SourceTrackMismatch
+            | Self::InvalidDocumentShape => None,
         }
     }
 }
@@ -3728,6 +3779,86 @@ pub fn serialize_audio_track_rename(
         document.insert("name".to_owned(), track_name.into());
     })
     .map_err(AudioTrackRenameSerializationError::Document)
+}
+
+/// Replaces only the display name in one validated canonical Group or Return
+/// track document while preserving identity, routing role, hierarchy, and
+/// namespaced extensions.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the selected track is absent or not a
+/// routing bus, the supplied bytes disagree with the loaded project, the new
+/// name is outside the version-1 domain, or the resulting project structure
+/// fails validation.
+pub fn serialize_routing_bus_rename(
+    project: &LoadedPlaybackProject,
+    source_track: &[u8],
+    track_id: &str,
+    track_name: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, RoutingBusRenameSerializationError> {
+    let name_length = track_name.chars().count();
+    if track_name.trim() != track_name
+        || !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
+    {
+        return Err(RoutingBusRenameSerializationError::InvalidTrackName);
+    }
+    let track_index = project
+        .track_index(track_id)
+        .ok_or(RoutingBusRenameSerializationError::TrackMissing)?;
+    let current = project
+        .tracks
+        .get(track_index)
+        .ok_or(RoutingBusRenameSerializationError::TrackMissing)?;
+    if !matches!(current.kind, TrackKind::Group | TrackKind::Return) {
+        return Err(RoutingBusRenameSerializationError::TrackNotRoutingBus);
+    }
+    let source = load_track(
+        source_track,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(RoutingBusRenameSerializationError::Source)?;
+    if source.id != current.id
+        || source.name != current.name
+        || source.kind != current.kind
+        || source.order != current.order
+        || source.active != current.active
+        || source.parent_track_id != current.parent_track_id
+        || source.clip_ids != current.clip_ids
+    {
+        return Err(RoutingBusRenameSerializationError::SourceTrackMismatch);
+    }
+    let mut value: Value = serde_json::from_slice(source_track)
+        .map_err(RoutingBusRenameSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&value)
+        .map_err(RoutingBusRenameSerializationError::Serialization)?;
+    if canonical_source != source_track {
+        return Err(RoutingBusRenameSerializationError::NonCanonicalSource);
+    }
+    let document = value
+        .as_object_mut()
+        .ok_or(RoutingBusRenameSerializationError::InvalidDocumentShape)?;
+    document.insert("name".to_owned(), track_name.into());
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(RoutingBusRenameSerializationError::Serialization)?;
+    let edited = load_track(
+        &output,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(RoutingBusRenameSerializationError::Source)?;
+    let mut renamed_project = project.clone();
+    renamed_project.tracks[track_index] = edited;
+    validate_track_hierarchy(&renamed_project.tracks)
+        .map_err(RoutingBusRenameSerializationError::Source)?;
+    validate_loaded_identities(&renamed_project).map_err(RoutingBusRenameSerializationError::Source)?;
+    Ok(output)
 }
 
 /// Replaces only the display name in one validated canonical scene document
@@ -10473,6 +10604,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scenario verifies the complete primary-route graph and each refusal boundary"
+    )]
     fn audio_primary_route_edits_preserve_the_verified_mixer_graph() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];
@@ -10610,6 +10745,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scenario proves routing-bus removal refuses every explicit dependency until cleanup"
+    )]
     fn routing_bus_removal_requires_explicit_dependency_cleanup() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];
@@ -10817,6 +10956,128 @@ mod tests {
                 LoaderLimits::VERSION_1,
             ),
             Err(RoutingBusRemovalSerializationError::TrackNotRoutingBus)
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scenario verifies Group and Return rename byte deltas and refusal boundaries"
+    )]
+    fn routing_bus_rename_preserves_the_verified_routing_track() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let project = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer_id = "018f47a2-6b2d-7c11-8a44-001122334468";
+        let source_track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let group_track_id = "018f47a2-6b2d-7c11-8a44-001122334470";
+        let group = serialize_routing_bus_creation(
+            &project,
+            &asset_facts(),
+            MIXER,
+            mixer_id,
+            RoutingBusKind::Group,
+            group_track_id,
+            "Drum Bus",
+            &[source_track_id],
+            &[],
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let group_tracks: [&[u8]; 2] = [TRACK, group.track()];
+        let group_project = load(
+            input(TIMELINE, &group_tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let renamed_group = serialize_routing_bus_rename(
+            &group_project,
+            group.track(),
+            group_track_id,
+            "Drums",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected_group: Value = serde_json::from_slice(group.track()).unwrap();
+        expected_group["name"] = "Drums".into();
+        assert_eq!(
+            renamed_group,
+            serde_json_canonicalizer::to_vec(&expected_group).unwrap()
+        );
+
+        let return_track_id = "018f47a2-6b2d-7c11-8a44-001122334471";
+        let return_send_id = "018f47a2-6b2d-7c11-8a44-001122334472";
+        let return_bus = serialize_routing_bus_creation(
+            &group_project,
+            &asset_facts(),
+            group.mixer(),
+            mixer_id,
+            RoutingBusKind::Return,
+            return_track_id,
+            "Verb",
+            &[source_track_id],
+            &[return_send_id],
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let return_tracks: [&[u8]; 3] = [TRACK, group.track(), return_bus.track()];
+        let return_project = load(
+            input(TIMELINE, &return_tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let renamed_return = serialize_routing_bus_rename(
+            &return_project,
+            return_bus.track(),
+            return_track_id,
+            "Plate",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected_return: Value = serde_json::from_slice(return_bus.track()).unwrap();
+        expected_return["name"] = "Plate".into();
+        assert_eq!(
+            renamed_return,
+            serde_json_canonicalizer::to_vec(&expected_return).unwrap()
+        );
+
+        assert!(matches!(
+            serialize_routing_bus_rename(
+                &project,
+                TRACK,
+                source_track_id,
+                "Audio",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(RoutingBusRenameSerializationError::TrackNotRoutingBus)
+        ));
+        assert!(matches!(
+            serialize_routing_bus_rename(
+                &group_project,
+                group.track(),
+                group_track_id,
+                " Group ",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(RoutingBusRenameSerializationError::InvalidTrackName)
+        ));
+        let noncanonical = serde_json::to_vec_pretty(
+            &serde_json::from_slice::<Value>(group.track()).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_routing_bus_rename(
+                &group_project,
+                &noncanonical,
+                group_track_id,
+                "Drums",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(RoutingBusRenameSerializationError::NonCanonicalSource)
         ));
     }
 
