@@ -179,6 +179,7 @@ use hyper_storage_engine::{
     DeviceChainPublicationRequest, DeviceChainRemovalRequest,
     ImportedAudioClipPublicationRequest, ProjectResourcePublicationError,
     ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
+    MixerRecoverySnapshotError, MixerRecoverySnapshotRequest,
     RequiredControlCapabilities, SampleCleanupOutcome, SampleCleanupRequest,
     RoutingBusPublicationKind, RoutingBusPublicationRequest, RoutingBusRemovalKind,
     RoutingBusRemovalOutcome, RoutingBusRemovalRequest,
@@ -188,6 +189,7 @@ use hyper_storage_engine::{
     remove_audio_clip, remove_audio_track, remove_routing_bus, remove_automation_take, remove_device_chain,
     remove_scene,
     TrackOrderPublicationOutcome, TrackOrderPublicationRequest, publish_track_order,
+    store_mixer_recovery_snapshot,
 };
 
 mod recording;
@@ -1907,6 +1909,7 @@ pub enum IdeProjectSaveError {
     MixerLayoutMismatch,
     CapacityUnavailable,
     Storage(StorageError),
+    RecoverySnapshot(MixerRecoverySnapshotError),
     Serialization(MixerStateSerializationError),
     NativeClose(IdeNativeCloseFailure),
     NativeCloseAndReopen {
@@ -1960,6 +1963,7 @@ impl fmt::Display for IdeProjectSaveError {
             }
             Self::CapacityUnavailable => formatter.write_str("mixer save capacity is unavailable"),
             Self::Storage(source) => source.fmt(formatter),
+            Self::RecoverySnapshot(source) => source.fmt(formatter),
             Self::Serialization(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
@@ -1998,6 +2002,7 @@ impl Error for IdeProjectSaveError {
         match self {
             Self::MixerCommit(source) => Some(source),
             Self::Storage(source) => Some(source),
+            Self::RecoverySnapshot(source) => Some(source),
             Self::Serialization(source) => Some(source),
             Self::Publication(source) => Some(source.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
@@ -8862,6 +8867,15 @@ impl RunningDesktopIdeApplication {
         let project = recovery
             .prepared_project()
             .ok_or(IdeProjectSaveError::ProjectSnapshotUnavailable)?;
+        let checkpoint = recovery.checkpoint();
+        Self::prepare_mixer_save_from_snapshot(application, project, &checkpoint)
+    }
+
+    fn prepare_mixer_save_from_snapshot(
+        application: &DesktopIdeApplication,
+        project: &PreparedProjectPlayback,
+        checkpoint: &PlaybackRecoverySnapshot,
+    ) -> Result<IdeMixerSavePlan, IdeProjectSaveError> {
         let package = project.package();
         let mut mixer_descriptors = package
             .manifest()
@@ -8877,8 +8891,7 @@ impl RunningDesktopIdeApplication {
         let source = package
             .read_resource(descriptor.id())
             .map_err(IdeProjectSaveError::Storage)?;
-        let live = recovery
-            .checkpoint()
+        let live = checkpoint
             .mixer_parameter_state()
             .ok_or(IdeProjectSaveError::MixerStateUnavailable)?;
         let (_, mixer, _, _) = project.session().parts();
@@ -8900,6 +8913,36 @@ impl RunningDesktopIdeApplication {
             resource_id: try_save_owned(descriptor.id())?,
             resource_bytes,
         })
+    }
+
+    fn store_mixer_recovery_snapshot(&self) -> Result<(), IdeProjectSaveError> {
+        #[cfg(not(test))]
+        let IdePlaybackSessionOwner::Native(session) = &self.session;
+        #[cfg(test)]
+        let session = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            IdePlaybackSessionOwner::Test(_) => {
+                return Err(IdeProjectSaveError::ProjectSnapshotUnavailable);
+            }
+        };
+        let project = session
+            .prepared_project()
+            .ok_or(IdeProjectSaveError::ProjectSnapshotUnavailable)?;
+        let checkpoint = session.recovery_checkpoint().snapshot();
+        let plan = Self::prepare_mixer_save_from_snapshot(
+            &self.application,
+            project,
+            &checkpoint,
+        )?;
+        store_mixer_recovery_snapshot(
+            &plan.project_path,
+            MixerRecoverySnapshotRequest {
+                expected_project_sha256: plan.expected_project_sha256,
+                mixer_id: &plan.resource_id,
+                mixer_bytes: &plan.resource_bytes,
+            },
+        )
+        .map_err(IdeProjectSaveError::RecoverySnapshot)
     }
 
     fn prepare_audio_track_addition(

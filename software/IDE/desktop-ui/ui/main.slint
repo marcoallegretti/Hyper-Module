@@ -368,6 +368,8 @@ export global IdeActions {
     callback close-project();
     callback confirm-close-project();
     callback cancel-close-project();
+    callback restore-mixer-recovery();
+    callback discard-mixer-recovery();
 }
 
 component Panel inherits Rectangle {
@@ -772,6 +774,7 @@ export component MainWindow inherits Window {
     in property <bool> mixer-main-muted: false;
     in property <bool> mixer-unsaved-changes: false;
     in-out property <bool> close-unsaved-mixer-confirming: false;
+    in-out property <bool> mixer-recovery-available: false;
     in property <[string]> recording-target-names: [];
     in-out property <int> selected-recording-target-index: 0;
     in property <string> recording-target: "—";
@@ -1364,6 +1367,19 @@ export component MainWindow inherits Window {
                                     enabled: root.app-mode == AppMode.closed;
                                     clicked => { IdeActions.choose-project(); }
                                 }
+                            }
+                            if root.mixer-recovery-available : HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: "Unsaved mixer changes were recovered after an interrupted session.";
+                                    color: #ffbf9b;
+                                    font-size: 9px;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                                Button { text: "Discard"; clicked => { IdeActions.discard-mixer-recovery(); } }
+                                Button { text: "Restore"; clicked => { IdeActions.restore-mixer-recovery(); } }
                             }
                             }
                         }

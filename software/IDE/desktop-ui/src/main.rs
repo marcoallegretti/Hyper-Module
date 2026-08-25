@@ -1246,6 +1246,25 @@ fn bind_project_close_callback_with(ui: &MainWindow, submitter: UiCommandSubmitt
         }
         cancel_submitter(&ui, IdeWorkerCommand::CancelCloseProject);
     });
+    let weak = ui.as_weak();
+    let restore_submitter = Rc::clone(&submitter);
+    actions.on_restore_mixer_recovery(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_mixer_recovery_available() {
+            restore_submitter(&ui, IdeWorkerCommand::RestoreMixerRecovery);
+        }
+    });
+    let weak = ui.as_weak();
+    actions.on_discard_mixer_recovery(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_mixer_recovery_available() {
+            submitter(&ui, IdeWorkerCommand::DiscardMixerRecovery);
+        }
+    });
 }
 
 fn bind_window_close_callback(ui: &MainWindow) {
@@ -4760,6 +4779,12 @@ fn apply_event(
         IdeWorkerEvent::ProjectHistoryWarning(error) => {
             ui.set_project_history_warning(format!("Recent projects unavailable: {error}").into());
         }
+        IdeWorkerEvent::MixerRecoveryAvailable => {
+            ui.set_app_mode(AppMode::Closed);
+            ui.set_mixer_recovery_available(true);
+            ui.set_status_text("Recovery data is available; choose Restore or Discard before opening".into());
+            ui.set_error_text(SharedString::default());
+        }
         IdeWorkerEvent::Closed {
             snapshot,
             native_failure,
@@ -4777,6 +4802,7 @@ fn apply_event(
             ui.set_selected_audio_import_track_index(-1);
             reset_project(ui, &routes.recordings, &routes.takes, project_state);
             ui.set_output_test_confirming(false);
+            ui.set_mixer_recovery_available(false);
             let mode = mode_after_closed_event(ui.get_app_mode());
             ui.set_app_mode(mode);
             if mode == AppMode::Closed {
@@ -4831,6 +4857,12 @@ fn apply_event(
         IdeWorkerEvent::MixerQueued(_) => {
             ui.set_status_text("Mixer base command queued for the audio runtime".into());
             ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::MixerRecoverySnapshotSaved => {
+            ui.set_status_text("Live mixer recovery snapshot updated".into());
+        }
+        IdeWorkerEvent::MixerRecoverySnapshotWarning(reason) => {
+            ui.set_error_text(format!("Live mixer recovery is unavailable: {reason}").into());
         }
         IdeWorkerEvent::CloseDiscardRequired => {
             apply_close_discard_required(ui);
@@ -6941,6 +6973,7 @@ fn apply_running_event(
     project_state: &ProjectUiStateCell,
     observation: &IdeRunningObservation,
 ) {
+    ui.set_mixer_recovery_available(false);
     ui.set_new_project_visible(false);
     ui.set_save_project_as_visible(false);
     ui.set_rename_project_visible(false);
@@ -12005,6 +12038,26 @@ mod tests {
             CloseRequestResponse::KeepWindowShown,
             "a clean native close waits for the worker's fenced close decision"
         );
+
+        submitted.borrow_mut().clear();
+        ui.set_mixer_recovery_available(false);
+        ui.global::<IdeActions>().invoke_restore_mixer_recovery();
+        ui.global::<IdeActions>().invoke_discard_mixer_recovery();
+        assert!(
+            submitted.borrow().is_empty(),
+            "recovery actions remain inert until the worker reports matching recovery data"
+        );
+        ui.set_mixer_recovery_available(true);
+        ui.global::<IdeActions>().invoke_restore_mixer_recovery();
+        ui.global::<IdeActions>().invoke_discard_mixer_recovery();
+        assert!(
+            matches!(
+                submitted.borrow().as_slice(),
+                [IdeWorkerCommand::RestoreMixerRecovery, IdeWorkerCommand::DiscardMixerRecovery]
+            ),
+            "the recovery controls preserve the worker-owned explicit restore-or-discard choice"
+        );
+        ui.set_mixer_recovery_available(false);
     }
 
     fn assert_transport_space_shortcut_contract(ui: &MainWindow) {

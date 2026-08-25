@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod mapping_publication;
+mod mixer_recovery;
 mod project_creation;
 mod project_copy;
 mod project_lock;
@@ -17,6 +18,11 @@ pub use mapping_publication::{
     ControlMappingPublicationRecoveryDisposition, ControlMappingPublicationRequest,
     RequiredControlCapabilities,
     publish_control_mapping, recover_control_mapping_publications,
+};
+pub use mixer_recovery::{
+    MixerRecoverySnapshot, MixerRecoverySnapshotError, MixerRecoverySnapshotErrorKind,
+    MixerRecoverySnapshotRequest, clear_mixer_recovery_snapshot,
+    load_mixer_recovery_snapshot, store_mixer_recovery_snapshot,
 };
 pub use project_creation::{
     ProjectCreationError, ProjectCreationErrorKind, ProjectCreationOutcome, ProjectCreationRequest,

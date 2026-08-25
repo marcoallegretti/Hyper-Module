@@ -13,7 +13,7 @@ use hyper_desktop_audio::{DesktopAudioPreviewSnapshot, DesktopAudioPreviewState}
 use hyper_fs_authority::path_is_proven_absent;
 use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, TransportCommand};
 use hyper_playback_json::SceneTrackAction;
-use hyper_project_model::is_valid_interactive_project_name;
+use hyper_project_model::{ResourceRole, is_valid_interactive_project_name};
 use hyper_project_history::{ProjectHistory, ProjectHistoryError, RecentProject};
 use hyper_recording_metadata::RecordingCaptureKind;
 use hyper_runtime_bundle_builder::{
@@ -23,6 +23,9 @@ use hyper_runtime_bundle_builder::{
 use hyper_storage_engine::{
     ProjectCopyError, ProjectCopyRequest, ProjectCreationError, ProjectCreationRequest,
     ProjectRenameError, ProjectRenameOutcome, ProjectRenameRequest,
+    MixerRecoverySnapshot, MixerRecoverySnapshotErrorKind, clear_mixer_recovery_snapshot,
+    load_mixer_recovery_snapshot,
+    ProjectResourcePublicationRequest, publish_project_resource,
     copy_project as copy_project_package, create_project as create_project_package,
     rename_project as rename_project_package,
 };
@@ -77,6 +80,7 @@ const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 const MIXER_SAVE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const MIXER_SAVE_COMMIT_TIMEOUT: Duration = Duration::from_millis(50);
+const MIXER_RECOVERY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 pub const MAX_IDE_WORKER_COMMANDS: usize = 64;
 pub const MAX_IDE_WORKER_EVENTS: usize = 64;
 
@@ -243,6 +247,8 @@ pub enum IdeWorkerCommand {
     },
     OpenProject(PathBuf),
     OpenRecentProject(PathBuf),
+    RestoreMixerRecovery,
+    DiscardMixerRecovery,
     Transport(TransportCommand),
     Seek {
         frame: usize,
@@ -520,7 +526,10 @@ impl IdeWorkerCommand {
             Self::StartOutputTest => IdeWorkerCommandKind::StartOutputTest,
             Self::StopOutputTest => IdeWorkerCommandKind::StopOutputTest,
             Self::CreateProject { .. } => IdeWorkerCommandKind::CreateProject,
-            Self::OpenProject(_) | Self::OpenRecentProject(_) => IdeWorkerCommandKind::OpenProject,
+            Self::OpenProject(_)
+            | Self::OpenRecentProject(_)
+            | Self::RestoreMixerRecovery
+            | Self::DiscardMixerRecovery => IdeWorkerCommandKind::OpenProject,
             Self::Transport(_) => IdeWorkerCommandKind::Transport,
             Self::Seek { .. } => IdeWorkerCommandKind::Seek,
             Self::LocatePlacement { .. } => IdeWorkerCommandKind::LocatePlacement,
@@ -2332,6 +2341,7 @@ pub enum IdeWorkerEvent {
         projects: Vec<RecentProject>,
     },
     ProjectHistoryWarning(ProjectHistoryError),
+    MixerRecoveryAvailable,
     Closed {
         snapshot: IdeClosedSnapshot,
         native_failure: Option<IdeNativeCloseFailure>,
@@ -2351,6 +2361,8 @@ pub enum IdeWorkerEvent {
         revision: u64,
         changed: bool,
     },
+    MixerRecoverySnapshotSaved,
+    MixerRecoverySnapshotWarning(IdeProjectSaveError),
     ProjectCopied {
         project_path: PathBuf,
         opened: bool,
@@ -3133,12 +3145,22 @@ impl DesktopIdeWorkerPendingShutdown {
 enum WorkerState {
     Undiscovered(IdeApplicationConfig),
     Closed(DesktopIdeApplication),
+    AwaitingMixerRecovery {
+        application: DesktopIdeApplication,
+        path: PathBuf,
+        snapshot: MixerRecoverySnapshot,
+    },
     OutputTesting(OutputTestingDesktopIdeApplication),
     OutputTestStopping {
         pending: IdePendingOutputTestShutdown,
         command: IdeWorkerCommandKind,
     },
     Running(RunningDesktopIdeApplication),
+    AutosaveFence {
+        application: RunningDesktopIdeApplication,
+        sequence: u64,
+        deadline: Instant,
+    },
     SaveFence {
         application: RunningDesktopIdeApplication,
         operation: ProjectMutation,
@@ -3894,6 +3916,7 @@ fn run_worker(
 ) -> IdeWorkerShutdownReport {
     let mut unpublished_native_failure = None;
     let mut history = UndoHistory::default();
+    let mut next_mixer_recovery_snapshot = None;
     if !publish_project_history(project_history, events) {
         return finish_worker(state, unpublished_native_failure);
     }
@@ -3910,9 +3933,24 @@ fn run_worker(
         ) {
             return finish_worker(state, unpublished_native_failure);
         }
+        match &state {
+            WorkerState::Running(_) => {
+                let due = next_mixer_recovery_snapshot
+                    .get_or_insert_with(|| Instant::now() + MIXER_RECOVERY_SNAPSHOT_INTERVAL);
+                if Instant::now() >= *due {
+                    next_mixer_recovery_snapshot = None;
+                    if !begin_mixer_recovery_snapshot(&mut state, events) {
+                        return finish_worker(state, unpublished_native_failure);
+                    }
+                    continue;
+                }
+            }
+            _ => next_mixer_recovery_snapshot = None,
+        }
         let command = if matches!(
             state,
-            WorkerState::SaveFence { .. }
+            WorkerState::AutosaveFence { .. }
+                | WorkerState::SaveFence { .. }
                 | WorkerState::RecordingFence { .. }
                 | WorkerState::AudioPreviewFence { .. }
                 | WorkerState::CloseFence { .. }
@@ -4125,6 +4163,12 @@ fn process_command(
             unpublished_native_failure,
             project_history,
         ),
+        IdeWorkerCommand::RestoreMixerRecovery => {
+            restore_mixer_recovery(state, events, unpublished_native_failure, project_history)
+        }
+        IdeWorkerCommand::DiscardMixerRecovery => {
+            discard_mixer_recovery(state, events, unpublished_native_failure, project_history)
+        }
         IdeWorkerCommand::Transport(command) => process_transport_command(state, command, events),
         IdeWorkerCommand::Seek { frame } => process_seek_command(state, frame, events),
         IdeWorkerCommand::LocatePlacement {
@@ -4690,6 +4734,28 @@ fn open_project(
     let WorkerState::Closed(application) = std::mem::replace(state, WorkerState::Empty) else {
         unreachable!("closed state was checked before ownership transfer");
     };
+    match load_mixer_recovery_snapshot(&path) {
+        Ok(Some(snapshot)) => {
+            *state = WorkerState::AwaitingMixerRecovery {
+                application,
+                path,
+                snapshot,
+            };
+            return send_event(events, IdeWorkerEvent::MixerRecoveryAvailable);
+        }
+        Err(reason) if reason.kind() == MixerRecoverySnapshotErrorKind::SnapshotInvalid => {
+            if !send_event(
+                events,
+                IdeWorkerEvent::MixerRecoverySnapshotWarning(
+                    IdeProjectSaveError::RecoverySnapshot(reason),
+                ),
+            ) {
+                *state = WorkerState::Closed(application);
+                return false;
+            }
+        }
+        Ok(None) | Err(_) => {}
+    }
     match application.open_project(path) {
         Ok(running) => {
             let history_published = remember_running_project(project_history, &running, events);
@@ -4704,6 +4770,91 @@ fn open_project(
                 IdeWorkerCommandKind::OpenProject,
                 IdeWorkerCommandFailure::ProjectOpen(reason),
             )
+        }
+    }
+}
+
+fn restore_mixer_recovery(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    project_history: Option<&ProjectHistory>,
+) -> bool {
+    let WorkerState::AwaitingMixerRecovery { application, path, snapshot } =
+        std::mem::replace(state, WorkerState::Empty)
+    else {
+        return publish_failure(events, IdeWorkerCommandKind::OpenProject, IdeWorkerCommandFailure::InvalidState);
+    };
+    let publication = publish_project_resource(
+        &path,
+        ProjectResourcePublicationRequest {
+            expected_project_sha256: *snapshot.manifest_sha256(),
+            resource_id: snapshot.mixer_id(),
+            expected_role: ResourceRole::Mixer,
+            resource_bytes: snapshot.mixer_bytes(),
+        },
+    );
+    if let Err(reason) = publication {
+        *state = WorkerState::AwaitingMixerRecovery { application, path, snapshot };
+        return send_event(
+            events,
+            IdeWorkerEvent::MixerRecoverySnapshotWarning(IdeProjectSaveError::Publication(Box::new(reason))),
+        );
+    }
+    let clear = clear_mixer_recovery_snapshot(&path);
+    open_recovery_project(state, application, &path, events, unpublished_native_failure, project_history)
+        && match clear {
+            Ok(()) => true,
+            Err(reason) => send_event(
+                events,
+                IdeWorkerEvent::MixerRecoverySnapshotWarning(IdeProjectSaveError::RecoverySnapshot(reason)),
+            ),
+        }
+}
+
+fn discard_mixer_recovery(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    project_history: Option<&ProjectHistory>,
+) -> bool {
+    let WorkerState::AwaitingMixerRecovery { application, path, snapshot } =
+        std::mem::replace(state, WorkerState::Empty)
+    else {
+        return publish_failure(events, IdeWorkerCommandKind::OpenProject, IdeWorkerCommandFailure::InvalidState);
+    };
+    if let Err(reason) = clear_mixer_recovery_snapshot(&path) {
+        *state = WorkerState::AwaitingMixerRecovery {
+            application,
+            path,
+            snapshot,
+        };
+        return send_event(
+            events,
+            IdeWorkerEvent::MixerRecoverySnapshotWarning(IdeProjectSaveError::RecoverySnapshot(reason)),
+        );
+    }
+    open_recovery_project(state, application, &path, events, unpublished_native_failure, project_history)
+}
+
+fn open_recovery_project(
+    state: &mut WorkerState,
+    application: DesktopIdeApplication,
+    path: &Path,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    project_history: Option<&ProjectHistory>,
+) -> bool {
+    match application.open_project(path) {
+        Ok(running) => {
+            let history_published = remember_running_project(project_history, &running, events);
+            *state = WorkerState::Running(running);
+            history_published && publish_state(state, events, unpublished_native_failure)
+        }
+        Err(failure) => {
+            let (application, reason) = failure.into_parts();
+            *state = WorkerState::Closed(application);
+            publish_failure(events, IdeWorkerCommandKind::OpenProject, IdeWorkerCommandFailure::ProjectOpen(reason))
         }
     }
 }
@@ -8152,6 +8303,49 @@ fn begin_project_mutation_request(
         unreachable!();
     };
     send_event(events, operation.pending_event())
+}
+
+fn begin_mixer_recovery_snapshot(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let WorkerState::Running(application) = state else {
+        return true;
+    };
+    if application.audio_preview_is_active() || !application.can_save_mixer() {
+        return true;
+    }
+    if application.mixer_close_requires_discard() != Some(true) {
+        return true;
+    }
+    let sequence = match application.try_send_mixer_fence() {
+        Ok(Some(sequence)) => sequence,
+        Ok(None) => {
+            return send_event(
+                events,
+                IdeWorkerEvent::MixerRecoverySnapshotWarning(
+                    IdeProjectSaveError::MixerFenceSequenceUnavailable,
+                ),
+            );
+        }
+        Err(reason) => {
+            return send_event(
+                events,
+                IdeWorkerEvent::MixerRecoverySnapshotWarning(IdeProjectSaveError::MixerCommit(
+                    reason,
+                )),
+            );
+        }
+    };
+    let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("running state was checked before autosave ownership transfer");
+    };
+    *state = WorkerState::AutosaveFence {
+        application,
+        sequence,
+        deadline: Instant::now() + MIXER_SAVE_COMMIT_TIMEOUT,
+    };
+    true
 }
 
 #[allow(
@@ -13506,6 +13700,37 @@ fn poll_pending_state(
                 true
             }
         },
+        WorkerState::AutosaveFence {
+            application,
+            sequence,
+            deadline,
+        } => {
+            if application.committed_mixer_fence() >= sequence {
+                let result = application.store_mixer_recovery_snapshot();
+                *state = WorkerState::Running(application);
+                match result {
+                    Ok(()) => send_event(events, IdeWorkerEvent::MixerRecoverySnapshotSaved),
+                    Err(reason) => {
+                        send_event(events, IdeWorkerEvent::MixerRecoverySnapshotWarning(reason))
+                    }
+                }
+            } else if Instant::now() >= deadline {
+                *state = WorkerState::Running(application);
+                send_event(
+                    events,
+                    IdeWorkerEvent::MixerRecoverySnapshotWarning(
+                        IdeProjectSaveError::MixerCommitTimeout,
+                    ),
+                )
+            } else {
+                *state = WorkerState::AutosaveFence {
+                    application,
+                    sequence,
+                    deadline,
+                };
+                true
+            }
+        }
         WorkerState::SaveFence {
             application,
             operation,
@@ -13696,6 +13921,7 @@ fn publish_state(
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
 ) -> bool {
     let event = match state {
+        WorkerState::AwaitingMixerRecovery { .. } => IdeWorkerEvent::MixerRecoveryAvailable,
         WorkerState::Closed(application) => match closed_snapshot(application) {
             Ok(snapshot) => IdeWorkerEvent::Closed {
                 snapshot,
@@ -13726,7 +13952,8 @@ fn publish_state(
             }
         },
         WorkerState::Closing(_) => IdeWorkerEvent::Closing,
-        WorkerState::CloseFence { application, .. }
+        WorkerState::AutosaveFence { application, .. }
+        | WorkerState::CloseFence { application, .. }
         | WorkerState::AwaitingCloseDiscard(application) => match running_observation(application) {
             Ok(observation) => IdeWorkerEvent::Running(observation),
             Err(reason) => {
@@ -14194,6 +14421,10 @@ fn shutdown_state(
                 IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
             },
+            WorkerState::AutosaveFence { application, .. } => match application.close() {
+                IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
+                IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
+            },
             WorkerState::SaveFence { application, .. } => match application.close() {
                 IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
@@ -14240,7 +14471,10 @@ fn shutdown_state(
                     Err(failure) => (None, Some(Err(failure.reason))),
                 };
             }
-            WorkerState::Undiscovered(_) | WorkerState::Closed(_) | WorkerState::Empty => {
+            WorkerState::Undiscovered(_)
+            | WorkerState::Closed(_)
+            | WorkerState::AwaitingMixerRecovery { .. }
+            | WorkerState::Empty => {
                 return (None, None);
             }
         };
@@ -21545,6 +21779,42 @@ mod tests {
         ));
         assert_eq!(history.undo.len(), 1);
         assert!(matches!(state, WorkerState::Running(_)));
+    }
+
+    #[test]
+    fn clean_mixer_state_does_not_start_a_recovery_snapshot_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                close_requires_discard: Some(false),
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let mut state = WorkerState::Running(running);
+        let (events, receiver) = sync_channel(1);
+
+        assert!(begin_mixer_recovery_snapshot(&mut state, &events));
+        assert!(matches!(state, WorkerState::Running(_)));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn dirty_mixer_state_starts_a_recovery_snapshot_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                close_requires_discard: Some(true),
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let mut state = WorkerState::Running(running);
+        let (events, receiver) = sync_channel(1);
+
+        assert!(begin_mixer_recovery_snapshot(&mut state, &events));
+        assert!(matches!(state, WorkerState::AutosaveFence { sequence: 1, .. }));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
