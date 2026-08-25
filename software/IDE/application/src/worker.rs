@@ -30,6 +30,7 @@ use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSn
 
 use super::recording::{IdeRecordingPlan, IdeRecordingTarget, RecordingDesktopIdeApplication};
 use super::{
+    control_binding_references_scene,
     ControlBinding, ControlScope, ControlSource, ControlTarget, ControlTransform,
     DesktopIdeApplication, DesktopIdePendingClose, DesktopIdePendingSaveClose,
     DesktopPlaybackRecovery, Edge, IdeApplicationConfig, IdeArrangementLocateError,
@@ -60,7 +61,7 @@ use super::{
     IdeRecordingAbortError, IdeRecordingAbortOutcome, IdeRecordingClipCreationError,
     IdeRecordingError, IdeRecordingImportOutcome, IdeRecordingObservation, IdeResourceRestoreError,
     IdeSaveCloseOutcome, IdeSceneAvailability, IdeSceneCreationError, IdeSceneDuplicationError,
-    IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRenameError, IdeSceneSlotEdit,
+    IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEdit,
     IdeSceneSlotEditError, IdeTempoEditError, IdeTransportSeekError, IdeUnusedSampleCleanupError,
     IdeUnusedSampleCleanupSummary, IdeMixerPrimaryDestination, InputInventoryError,
     LocateState, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
@@ -198,6 +199,7 @@ pub enum IdeWorkerCommandKind {
     SetAudioClipSourceStart,
     TrimAudioClipSource,
     AddScene,
+    RemoveScene,
     DuplicateScene,
     SetSceneSlot,
     RenameScene,
@@ -433,6 +435,9 @@ pub enum IdeWorkerCommand {
         name: String,
         quantization: IdeSceneLaunchQuantization,
     },
+    RemoveScene {
+        scene_id: String,
+    },
     AddAutomationTake {
         request: IdeAutomationTakeRequest,
     },
@@ -590,6 +595,7 @@ impl IdeWorkerCommand {
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
             Self::TrimAudioClipSource { .. } => IdeWorkerCommandKind::TrimAudioClipSource,
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
+            Self::RemoveScene { .. } => IdeWorkerCommandKind::RemoveScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
             Self::RemoveAutomationTake { .. } => IdeWorkerCommandKind::RemoveAutomationTake,
@@ -990,6 +996,7 @@ pub struct IdeScene {
     name: String,
     active: bool,
     availability: IdeSceneAvailability,
+    removable: bool,
     track_slots: Vec<IdeSceneTrackSlot>,
 }
 
@@ -1400,6 +1407,12 @@ impl IdeScene {
         self.availability
     }
 
+    /// Whether no independent project authority currently references this scene.
+    #[must_use]
+    pub const fn removable(&self) -> bool {
+        self.removable
+    }
+
     #[cfg(any(test, feature = "ui-test-support"))]
     #[must_use]
     pub fn for_test(id: &str, name: &str, track_slots: Vec<IdeSceneTrackSlot>) -> Self {
@@ -1408,6 +1421,7 @@ impl IdeScene {
             name: name.to_owned(),
             active: true,
             availability: IdeSceneAvailability::Ready,
+            removable: true,
             track_slots,
         }
     }
@@ -1986,6 +2000,7 @@ pub enum IdeWorkerCommandFailure {
     AudioClipSourceSlip(Box<IdeAudioClipSourceSlipEditError>),
     AudioClipSourceTrim(Box<IdeAudioClipSourceTrimEditError>),
     SceneCreation(Box<IdeSceneCreationError>),
+    SceneRemoval(Box<IdeSceneRemovalError>),
     AutomationTakeCreation(Box<IdeAutomationTakeCreationError>),
     AutomationTakeActivation(Box<IdeAutomationTakeEditError>),
     AutomationTakeRemoval(Box<IdeAutomationTakeEditError>),
@@ -2134,6 +2149,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipSourceSlip(source) => source.fmt(formatter),
             Self::AudioClipSourceTrim(source) => source.fmt(formatter),
             Self::SceneCreation(source) => source.fmt(formatter),
+            Self::SceneRemoval(source) => source.fmt(formatter),
             Self::AutomationTakeCreation(source) => source.fmt(formatter),
             Self::AutomationTakeActivation(source) | Self::AutomationTakeRemoval(source) => {
                 source.fmt(formatter)
@@ -2225,6 +2241,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipSourceSlip(source) => Some(source),
             Self::AudioClipSourceTrim(source) => Some(source),
             Self::SceneCreation(source) => Some(source),
+            Self::SceneRemoval(source) => Some(source),
             Self::AutomationTakeCreation(source) => Some(source),
             Self::AutomationTakeActivation(source) | Self::AutomationTakeRemoval(source) => {
                 Some(source)
@@ -2538,6 +2555,13 @@ pub enum IdeWorkerEvent {
         name: String,
         warning: Box<IdeSceneCreationError>,
     },
+    SceneRemoved {
+        revision: u64,
+        scene_id: String,
+    },
+    SceneRemovalCommittedWithWarning {
+        warning: Box<IdeSceneRemovalError>,
+    },
     AutomationTakeAdded {
         revision: u64,
         take_id: String,
@@ -2758,6 +2782,7 @@ pub enum IdeWorkerEvent {
         source_frame_count: u64,
     },
     SceneAdding,
+    SceneRemoving,
     AutomationTakeAdding,
     AutomationTakeActivationChanging {
         enabled: bool,
@@ -3311,6 +3336,9 @@ enum ProjectMutation {
         name: String,
         quantization: IdeSceneLaunchQuantization,
     },
+    RemoveScene {
+        scene_id: String,
+    },
     AddAutomationTake {
         request: IdeAutomationTakeRequest,
     },
@@ -3421,6 +3449,7 @@ impl ProjectMutation {
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
             Self::TrimAudioClipSource { .. } => IdeWorkerCommandKind::TrimAudioClipSource,
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
+            Self::RemoveScene { .. } => IdeWorkerCommandKind::RemoveScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
             Self::RemoveAutomationTake { .. } => IdeWorkerCommandKind::RemoveAutomationTake,
@@ -3563,6 +3592,7 @@ impl ProjectMutation {
                 source_frame_count: *source_frame_count,
             },
             Self::AddScene { .. } => IdeWorkerEvent::SceneAdding,
+            Self::RemoveScene { .. } => IdeWorkerEvent::SceneRemoving,
             Self::AddAutomationTake { .. } => IdeWorkerEvent::AutomationTakeAdding,
             Self::SetAutomationTakeActive { enabled, .. } => {
                 IdeWorkerEvent::AutomationTakeActivationChanging { enabled: *enabled }
@@ -3777,6 +3807,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetAudioClipReverse => "clip direction",
         IdeWorkerCommandKind::SetAudioClipSourceStart => "clip source slip",
         IdeWorkerCommandKind::TrimAudioClipSource => "clip source trim",
+        IdeWorkerCommandKind::RemoveScene => "scene removal",
         IdeWorkerCommandKind::RenameScene => "scene rename",
         IdeWorkerCommandKind::SetSceneSlot => "scene slot edit",
         IdeWorkerCommandKind::SetSceneActive => "scene activation",
@@ -4154,6 +4185,7 @@ fn process_command(
         | IdeWorkerCommand::SetAudioClipSourceStart { .. }
         | IdeWorkerCommand::TrimAudioClipSource { .. }
         | IdeWorkerCommand::AddScene { .. }
+        | IdeWorkerCommand::RemoveScene { .. }
         | IdeWorkerCommand::AddAutomationTake { .. }
         | IdeWorkerCommand::SetAutomationTakeActive { .. }
         | IdeWorkerCommand::RemoveAutomationTake { .. }
@@ -4411,6 +4443,9 @@ fn process_project_mutation_command(
         ),
         IdeWorkerCommand::AddScene { name, quantization } => {
             add_scene(state, events, &name, quantization)
+        }
+        IdeWorkerCommand::RemoveScene { scene_id } => {
+            remove_scene_request(state, events, &scene_id)
         }
         IdeWorkerCommand::AddAutomationTake { request } => {
             add_automation_take(state, events, request)
@@ -6870,6 +6905,33 @@ fn add_scene(
     )
 }
 
+fn remove_scene_request(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    scene_id: &str,
+) -> bool {
+    let mut owned_scene_id = String::new();
+    if scene_id.is_empty() || owned_scene_id.try_reserve_exact(scene_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RemoveScene,
+            IdeWorkerCommandFailure::SceneRemoval(Box::new(if scene_id.is_empty() {
+                IdeSceneRemovalError::InvalidSceneIdentity
+            } else {
+                IdeSceneRemovalError::CapacityUnavailable
+            })),
+        );
+    }
+    owned_scene_id.push_str(scene_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::RemoveScene {
+            scene_id: owned_scene_id,
+        },
+    )
+}
+
 fn add_automation_take(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -7351,11 +7413,20 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::CreateAudioClipFromTake(Ok(_))
         | ProjectMutationAttempt::DuplicateAudioClip { result: Ok(_), .. }
         | ProjectMutationAttempt::RemoveAudioClip(Ok(_))
+        | ProjectMutationAttempt::RemoveScene { result: Ok(_), .. }
         | ProjectMutationAttempt::CleanUnusedSamples(Ok(_))
         | ProjectMutationAttempt::EditControlMapping { result: Ok(_), .. } => {
             HistoryEffect::Invalidate
         }
         ProjectMutationAttempt::RemoveAudioClip(Err(reason))
+            if reason.publication_committed() =>
+        {
+            HistoryEffect::Invalidate
+        }
+        ProjectMutationAttempt::RemoveScene {
+            result: Err(reason),
+            ..
+        }
             if reason.publication_committed() =>
         {
             HistoryEffect::Invalidate
@@ -7429,6 +7500,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::SetAudioClipSourceStart { result: Err(_), .. }
         | ProjectMutationAttempt::TrimAudioClipSource { result: Err(_), .. }
         | ProjectMutationAttempt::AddScene { result: Err(_), .. }
+        | ProjectMutationAttempt::RemoveScene { result: Err(_), .. }
         | ProjectMutationAttempt::AddAutomationTake { result: Err(_), .. }
         | ProjectMutationAttempt::SetAutomationTakeActive { result: Err(_), .. }
         | ProjectMutationAttempt::EditControlMapping { result: Err(_), .. }
@@ -8253,6 +8325,9 @@ fn project_mutation_save_failure(
         ProjectMutation::AddScene { .. } => IdeWorkerCommandFailure::SceneCreation(Box::new(
             IdeSceneCreationError::MixerSave(Box::new(reason)),
         )),
+        ProjectMutation::RemoveScene { .. } => IdeWorkerCommandFailure::SceneRemoval(Box::new(
+            IdeSceneRemovalError::MixerSave(Box::new(reason)),
+        )),
         ProjectMutation::AddAutomationTake { .. } => {
             IdeWorkerCommandFailure::AutomationTakeCreation(Box::new(
                 IdeAutomationTakeCreationError::MixerSave(Box::new(reason)),
@@ -8555,6 +8630,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::AddScene { .. } => IdeWorkerCommandFailure::SceneCreation(Box::new(
             IdeSceneCreationError::NativeClose(failure),
         )),
+        ProjectMutation::RemoveScene { .. } => IdeWorkerCommandFailure::SceneRemoval(Box::new(
+            IdeSceneRemovalError::NativeClose(failure),
+        )),
         ProjectMutation::AddAutomationTake { .. } => {
             IdeWorkerCommandFailure::AutomationTakeCreation(Box::new(
                 IdeAutomationTakeCreationError::NativeClose(failure),
@@ -8845,6 +8923,13 @@ enum ProjectMutationAttempt {
         result:
             Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeSceneCreationError>,
     },
+    RemoveScene {
+        scene_id: String,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeSceneRemovalError,
+        >,
+    },
     AddAutomationTake {
         name: String,
         inverse: Option<IdeHistoryOperation>,
@@ -9114,6 +9199,19 @@ pub(super) fn scene_creation_failure_event(
         IdeWorkerEvent::CommandFailed {
             command: IdeWorkerCommandKind::AddScene,
             reason: IdeWorkerCommandFailure::SceneCreation(Box::new(reason)),
+        }
+    }
+}
+
+fn scene_removal_failure_event(reason: IdeSceneRemovalError) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::SceneRemovalCommittedWithWarning {
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::RemoveScene,
+            reason: IdeWorkerCommandFailure::SceneRemoval(Box::new(reason)),
         }
     }
 }
@@ -9983,6 +10081,20 @@ fn complete_project_mutation(
                     name,
                     result: Err(reason),
                 } => send_event(events, scene_creation_failure_event(name, reason)),
+                ProjectMutationAttempt::RemoveScene {
+                    scene_id,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::SceneRemoved {
+                        revision: outcome.project_revision(),
+                        scene_id,
+                    },
+                ),
+                ProjectMutationAttempt::RemoveScene {
+                    result: Err(reason),
+                    ..
+                } => send_event(events, scene_removal_failure_event(reason)),
                 ProjectMutationAttempt::AddAutomationTake {
                     name,
                     result: Ok(outcome),
@@ -11196,6 +11308,18 @@ fn attempt_project_mutation(
                 })
             },
         },
+        ProjectMutation::RemoveScene { scene_id } => ProjectMutationAttempt::RemoveScene {
+            scene_id: scene_id.clone(),
+            result: if let Some(failure) = native_failure {
+                Err(IdeSceneRemovalError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_scene_removal(application, recovery, &scene_id)
+                    .and_then(|plan| {
+                        plan.publish()
+                            .map_err(|source| IdeSceneRemovalError::Publication(Box::new(source)))
+                    })
+            },
+        },
         ProjectMutation::DuplicateScene { scene_id, name } => {
             ProjectMutationAttempt::DuplicateScene {
                 name: name.clone(),
@@ -12345,6 +12469,9 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::AddScene { result, .. } => {
             scene_creation_reopen_failure(result, reopen)
         }
+        ProjectMutationAttempt::RemoveScene { result, .. } => {
+            scene_removal_reopen_failure(result, reopen)
+        }
         ProjectMutationAttempt::AddAutomationTake { result, .. } => {
             automation_take_creation_reopen_failure(result, reopen)
         }
@@ -12621,6 +12748,35 @@ fn scene_creation_reopen_failure(
         },
     };
     IdeWorkerCommandFailure::SceneCreation(Box::new(reason))
+}
+
+fn scene_removal_reopen_failure(
+    result: Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeSceneRemovalError>,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    let reason = match result {
+        Ok(outcome) => IdeSceneRemovalError::ReopenAfterPublication {
+            outcome: Box::new(outcome),
+            source: Box::new(reopen),
+        },
+        Err(IdeSceneRemovalError::Publication(publication)) => {
+            IdeSceneRemovalError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(IdeSceneRemovalError::NativeClose(close)) => {
+            IdeSceneRemovalError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(preparation) => IdeSceneRemovalError::ReopenAfterPreparation {
+            preparation: Box::new(preparation),
+            reopen: Box::new(reopen),
+        },
+    };
+    IdeWorkerCommandFailure::SceneRemoval(Box::new(reason))
 }
 
 pub(super) fn scene_duplication_reopen_failure(
@@ -13748,11 +13904,21 @@ fn running_observation(
                 action,
             });
         }
+        let scene_id = snapshot.scene_ids[scene_index];
+        let removable = snapshot
+            .loaded
+            .scene_removal_blockers(scene_id)
+            .is_some_and(hyper_playback_json::SceneRemovalBlockers::is_empty)
+            && !snapshot
+                .control_bindings
+                .iter()
+                .any(|binding| control_binding_references_scene(binding, scene_id));
         scenes.push(IdeScene {
-            id: try_project_owned(snapshot.scene_ids[scene_index])?,
+            id: try_project_owned(scene_id)?,
             name: try_project_owned(snapshot.scene_names[scene_index])?,
             active: snapshot.scene_active[scene_index],
             availability: snapshot.scene_availability[scene_index],
+            removable,
             track_slots,
         });
     }
@@ -22039,6 +22205,56 @@ mod tests {
                 command: IdeWorkerCommandKind::AddScene,
                 reason: IdeWorkerCommandFailure::SceneCreation(reason),
             } if matches!(reason.as_ref(), IdeSceneCreationError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn scene_removal_validates_identity_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 5, 10).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::RemoveScene {
+                scene_id: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RemoveScene,
+                reason: IdeWorkerCommandFailure::SceneRemoval(reason),
+            } if matches!(reason.as_ref(), IdeSceneRemovalError::InvalidSceneIdentity)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::RemoveScene {
+                scene_id: "scene".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::SceneRemoving));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RemoveScene,
+                reason: IdeWorkerCommandFailure::SceneRemoval(reason),
+            } if matches!(reason.as_ref(), IdeSceneRemovalError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);

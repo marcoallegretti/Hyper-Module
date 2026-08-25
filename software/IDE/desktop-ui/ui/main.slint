@@ -58,6 +58,7 @@ export enum AppMode {
     renaming-scene,
     duplicating-scene,
     changing-scene-activation,
+    removing-scene,
     creating-clip,
     importing-audio,
     preparing-preview,
@@ -78,6 +79,7 @@ export struct SceneRow {
     availability: string,
     runtime-state: string,
     active: bool,
+    removable: bool,
     launchable: bool,
     queued: bool,
     current: bool,
@@ -301,6 +303,7 @@ export global IdeActions {
     callback launch-scene(int);
     callback begin-add-scene();
     callback add-scene(string, int, string);
+    callback remove-scene(string);
     callback open-scene-slots(string);
     callback select-scene-slot(int);
     callback set-scene-slot(string, string, int, int);
@@ -484,9 +487,13 @@ export component MainWindow inherits Window {
     in-out property <string> scene-duplicate-id: "";
     in-out property <string> scene-duplicate-source-name: "";
     in-out property <string> scene-duplicate-name: "";
+    in-out property <bool> scene-remove-visible: false;
+    in-out property <string> scene-remove-id: "";
+    in-out property <string> scene-remove-name: "";
     in-out property <bool> scene-slots-visible: false;
     in-out property <string> scene-slots-scene-id: "";
     in-out property <string> scene-slots-scene-name: "";
+    in property <bool> scene-slots-scene-removable: false;
     in property <[SceneSlotRow]> scene-slots: [];
     in-out property <int> selected-scene-slot-index: -1;
     in-out property <string> selected-scene-slot-track-id: "";
@@ -616,6 +623,7 @@ export component MainWindow inherits Window {
         || root.scene-create-visible
         || root.scene-rename-visible
         || root.scene-duplicate-visible
+        || root.scene-remove-visible
         || root.scene-slots-visible
         || root.duplicate-track-visible
         || root.rename-track-visible
@@ -2035,6 +2043,19 @@ export component MainWindow inherits Window {
                                     root.scene-duplicate-visible = true;
                                 }
                             }
+                            Button {
+                                text: "Remove scene";
+                                accessible-label: "Remove " + root.scene-slots-scene-name;
+                                enabled: root.app-mode == AppMode.running
+                                    && root.scene-slots-scene-id != ""
+                                    && root.scene-slots-scene-removable;
+                                clicked => {
+                                    root.scene-remove-id = root.scene-slots-scene-id;
+                                    root.scene-remove-name = root.scene-slots-scene-name;
+                                    root.scene-slots-visible = false;
+                                    root.scene-remove-visible = true;
+                                }
+                            }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                         }
                     }
@@ -2115,6 +2136,26 @@ export component MainWindow inherits Window {
                                     && root.scenes.length < root.max-scene-count;
                                 clicked => { IdeActions.duplicate-scene(root.scene-duplicate-id, root.scene-duplicate-name); }
                             }
+                        }
+                    }
+                }
+
+                if root.scene-remove-visible && !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-create-visible && !root.scene-rename-visible && !root.scene-duplicate-visible && !root.scene-slots-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 16px;
+                        Text { text: "REMOVE SCENE"; color: #ff9d76; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.scene-remove-name; color: #edf2f8; font-size: 24px; font-weight: 600; overflow: elide; }
+                        Rectangle { height: 1px; background: #27313d; }
+                        Text { text: "This cannot be undone. Removal is available only when no arrangement launch or control mapping references this scene. Its scene slots are removed with it; reusable clips are preserved."; color: #aebccc; font-size: 11px; wrap: word-wrap; }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.scene-remove-visible = false; root.scene-remove-id = ""; root.scene-remove-name = ""; } }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button { text: root.app-mode == AppMode.removing-scene ? "Removing scene..." : "Remove scene"; enabled: root.app-mode == AppMode.running && root.scene-remove-id != ""; clicked => { IdeActions.remove-scene(root.scene-remove-id); } }
                         }
                     }
                 }

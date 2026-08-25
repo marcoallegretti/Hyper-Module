@@ -989,6 +989,28 @@ pub enum SceneDuplicationSerializationError {
     ProjectCompilation(AdapterCompileError),
 }
 
+/// Playback-document references that prevent removing one scene resource.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SceneRemovalBlockers {
+    pub arrangement_scene_launches: usize,
+}
+
+impl SceneRemovalBlockers {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.arrangement_scene_launches == 0
+    }
+}
+
+/// Failure to remove one unreferenced version-1 scene resource.
+#[derive(Debug)]
+pub enum SceneRemovalSerializationError {
+    SceneMissing,
+    Blocked(SceneRemovalBlockers),
+    Document(SceneDocumentSerializationError),
+    ProjectCompilation(AdapterCompileError),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SceneSlotEdit<'a> {
     Continue,
@@ -1440,6 +1462,31 @@ impl Error for SceneDuplicationSerializationError {
             | Self::InvalidSceneIdentity
             | Self::InvalidSceneName
             | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+impl fmt::Display for SceneRemovalSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SceneMissing => formatter.write_str("the selected scene is missing"),
+            Self::Blocked(blockers) => write!(
+                formatter,
+                "scene removal is blocked by {} arrangement launch(es)",
+                blockers.arrangement_scene_launches
+            ),
+            Self::Document(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for SceneRemovalSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::SceneMissing | Self::Blocked(_) => None,
         }
     }
 }
@@ -3910,6 +3957,48 @@ pub fn serialize_scene_activation(
         document.insert("enabled".to_owned(), active.into());
         Ok(())
     })
+}
+
+/// Validates removal of one canonical, unreferenced scene resource.
+///
+/// The scene owns its sparse slot collection, so those slot actions disappear
+/// with the resource. Arrangement scene-launch markers are independent user
+/// intent and therefore block removal instead of being deleted implicitly.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the scene is missing, its canonical
+/// source bytes are stale or malformed, an arrangement marker still references
+/// it, or the reduced project cannot compile through the complete playback
+/// boundary. The returned bytes are the verified canonical resource to remove.
+pub fn serialize_scene_removal(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_scene: &[u8],
+    scene_id: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, SceneRemovalSerializationError> {
+    let scene_index = project
+        .scenes
+        .iter()
+        .position(|scene| scene.id == scene_id)
+        .ok_or(SceneRemovalSerializationError::SceneMissing)?;
+    let blockers = project
+        .scene_removal_blockers(scene_id)
+        .ok_or(SceneRemovalSerializationError::SceneMissing)?;
+    if !blockers.is_empty() {
+        return Err(SceneRemovalSerializationError::Blocked(blockers));
+    }
+    let canonical = serialize_scene_document_edit(project, source_scene, scene_id, limits, |_| Ok(()))
+        .map_err(SceneRemovalSerializationError::Document)?;
+    let mut reduced = project.clone();
+    reduced.scenes.remove(scene_index);
+    validate_loaded_identities(&reduced)
+        .map_err(|source| SceneRemovalSerializationError::Document(SceneDocumentSerializationError::Source(source)))?;
+    reduced
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(SceneRemovalSerializationError::ProjectCompilation)?;
+    Ok(canonical)
 }
 
 /// Builds and validates one canonical empty scene appended after the loaded
@@ -6824,6 +6913,24 @@ impl LoadedPlaybackProject {
             AudioClipRemovalBlockers {
                 arrangement_placements,
                 scene_slots,
+            }
+        })
+    }
+
+    /// Returns the persisted arrangement references that prevent safe scene
+    /// removal. `None` means the scene identity is not part of this project.
+    #[must_use]
+    pub fn scene_removal_blockers(&self, scene_id: &str) -> Option<SceneRemovalBlockers> {
+        self.scenes.iter().any(|scene| scene.id == scene_id).then(|| {
+            let arrangement_scene_launches = self.arrangement.as_ref().map_or(0, |arrangement| {
+                arrangement
+                    .scene_launches
+                    .iter()
+                    .filter(|launch| launch.scene_id == scene_id)
+                    .count()
+            });
+            SceneRemovalBlockers {
+                arrangement_scene_launches,
             }
         })
     }
@@ -11736,6 +11843,138 @@ mod tests {
                 LoaderLimits::VERSION_1,
             ),
             Err(SceneDocumentSerializationError::NonCanonicalSource)
+        ));
+    }
+
+    #[test]
+    fn scene_removal_preserves_unrelated_scenes_and_their_playback_graph() {
+        let source = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(SCENE).unwrap(),
+        )
+        .unwrap();
+        let mut remaining: Value = serde_json::from_slice(SCENE).unwrap();
+        remaining["id"] = "018f47a2-6b2d-7c11-8a44-001122334469".into();
+        remaining["name"] = "Chorus".into();
+        remaining["order"] = 1.into();
+        remaining["slots"] = json!([]);
+        remaining["extensions"]["org.example.scene"] = json!({"kept": true});
+        let remaining = serde_json_canonicalizer::to_vec(&remaining).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 2] = [&source, &remaining];
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let scene_id = "018f47a2-6b2d-7c11-8a44-001122334461";
+
+        let removed = serialize_scene_removal(
+            &loaded,
+            &asset_facts(),
+            &source,
+            scene_id,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(removed, source);
+        let surviving_scenes: [&[u8]; 1] = [&remaining];
+        let reopened = load(
+            input_with_scenes(
+                TIMELINE,
+                &tracks,
+                &clips,
+                &surviving_scenes,
+                None,
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.scene_count(), 1);
+        assert_eq!(reopened.scene_id(0), Some("018f47a2-6b2d-7c11-8a44-001122334469"));
+        assert_eq!(reopened.scene_name(0), Some("Chorus"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&remaining).unwrap()["extensions"]
+                ["org.example.scene"],
+            json!({"kept": true})
+        );
+    }
+
+    #[test]
+    fn scene_removal_refuses_arrangement_references_and_stale_authority() {
+        let source: Value = serde_json::from_slice(SCENE).unwrap();
+        let canonical = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [&canonical];
+        let mut arrangement: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        arrangement["scene_launches"] = json!([{
+            "id": "018f47a2-6b2d-7c11-8a44-001122334465",
+            "tick": 8,
+            "scene_id": "018f47a2-6b2d-7c11-8a44-001122334461",
+        }]);
+        let arrangement = serde_json_canonicalizer::to_vec(&arrangement).unwrap();
+        let referenced = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&arrangement)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let scene_id = "018f47a2-6b2d-7c11-8a44-001122334461";
+        assert!(matches!(
+            serialize_scene_removal(
+                &referenced,
+                &asset_facts(),
+                &canonical,
+                scene_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneRemovalSerializationError::Blocked(SceneRemovalBlockers {
+                arrangement_scene_launches: 1,
+            }))
+        ));
+
+        let unreferenced = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut stale = source.clone();
+        stale["enabled"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_scene_removal(
+                &unreferenced,
+                &asset_facts(),
+                &stale,
+                scene_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneRemovalSerializationError::Document(
+                SceneDocumentSerializationError::SourceSceneMismatch
+            ))
+        ));
+        let noncanonical = serde_json::to_vec_pretty(&source).unwrap();
+        assert!(matches!(
+            serialize_scene_removal(
+                &unreferenced,
+                &asset_facts(),
+                &noncanonical,
+                scene_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneRemovalSerializationError::Document(
+                SceneDocumentSerializationError::NonCanonicalSource
+            ))
+        ));
+        assert!(matches!(
+            serialize_scene_removal(
+                &unreferenced,
+                &asset_facts(),
+                &canonical,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneRemovalSerializationError::SceneMissing)
         ));
     }
 

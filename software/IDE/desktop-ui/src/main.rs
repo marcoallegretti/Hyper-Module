@@ -52,7 +52,7 @@ use hyper_mixer_runtime::PlaybackRecoverySnapshot;
 use hyper_desktop_ide::{
     IdeArrangementPlacementEditError, IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError,
     IdeAudioClipLoopEditError, IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
-    IdeAudioClipSourceTrimEditError,
+    IdeAudioClipSourceTrimEditError, IdeSceneRemovalError,
     IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome, IdeAudioImportError,
     IdeAutomationTakeEditError,
     IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneRenameError, IdeSceneSlotEditError,
@@ -2087,6 +2087,34 @@ fn bind_scene_callbacks(ui: &MainWindow, worker: &WorkerCell, project_state: &Pr
             }
         };
         submit_to_ui(&ui, &worker_for_scene_activation, command);
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_scene_removal = Rc::clone(worker);
+    actions.on_remove_scene(move |scene_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text("Scene removal is unavailable in the current state".into());
+            return;
+        }
+        let scenes = ui.get_scenes();
+        let Some(scene) = scenes.iter().find(|scene| scene.id == scene_id) else {
+            ui.set_error_text("The selected scene is no longer available".into());
+            return;
+        };
+        if !scene.removable {
+            ui.set_error_text("Clear this scene's arrangement launches and control mappings before removing it".into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_scene_removal,
+            IdeWorkerCommand::RemoveScene {
+                scene_id: scene.id.to_string(),
+            },
+        );
     });
 }
 
@@ -4487,6 +4515,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::SetAudioClipSourceStart => AppMode::ChangingClipSource,
         IdeWorkerCommandKind::TrimAudioClipSource => AppMode::TrimmingClipSource,
         IdeWorkerCommandKind::RenameScene => AppMode::RenamingScene,
+        IdeWorkerCommandKind::RemoveScene => AppMode::RemovingScene,
         IdeWorkerCommandKind::DuplicateScene => AppMode::DuplicatingScene,
         IdeWorkerCommandKind::SetSceneActive => AppMode::ChangingSceneActivation,
         IdeWorkerCommandKind::CreateAudioClipFromTake => AppMode::CreatingClip,
@@ -4649,6 +4678,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::AddScene => {
             "Preserving mixer state, creating the scene, and reopening project..."
+        }
+        IdeWorkerCommandKind::RemoveScene => {
+            "Preserving mixer state, removing the scene, and reopening project..."
         }
         IdeWorkerCommandKind::AddAutomationTake => {
             "Preserving mixer state, adding the automation take, and reopening project..."
@@ -5012,6 +5044,9 @@ fn apply_event(
         event @ (IdeWorkerEvent::SceneAdded { .. }
         | IdeWorkerEvent::SceneCreationCommittedWithWarning { .. }
         | IdeWorkerEvent::SceneAdding) => apply_scene_creation_event(ui, &event),
+        event @ (IdeWorkerEvent::SceneRemoved { .. }
+        | IdeWorkerEvent::SceneRemovalCommittedWithWarning { .. }
+        | IdeWorkerEvent::SceneRemoving) => apply_scene_removal_event(ui, &event),
         event @ (IdeWorkerEvent::AutomationTakeAdded { .. }
         | IdeWorkerEvent::AutomationTakeCreationCommittedWithWarning { .. }
         | IdeWorkerEvent::AutomationTakeAdding) => {
@@ -6014,6 +6049,27 @@ fn apply_scene_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     }
 }
 
+fn apply_scene_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::SceneRemoved { revision, scene_id } => {
+            reset_scene_removal_form(ui);
+            ui.set_status_text(format!("Scene {scene_id} removed in project revision {revision}").into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::SceneRemovalCommittedWithWarning { warning } => {
+            reset_scene_removal_form(ui);
+            ui.set_status_text(committed_warning_status(ui.get_app_mode(), "Scene removal").into());
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::SceneRemoving => {
+            ui.set_app_mode(AppMode::RemovingScene);
+            ui.set_status_text("Waiting for native output before removing the scene…".into());
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("scene removal event dispatcher received another event"),
+    }
+}
+
 fn apply_scene_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::SceneDuplicated {
@@ -6190,6 +6246,12 @@ fn reset_scene_duplication_form(ui: &MainWindow) {
     ui.set_scene_duplicate_id(SharedString::default());
     ui.set_scene_duplicate_source_name(SharedString::default());
     ui.set_scene_duplicate_name(SharedString::default());
+}
+
+fn reset_scene_removal_form(ui: &MainWindow) {
+    ui.set_scene_remove_visible(false);
+    ui.set_scene_remove_id(SharedString::default());
+    ui.set_scene_remove_name(SharedString::default());
 }
 
 fn apply_audio_clip_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -7948,6 +8010,7 @@ fn reset_project(
     ui.set_scene_names(ModelRc::default());
     reset_scene_rename_form(ui);
     reset_scene_duplication_form(ui);
+    reset_scene_removal_form(ui);
     reset_scene_slots_form(ui);
     ui.set_mixer_visible(false);
     ui.set_mixer_sends_visible(false);
@@ -8271,6 +8334,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::RenameScene if current == AppMode::RenamingScene => AppMode::Running,
+        IdeWorkerCommandKind::RemoveScene if current == AppMode::RemovingScene => AppMode::Running,
         IdeWorkerCommandKind::DuplicateScene if current == AppMode::DuplicatingScene => {
             AppMode::Running
         }
@@ -8334,6 +8398,7 @@ fn scene_rows(
                 availability: availability.into(),
                 runtime_state: runtime_state.into(),
                 active: scene.active(),
+                removable: scene.removable(),
                 launchable,
                 queued,
                 current,
@@ -8482,6 +8547,7 @@ fn open_scene_slots(
     let has_slots = !rows.is_empty();
     ui.set_scene_slots_scene_id(scene.id().into());
     ui.set_scene_slots_scene_name(scene.name().into());
+    ui.set_scene_slots_scene_removable(scene.removable());
     ui.set_scene_slots(ModelRc::from(Rc::new(VecModel::from(rows))));
     ui.set_scene_slots_visible(true);
     drop(clips);
@@ -8631,6 +8697,7 @@ fn reset_scene_slots_form(ui: &MainWindow) {
     ui.set_scene_slots_visible(false);
     ui.set_scene_slots_scene_id(SharedString::default());
     ui.set_scene_slots_scene_name(SharedString::default());
+    ui.set_scene_slots_scene_removable(false);
     ui.set_scene_slots(ModelRc::default());
     reset_scene_slot_selection(ui);
 }
@@ -13409,6 +13476,7 @@ mod tests {
                 availability: "Ready".into(),
                 runtime_state: "".into(),
                 active: true,
+                removable: true,
                 launchable: true,
                 queued: false,
                 current: false,
@@ -13421,6 +13489,7 @@ mod tests {
                 availability: "Disabled".into(),
                 runtime_state: "".into(),
                 active: false,
+                removable: false,
                 launchable: false,
                 queued: false,
                 current: false,
@@ -16154,6 +16223,7 @@ mod tests {
         assert_arrangement_scene_launch_edit_events(&ui);
         assert_arrangement_scene_launch_committed_warnings(&ui);
         assert_scene_authoring_forms(&ui);
+        assert_scene_removal_events_reset_form(&ui);
         assert_scene_duplication_events_reset_form(&ui);
         assert_scene_rename_success_resets_form(&ui);
         assert_scene_activation_events_preserve_state(&ui);
@@ -16826,6 +16896,46 @@ mod tests {
         assert_eq!(ui.get_selected_scene_slot_index(), -1);
         assert!(ui.get_selected_scene_slot_track_id().is_empty());
         assert!(ui.get_selected_scene_slot_track_name().is_empty());
+        assert!(ui.get_status_text().contains("committed and reopened"));
+        assert!(!ui.get_error_text().is_empty());
+    }
+
+    fn assert_scene_removal_events_reset_form(ui: &MainWindow) {
+        ui.set_app_mode(AppMode::Running);
+        ui.set_scene_remove_visible(true);
+        ui.set_scene_remove_id("scene-a".into());
+        ui.set_scene_remove_name("Intro".into());
+        apply_scene_removal_event(ui, &IdeWorkerEvent::SceneRemoving);
+        assert_eq!(ui.get_app_mode(), AppMode::RemovingScene);
+        assert!(ui.get_scene_remove_visible());
+        assert!(ui.get_status_text().contains("removing the scene"));
+
+        ui.set_app_mode(AppMode::Running);
+        apply_scene_removal_event(
+            ui,
+            &IdeWorkerEvent::SceneRemoved {
+                revision: 4,
+                scene_id: "scene-a".to_owned(),
+            },
+        );
+        assert!(!ui.get_scene_remove_visible());
+        assert!(ui.get_scene_remove_id().is_empty());
+        assert!(ui.get_scene_remove_name().is_empty());
+        assert!(ui.get_status_text().contains("project revision 4"));
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_scene_remove_visible(true);
+        ui.set_scene_remove_id("scene-a".into());
+        ui.set_scene_remove_name("Intro".into());
+        apply_scene_removal_event(
+            ui,
+            &IdeWorkerEvent::SceneRemovalCommittedWithWarning {
+                warning: Box::new(IdeSceneRemovalError::InvalidSceneIdentity),
+            },
+        );
+        assert!(!ui.get_scene_remove_visible());
+        assert!(ui.get_scene_remove_id().is_empty());
+        assert!(ui.get_scene_remove_name().is_empty());
         assert!(ui.get_status_text().contains("committed and reopened"));
         assert!(!ui.get_error_text().is_empty());
     }

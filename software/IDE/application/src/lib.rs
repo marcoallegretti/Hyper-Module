@@ -104,7 +104,8 @@ use hyper_playback_json::{
     MediaAssetFact, MixerBaseState, MixerChannelBaseState, MixerSendBaseState,
     MixerStateSerializationError, SceneAdditionSerializationError, SceneDocumentSerializationError,
     SceneDuplicationSerializationError, SceneRenameSerializationError, SceneSlotEdit,
-    SceneSlotEditSerializationError, TempoSerializationError, serialize_arrangement_loop_range,
+    SceneRemovalBlockers, SceneRemovalSerializationError, SceneSlotEditSerializationError,
+    TempoSerializationError, serialize_arrangement_loop_range,
     serialize_arrangement_placement_activation, serialize_arrangement_placement_addition,
     serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
     serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
@@ -126,6 +127,7 @@ use hyper_playback_json::{
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_mixer_base_state, serialize_recording_audio_clip_addition,
     serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
+    serialize_scene_removal,
     serialize_scene_rename, serialize_scene_slot_edit, serialize_timeline_meter,
     serialize_timeline_tempo,
 };
@@ -178,10 +180,11 @@ use hyper_storage_engine::{
     RequiredControlCapabilities, SampleCleanupOutcome, SampleCleanupRequest,
     RoutingBusPublicationKind, RoutingBusPublicationRequest, RoutingBusRemovalKind,
     RoutingBusRemovalOutcome, RoutingBusRemovalRequest,
-    ScenePublicationRequest, StorageError, clean_unused_samples, publish_arrangement,
+    ScenePublicationRequest, SceneRemovalRequest, StorageError, clean_unused_samples, publish_arrangement,
     publish_audio_clip, publish_audio_track, publish_audio_track_content_removal, publish_audio_track_duplication, publish_automation_take, publish_control_mapping,
     publish_device_chain, publish_imported_audio_clip, publish_project_resource, publish_routing_bus, publish_scene,
     remove_audio_clip, remove_audio_track, remove_routing_bus, remove_automation_take, remove_device_chain,
+    remove_scene,
     TrackOrderPublicationOutcome, TrackOrderPublicationRequest, publish_track_order,
 };
 
@@ -5947,6 +5950,133 @@ impl Error for IdeSceneEditError {
     }
 }
 
+/// References outside a scene document that must be cleared before the scene
+/// can be removed without silently changing unrelated project authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IdeSceneRemovalBlockers {
+    pub playback: SceneRemovalBlockers,
+    pub control_mappings: usize,
+}
+
+impl IdeSceneRemovalBlockers {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.playback.is_empty() && self.control_mappings == 0
+    }
+}
+
+/// Rejection for a scene deletion that preserves all independent authority.
+#[derive(Debug)]
+pub enum IdeSceneRemovalError {
+    InvalidSceneIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    SceneResourceMissing,
+    SceneResourceRoleMismatch,
+    Storage(StorageError),
+    Blocked(IdeSceneRemovalBlockers),
+    Serialization(SceneRemovalSerializationError),
+    CapacityUnavailable,
+    Publication(Box<IdeSceneEditPublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeSceneRemovalError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: Box<ProjectResourcePublicationOutcome>,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeSceneEditPublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeSceneRemovalError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.scene_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.scene_published(),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeSceneRemovalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSceneIdentity => formatter.write_str("scene removal requires an identity"),
+            Self::MixerSave(source) => write!(formatter, "live mixer state could not be preserved: {source}"),
+            Self::SceneResourceMissing => formatter.write_str("the selected scene resource is missing"),
+            Self::SceneResourceRoleMismatch => {
+                formatter.write_str("the selected identity is not a scene resource")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Blocked(blockers) => write!(
+                formatter,
+                "scene removal is blocked by {} arrangement launch(es) and {} control mapping(s)",
+                blockers.playback.arrangement_scene_launches,
+                blockers.control_mappings
+            ),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => formatter.write_str("scene removal capacity is unavailable"),
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before removing the scene: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before removing the scene ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation { preparation, reopen } => write!(
+                formatter,
+                "scene removal preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "scene was removed in project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen { publication, reopen } if publication.scene_published() => write!(
+                formatter,
+                "scene removal was committed with incomplete project verification or transaction recovery ({publication}) and the project could not be reopened ({reopen})"
+            ),
+            Self::PublicationAndReopen { publication, reopen } => write!(
+                formatter,
+                "scene removal failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeSceneRemovalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidSceneIdentity
+            | Self::SceneResourceMissing
+            | Self::SceneResourceRoleMismatch
+            | Self::Blocked(_)
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
 pub type IdeSceneRenameError = IdeSceneEditError;
 
 impl IdeAudioClipEditPublicationError {
@@ -7285,6 +7415,12 @@ struct IdeScenePublicationPlan {
 }
 
 #[derive(Debug)]
+struct IdeSceneRemovalPlan {
+    mixer: IdeMixerSavePlan,
+    scene_id: String,
+}
+
+#[derive(Debug)]
 struct IdeAutomationTakePublicationPlan {
     mixer: IdeMixerSavePlan,
     take_id: String,
@@ -8198,6 +8334,26 @@ impl IdeScenePublicationPlan {
             },
         )
         .map_err(|source| IdeScenePublicationError::Scene {
+            mixer: Box::new(mixer),
+            source: Box::new(source),
+        })
+    }
+}
+
+impl IdeSceneRemovalPlan {
+    fn publish(&self) -> Result<ProjectResourcePublicationOutcome, IdeSceneEditPublicationError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeSceneEditPublicationError::Mixer(Box::new(source)))?;
+        remove_scene(
+            &self.mixer.project_path,
+            SceneRemovalRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                scene_id: &self.scene_id,
+            },
+        )
+        .map_err(|source| IdeSceneEditPublicationError::Scene {
             mixer: Box::new(mixer),
             source: Box::new(source),
         })
@@ -12289,6 +12445,87 @@ impl RunningDesktopIdeApplication {
         )
     }
 
+    fn prepare_scene_removal(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        scene_id: &str,
+    ) -> Result<IdeSceneRemovalPlan, IdeSceneRemovalError> {
+        if scene_id.is_empty() {
+            return Err(IdeSceneRemovalError::InvalidSceneIdentity);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeSceneRemovalError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeSceneRemovalError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Self::prepare_scene_removal_from_project(application, mixer, prepared, scene_id)
+    }
+
+    fn prepare_scene_removal_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        scene_id: &str,
+    ) -> Result<IdeSceneRemovalPlan, IdeSceneRemovalError> {
+        if scene_id.is_empty() {
+            return Err(IdeSceneRemovalError::InvalidSceneIdentity);
+        }
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == scene_id)
+            .ok_or(IdeSceneRemovalError::SceneResourceMissing)?;
+        if descriptor.role() != ResourceRole::Scene {
+            return Err(IdeSceneRemovalError::SceneResourceRoleMismatch);
+        }
+        let source_scene = package
+            .read_resource(scene_id)
+            .map_err(IdeSceneRemovalError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        let playback = project
+            .scene_removal_blockers(scene_id)
+            .ok_or(IdeSceneRemovalError::SceneResourceMissing)?;
+        let blockers = IdeSceneRemovalBlockers {
+            playback,
+            control_mappings: prepared.control_mapping().map_or(0, |mapping| {
+                mapping
+                    .bindings()
+                    .iter()
+                    .filter(|binding| control_binding_references_scene(binding, scene_id))
+                    .count()
+            }),
+        };
+        if !blockers.is_empty() {
+            return Err(IdeSceneRemovalError::Blocked(blockers));
+        }
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeSceneRemovalError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        serialize_scene_removal(
+            project,
+            &assets,
+            &source_scene,
+            scene_id,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeSceneRemovalError::Serialization)?;
+        let mut owned_scene_id = String::new();
+        owned_scene_id
+            .try_reserve_exact(scene_id.len())
+            .map_err(|_| IdeSceneRemovalError::CapacityUnavailable)?;
+        owned_scene_id.push_str(scene_id);
+        Ok(IdeSceneRemovalPlan {
+            mixer,
+            scene_id: owned_scene_id,
+        })
+    }
+
     fn prepare_scene_activation(
         application: &DesktopIdeApplication,
         recovery: &DesktopPlaybackRecovery,
@@ -13333,6 +13570,11 @@ fn control_binding_references_audio_track(
             | ControlTarget::Scene { .. }
             | ControlTarget::Transport { .. } => false,
         }
+}
+
+fn control_binding_references_scene(binding: &ControlBinding, scene_id: &str) -> bool {
+    matches!(binding.scope(), ControlScope::Scene { scene_id: id } if id == scene_id)
+        || matches!(binding.target(), ControlTarget::Scene { scene_id: id, .. } if id == scene_id)
 }
 
 fn ide_mixer_main_state(

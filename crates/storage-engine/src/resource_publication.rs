@@ -90,6 +90,12 @@ pub struct ScenePublicationRequest<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct SceneRemovalRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub scene_id: &'a str,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct AutomationTakePublicationRequest<'a> {
     pub expected_project_sha256: [u8; 32],
     pub take_id: &'a str,
@@ -774,6 +780,7 @@ enum ProjectResourcePublicationMode {
     Replacement,
     ArrangementAddition,
     SceneAddition,
+    SceneRemoval,
     AutomationTakeAddition,
     AutomationTakeRemoval,
     DeviceChainAddition,
@@ -782,7 +789,10 @@ enum ProjectResourcePublicationMode {
 
 impl ProjectResourcePublicationMode {
     const fn is_removal(self) -> bool {
-        matches!(self, Self::AutomationTakeRemoval | Self::DeviceChainRemoval)
+        matches!(
+            self,
+            Self::SceneRemoval | Self::AutomationTakeRemoval | Self::DeviceChainRemoval
+        )
     }
 }
 
@@ -868,6 +878,30 @@ pub fn publish_scene(
             resource_bytes: request.scene_bytes,
         },
         ProjectResourcePublicationMode::SceneAddition,
+        |_, _| Ok(()),
+    )
+}
+
+/// Removes one scene through the serialized, recoverable manifest-last
+/// resource transaction family.
+///
+/// # Errors
+///
+/// Returns a classified validation, conflict, integrity, I/O, or recovery
+/// error. Only an existing scene resource can be removed.
+pub fn remove_scene(
+    project_path: impl AsRef<Path>,
+    request: SceneRemovalRequest<'_>,
+) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
+    publish_project_resource_observed(
+        project_path.as_ref(),
+        ProjectResourcePublicationRequest {
+            expected_project_sha256: request.expected_project_sha256,
+            resource_id: request.scene_id,
+            expected_role: ResourceRole::Scene,
+            resource_bytes: &[],
+        },
+        ProjectResourcePublicationMode::SceneRemoval,
         |_, _| Ok(()),
     )
 }
@@ -1870,6 +1904,9 @@ fn publish_project_resource_observed(
         ProjectResourcePublicationMode::SceneAddition => {
             validate_scene_addition_request(&verified, request)?;
         }
+        ProjectResourcePublicationMode::SceneRemoval => {
+            unique_resource(&verified, request.resource_id, ResourceRole::Scene)?;
+        }
         ProjectResourcePublicationMode::AutomationTakeAddition => {
             validate_automation_take_addition_request(&verified, request)?;
         }
@@ -1974,7 +2011,8 @@ fn publish_project_resource_observed(
                 candidate_addition_manifest(&active_project, request, &path, next_revision)?;
             (path, None, created_parent_directory, candidate)
         }
-        ProjectResourcePublicationMode::AutomationTakeRemoval
+        ProjectResourcePublicationMode::SceneRemoval
+        | ProjectResourcePublicationMode::AutomationTakeRemoval
         | ProjectResourcePublicationMode::DeviceChainRemoval => {
             let descriptor = unique_resource(
                 &verified,
@@ -6571,6 +6609,7 @@ fn read_transaction(
 
 fn removal_directory(tx: &TransactionRecord) -> Result<&'static str, ProjectResourcePublicationError> {
     match tx.resource_role.as_str() {
+        "scene" if addition_path_matches(tx, "scenes") => Ok("scenes"),
         "automation-take" if addition_path_matches(tx, "takes") => Ok("takes"),
         "device-chain" if addition_path_matches(tx, "devices") => Ok("devices"),
         _ => Err(failure(
@@ -8172,6 +8211,25 @@ mod tests {
             }
         }
 
+        fn removal_request(&self) -> SceneRemovalRequest<'_> {
+            SceneRemovalRequest {
+                expected_project_sha256: *verify_project_package(&self.root)
+                    .unwrap()
+                    .manifest_sha256(),
+                scene_id: SCENE_ID,
+            }
+        }
+
+        fn removal_resource_request(&self) -> ProjectResourcePublicationRequest<'_> {
+            let request = self.removal_request();
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: request.expected_project_sha256,
+                resource_id: request.scene_id,
+                expected_role: ResourceRole::Scene,
+                resource_bytes: &[],
+            }
+        }
+
         fn transaction_count(&self) -> usize {
             fs::read_dir(self.root.join("backups"))
                 .unwrap()
@@ -9082,6 +9140,77 @@ mod tests {
             error.kind(),
             ProjectResourcePublicationErrorKind::ResourceConflict
         );
+    }
+
+    #[test]
+    fn removes_the_last_scene_without_leaving_a_resource_directory() {
+        let fixture = SceneFixture::new();
+        publish_scene(&fixture.root, fixture.request()).unwrap();
+
+        let removed = remove_scene(&fixture.root, fixture.removal_request()).unwrap();
+
+        assert!(removed.changed());
+        assert_eq!(removed.project_revision(), 3);
+        assert_eq!(removed.resource_id(), SCENE_ID);
+        assert_eq!(removed.previous_resource(), Some(fixture.scene.as_slice()));
+        assert!(!fixture.root.join(removed.resource_path()).exists());
+        assert!(!fixture.root.join("scenes").exists());
+        let verified = verify_project_package(&fixture.root).unwrap();
+        assert!(
+            verified
+                .manifest()
+                .resources()
+                .iter()
+                .all(|resource| resource.id() != SCENE_ID)
+        );
+    }
+
+    #[test]
+    fn scene_removal_recovers_every_durable_phase() {
+        for crash_phase in [
+            PublicationPhase::Transaction,
+            PublicationPhase::ResourceFile,
+            PublicationPhase::Resource,
+            PublicationPhase::Manifest,
+        ] {
+            let fixture = SceneFixture::new();
+            publish_scene(&fixture.root, fixture.request()).unwrap();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_project_resource_observed(
+                    &fixture.root,
+                    fixture.removal_resource_request(),
+                    ProjectResourcePublicationMode::SceneRemoval,
+                    |phase, _| {
+                        assert_ne!(phase, crash_phase, "simulated process crash");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+
+            let recovered = recover_project_resource_publications(&fixture.root).unwrap();
+            assert_eq!(recovered.len(), 1);
+            let committed = crash_phase == PublicationPhase::Manifest;
+            assert_eq!(
+                recovered[0].disposition(),
+                if committed {
+                    ProjectResourcePublicationRecoveryDisposition::Committed
+                } else {
+                    ProjectResourcePublicationRecoveryDisposition::RolledBack
+                }
+            );
+            let verified = verify_project_package(&fixture.root).unwrap();
+            assert_eq!(verified.manifest().revision(), if committed { 3 } else { 2 });
+            assert_eq!(
+                fixture
+                    .root
+                    .join("scenes")
+                    .join(format!("{SCENE_ID}.json"))
+                    .exists(),
+                !committed
+            );
+            assert_eq!(fixture.root.join("scenes").exists(), !committed);
+        }
     }
 
     #[test]
