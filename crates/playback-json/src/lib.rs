@@ -11691,6 +11691,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one validation matrix preserves the complete flat-routing authority contract"
+    )]
     fn mixer_strip_reorder_refuses_noop_stale_and_unsupported_authority() {
         let first_id = "018f47a2-6b2d-7c11-8a44-001122334456";
         let second_id = "018f47a2-6b2d-7c11-8a44-001122334469";

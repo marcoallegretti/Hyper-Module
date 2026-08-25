@@ -10110,6 +10110,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one paired Group and Return lifecycle proves both removal contracts stay executable"
+    )]
     fn removes_unreferenced_group_and_return_buses_atomically() {
         let group_fixture = AudioTrackFixture::new();
         let (identity, source_track_id, documents) = prepared_routing_bus_documents(
@@ -10298,6 +10302,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one crash matrix verifies every durable phase for both routing-bus contracts"
+    )]
     fn routing_bus_removal_crashes_recover_to_one_complete_project_identity() {
         for (playback_kind, removal_kind, track_id, send_id) in [
             (

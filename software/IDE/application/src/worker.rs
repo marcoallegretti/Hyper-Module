@@ -15104,6 +15104,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker lifecycle proves a retained-source project copy preserves durable mixer state"
+    )]
     fn save_as_can_keep_the_verified_source_open_after_copying() {
         let fixture = std::env::temp_dir().join(format!(
             "hyper-desktop-ide-save-as-stay-{}",
@@ -16137,6 +16141,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker lifecycle proves copied routing buses retain their incoming routes"
+    )]
     fn routing_bus_duplication_preserves_existing_incoming_routes() {
         let fixture = std::env::temp_dir().join(format!(
             "hyper-desktop-ide-routing-bus-duplication-{}",
