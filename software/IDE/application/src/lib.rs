@@ -95,6 +95,7 @@ use hyper_playback_json::{
     AudioTrackReorderSerializationError,
     AudioPrimaryRouteSerializationError, AudioPrimaryRouteTarget,
     ReturnSendSerializationError, RoutingBusCreationSerializationError,
+    RoutingBusRemovalSerializationError,
     RoutingBusKind as PlaybackRoutingBusKind,
     AutomationTakeAddition, AutomationTakeAdditionSerializationError,
     AutomationTakeEditSerializationError, AutomationTargetSelection, CompiledMixerDestination,
@@ -120,7 +121,7 @@ use hyper_playback_json::{
     serialize_audio_track_duplication, serialize_audio_track_reorder,
     serialize_audio_primary_route_change, serialize_return_send_addition,
     serialize_return_send_removal,
-    serialize_routing_bus_creation,
+    serialize_routing_bus_creation, serialize_routing_bus_removal,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_mixer_base_state, serialize_recording_audio_clip_addition,
     serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
@@ -174,11 +175,12 @@ use hyper_storage_engine::{
     ImportedAudioClipPublicationRequest, ProjectResourcePublicationError,
     ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
     RequiredControlCapabilities, SampleCleanupOutcome, SampleCleanupRequest,
-    RoutingBusPublicationKind, RoutingBusPublicationRequest,
+    RoutingBusPublicationKind, RoutingBusPublicationRequest, RoutingBusRemovalKind,
+    RoutingBusRemovalOutcome, RoutingBusRemovalRequest,
     ScenePublicationRequest, StorageError, clean_unused_samples, publish_arrangement,
     publish_audio_clip, publish_audio_track, publish_audio_track_content_removal, publish_audio_track_duplication, publish_automation_take, publish_control_mapping,
     publish_device_chain, publish_imported_audio_clip, publish_project_resource, publish_routing_bus, publish_scene,
-    remove_audio_clip, remove_audio_track, remove_automation_take, remove_device_chain,
+    remove_audio_clip, remove_audio_track, remove_routing_bus, remove_automation_take, remove_device_chain,
     TrackOrderPublicationOutcome, TrackOrderPublicationRequest, publish_track_order,
 };
 
@@ -2194,6 +2196,80 @@ impl Error for IdeRoutingBusCreationError {
             | Self::EmptySourceSelection
             | Self::CapacityUnavailable
             | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+/// Rejection for removal of one Group or Return bus after all dependent
+/// routing has been explicitly cleared.
+#[derive(Debug)]
+pub enum IdeRoutingBusRemovalError {
+    InvalidTrackIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    Blocked(IdeAudioTrackRemovalBlockers),
+    Serialization(RoutingBusRemovalSerializationError),
+    CapacityUnavailable,
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeRoutingBusRemovalError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: RoutingBusRemovalOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeRoutingBusRemovalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTrackIdentity => {
+                formatter.write_str("routing-bus removal requires a track identity")
+            }
+            Self::MixerSave(source) => write!(formatter, "live mixer state could not be preserved: {source}"),
+            Self::Blocked(blockers) => write!(
+                formatter,
+                "routing bus cannot be removed while referenced (clips: {}, child tracks: {}, scene slots: {}, placements: {}, mappings: {}, recordings: {}, automation: {})",
+                blockers.playback.clip_references,
+                blockers.playback.child_tracks,
+                blockers.playback.scene_slots,
+                blockers.playback.arrangement_placements,
+                blockers.control_mappings,
+                blockers.recording_metadata,
+                blockers.has_automation
+            ),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => formatter.write_str("routing-bus removal capacity is unavailable"),
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(formatter, "native playback did not close cleanly before removing the routing bus: {source:?}"),
+            Self::NativeCloseAndReopen { close, reopen } => write!(formatter, "native playback did not close cleanly before removing the routing bus ({close:?}) and the unchanged project could not be reopened ({reopen})"),
+            Self::ReopenAfterPreparation { preparation, reopen } => write!(formatter, "routing-bus removal preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"),
+            Self::ReopenAfterPublication { outcome, source } => write!(formatter, "routing bus {} was removed in project revision {} but the project could not be reopened: {source}", outcome.track_id(), outcome.project_revision()),
+            Self::PublicationAndReopen { publication, reopen } => write!(formatter, "routing-bus removal failed ({publication}) and the project could not be reopened ({reopen})"),
+        }
+    }
+}
+
+impl Error for IdeRoutingBusRemovalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidTrackIdentity | Self::Blocked(_) | Self::CapacityUnavailable | Self::NativeClose(_) => None,
         }
     }
 }
@@ -6928,6 +7004,16 @@ struct IdeRoutingBusCreationPlan {
 }
 
 #[derive(Debug)]
+struct IdeRoutingBusRemovalPlan {
+    project_path: PathBuf,
+    expected_project_sha256: [u8; 32],
+    track_id: String,
+    mixer_id: String,
+    mixer_bytes: Vec<u8>,
+    kind: RoutingBusRemovalKind,
+}
+
+#[derive(Debug)]
 struct IdeAudioTrackRemovalPlan {
     project_path: PathBuf,
     expected_project_sha256: [u8; 32],
@@ -7023,6 +7109,21 @@ impl IdeAudioTrackRemovalPlan {
                 track_id: &self.track_id,
                 mixer_id: &self.mixer_id,
                 mixer_bytes: &self.mixer_bytes,
+            },
+        )
+    }
+}
+
+impl IdeRoutingBusRemovalPlan {
+    fn publish(&self) -> Result<RoutingBusRemovalOutcome, ProjectResourcePublicationError> {
+        remove_routing_bus(
+            &self.project_path,
+            RoutingBusRemovalRequest {
+                expected_project_sha256: self.expected_project_sha256,
+                track_id: &self.track_id,
+                mixer_id: &self.mixer_id,
+                mixer_bytes: &self.mixer_bytes,
+                kind: self.kind,
             },
         )
     }
@@ -8914,6 +9015,77 @@ impl RunningDesktopIdeApplication {
             track_id: owned_track_id,
             mixer_id: mixer_plan.resource_id,
             mixer_bytes,
+        })
+    }
+
+    fn prepare_routing_bus_removal(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        track_id: &str,
+    ) -> Result<IdeRoutingBusRemovalPlan, IdeRoutingBusRemovalError> {
+        let mixer_plan = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeRoutingBusRemovalError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeRoutingBusRemovalError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let (project, mixer, _, media) = prepared.session().parts();
+        let track_slot = mixer.slots().iter().find(|slot| slot.track_id() == track_id);
+        let blockers = IdeAudioTrackRemovalBlockers {
+            playback: project.audio_track_removal_blockers(track_id),
+            control_mappings: prepared.control_mapping().map_or(0, |mapping| {
+                mapping
+                    .bindings()
+                    .iter()
+                    .filter(|binding| {
+                        control_binding_references_audio_track(binding, track_id, |send_id| {
+                            track_slot.is_some_and(|slot| {
+                                slot.sends().iter().any(|send| send.id() == send_id)
+                            })
+                        })
+                    })
+                    .count()
+            }),
+            recording_metadata: prepared
+                .recording_metadata()
+                .iter()
+                .filter(|metadata| metadata.track_id() == track_id)
+                .count(),
+            has_automation: prepared.session().has_automation(),
+        };
+        if !blockers.is_empty() {
+            return Err(IdeRoutingBusRemovalError::Blocked(blockers));
+        }
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeRoutingBusRemovalError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let documents = serialize_routing_bus_removal(
+            project,
+            &assets,
+            &mixer_plan.resource_bytes,
+            &mixer_plan.resource_id,
+            track_id,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeRoutingBusRemovalError::Serialization)?;
+        let mut owned_track_id = String::new();
+        owned_track_id
+            .try_reserve_exact(track_id.len())
+            .map_err(|_| IdeRoutingBusRemovalError::CapacityUnavailable)?;
+        owned_track_id.push_str(track_id);
+        Ok(IdeRoutingBusRemovalPlan {
+            project_path: mixer_plan.project_path,
+            expected_project_sha256: mixer_plan.expected_project_sha256,
+            track_id: owned_track_id,
+            mixer_id: mixer_plan.resource_id,
+            mixer_bytes: documents.mixer().to_vec(),
+            kind: match documents.kind() {
+                PlaybackRoutingBusKind::Group => RoutingBusRemovalKind::Group,
+                PlaybackRoutingBusKind::Return => RoutingBusRemovalKind::Return,
+            },
         })
     }
 
