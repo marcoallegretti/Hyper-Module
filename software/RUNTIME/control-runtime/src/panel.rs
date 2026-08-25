@@ -289,7 +289,7 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
     ///
     /// # Errors
     ///
-    /// Returns [`PanelAlreadyConnected`] when a panel is still connected.
+    /// Returns [`PanelConnectError::AlreadyConnected`] when a panel is still connected.
     pub fn connect_panel(
         &mut self,
         descriptor: PanelDescriptor,
@@ -491,7 +491,7 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
 
     /// Makes room for one binding's shadow without reading it.
     ///
-    /// The value is left unknown so [`Self::refresh_missing_state`] reads it at
+    /// The value is left unknown so `refresh_missing_state` reads it at
     /// first use rather than at connect — the sink's snapshot lags what the
     /// audio thread has been sent, and reading late is reading less stale. A
     /// shadow an existing binding already owns is left alone; one created here
