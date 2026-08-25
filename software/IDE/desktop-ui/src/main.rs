@@ -2323,9 +2323,20 @@ fn bind_audio_track_rename_callback(ui: &MainWindow, worker: &WorkerCell) {
 }
 
 fn bind_routing_bus_rename_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let worker_for_rename = Rc::clone(worker);
+    bind_routing_bus_rename_callback_with(
+        ui,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker_for_rename, command)),
+    );
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the generated callback retains the shared command submitter for the window lifetime"
+)]
+fn bind_routing_bus_rename_callback_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker_for_rename = Rc::clone(worker);
     actions.on_rename_routing_bus(move |index, name| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -2336,7 +2347,7 @@ fn bind_routing_bus_rename_callback(ui: &MainWindow, worker: &WorkerCell) {
             name.as_str(),
             &ui.get_mixer_channels(),
         ) {
-            Ok(command) => submit_to_ui(&ui, &worker_for_rename, command),
+            Ok(command) => submitter(&ui, command),
             Err(reason) => ui.set_error_text(reason.message().into()),
         }
     });
@@ -12359,6 +12370,53 @@ mod tests {
         assert!(ui
             .get_error_text()
             .contains("removal confirmation is no longer current"));
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn generated_routing_bus_rename_form_submits_the_current_return_bus() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_visible(true);
+        let track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let mut routing_bus = audio_track_mixer_row(0, track_id);
+        routing_bus.name = "Verb".into();
+        routing_bus.display_name = "Verb".into();
+        routing_bus.kind = "RETURN".into();
+        routing_bus.removable = false;
+        routing_bus.activation_toggleable = false;
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![routing_bus]))));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_routing_bus_rename_callback_with(
+            &ui,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+        ui.show().unwrap();
+
+        let rename = ElementHandle::find_by_accessible_label(&ui, "Rename")
+            .next()
+            .expect("the current Return bus exposes renaming");
+        assert_eq!(rename.accessible_enabled(), Some(true));
+        rename.mock_single_click(PointerEventButton::Left);
+        assert!(ui.get_rename_track_visible());
+        assert_eq!(ui.get_rename_track_index(), 0);
+        assert_eq!(ui.get_rename_track_original_name(), "Verb");
+        assert_eq!(ui.get_rename_track_kind(), "RETURN");
+
+        ui.set_rename_track_name("Reverb".into());
+        let confirm = ElementHandle::find_by_accessible_label(&ui, "Rename routing bus")
+            .next()
+            .expect("the visible routing-bus form exposes one confirmation action");
+        assert_eq!(confirm.accessible_enabled(), Some(true));
+        confirm.mock_single_click(PointerEventButton::Left);
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::RenameRoutingBus { track_id: submitted_track_id, name }]
+                if submitted_track_id == track_id && name == "Reverb"
+        ));
         ui.hide().unwrap();
     }
 
