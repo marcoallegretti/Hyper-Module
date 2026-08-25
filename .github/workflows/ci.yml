@@ -62,8 +62,11 @@ jobs:
       - name: Lint all targets and features
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: Test workspace
-        run: cargo test --workspace --all-targets --locked
+      - name: Test workspace outside the bounded IDE worker harness
+        run: cargo test --workspace --exclude hyper-desktop-ide --all-targets --locked
+
+      - name: Test bounded IDE worker harness
+        run: cargo test -p hyper-desktop-ide --all-targets --locked -- --test-threads=1
 
       - name: Lint and test vendored PipeWire bindings
         if: runner.os == 'Linux'

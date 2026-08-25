@@ -855,7 +855,7 @@ mod tests {
                 panic!("runtime panic");
             },
             TEST_STARTUP_TIMEOUT,
-            Duration::from_millis(20),
+            TEST_STARTUP_TIMEOUT,
         )
         .unwrap();
 
