@@ -3060,6 +3060,75 @@ mod tests {
     }
 
     #[test]
+    fn refuses_return_duplication_when_all_return_buses_are_occupied() {
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let second_return_id = "018f47a2-6b2d-7c11-8a44-001122335204";
+        let mut second_return: Value = serde_json::from_slice(&return_track).unwrap();
+        second_return["id"] = second_return_id.into();
+        second_return["name"] = "Delay".into();
+        second_return["order"] = 2.into();
+        let second_return = canonical(second_return);
+        let mut occupied_mixer: Value = serde_json::from_slice(&mixer).unwrap();
+        occupied_mixer["channels"].as_array_mut().unwrap().push(serde_json::json!({
+            "track_id": second_return_id, "gain_millionths": 1_000_000,
+            "pan_millionths": 0, "mute": false, "solo": false,
+            "destination": {"kind": "main"}, "sends": []
+        }));
+        occupied_mixer["return_buses"] = serde_json::json!([
+            {"bus": "a", "track_id": RETURN_ID},
+            {"bus": "b", "track_id": second_return_id}
+        ]);
+        let occupied_mixer = canonical(occupied_mixer);
+        let original_mixer = occupied_mixer.clone();
+        let mut return_chain: Value = serde_json::from_slice(&device_chain).unwrap();
+        return_chain["track_id"] = RETURN_ID.into();
+        let return_chain = canonical(return_chain);
+        let tracks = [track.as_slice(), return_track.as_slice(), second_return.as_slice()];
+        let clips = [clip.as_slice()];
+        let scenes = [scene.as_slice()];
+        let project = crate::load(
+            crate::PlaybackJsonInput {
+                project_id: PROJECT_ID,
+                sample_rate_hz: 48_000,
+                timeline: &timeline,
+                tracks: &tracks,
+                clips: &clips,
+                scenes: &scenes,
+                arrangement: Some(&arrangement),
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let assets = [MediaAssetFact {
+            id: ASSET_ID,
+            sample_rate_hz: 48_000,
+            frame_count: 24_000,
+        }];
+        let result = serialize_routing_bus_duplication(
+            &project,
+            &assets,
+            RoutingBusDuplicationSource {
+                track: &return_track,
+                mixer: &occupied_mixer,
+                automation_take_ids: &[TAKE_ID],
+                automation_takes: &[(TAKE_ID, take.as_slice())],
+                device_chain_id: Some("018f47a2-6b2d-7c11-8a44-001122335017"),
+                device_chain: Some(&return_chain),
+            },
+            RETURN_ID,
+            "Verb copy",
+            LoaderLimits::VERSION_1,
+            || "018f47a2-6b2d-7c11-8a44-001122335205".to_owned(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(RoutingBusDuplicationSerializationError::ReturnBusUnavailable)
+        ));
+        assert_eq!(occupied_mixer, original_mixer);
+    }
+
+    #[test]
     fn removes_the_complete_audio_track_identity_graph_and_keeps_immutable_media() {
         let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
         let tracks = [track.as_slice(), return_track.as_slice()];

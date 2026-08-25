@@ -4602,7 +4602,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
             "Preserving mixer state, changing the primary route, and reopening project…"
         }
         IdeWorkerCommandKind::DuplicateAudioTrack => {
-            "Preserving mixer state, duplicating the audio track, and reopening project…"
+            "Preserving mixer state, duplicating the mixer strip, and reopening project…"
         }
         IdeWorkerCommandKind::RemoveAudioTrack => {
             "Preserving mixer state, removing the empty audio track, and reopening project…"
@@ -5422,13 +5422,13 @@ fn apply_audio_track_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) 
         IdeWorkerEvent::AudioTrackDuplicated { revision, .. } => {
             reset_audio_track_duplication_form(ui);
             ui.set_status_text(
-                format!("Audio track duplicated in project revision {revision}").into(),
+                format!("Mixer strip duplicated in project revision {revision}").into(),
             );
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::AudioTrackDuplicating => {
             ui.set_app_mode(AppMode::DuplicatingTrack);
-            ui.set_status_text("Waiting for native output before duplicating the audio track…".into());
+            ui.set_status_text("Waiting for native output before duplicating the mixer strip…".into());
         }
         _ => unreachable!("audio-track duplication event dispatcher received another event"),
     }
@@ -12313,6 +12313,29 @@ mod tests {
             &[(0, "Audio 1 copy".to_owned())],
             "the generated row and form must forward the source row and chosen name exactly"
         );
+    }
+
+    #[test]
+    fn mixer_strip_duplication_lifecycle_uses_generic_status_text() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+
+        apply_audio_track_duplication_event(&ui, &IdeWorkerEvent::AudioTrackDuplicating);
+        assert_eq!(ui.get_app_mode(), AppMode::DuplicatingTrack);
+        assert_eq!(
+            ui.get_status_text(),
+            "Waiting for native output before duplicating the mixer strip…"
+        );
+
+        apply_audio_track_duplication_event(
+            &ui,
+            &IdeWorkerEvent::AudioTrackDuplicated {
+                revision: 7,
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+            },
+        );
+        assert_eq!(ui.get_status_text(), "Mixer strip duplicated in project revision 7");
     }
 
     #[test]
