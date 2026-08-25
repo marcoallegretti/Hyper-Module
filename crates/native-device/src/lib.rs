@@ -203,7 +203,7 @@ impl NativeCompressorState {
 }
 
 /// The state discriminant stored by a version-2 device-chain document.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "parameters", rename_all = "kebab-case")]
 pub enum NativeDeviceState {
     Filter(NativeFilterState),
@@ -547,7 +547,7 @@ impl DeviceChain {
                         state_version: device.state_version,
                         dsp_version: device.dsp_version,
                         enabled: device.enabled,
-                        state: device.state.clone(),
+                        state: device.state,
                         extensions: device.extensions.clone(),
                     })
                     .collect(),
@@ -1061,6 +1061,15 @@ struct BiquadCoefficients {
     a2: f64,
 }
 
+const PARAMETER_TRANSITION_FRAMES: u16 = 128;
+
+#[derive(Clone, Copy, Debug)]
+struct FilterTransition {
+    coefficients: BiquadCoefficients,
+    channels: [BiquadState; 2],
+    frames_remaining: u16,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeDeviceProcessError {
     ChannelLengthMismatch { left: usize, right: usize },
@@ -1115,8 +1124,10 @@ impl Error for NativeDeviceCreationError {}
 #[derive(Debug)]
 pub struct NativeFilterProcessor {
     enabled: bool,
+    state: NativeFilterState,
     coefficients: BiquadCoefficients,
     channels: [BiquadState; 2],
+    transition: Option<FilterTransition>,
 }
 
 impl NativeFilterProcessor {
@@ -1138,14 +1149,21 @@ impl NativeFilterProcessor {
         }
         Ok(Self {
             enabled,
+            state,
             coefficients: coefficients(state, sample_rate_hz),
             channels: [BiquadState::default(); 2],
+            transition: None,
         })
     }
 
     #[must_use]
     pub const fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> NativeFilterState {
+        self.state
     }
 
     /// Changes bypass state without allocating.
@@ -1159,8 +1177,31 @@ impl NativeFilterProcessor {
         }
     }
 
+    /// Retunes one prepared filter without allocation or processor recreation.
+    ///
+    /// Enabled processors preserve their current biquad histories and crossfade
+    /// the old and new stable coefficient paths for a fixed number of frames.
+    /// This prevents a direct coefficient discontinuity from becoming an
+    /// audible control step. Disabled processors update their next enabled
+    /// state directly.
+    pub fn set_state(&mut self, state: NativeFilterState) {
+        if self.state == state {
+            return;
+        }
+        if self.enabled {
+            self.transition = Some(FilterTransition {
+                coefficients: self.coefficients,
+                channels: self.channels,
+                frames_remaining: PARAMETER_TRANSITION_FRAMES,
+            });
+        }
+        self.state = state;
+        self.coefficients = coefficients(state, PROJECT_SAMPLE_RATE_HZ);
+    }
+
     pub fn reset(&mut self) {
         self.channels = [BiquadState::default(); 2];
+        self.transition = None;
     }
 
     /// Processes one planar stereo block in place without allocation.
@@ -1182,27 +1223,74 @@ impl NativeFilterProcessor {
         if !self.enabled {
             return Ok(());
         }
-        let coefficients = self.coefficients;
         let mut states = self.channels;
-        for (channel, state) in [left, right].into_iter().zip(&mut states) {
-            for sample in channel {
-                let input = f64::from(*sample);
-                let output = coefficients.b0.mul_add(input, state.z1);
-                state.z1 = coefficients
-                    .b1
-                    .mul_add(input, (-coefficients.a1).mul_add(output, state.z2));
-                state.z2 = coefficients.b2.mul_add(input, -coefficients.a2 * output);
-                let output = output as f32;
-                if !output.is_finite() || !state.z1.is_finite() || !state.z2.is_finite() {
-                    self.reset();
-                    return Err(NativeDeviceProcessError::NonFiniteOutput);
+        let mut transition = self.transition;
+        for (left, right) in left.iter_mut().zip(right) {
+            let left_input = f64::from(*left);
+            let right_input = f64::from(*right);
+            let (next_left, next_right) = if let Some(active) = &mut transition {
+                let old_left = process_biquad_sample(
+                    active.coefficients,
+                    &mut active.channels[0],
+                    left_input,
+                );
+                let old_right = process_biquad_sample(
+                    active.coefficients,
+                    &mut active.channels[1],
+                    right_input,
+                );
+                let new_left = process_biquad_sample(self.coefficients, &mut states[0], left_input);
+                let new_right =
+                    process_biquad_sample(self.coefficients, &mut states[1], right_input);
+                let progress = f64::from(
+                    PARAMETER_TRANSITION_FRAMES - active.frames_remaining + 1,
+                ) / f64::from(PARAMETER_TRANSITION_FRAMES);
+                active.frames_remaining -= 1;
+                if active.frames_remaining == 0 {
+                    transition = None;
                 }
-                *sample = output;
+                (
+                    old_left.mul_add(1.0 - progress, new_left * progress),
+                    old_right.mul_add(1.0 - progress, new_right * progress),
+                )
+            } else {
+                (
+                    process_biquad_sample(self.coefficients, &mut states[0], left_input),
+                    process_biquad_sample(self.coefficients, &mut states[1], right_input),
+                )
+            };
+            let next_left = next_left as f32;
+            let next_right = next_right as f32;
+            if !next_left.is_finite()
+                || !next_right.is_finite()
+                || !states.iter().all(|state| state.z1.is_finite() && state.z2.is_finite())
+                || transition.is_some_and(|active| {
+                    active.channels.iter().any(|state| !state.z1.is_finite() || !state.z2.is_finite())
+                })
+            {
+                self.reset();
+                return Err(NativeDeviceProcessError::NonFiniteOutput);
             }
+            *left = next_left;
+            *right = next_right;
         }
         self.channels = states;
+        self.transition = transition;
         Ok(())
     }
+}
+
+fn process_biquad_sample(
+    coefficients: BiquadCoefficients,
+    state: &mut BiquadState,
+    input: f64,
+) -> f64 {
+    let output = coefficients.b0.mul_add(input, state.z1);
+    state.z1 = coefficients
+        .b1
+        .mul_add(input, (-coefficients.a1).mul_add(output, state.z2));
+    state.z2 = coefficients.b2.mul_add(input, -coefficients.a2 * output);
+    output
 }
 
 fn validate_block(left: &[f32], right: &[f32]) -> Result<(), NativeDeviceProcessError> {
@@ -1255,12 +1343,25 @@ fn coefficients(state: NativeFilterState, sample_rate_hz: u32) -> BiquadCoeffici
 #[derive(Debug)]
 pub struct NativeCompressorProcessor {
     enabled: bool,
+    state: NativeCompressorState,
     threshold_decibels: f64,
     ratio: f64,
     attack_coefficient: f64,
     release_coefficient: f64,
     makeup_gain: f64,
     gain_reduction_decibels: f64,
+    transition: Option<CompressorTransition>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompressorTransition {
+    threshold_decibels: f64,
+    ratio: f64,
+    attack_coefficient: f64,
+    release_coefficient: f64,
+    makeup_gain: f64,
+    gain_reduction_decibels: f64,
+    frames_remaining: u16,
 }
 
 impl NativeCompressorProcessor {
@@ -1286,18 +1387,25 @@ impl NativeCompressorProcessor {
         let makeup_decibels = f64::from(state.makeup_millidecibels) / 1_000.0;
         Ok(Self {
             enabled,
+            state,
             threshold_decibels: f64::from(state.threshold_millidecibels) / 1_000.0,
             ratio: f64::from(state.ratio_millionths) / 1_000_000.0,
             attack_coefficient: (-1.0 / (attack_seconds * rate)).exp(),
             release_coefficient: (-1.0 / (release_seconds * rate)).exp(),
             makeup_gain: 10.0_f64.powf(makeup_decibels / 20.0),
             gain_reduction_decibels: 0.0,
+            transition: None,
         })
     }
 
     #[must_use]
     pub const fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> NativeCompressorState {
+        self.state
     }
 
     /// Changes bypass state without allocating.
@@ -1311,8 +1419,42 @@ impl NativeCompressorProcessor {
         }
     }
 
+    /// Updates one prepared compressor without allocating or rebuilding it.
+    ///
+    /// Detector history remains authoritative. The old and new complete
+    /// compressor paths crossfade for a fixed number of frames, so every
+    /// exposed control changes without an instantaneous output step.
+    pub fn set_state(&mut self, state: NativeCompressorState) {
+        if self.state == state {
+            return;
+        }
+        let rate = f64::from(PROJECT_SAMPLE_RATE_HZ);
+        let attack_seconds = f64::from(state.attack_microseconds()) / 1_000_000.0;
+        let release_seconds = f64::from(state.release_microseconds()) / 1_000_000.0;
+        let makeup_gain =
+            10.0_f64.powf(f64::from(state.makeup_millidecibels()) / 1_000.0 / 20.0);
+        if self.enabled {
+            self.transition = Some(CompressorTransition {
+                threshold_decibels: self.threshold_decibels,
+                ratio: self.ratio,
+                attack_coefficient: self.attack_coefficient,
+                release_coefficient: self.release_coefficient,
+                makeup_gain: self.makeup_gain,
+                gain_reduction_decibels: self.gain_reduction_decibels,
+                frames_remaining: PARAMETER_TRANSITION_FRAMES,
+            });
+        }
+        self.state = state;
+        self.threshold_decibels = f64::from(state.threshold_millidecibels()) / 1_000.0;
+        self.ratio = f64::from(state.ratio_millionths()) / 1_000_000.0;
+        self.attack_coefficient = (-1.0 / (attack_seconds * rate)).exp();
+        self.release_coefficient = (-1.0 / (release_seconds * rate)).exp();
+        self.makeup_gain = makeup_gain;
+    }
+
     pub fn reset(&mut self) {
         self.gain_reduction_decibels = 0.0;
+        self.transition = None;
     }
 
     /// Processes one planar stereo block in place without allocation.
@@ -1338,31 +1480,60 @@ impl NativeCompressorProcessor {
             return Ok(());
         }
         let mut gain_reduction_decibels = self.gain_reduction_decibels;
+        let mut transition = self.transition;
         for (left, right) in left.iter_mut().zip(right) {
-            let peak = f64::from(left.abs().max(right.abs()));
-            let level_decibels = 20.0 * peak.max(f64::MIN_POSITIVE).log10();
-            let target_gain_reduction = if level_decibels > self.threshold_decibels {
-                (level_decibels - self.threshold_decibels) * (1.0 - 1.0 / self.ratio)
+            let left_input = f64::from(*left);
+            let right_input = f64::from(*right);
+            let (next_left, next_right) = if let Some(active) = &mut transition {
+                let (old_left, old_right) = process_compressor_sample(
+                    left_input,
+                    right_input,
+                    active.threshold_decibels,
+                    active.ratio,
+                    active.attack_coefficient,
+                    active.release_coefficient,
+                    active.makeup_gain,
+                    &mut active.gain_reduction_decibels,
+                );
+                let (new_left, new_right) = process_compressor_sample(
+                    left_input,
+                    right_input,
+                    self.threshold_decibels,
+                    self.ratio,
+                    self.attack_coefficient,
+                    self.release_coefficient,
+                    self.makeup_gain,
+                    &mut gain_reduction_decibels,
+                );
+                let progress = f64::from(
+                    PARAMETER_TRANSITION_FRAMES - active.frames_remaining + 1,
+                ) / f64::from(PARAMETER_TRANSITION_FRAMES);
+                active.frames_remaining -= 1;
+                if active.frames_remaining == 0 {
+                    transition = None;
+                }
+                (
+                    old_left.mul_add(1.0 - progress, new_left * progress),
+                    old_right.mul_add(1.0 - progress, new_right * progress),
+                )
             } else {
-                0.0
+                process_compressor_sample(
+                    left_input,
+                    right_input,
+                    self.threshold_decibels,
+                    self.ratio,
+                    self.attack_coefficient,
+                    self.release_coefficient,
+                    self.makeup_gain,
+                    &mut gain_reduction_decibels,
+                )
             };
-            let coefficient = if target_gain_reduction > gain_reduction_decibels {
-                self.attack_coefficient
-            } else {
-                self.release_coefficient
-            };
-            gain_reduction_decibels = coefficient.mul_add(
-                gain_reduction_decibels,
-                (1.0 - coefficient) * target_gain_reduction,
-            );
-            let gain = 10.0_f64.powf(-gain_reduction_decibels / 20.0) * self.makeup_gain;
-            let next_left = f64::from(*left) * gain;
-            let next_right = f64::from(*right) * gain;
             let next_left = next_left as f32;
             let next_right = next_right as f32;
             if !next_left.is_finite()
                 || !next_right.is_finite()
                 || !gain_reduction_decibels.is_finite()
+                || transition.is_some_and(|active| !active.gain_reduction_decibels.is_finite())
             {
                 self.reset();
                 return Err(NativeDeviceProcessError::NonFiniteOutput);
@@ -1371,8 +1542,40 @@ impl NativeCompressorProcessor {
             *right = next_right;
         }
         self.gain_reduction_decibels = gain_reduction_decibels;
+        self.transition = transition;
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments, reason = "the callback path keeps both crossfade states explicit and allocation-free")]
+fn process_compressor_sample(
+    left: f64,
+    right: f64,
+    threshold_decibels: f64,
+    ratio: f64,
+    attack_coefficient: f64,
+    release_coefficient: f64,
+    makeup_gain: f64,
+    gain_reduction_decibels: &mut f64,
+) -> (f64, f64) {
+    let peak = left.abs().max(right.abs());
+    let level_decibels = 20.0 * peak.max(f64::MIN_POSITIVE).log10();
+    let target_gain_reduction = if level_decibels > threshold_decibels {
+        (level_decibels - threshold_decibels) * (1.0 - 1.0 / ratio)
+    } else {
+        0.0
+    };
+    let coefficient = if target_gain_reduction > *gain_reduction_decibels {
+        attack_coefficient
+    } else {
+        release_coefficient
+    };
+    *gain_reduction_decibels = coefficient.mul_add(
+        *gain_reduction_decibels,
+        (1.0 - coefficient) * target_gain_reduction,
+    );
+    let gain = 10.0_f64.powf(-*gain_reduction_decibels / 20.0) * makeup_gain;
+    (left * gain, right * gain)
 }
 
 #[derive(Debug)]
@@ -1393,6 +1596,28 @@ impl NativeDeviceProcessor {
         match self {
             Self::Filter(processor) => processor.set_enabled(enabled),
             Self::Compressor(processor) => processor.set_enabled(enabled),
+        }
+    }
+
+    const fn state(&self) -> NativeDeviceState {
+        match self {
+            Self::Filter(processor) => NativeDeviceState::Filter(processor.state()),
+            Self::Compressor(processor) => NativeDeviceState::Compressor(processor.state()),
+        }
+    }
+
+    fn set_state(&mut self, state: NativeDeviceState) -> bool {
+        match (self, state) {
+            (Self::Filter(processor), NativeDeviceState::Filter(state)) => {
+                processor.set_state(state);
+                true
+            }
+            (Self::Compressor(processor), NativeDeviceState::Compressor(state)) => {
+                processor.set_state(state);
+                true
+            }
+            (Self::Filter(_), NativeDeviceState::Compressor(_))
+            | (Self::Compressor(_), NativeDeviceState::Filter(_)) => false,
         }
     }
 
@@ -1466,6 +1691,12 @@ impl NativeDeviceChainProcessor {
         self.devices.get(index).map(NativeDeviceProcessor::enabled)
     }
 
+    /// Returns one prepared device's current validated parameter state.
+    #[must_use]
+    pub fn device_state(&self, index: usize) -> Option<NativeDeviceState> {
+        self.devices.get(index).map(NativeDeviceProcessor::state)
+    }
+
     /// Changes one prepared device's bypass state without allocating.
     ///
     /// Returns `false` when `index` is outside this prepared chain.
@@ -1475,6 +1706,14 @@ impl NativeDeviceChainProcessor {
         };
         device.set_enabled(enabled);
         true
+    }
+
+    /// Updates one prepared device's complete typed parameter state without
+    /// allocating. Returns `false` for an invalid index or mismatched kind.
+    pub fn set_device_state(&mut self, index: usize, state: NativeDeviceState) -> bool {
+        self.devices
+            .get_mut(index)
+            .is_some_and(|device| device.set_state(state))
     }
 
     pub fn reset(&mut self) {
@@ -2117,6 +2356,99 @@ mod tests {
             .unwrap();
         assert_eq!(replay_left.map(f32::to_bits), fresh_left.map(f32::to_bits));
         assert_eq!(replay_right.map(f32::to_bits), fresh_right.map(f32::to_bits));
+    }
+
+    #[test]
+    fn prepared_filter_retarget_preserves_history_and_finishes_a_bounded_crossfade() {
+        let initial = state(NativeFilterMode::LowPass);
+        let target =
+            NativeFilterState::try_new(NativeFilterMode::HighPass, 4_000_000, 1_500_000).unwrap();
+        let mut processor =
+            NativeFilterProcessor::try_new(initial, true, PROJECT_SAMPLE_RATE_HZ).unwrap();
+        let mut left = vec![1.0; usize::from(PARAMETER_TRANSITION_FRAMES) + 1];
+        let mut right = vec![-0.5; usize::from(PARAMETER_TRANSITION_FRAMES) + 1];
+        processor
+            .process_in_place(&mut left[..1], &mut right[..1])
+            .unwrap();
+        processor.set_state(target);
+        assert_eq!(processor.state(), target);
+        assert!(processor.transition.is_some());
+
+        processor
+            .process_in_place(&mut left[1..], &mut right[1..])
+            .unwrap();
+
+        assert!(left.iter().all(|sample| sample.is_finite()));
+        assert!(right.iter().all(|sample| sample.is_finite()));
+        assert!(processor.transition.is_none());
+        assert_eq!(processor.state(), target);
+    }
+
+    #[test]
+    fn prepared_compressor_retarget_uses_a_bounded_crossfade() {
+        let initial =
+            NativeCompressorState::try_new(-18_000, 1_000_000, 10_000, 100_000, 0).unwrap();
+        let target =
+            NativeCompressorState::try_new(-36_000, 4_000_000, 10_000, 100_000, 6_020).unwrap();
+        let mut processor =
+            NativeCompressorProcessor::try_new(initial, true, PROJECT_SAMPLE_RATE_HZ).unwrap();
+        processor.set_state(target);
+        let mut left = vec![1.0; usize::from(PARAMETER_TRANSITION_FRAMES)];
+        let mut right = vec![1.0; usize::from(PARAMETER_TRANSITION_FRAMES)];
+        let mut expected_left = left.clone();
+        let mut expected_right = right.clone();
+        let mut target_processor =
+            NativeCompressorProcessor::try_new(target, true, PROJECT_SAMPLE_RATE_HZ).unwrap();
+        target_processor
+            .process_in_place(&mut expected_left, &mut expected_right)
+            .unwrap();
+
+        processor
+            .process_in_place(&mut left[..1], &mut right[..1])
+            .unwrap();
+        assert!(left[0] > 1.0 && left[0] < expected_left[0]);
+        assert!((left[0] - right[0]).abs() < f32::EPSILON);
+        processor
+            .process_in_place(&mut left[1..], &mut right[1..])
+            .unwrap();
+
+        assert!(processor.transition.is_none());
+        assert_eq!(
+            left.last().map(|sample| sample.to_bits()),
+            expected_left.last().map(|sample| sample.to_bits())
+        );
+        assert_eq!(
+            right.last().map(|sample| sample.to_bits()),
+            expected_right.last().map(|sample| sample.to_bits())
+        );
+        assert_eq!(processor.state(), target);
+    }
+
+    #[test]
+    fn prepared_chain_rejects_cross_kind_retarget_without_mutation() {
+        let filter = NativeDeviceInstance::try_new_filter(
+            DEVICE_ID.to_owned(),
+            true,
+            state(NativeFilterMode::LowPass),
+        )
+        .unwrap();
+        let chain = DeviceChain::try_new(
+            CHAIN_ID.to_owned(),
+            PROJECT_ID.to_owned(),
+            TRACK_ID.to_owned(),
+            vec![filter],
+        )
+        .unwrap();
+        let mut processor =
+            NativeDeviceChainProcessor::try_new(&chain, PROJECT_SAMPLE_RATE_HZ).unwrap();
+        let before = processor.device_state(0);
+
+        assert!(!processor.set_device_state(
+            0,
+            NativeDeviceState::Compressor(compressor_state()),
+        ));
+
+        assert_eq!(processor.device_state(0), before);
     }
 
     #[test]

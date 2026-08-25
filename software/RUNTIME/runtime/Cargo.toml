@@ -27,6 +27,7 @@ hyper-project-loader = { path = "../../../crates/project-loader" }
 hyper-runtime-deployment = { path = "../deployment" }
 hyper-runtime-host = { path = "../runtime-host" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
+hyper-native-device = { path = "../../../crates/native-device" }
 slint = { version = "=1.17.1", default-features = false, features = [
     "accessibility",
     "backend-winit",

@@ -3,7 +3,10 @@ use super::{
     MixerParameterStateSnapshot, MixerSendParameterState, NativeDeviceStateSnapshot,
     TransportCommand, TransportCycle, TransportLoopRange, TransportState,
 };
-use hyper_native_device::MAX_DEVICES_PER_CHAIN;
+use hyper_native_device::{
+    MAX_DEVICES_PER_CHAIN, NativeCompressorState, NativeDeviceState, NativeFilterMode,
+    NativeFilterState,
+};
 use core::hint::spin_loop;
 use core::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
@@ -78,7 +81,7 @@ impl PlaybackRecoverySnapshot {
         self.mixer_parameter_state
     }
 
-    /// Returns recovered session-only native-device bypass state.
+    /// Returns recovered session-only native-device state.
     #[must_use]
     pub const fn native_device_state(&self) -> Option<NativeDeviceStateSnapshot> {
         self.native_device_state
@@ -329,11 +332,104 @@ impl AtomicMixerParameterState {
     }
 }
 
+const NATIVE_DEVICE_STATE_FILTER: u8 = 1;
+const NATIVE_DEVICE_STATE_COMPRESSOR: u8 = 2;
+
+#[derive(Debug, Default)]
+struct AtomicNativeDeviceParameters {
+    kind: AtomicU8,
+    filter_mode: AtomicU8,
+    filter_cutoff_millihertz: AtomicU32,
+    filter_resonance_millionths: AtomicU32,
+    compressor_threshold_millidecibels: AtomicU32,
+    compressor_ratio_millionths: AtomicU32,
+    compressor_attack_microseconds: AtomicU32,
+    compressor_release_microseconds: AtomicU32,
+    compressor_makeup_millidecibels: AtomicU32,
+}
+
+impl AtomicNativeDeviceParameters {
+    fn store(&self, state: NativeDeviceState) {
+        match state {
+            NativeDeviceState::Filter(state) => {
+                self.filter_mode.store(
+                    match state.mode() {
+                        NativeFilterMode::LowPass => 0,
+                        NativeFilterMode::HighPass => 1,
+                    },
+                    Ordering::Relaxed,
+                );
+                self.filter_cutoff_millihertz
+                    .store(state.cutoff_millihertz(), Ordering::Relaxed);
+                self.filter_resonance_millionths
+                    .store(state.resonance_millionths(), Ordering::Relaxed);
+                self.kind
+                    .store(NATIVE_DEVICE_STATE_FILTER, Ordering::Relaxed);
+            }
+            NativeDeviceState::Compressor(state) => {
+                self.compressor_threshold_millidecibels
+                    .store(
+                        u32::from_ne_bytes(state.threshold_millidecibels().to_ne_bytes()),
+                        Ordering::Relaxed,
+                    );
+                self.compressor_ratio_millionths
+                    .store(state.ratio_millionths(), Ordering::Relaxed);
+                self.compressor_attack_microseconds
+                    .store(state.attack_microseconds(), Ordering::Relaxed);
+                self.compressor_release_microseconds
+                    .store(state.release_microseconds(), Ordering::Relaxed);
+                self.compressor_makeup_millidecibels
+                    .store(
+                        u32::from_ne_bytes(state.makeup_millidecibels().to_ne_bytes()),
+                        Ordering::Relaxed,
+                    );
+                self.kind
+                    .store(NATIVE_DEVICE_STATE_COMPRESSOR, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn load(&self) -> Option<NativeDeviceState> {
+        match self.kind.load(Ordering::Relaxed) {
+            NATIVE_DEVICE_STATE_FILTER => NativeFilterState::try_new(
+                match self.filter_mode.load(Ordering::Relaxed) {
+                    0 => NativeFilterMode::LowPass,
+                    1 => NativeFilterMode::HighPass,
+                    _ => return None,
+                },
+                self.filter_cutoff_millihertz.load(Ordering::Relaxed),
+                self.filter_resonance_millionths.load(Ordering::Relaxed),
+            )
+            .ok()
+            .map(NativeDeviceState::Filter),
+            NATIVE_DEVICE_STATE_COMPRESSOR => NativeCompressorState::try_new(
+                i32::from_ne_bytes(
+                    self.compressor_threshold_millidecibels
+                        .load(Ordering::Relaxed)
+                        .to_ne_bytes(),
+                ),
+                self.compressor_ratio_millionths.load(Ordering::Relaxed),
+                self.compressor_attack_microseconds.load(Ordering::Relaxed),
+                self.compressor_release_microseconds.load(Ordering::Relaxed),
+                i32::from_ne_bytes(
+                    self.compressor_makeup_millidecibels
+                        .load(Ordering::Relaxed)
+                        .to_ne_bytes(),
+                ),
+            )
+            .ok()
+            .map(NativeDeviceState::Compressor),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct AtomicNativeDeviceState {
     present: AtomicBool,
     layout_signature: [AtomicU64; 4],
     enabled: [[AtomicBool; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS],
+    states: [[AtomicNativeDeviceParameters; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS],
     device_counts: [AtomicUsize; MAX_MAIN_MIXER_SLOTS],
 }
 
@@ -344,6 +440,9 @@ impl Default for AtomicNativeDeviceState {
             layout_signature: std::array::from_fn(|_| AtomicU64::new(0)),
             enabled: std::array::from_fn(|_| {
                 std::array::from_fn(|_| AtomicBool::new(false))
+            }),
+            states: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicNativeDeviceParameters::default())
             }),
             device_counts: std::array::from_fn(|_| AtomicUsize::new(0)),
         }
@@ -370,6 +469,11 @@ impl AtomicNativeDeviceState {
                         .expect("an in-range native device state exists"),
                     Ordering::Relaxed,
                 );
+                self.states[slot][device].store(
+                    snapshot
+                        .state(slot, device)
+                        .expect("an in-range native device state exists"),
+                );
             }
             self.device_counts[slot].store(count, Ordering::Relaxed);
         }
@@ -385,6 +489,7 @@ impl AtomicNativeDeviceState {
             .each_ref()
             .map(|word| word.load(Ordering::Relaxed));
         let mut enabled = [[false; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS];
+        let mut states = [[None; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS];
         let mut device_counts = [0; MAX_MAIN_MIXER_SLOTS];
         for slot in 0..MAX_MAIN_MIXER_SLOTS {
             let count = self.device_counts[slot].load(Ordering::Relaxed);
@@ -394,11 +499,13 @@ impl AtomicNativeDeviceState {
             device_counts[slot] = count;
             for (device, state) in enabled[slot].iter_mut().take(count).enumerate() {
                 *state = self.enabled[slot][device].load(Ordering::Relaxed);
+                states[slot][device] = Some(self.states[slot][device].load()?);
             }
         }
         NativeDeviceStateSnapshot::from_recovery_parts(
             signature_bytes(signature_words),
             enabled,
+            &states,
             device_counts,
         )
     }
@@ -660,7 +767,7 @@ impl PlaybackRecoveryPublisher {
     }
 
     /// Publishes one committed transport cycle with any newly committed
-    /// session-only native-device bypass state.
+    /// session-only native-device state.
     pub fn publish_cycle_with_native_device_state(
         &mut self,
         cycle: TransportCycle,
@@ -809,7 +916,7 @@ pub fn playback_recovery_channel_with_initial_loop_and_metronome(
     )
 }
 
-/// Creates a recovery channel with session-only initial native-device bypass
+/// Creates a recovery channel with session-only initial native-device
 /// state. A previously committed recovery snapshot takes precedence over the
 /// supplied initial state.
 #[must_use]
@@ -963,12 +1070,18 @@ mod tests {
         .unwrap()
     }
 
-    fn native_device_state(enabled: bool) -> NativeDeviceStateSnapshot {
-        let mut states = [[false; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS];
-        states[0][0] = enabled;
+    fn native_device_state(
+        enabled: bool,
+        parameters: NativeDeviceState,
+    ) -> NativeDeviceStateSnapshot {
+        let mut enabled_states = [[false; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS];
+        let mut states = [[None; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS];
+        enabled_states[0][0] = enabled;
+        states[0][0] = Some(parameters);
         NativeDeviceStateSnapshot::from_recovery_parts(
             [9; 32],
-            states,
+            enabled_states,
+            &states,
             [1, 0, 0, 0, 0, 0, 0, 0],
         )
         .unwrap()
@@ -1106,7 +1219,13 @@ mod tests {
 
     #[test]
     fn native_device_state_updates_only_with_a_committed_change_and_recovers_initial_state() {
-        let initial = native_device_state(true);
+        let initial = native_device_state(
+            true,
+            NativeDeviceState::Filter(
+                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107)
+                    .unwrap(),
+            ),
+        );
         let (mut publisher, checkpoint) =
             playback_recovery_channel_with_initial_loop_metronome_and_native_device_state(
                 None,
@@ -1119,7 +1238,13 @@ mod tests {
             );
         assert_eq!(checkpoint.snapshot().native_device_state(), Some(initial));
 
-        let changed = native_device_state(false);
+        let changed = native_device_state(
+            false,
+            NativeDeviceState::Compressor(
+                NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 6_000)
+                    .unwrap(),
+            ),
+        );
         publisher.publish_cycle_with_native_device_state(
             transport_cycle_for_test(),
             None,

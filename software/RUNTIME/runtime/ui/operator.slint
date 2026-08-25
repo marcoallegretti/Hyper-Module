@@ -33,8 +33,17 @@ export struct OperatorMixerSendRow {
 export struct OperatorNativeDeviceRow {
     track-name: string,
     kind: string,
+    kind-index: int,
     enabled: bool,
     controls-enabled: bool,
+    filter-mode-index: int,
+    filter-cutoff-hz: float,
+    filter-resonance: float,
+    compressor-threshold-decibels: float,
+    compressor-ratio: float,
+    compressor-attack-milliseconds: float,
+    compressor-release-milliseconds: float,
+    compressor-makeup-decibels: float,
 }
 
 component FactCard inherits Rectangle {
@@ -498,6 +507,14 @@ export component OperatorWindow inherits Window {
     callback set-mixer-channel-pan-requested(int, float);
     callback toggle-mixer-send-requested(int);
     callback toggle-native-device-requested(int);
+    callback toggle-native-filter-mode-requested(int);
+    callback set-native-filter-cutoff-requested(int, float);
+    callback set-native-filter-resonance-requested(int, float);
+    callback set-native-compressor-threshold-requested(int, float);
+    callback set-native-compressor-ratio-requested(int, float);
+    callback set-native-compressor-attack-requested(int, float);
+    callback set-native-compressor-release-requested(int, float);
+    callback set-native-compressor-makeup-requested(int, float);
     callback set-mixer-send-gain-requested(int, float);
     callback set-mixer-send-pan-requested(int, float);
     callback set-main-gain-requested(float);
@@ -823,7 +840,7 @@ export component OperatorWindow inherits Window {
             border-color: #2c3445;
             border-width: 1px;
             border-radius: 8px;
-            min-height: 118px;
+            min-height: 266px;
             VerticalLayout {
                 padding: 12px;
                 spacing: 7px;
@@ -833,18 +850,71 @@ export component OperatorWindow inherits Window {
                     Text { text: root.native-device-state; color: #8d99ad; font-size: 10px; overflow: elide; }
                 }
                 ListView {
-                    height: 76px;
+                    height: 224px;
                     for device[index] in root.native-devices : Rectangle {
-                        min-height: 32px;
+                        min-height: device.kind-index == 0 ? 82px : 112px;
                         background: transparent;
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Text { text: device.track-name + " · " + device.kind; color: #edf2f8; font-size: 11px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
-                            Button {
-                                text: device.enabled ? "Bypass" : "Enable";
-                                accessible-label: self.text + " " + device.track-name + " " + device.kind;
-                                enabled: device.controls-enabled;
-                                clicked => { root.toggle-native-device-requested(index); }
+                        VerticalLayout {
+                            spacing: 5px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text { text: device.track-name + " · " + device.kind; color: #edf2f8; font-size: 11px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                                Button {
+                                    text: device.enabled ? "Bypass" : "Enable";
+                                    accessible-label: self.text + " " + device.track-name + " " + device.kind;
+                                    enabled: device.controls-enabled;
+                                    clicked => { root.toggle-native-device-requested(index); }
+                                }
+                            }
+                            if device.kind-index == 0 : HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: device.filter-mode-index == 0 ? "Low-pass" : "High-pass";
+                                    accessible-label: "Toggle " + device.track-name + " filter mode";
+                                    enabled: device.controls-enabled;
+                                    clicked => { root.toggle-native-filter-mode-requested(index); }
+                                }
+                                Text { text: "CUTOFF " + Math.round(device.filter-cutoff-hz) + " Hz"; color: #8d99ad; font-size: 9px; vertical-alignment: center; }
+                                CommittedSlider {
+                                    width: 150px;
+                                    minimum: 20;
+                                    maximum: 20000;
+                                    step: 1;
+                                    committed-value: device.filter-cutoff-hz;
+                                    enabled: device.controls-enabled;
+                                    control-label: device.track-name + " filter cutoff hertz";
+                                    released(value) => { root.set-native-filter-cutoff-requested(index, value); }
+                                }
+                                Text { text: "Q " + Math.round(device.filter-resonance * 100) / 100; color: #8d99ad; font-size: 9px; vertical-alignment: center; }
+                                CommittedSlider {
+                                    width: 110px;
+                                    minimum: 0.1;
+                                    maximum: 20;
+                                    step: 0.01;
+                                    committed-value: device.filter-resonance;
+                                    enabled: device.controls-enabled;
+                                    control-label: device.track-name + " filter resonance";
+                                    released(value) => { root.set-native-filter-resonance-requested(index, value); }
+                                }
+                            }
+                            if device.kind-index == 1 : VerticalLayout {
+                                spacing: 4px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text { text: "THRESHOLD " + Math.round(device.compressor-threshold-decibels) + " dB"; color: #8d99ad; font-size: 9px; width: 110px; vertical-alignment: center; }
+                                    CommittedSlider { horizontal-stretch: 1; minimum: -80; maximum: 0; step: 0.1; committed-value: device.compressor-threshold-decibels; enabled: device.controls-enabled; control-label: device.track-name + " compressor threshold decibels"; released(value) => { root.set-native-compressor-threshold-requested(index, value); } }
+                                    Text { text: "RATIO " + Math.round(device.compressor-ratio * 100) / 100 + ":1"; color: #8d99ad; font-size: 9px; width: 88px; vertical-alignment: center; }
+                                    CommittedSlider { width: 110px; minimum: 1; maximum: 100; step: 0.01; committed-value: device.compressor-ratio; enabled: device.controls-enabled; control-label: device.track-name + " compressor ratio"; released(value) => { root.set-native-compressor-ratio-requested(index, value); } }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text { text: "ATTACK " + Math.round(device.compressor-attack-milliseconds * 10) / 10 + " ms"; color: #8d99ad; font-size: 9px; width: 110px; vertical-alignment: center; }
+                                    CommittedSlider { horizontal-stretch: 1; minimum: 0.1; maximum: 500; step: 0.1; committed-value: device.compressor-attack-milliseconds; enabled: device.controls-enabled; control-label: device.track-name + " compressor attack milliseconds"; released(value) => { root.set-native-compressor-attack-requested(index, value); } }
+                                    Text { text: "RELEASE " + Math.round(device.compressor-release-milliseconds * 10) / 10 + " ms"; color: #8d99ad; font-size: 9px; width: 88px; vertical-alignment: center; }
+                                    CommittedSlider { width: 110px; minimum: 0.1; maximum: 2000; step: 0.1; committed-value: device.compressor-release-milliseconds; enabled: device.controls-enabled; control-label: device.track-name + " compressor release milliseconds"; released(value) => { root.set-native-compressor-release-requested(index, value); } }
+                                    Text { text: "MAKEUP " + Math.round(device.compressor-makeup-decibels * 10) / 10 + " dB"; color: #8d99ad; font-size: 9px; width: 94px; vertical-alignment: center; }
+                                    CommittedSlider { width: 110px; minimum: -24; maximum: 24; step: 0.1; committed-value: device.compressor-makeup-decibels; enabled: device.controls-enabled; control-label: device.track-name + " compressor makeup decibels"; released(value) => { root.set-native-compressor-makeup-requested(index, value); } }
+                                }
                             }
                         }
                     }

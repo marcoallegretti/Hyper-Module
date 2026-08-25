@@ -8,11 +8,12 @@ use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{InterleavedStereoCallback, LoudnessMeasurementCommand, StereoOutput};
 use hyper_mixer_runtime::{
     EbuLoudnessPresentationConfig, FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime,
-    MetronomePlan, MixerParameterCommand, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
-    TransportCommand, TransportOutputProcessor, loudness_command_channel, output_meter_channel,
+    MetronomePlan, MixerParameterCommand, NativeDeviceCommand, PreparedPlaybackMainRuntime,
+    PreparedPlaybackTransportRuntime, TransportCommand, TransportOutputProcessor,
+    loudness_command_channel, output_meter_channel,
 };
 use hyper_native_device::{
-    DeviceChain, NativeDeviceInstance, NativeFilterMode, NativeFilterState,
+    DeviceChain, NativeDeviceInstance, NativeDeviceState, NativeFilterMode, NativeFilterState,
 };
 use hyper_playback_compiler::{MeterEvent, TempoEvent};
 
@@ -246,6 +247,62 @@ fn native_filter_playback_performs_zero_heap_allocations() {
     assert!(result.is_ok());
     assert_eq!(heap_operations, 0);
     assert!(output_left.iter().any(|sample| *sample != 0.0));
+}
+
+#[test]
+fn native_filter_retarget_performs_zero_heap_allocations() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let chain = native_filter_chain();
+    let runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        core::slice::from_ref(&chain),
+        64,
+    )
+    .unwrap();
+    let (_transport_sender, _mixer_sender, mut device_sender, mut transport) =
+        PreparedPlaybackTransportRuntime::with_command_queues_and_native_device_commands(runtime);
+    let device = device_sender
+        .resolve_device(chain.track_id(), chain.devices()[0].id())
+        .unwrap();
+    device_sender
+        .try_send(NativeDeviceCommand::SetState {
+            device,
+            state: NativeDeviceState::Filter(
+                NativeFilterState::try_new(NativeFilterMode::HighPass, 4_000_000, 1_500_000)
+                    .unwrap(),
+            ),
+        })
+        .unwrap();
+    transport.apply_command(TransportCommand::Start).unwrap();
+    let mut arrangement_left = [0.0_f32; 64];
+    let mut arrangement_right = [0.0_f32; 64];
+    let mut scene_left = [0.0_f32; 64];
+    let mut scene_right = [0.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut output_left = [0.0_f32; 64];
+    let mut output_right = [0.0_f32; 64];
+
+    let measurement = HeapMeasurement::start_verified();
+    let result = transport.process_cycle(
+        &mut scratch,
+        StereoOutput {
+            left: &mut output_left,
+            right: &mut output_right,
+        },
+    );
+    let heap_operations = measurement.finish();
+
+    assert_eq!(result.unwrap().applied_native_device_command_count(), 1);
+    assert_eq!(heap_operations, 0);
+    assert!(output_left.iter().all(|sample| sample.is_finite()));
+    assert!(output_right.iter().all(|sample| sample.is_finite()));
 }
 
 #[test]

@@ -19,7 +19,7 @@ use hyper_audio_engine::{
 use hyper_media_cache::{PreparedPlayback, PreparedSceneAvailability, PreparedSchedule};
 use hyper_native_device::{
     DeviceChain, NativeDeviceChainProcessor, NativeDeviceCreationError,
-    NativeDeviceProcessError, MAX_DEVICES_PER_CHAIN, PROJECT_SAMPLE_RATE_HZ,
+    NativeDeviceProcessError, NativeDeviceState, MAX_DEVICES_PER_CHAIN, PROJECT_SAMPLE_RATE_HZ,
 };
 use hyper_playback_compiler::FrameTimelineError;
 use hyper_playback_compiler::scene::{SceneRuntimeCheckpoint, SceneRuntimeError};
@@ -499,7 +499,7 @@ impl NativeDeviceHandle {
     }
 }
 
-/// One session-only native-device bypass command.
+/// One session-only prepared native-device command.
 ///
 /// The target is resolved from a prepared device-chain layout and is accepted
 /// only at the next process-cycle boundary.
@@ -508,6 +508,10 @@ pub enum NativeDeviceCommand {
     SetEnabled {
         device: NativeDeviceHandle,
         enabled: bool,
+    },
+    SetState {
+        device: NativeDeviceHandle,
+        state: NativeDeviceState,
     },
 }
 
@@ -527,11 +531,19 @@ impl Error for NativeDeviceResolveError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeDeviceTargetError {
     ForeignDevice(NativeDeviceHandle),
+    DeviceKindMismatch { device: NativeDeviceHandle },
 }
 
 impl fmt::Display for NativeDeviceTargetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("native device handle belongs to another runtime")
+        match self {
+            Self::ForeignDevice(_) => {
+                formatter.write_str("native device handle belongs to another runtime")
+            }
+            Self::DeviceKindMismatch { .. } => {
+                formatter.write_str("native device state does not match the prepared device kind")
+            }
+        }
     }
 }
 
@@ -1135,6 +1147,7 @@ struct NativeDeviceSlotLayout {
 struct NativeDeviceLayoutEntry {
     id: String,
     handle: NativeDeviceHandle,
+    state: NativeDeviceState,
 }
 
 impl NativeDeviceLayout {
@@ -1152,17 +1165,34 @@ impl NativeDeviceLayout {
     }
 
     fn validate(&self, command: NativeDeviceCommand) -> Result<(), NativeDeviceTargetError> {
-        let NativeDeviceCommand::SetEnabled { device, .. } = command;
-        self.slots
+        let device = match command {
+            NativeDeviceCommand::SetEnabled { device, .. }
+            | NativeDeviceCommand::SetState { device, .. } => device,
+        };
+        let resolved = self.slots
             .get(device.slot)
             .and_then(|slot| slot.devices.get(device.device))
             .filter(|resolved| self.id == device.layout_id && resolved.handle == device)
-            .map(|_| ())
-            .ok_or(NativeDeviceTargetError::ForeignDevice(device))
+            .ok_or(NativeDeviceTargetError::ForeignDevice(device))?;
+        match command {
+            NativeDeviceCommand::SetEnabled { .. } => Ok(()),
+            NativeDeviceCommand::SetState { state, .. }
+                if matches!(
+                    (resolved.state, state),
+                    (NativeDeviceState::Filter(_), NativeDeviceState::Filter(_))
+                        | (NativeDeviceState::Compressor(_), NativeDeviceState::Compressor(_))
+                ) =>
+            {
+                Ok(())
+            }
+            NativeDeviceCommand::SetState { .. } => {
+                Err(NativeDeviceTargetError::DeviceKindMismatch { device })
+            }
+        }
     }
 }
 
-/// Exact session-only bypass state bound to one prepared native-device layout.
+/// Exact session-only native-device state bound to one prepared layout.
 ///
 /// The snapshot is private to the playback runtime's construction and recovery
 /// path, preventing callers from forging state for another prepared graph.
@@ -1170,6 +1200,7 @@ impl NativeDeviceLayout {
 pub struct NativeDeviceStateSnapshot {
     layout_signature: [u8; 32],
     enabled: [[bool; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS],
+    states: [[Option<NativeDeviceState>; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS],
     device_counts: [usize; MAX_MAIN_MIXER_SLOTS],
 }
 
@@ -1178,15 +1209,20 @@ impl NativeDeviceStateSnapshot {
     pub(crate) fn from_recovery_parts(
         layout_signature: [u8; 32],
         enabled: [[bool; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS],
+        states: &[[Option<NativeDeviceState>; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS],
         device_counts: [usize; MAX_MAIN_MIXER_SLOTS],
     ) -> Option<Self> {
         if device_counts
             .iter()
             .all(|count| *count <= MAX_DEVICES_PER_CHAIN)
+            && device_counts.iter().enumerate().all(|(slot, count)| {
+                states[slot][..*count].iter().all(Option::is_some)
+            })
         {
             Some(Self {
                 layout_signature,
                 enabled,
+                states: *states,
                 device_counts,
             })
         } else {
@@ -1212,6 +1248,16 @@ impl NativeDeviceStateSnapshot {
     pub const fn enabled(&self, slot: usize, device: usize) -> Option<bool> {
         if slot < MAX_MAIN_MIXER_SLOTS && device < self.device_counts[slot] {
             Some(self.enabled[slot][device])
+        } else {
+            None
+        }
+    }
+
+    /// Returns one committed prepared-device parameter state.
+    #[must_use]
+    pub const fn state(&self, slot: usize, device: usize) -> Option<NativeDeviceState> {
+        if slot < MAX_MAIN_MIXER_SLOTS && device < self.device_counts[slot] {
+            self.states[slot][device]
         } else {
             None
         }
@@ -3080,6 +3126,7 @@ fn build_native_device_layout(
                         slot,
                         device,
                     },
+                    state: *instance.state(),
                 });
             }
             devices
@@ -3273,19 +3320,29 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
     }
 
     fn apply_native_device_command(&mut self, command: NativeDeviceCommand) {
-        let NativeDeviceCommand::SetEnabled { device, enabled } = command;
+        let device = match command {
+            NativeDeviceCommand::SetEnabled { device, .. }
+            | NativeDeviceCommand::SetState { device, .. } => device,
+        };
         let processor = self.slots[device.slot]
             .device
             .as_mut()
             .expect("a validated native device command targets a prepared chain");
-        assert!(
-            processor.processor.set_device_enabled(device.device, enabled),
-            "a validated native device command targets a prepared device"
-        );
+        match command {
+            NativeDeviceCommand::SetEnabled { enabled, .. } => assert!(
+                processor.processor.set_device_enabled(device.device, enabled),
+                "a validated native device command targets a prepared device"
+            ),
+            NativeDeviceCommand::SetState { state, .. } => assert!(
+                processor.processor.set_device_state(device.device, state),
+                "a validated native device command targets a prepared device kind"
+            ),
+        }
     }
 
     fn capture_native_device_state(&self) -> NativeDeviceStateSnapshot {
         let mut enabled = [[false; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS];
+        let mut states = [[None; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS];
         let mut device_counts = [0; MAX_MAIN_MIXER_SLOTS];
         for (slot_index, slot) in self.slots.iter().enumerate() {
             let Some(device) = &slot.device else {
@@ -3301,11 +3358,18 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                     .processor
                     .device_enabled(device_index)
                     .expect("a native device count is derived from its processor");
+                states[slot_index][device_index] = Some(
+                    device
+                        .processor
+                        .device_state(device_index)
+                        .expect("a native device count is derived from its processor"),
+                );
             }
         }
         NativeDeviceStateSnapshot::from_recovery_parts(
             self.native_device_layout_signature,
             enabled,
+            &states,
             device_counts,
         )
         .expect("prepared native device chains stay within their declared bounds")
@@ -3340,6 +3404,14 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                         .processor
                         .set_device_enabled(device_index, state.enabled[slot_index][device_index]),
                     "a matching native device state addresses a prepared device"
+                );
+                debug_assert!(
+                    processor.processor.set_device_state(
+                        device_index,
+                        state.states[slot_index][device_index]
+                            .expect("a matching native device state retains every device kind"),
+                    ),
+                    "a matching native device state retains each prepared device kind"
                 );
             }
         }
@@ -4155,7 +4227,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         self.runtime.capture_parameter_state()
     }
 
-    /// Restores one session-only native-device bypass snapshot.
+    /// Restores one session-only native-device state snapshot.
     ///
     /// # Errors
     ///
@@ -4168,7 +4240,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         self.runtime.restore_native_device_state(snapshot)
     }
 
-    /// Captures current session-only native-device bypass state.
+    /// Captures current session-only native-device state.
     #[must_use]
     pub fn native_device_state(&self) -> NativeDeviceStateSnapshot {
         self.runtime.capture_native_device_state()
@@ -4313,7 +4385,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     /// consumed. A valid cycle applies bounded FIFO batches provisionally
     /// before it captures the cycle's state and start frame. If later work
     /// fails, transport state, renderer position, mixer base parameters, and
-    /// native-device bypass state
+    /// native-device state
     /// return to their preceding committed values; consumed commands are not
     /// replayed. Arbitrary mixer processor state is not transactional, so
     /// callers must not continue processing after a mixer failure.
@@ -4326,7 +4398,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     ///
     /// Returns [`RuntimeProcessError`] for output shape, block capacity, frame
     /// range, rendering, automation, or mixer failures. A failed cycle never
-    /// commits queued transport, mixer base state, or native-device bypass
+    /// commits queued transport, mixer base state, or native-device
     /// state and never advances the transport position.
     #[allow(
         clippy::too_many_lines,

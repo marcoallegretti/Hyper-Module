@@ -27,7 +27,8 @@ use hyper_mixer_runtime::{
     playback_recovery_channel,
 };
 use hyper_native_device::{
-    DeviceChain, NativeCompressorState, NativeDeviceInstance, NativeFilterMode, NativeFilterState,
+    DeviceChain, NativeCompressorState, NativeDeviceInstance, NativeDeviceState, NativeFilterMode,
+    NativeFilterState,
 };
 
 use common::{PlaybackFixture, fixture, graph_fixture, playback_fixture};
@@ -395,7 +396,7 @@ fn prepared_playback_runs_native_filter_before_the_mixer() {
     clippy::too_many_lines,
     reason = "one prepared session proves device command ownership, cycle commitment, audio effect, and refusal boundaries"
 )]
-fn native_device_bypass_is_bound_to_the_prepared_graph_and_commits_at_the_cycle_boundary() {
+fn native_device_commands_are_bound_to_the_prepared_graph_and_commit_at_the_cycle_boundary() {
     let fixture = playback_fixture();
     let graph = fixture.compile_playback();
     let prepared = fixture.cache.prepare_playback(&graph).unwrap();
@@ -476,6 +477,52 @@ fn native_device_bypass_is_bound_to_the_prepared_graph_and_commits_at_the_cycle_
     let filtered = render_with_device_chain(Some(&chain));
     assert_eq!(left.map(f32::to_bits), filtered.0.map(f32::to_bits));
     assert_eq!(right.map(f32::to_bits), filtered.1.map(f32::to_bits));
+
+    let retuned = NativeDeviceState::Filter(
+        NativeFilterState::try_new(NativeFilterMode::HighPass, 4_000_000, 1_500_000).unwrap(),
+    );
+    let retune_command = NativeDeviceCommand::SetState {
+        device,
+        state: retuned,
+    };
+    sender.try_send(retune_command).unwrap();
+    let wrong_kind = NativeDeviceCommand::SetState {
+        device,
+        state: NativeDeviceState::Compressor(
+            NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 0).unwrap(),
+        ),
+    };
+    assert_eq!(
+        sender.try_send(wrong_kind),
+        Err(NativeDeviceCommandSendError::InvalidTarget {
+            command: wrong_kind,
+            source: NativeDeviceTargetError::DeviceKindMismatch { device },
+        })
+    );
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 0,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    let retuned_cycle = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+    assert_eq!(retuned_cycle.applied_native_device_command_count(), 1);
+    assert_eq!(transport.native_device_state().state(0, 0), Some(retuned));
+    assert!(
+        left.iter()
+            .zip(filtered.0)
+            .any(|(retuned, filtered)| retuned.to_bits() != filtered.to_bits())
+    );
+    assert!(left.iter().all(|sample| sample.is_finite()));
+    assert!(right.iter().all(|sample| sample.is_finite()));
 
     let foreign_fixture = playback_fixture();
     let foreign_graph = foreign_fixture.compile_playback();
