@@ -14956,6 +14956,37 @@ mod tests {
             recv(&worker),
             IdeWorkerEvent::AudioPrimaryRouteChanged { revision: 7 }
         ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetAudioPrimaryRoute {
+                source_track_id: source_track_id.clone(),
+                target_group_track_id: Some(group_id.clone()),
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Saving));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("primary route"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(with_group_route) = recv(&worker) else {
+            panic!("restoring the Group route must reopen the project");
+        };
+        assert!(matches!(
+            with_group_route
+                .mixer_channels()
+                .iter()
+                .find(|channel| channel.id() == source_track_id)
+                .expect("the routed source remains present after reopen")
+                .destination(),
+            IdeMixerChannelDestination::Group { track_id, .. } if track_id == &group_id
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioPrimaryRouteChanged { revision: 8 }
+        ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
