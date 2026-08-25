@@ -2102,6 +2102,7 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
 }
 
 fn bind_routing_bus_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    bind_routing_bus_removal_callback(ui, worker);
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     actions.on_begin_routing_bus_creation(move || {
@@ -2189,6 +2190,37 @@ fn bind_routing_bus_callbacks(ui: &MainWindow, worker: &WorkerCell) {
                 name: name.to_owned(),
                 source_track_ids,
             },
+        );
+    });
+}
+
+fn bind_routing_bus_removal_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    actions.on_remove_routing_bus(move |track_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_routing_bus_removal_visible()
+            || ui.get_routing_bus_removal_id() != track_id
+        {
+            ui.set_error_text("Routing-bus removal confirmation is no longer current".into());
+            return;
+        }
+        let Ok(track_id) = validate_routing_bus_removal(
+            ui.get_app_mode(),
+            track_id.as_str(),
+            &ui.get_mixer_channels(),
+        ) else {
+            ui.set_error_text("The selected routing bus is no longer available".into());
+            return;
+        };
+        submit_to_ui(
+            &ui,
+            &worker,
+            IdeWorkerCommand::RemoveRoutingBus { track_id },
         );
     });
 }
@@ -4351,6 +4383,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         | IdeWorkerCommandKind::AddReturnSend
         | IdeWorkerCommandKind::RemoveReturnSend
         | IdeWorkerCommandKind::SetAudioPrimaryRoute
+        | IdeWorkerCommandKind::RemoveRoutingBus
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
@@ -4485,6 +4518,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::AddRoutingBus => {
             "Saving mixer state, creating the routing bus, and reopening project…"
+        }
+        IdeWorkerCommandKind::RemoveRoutingBus => {
+            "Saving mixer state, removing the routing bus, and reopening project…"
         }
         IdeWorkerCommandKind::AddReturnSend | IdeWorkerCommandKind::RemoveReturnSend => {
             "Preserving mixer state, editing the return send, and reopening project…"
@@ -4771,7 +4807,8 @@ fn apply_event(
             apply_audio_track_event(ui, &event);
         }
         event @ (IdeWorkerEvent::RoutingBusAdded { .. }
-        | IdeWorkerEvent::RoutingBusAdding { .. }) => {
+        | IdeWorkerEvent::RoutingBusAdding { .. }
+        | IdeWorkerEvent::RoutingBusRemoved { .. }) => {
             apply_routing_bus_event(ui, &event);
         }
         IdeWorkerEvent::ReturnSendEdited { revision } => {
@@ -5224,6 +5261,15 @@ fn apply_routing_bus_event(ui: &MainWindow, event: &IdeWorkerEvent) {
                 }
                 .into(),
             );
+        }
+        IdeWorkerEvent::RoutingBusRemoved { revision, track_id } => {
+            ui.set_routing_bus_removal_visible(false);
+            ui.set_routing_bus_removal_id(SharedString::default());
+            ui.set_routing_bus_removal_name(SharedString::default());
+            ui.set_status_text(
+                format!("Routing bus {track_id} removed in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
         }
         _ => unreachable!("routing-bus event dispatcher received another event"),
     }
@@ -7814,6 +7860,9 @@ fn reset_project(
     ui.set_remove_track_content_visible(false);
     ui.set_remove_track_content_id(SharedString::default());
     ui.set_remove_track_content_name(SharedString::default());
+    ui.set_routing_bus_removal_visible(false);
+    ui.set_routing_bus_removal_id(SharedString::default());
+    ui.set_routing_bus_removal_name(SharedString::default());
     ui.set_rename_track_index(-1);
     ui.set_rename_track_original_name(SharedString::default());
     ui.set_rename_track_name(SharedString::default());
@@ -7989,6 +8038,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         | IdeWorkerCommandKind::AddReturnSend
         | IdeWorkerCommandKind::RemoveReturnSend
         | IdeWorkerCommandKind::SetAudioPrimaryRoute
+        | IdeWorkerCommandKind::RemoveRoutingBus
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
@@ -8741,6 +8791,27 @@ fn validate_audio_track_removal(
         .find(|row| row.track_id.as_str() == track_id)
         .ok_or(MixerControlFailure::StaleSelection)?;
     if mode != AppMode::Running || !row.state_available || !row.removable {
+        return Err(MixerControlFailure::StateUnavailable);
+    }
+    Ok(row.track_id.to_string())
+}
+
+fn validate_routing_bus_removal(
+    mode: AppMode,
+    track_id: &str,
+    channels: &ModelRc<MixerChannelRow>,
+) -> Result<String, MixerControlFailure> {
+    if track_id.is_empty() {
+        return Err(MixerControlFailure::InvalidSelection);
+    }
+    let row = (0..channels.row_count())
+        .filter_map(|index| channels.row_data(index))
+        .find(|row| row.track_id.as_str() == track_id)
+        .ok_or(MixerControlFailure::StaleSelection)?;
+    if mode != AppMode::Running
+        || !row.state_available
+        || !matches!(row.kind.as_str(), "GROUP" | "RETURN")
+    {
         return Err(MixerControlFailure::StateUnavailable);
     }
     Ok(row.track_id.to_string())
@@ -12129,6 +12200,60 @@ mod tests {
     }
 
     #[test]
+    fn routing_bus_removal_requires_confirmation_for_the_current_bus() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_visible(true);
+        let track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let mut routing_bus = audio_track_mixer_row(0, track_id);
+        routing_bus.name = "Verb".into();
+        routing_bus.display_name = "Verb".into();
+        routing_bus.kind = "RETURN".into();
+        routing_bus.renameable = false;
+        routing_bus.removable = false;
+        routing_bus.activation_toggleable = false;
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![routing_bus]))));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        ui.global::<IdeActions>().on_remove_routing_bus(move |track_id| {
+            submitted_by_callback.borrow_mut().push(track_id.to_string());
+        });
+        ui.show().unwrap();
+
+        let remove = ElementHandle::find_by_accessible_label(&ui, "Remove routing bus Verb")
+            .next()
+            .expect("the current Return bus exposes removal");
+        assert_eq!(remove.accessible_enabled(), Some(true));
+        remove.mock_single_click(PointerEventButton::Left);
+        assert!(ui.get_routing_bus_removal_visible());
+        assert_eq!(ui.get_routing_bus_removal_id(), track_id);
+
+        let confirm = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Confirm removal of routing bus Verb",
+        )
+        .next()
+        .expect("the confirmation exposes exactly one removal action");
+        assert_eq!(confirm.accessible_enabled(), Some(true));
+        confirm.mock_single_click(PointerEventButton::Left);
+        assert_eq!(submitted.borrow().as_slice(), &[track_id.to_owned()]);
+
+        apply_routing_bus_event(
+            &ui,
+            &IdeWorkerEvent::RoutingBusRemoved {
+                revision: 7,
+                track_id: track_id.to_owned(),
+            },
+        );
+        assert!(!ui.get_routing_bus_removal_visible());
+        assert!(ui.get_routing_bus_removal_id().is_empty());
+        assert!(ui.get_status_text().contains("project revision 7"));
+        ui.hide().unwrap();
+    }
+
+    #[test]
     fn routing_bus_sources_follow_audio_channels_without_losing_current_selection() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();
@@ -13844,6 +13969,32 @@ mod tests {
         assert_eq!(
             validate_audio_track_content_removal(AppMode::Closed, track_a, &reordered),
             Err(MixerControlFailure::StateUnavailable)
+        );
+        let mut routing_bus = audio_track_mixer_row(0, track_a);
+        routing_bus.kind = "GROUP".into();
+        routing_bus.renameable = false;
+        routing_bus.removable = false;
+        routing_bus.activation_toggleable = false;
+        let routing_bus = ModelRc::from(Rc::new(VecModel::from(vec![routing_bus])));
+        assert_eq!(
+            validate_routing_bus_removal(AppMode::Running, track_a, &routing_bus).unwrap(),
+            track_a
+        );
+        assert_eq!(
+            validate_routing_bus_removal(AppMode::Closed, track_a, &routing_bus),
+            Err(MixerControlFailure::StateUnavailable)
+        );
+        assert_eq!(
+            validate_routing_bus_removal(AppMode::Running, track_a, &reordered),
+            Err(MixerControlFailure::StateUnavailable)
+        );
+        assert_eq!(
+            mode_after_successful_submission(AppMode::Running, IdeWorkerCommandKind::RemoveRoutingBus),
+            AppMode::Saving
+        );
+        assert_eq!(
+            mode_after_failure(AppMode::Saving, IdeWorkerCommandKind::RemoveRoutingBus),
+            AppMode::Running
         );
         let mut non_audio = audio_track_mixer_row(0, track_a);
         non_audio.activation_toggleable = false;
