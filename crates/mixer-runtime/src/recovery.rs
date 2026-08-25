@@ -1,8 +1,9 @@
 use super::{
     LocateState, MAX_MAIN_MIXER_SLOTS, MAX_MIXER_SENDS_PER_SLOT, MixerChannelParameterState,
-    MixerParameterStateSnapshot, MixerSendParameterState, TransportCommand, TransportCycle,
-    TransportLoopRange, TransportState,
+    MixerParameterStateSnapshot, MixerSendParameterState, NativeDeviceStateSnapshot,
+    TransportCommand, TransportCycle, TransportLoopRange, TransportState,
 };
+use hyper_native_device::MAX_DEVICES_PER_CHAIN;
 use core::hint::spin_loop;
 use core::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
@@ -25,6 +26,7 @@ pub struct PlaybackRecoverySnapshot {
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
     mixer_parameter_state: Option<MixerParameterStateSnapshot>,
+    native_device_state: Option<NativeDeviceStateSnapshot>,
 }
 
 impl PlaybackRecoverySnapshot {
@@ -42,6 +44,7 @@ impl PlaybackRecoverySnapshot {
             loop_range: None,
             loop_enabled: false,
             mixer_parameter_state: None,
+            native_device_state: None,
         }
     }
 
@@ -73,6 +76,12 @@ impl PlaybackRecoverySnapshot {
     #[must_use]
     pub const fn mixer_parameter_state(&self) -> Option<MixerParameterStateSnapshot> {
         self.mixer_parameter_state
+    }
+
+    /// Returns recovered session-only native-device bypass state.
+    #[must_use]
+    pub const fn native_device_state(&self) -> Option<NativeDeviceStateSnapshot> {
+        self.native_device_state
     }
 
     /// Creates the transport command that resumes this authenticated checkpoint.
@@ -320,6 +329,81 @@ impl AtomicMixerParameterState {
     }
 }
 
+#[derive(Debug)]
+struct AtomicNativeDeviceState {
+    present: AtomicBool,
+    layout_signature: [AtomicU64; 4],
+    enabled: [[AtomicBool; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS],
+    device_counts: [AtomicUsize; MAX_MAIN_MIXER_SLOTS],
+}
+
+impl Default for AtomicNativeDeviceState {
+    fn default() -> Self {
+        Self {
+            present: AtomicBool::new(false),
+            layout_signature: std::array::from_fn(|_| AtomicU64::new(0)),
+            enabled: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicBool::new(false))
+            }),
+            device_counts: std::array::from_fn(|_| AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl AtomicNativeDeviceState {
+    fn store(&self, snapshot: &NativeDeviceStateSnapshot) {
+        for (target, value) in self
+            .layout_signature
+            .iter()
+            .zip(signature_words(snapshot.layout_signature()))
+        {
+            target.store(value, Ordering::Relaxed);
+        }
+        for slot in 0..MAX_MAIN_MIXER_SLOTS {
+            let count = snapshot
+                .device_count(slot)
+                .expect("a native device state has fixed slot cardinality");
+            for device in 0..count {
+                self.enabled[slot][device].store(
+                    snapshot
+                        .enabled(slot, device)
+                        .expect("an in-range native device state exists"),
+                    Ordering::Relaxed,
+                );
+            }
+            self.device_counts[slot].store(count, Ordering::Relaxed);
+        }
+        self.present.store(true, Ordering::Relaxed);
+    }
+
+    fn load(&self) -> Option<NativeDeviceStateSnapshot> {
+        if !self.present.load(Ordering::Relaxed) {
+            return None;
+        }
+        let signature_words = self
+            .layout_signature
+            .each_ref()
+            .map(|word| word.load(Ordering::Relaxed));
+        let mut enabled = [[false; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS];
+        let mut device_counts = [0; MAX_MAIN_MIXER_SLOTS];
+        for slot in 0..MAX_MAIN_MIXER_SLOTS {
+            let count = self.device_counts[slot].load(Ordering::Relaxed);
+            if count > MAX_DEVICES_PER_CHAIN {
+                return None;
+            }
+            device_counts[slot] = count;
+            for (device, state) in enabled[slot].iter_mut().take(count).enumerate() {
+                *state = self.enabled[slot][device].load(Ordering::Relaxed);
+            }
+        }
+        NativeDeviceStateSnapshot::from_recovery_parts(
+            signature_bytes(signature_words),
+            enabled,
+            device_counts,
+        )
+    }
+}
+
 const NO_SCENE_INDEX: u8 = u8::MAX;
 
 #[derive(Debug)]
@@ -444,6 +528,7 @@ struct PlaybackRecoveryState {
     metronome_observation: AtomicMetronomeObservation,
     scene_launch: AtomicSceneLaunchObservation,
     mixer_parameters: AtomicMixerParameterState,
+    native_device_state: AtomicNativeDeviceState,
 }
 
 /// Cloneable observer for the last transport cycle committed by the audio thread.
@@ -479,6 +564,7 @@ impl PlaybackRecoveryCheckpoint {
             let state = decode_state(self.inner.transport_state.load(Ordering::Relaxed));
             let (loop_range, loop_enabled) = self.inner.loop_observation.load();
             let mixer_parameter_state = self.inner.mixer_parameters.load();
+            let native_device_state = self.inner.native_device_state.load();
             fence(Ordering::Acquire);
             let after = self.inner.sequence.load(Ordering::Relaxed);
             if before == after {
@@ -489,6 +575,7 @@ impl PlaybackRecoveryCheckpoint {
                     loop_range,
                     loop_enabled,
                     mixer_parameter_state,
+                    native_device_state,
                 };
             }
             spin_loop();
@@ -569,6 +656,17 @@ impl PlaybackRecoveryPublisher {
         cycle: TransportCycle,
         mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
     ) {
+        self.publish_cycle_with_native_device_state(cycle, mixer_parameter_state, None);
+    }
+
+    /// Publishes one committed transport cycle with any newly committed
+    /// session-only native-device bypass state.
+    pub fn publish_cycle_with_native_device_state(
+        &mut self,
+        cycle: TransportCycle,
+        mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
+        native_device_state: Option<&NativeDeviceStateSnapshot>,
+    ) {
         let scene = cycle.scene_launch_state();
         self.publish_observation(
             PlaybackCyclePublication {
@@ -586,6 +684,7 @@ impl PlaybackRecoveryPublisher {
                 last_launched_scene_index: scene.last_launched_scene_index(),
             },
             mixer_parameter_state,
+            native_device_state,
         );
     }
 
@@ -609,6 +708,7 @@ impl PlaybackRecoveryPublisher {
                 last_launched_scene_index: None,
             },
             mixer_parameter_state,
+            None,
         );
     }
 
@@ -616,6 +716,7 @@ impl PlaybackRecoveryPublisher {
         &mut self,
         publication: PlaybackCyclePublication,
         mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
+        native_device_state: Option<&NativeDeviceStateSnapshot>,
     ) {
         let odd = self.inner.sequence.fetch_add(1, Ordering::Acquire) | 1;
         fence(Ordering::Release);
@@ -638,6 +739,9 @@ impl PlaybackRecoveryPublisher {
         );
         if let Some(mixer_parameter_state) = mixer_parameter_state {
             self.inner.mixer_parameters.store(mixer_parameter_state);
+        }
+        if let Some(native_device_state) = native_device_state {
+            self.inner.native_device_state.store(native_device_state);
         }
         self.inner
             .sequence
@@ -694,12 +798,43 @@ pub fn playback_recovery_channel_with_initial_loop_and_metronome(
     initial_metronome_available: bool,
     initial_metronome_enabled: bool,
 ) -> (PlaybackRecoveryPublisher, PlaybackRecoveryCheckpoint) {
+    playback_recovery_channel_with_initial_loop_metronome_and_native_device_state(
+        snapshot,
+        initial_mixer_parameter_state,
+        None,
+        initial_loop_range,
+        initial_loop_enabled,
+        initial_metronome_available,
+        initial_metronome_enabled,
+    )
+}
+
+/// Creates a recovery channel with session-only initial native-device bypass
+/// state. A previously committed recovery snapshot takes precedence over the
+/// supplied initial state.
+#[must_use]
+pub fn playback_recovery_channel_with_initial_loop_metronome_and_native_device_state(
+    snapshot: Option<&PlaybackRecoverySnapshot>,
+    initial_mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
+    initial_native_device_state: Option<&NativeDeviceStateSnapshot>,
+    initial_loop_range: Option<TransportLoopRange>,
+    initial_loop_enabled: bool,
+    initial_metronome_available: bool,
+    initial_metronome_enabled: bool,
+) -> (PlaybackRecoveryPublisher, PlaybackRecoveryCheckpoint) {
     let mixer_parameters = AtomicMixerParameterState::default();
     if let Some(state) = snapshot
         .and_then(|snapshot| snapshot.mixer_parameter_state.as_ref())
         .or(initial_mixer_parameter_state)
     {
         mixer_parameters.store(state);
+    }
+    let native_device_state = AtomicNativeDeviceState::default();
+    if let Some(state) = snapshot
+        .and_then(|snapshot| snapshot.native_device_state.as_ref())
+        .or(initial_native_device_state)
+    {
+        native_device_state.store(state);
     }
     let inner = Arc::new(PlaybackRecoveryState {
         sequence: AtomicU64::new(snapshot.map_or(0, |snapshot| snapshot.committed_cycle_count * 2)),
@@ -724,6 +859,7 @@ pub fn playback_recovery_channel_with_initial_loop_and_metronome(
         ),
         scene_launch: AtomicSceneLaunchObservation::default(),
         mixer_parameters,
+        native_device_state,
     });
     (
         PlaybackRecoveryPublisher {
@@ -827,6 +963,39 @@ mod tests {
         .unwrap()
     }
 
+    fn native_device_state(enabled: bool) -> NativeDeviceStateSnapshot {
+        let mut states = [[false; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS];
+        states[0][0] = enabled;
+        NativeDeviceStateSnapshot::from_recovery_parts(
+            [9; 32],
+            states,
+            [1, 0, 0, 0, 0, 0, 0, 0],
+        )
+        .unwrap()
+    }
+
+    fn transport_cycle_for_test() -> TransportCycle {
+        TransportCycle {
+            state: TransportState::Rolling,
+            start_frame: 0,
+            position_frame: 128,
+            frame_count: 128,
+            loop_wrap_count: 0,
+            loop_range: None,
+            loop_enabled: false,
+            metronome_available: false,
+            metronome_enabled: false,
+            active_slot_count: 0,
+            scene_launch_state: hyper_playback_compiler::scene::SceneLaunchState::default(),
+            applied_command_count: 0,
+            command_sender_disconnected: false,
+            applied_mixer_parameter_command_count: 0,
+            mixer_parameter_command_sender_disconnected: false,
+            applied_native_device_command_count: 1,
+            native_device_command_sender_disconnected: false,
+        }
+    }
+
     #[test]
     fn checkpoint_starts_stopped_at_origin() {
         assert_eq!(
@@ -838,6 +1007,7 @@ mod tests {
                 loop_range: None,
                 loop_enabled: false,
                 mixer_parameter_state: None,
+                native_device_state: None,
             }
         );
         assert_eq!(
@@ -888,6 +1058,7 @@ mod tests {
                 loop_range: None,
                 loop_enabled: false,
                 mixer_parameter_state: None,
+                native_device_state: None,
             }
         );
         assert_eq!(
@@ -907,6 +1078,7 @@ mod tests {
                 loop_range: None,
                 loop_enabled: false,
                 mixer_parameter_state: None,
+                native_device_state: None,
             }
         );
         assert_eq!(
@@ -930,6 +1102,33 @@ mod tests {
         let unchanged = checkpoint.snapshot();
         assert_eq!(unchanged.position_frame(), 256);
         assert_eq!(unchanged.mixer_parameter_state(), Some(mixer));
+    }
+
+    #[test]
+    fn native_device_state_updates_only_with_a_committed_change_and_recovers_initial_state() {
+        let initial = native_device_state(true);
+        let (mut publisher, checkpoint) =
+            playback_recovery_channel_with_initial_loop_metronome_and_native_device_state(
+                None,
+                None,
+                Some(&initial),
+                None,
+                false,
+                false,
+                false,
+            );
+        assert_eq!(checkpoint.snapshot().native_device_state(), Some(initial));
+
+        let changed = native_device_state(false);
+        publisher.publish_cycle_with_native_device_state(
+            transport_cycle_for_test(),
+            None,
+            Some(&changed),
+        );
+        assert_eq!(checkpoint.snapshot().native_device_state(), Some(changed));
+
+        publisher.publish(PlaybackRecoveryTransportState::Rolling, 256, None);
+        assert_eq!(checkpoint.snapshot().native_device_state(), Some(changed));
     }
 
     #[test]
@@ -971,6 +1170,7 @@ mod tests {
                         last_launched_scene_index: scene.map(|value| value.2),
                     },
                     Some(&mixer),
+                    None,
                 );
             }
         });
@@ -1046,6 +1246,7 @@ mod tests {
             loop_range: Some(TransportLoopRange::new(128, 640).unwrap()),
             loop_enabled: true,
             mixer_parameter_state: Some(mixer),
+            native_device_state: None,
         };
         let different_initial = mixer_snapshot(3, false);
         let (mut publisher, checkpoint) =
@@ -1060,6 +1261,7 @@ mod tests {
                 loop_range: Some(TransportLoopRange::new(128, 640).unwrap()),
                 loop_enabled: true,
                 mixer_parameter_state: Some(mixer),
+                native_device_state: None,
             }
         );
         publisher.publish(PlaybackRecoveryTransportState::Rolling, 640, None);

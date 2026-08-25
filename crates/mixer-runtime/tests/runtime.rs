@@ -15,6 +15,8 @@ use hyper_mixer_runtime::{
     MixerChannelHandle,
     MixerParameterCommand, MixerParameterCommandSendError, MixerParameterCommandSender,
     MixerParameterResolveError, MixerParameterStateRestoreError, MixerParameterTargetError,
+    NativeDeviceCommand, NativeDeviceCommandSendError, NativeDeviceResolveError,
+    NativeDeviceTargetError, MAX_QUEUED_NATIVE_DEVICE_COMMANDS,
     OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
     PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, RuntimeCreationError,
     RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig, SceneLaunchState,
@@ -386,6 +388,142 @@ fn prepared_playback_runs_native_filter_before_the_mixer() {
             .zip(duplicated.0)
             .any(|(filtered, duplicated)| filtered.to_bits() != duplicated.to_bits())
     );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one prepared session proves device command ownership, cycle commitment, audio effect, and refusal boundaries"
+)]
+fn native_device_bypass_is_bound_to_the_prepared_graph_and_commits_at_the_cycle_boundary() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let chain = native_filter_chain(true);
+    let runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        core::slice::from_ref(&chain),
+        64,
+    )
+    .unwrap();
+    let (_transport_sender, _mixer_sender, mut sender, mut transport) =
+        PreparedPlaybackTransportRuntime::with_command_queues_and_native_device_commands(runtime);
+    let device = sender
+        .resolve_device(ARRANGEMENT_TRACK_ID, chain.devices()[0].id())
+        .unwrap();
+    assert_eq!(
+        sender.resolve_device(ARRANGEMENT_TRACK_ID, "missing"),
+        Err(NativeDeviceResolveError::DeviceNotFound)
+    );
+
+    let mut arrangement_left = [0.0_f32; 64];
+    let mut arrangement_right = [0.0_f32; 64];
+    let mut scene_left = [0.0_f32; 64];
+    let mut scene_right = [0.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut left = [0.0_f32; 64];
+    let mut right = [0.0_f32; 64];
+
+    sender
+        .try_send(NativeDeviceCommand::SetEnabled {
+            device,
+            enabled: false,
+        })
+        .unwrap();
+    transport.apply_command(TransportCommand::Start).unwrap();
+    let bypassed = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+    assert_eq!(bypassed.applied_native_device_command_count(), 1);
+    assert!(!bypassed.native_device_command_sender_disconnected());
+    assert_eq!(transport.native_device_state().enabled(0, 0), Some(false));
+    let baseline = render_with_device_chain(None);
+    assert_eq!(left.map(f32::to_bits), baseline.0.map(f32::to_bits));
+    assert_eq!(right.map(f32::to_bits), baseline.1.map(f32::to_bits));
+
+    sender
+        .try_send(NativeDeviceCommand::SetEnabled {
+            device,
+            enabled: true,
+        })
+        .unwrap();
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 0,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+    assert_eq!(transport.native_device_state().enabled(0, 0), Some(true));
+    let filtered = render_with_device_chain(Some(&chain));
+    assert_eq!(left.map(f32::to_bits), filtered.0.map(f32::to_bits));
+    assert_eq!(right.map(f32::to_bits), filtered.1.map(f32::to_bits));
+
+    let foreign_fixture = playback_fixture();
+    let foreign_graph = foreign_fixture.compile_playback();
+    let foreign_prepared = foreign_fixture.cache.prepare_playback(&foreign_graph).unwrap();
+    let foreign_runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &foreign_prepared,
+        &foreign_fixture.mixer,
+        core::slice::from_ref(&chain),
+        64,
+    )
+    .unwrap();
+    let (_foreign_transport, _foreign_mixer, foreign_sender, foreign_runtime) =
+        PreparedPlaybackTransportRuntime::with_command_queues_and_native_device_commands(
+            foreign_runtime,
+        );
+    let foreign_device = foreign_sender
+        .resolve_device(ARRANGEMENT_TRACK_ID, chain.devices()[0].id())
+        .unwrap();
+    let foreign_command = NativeDeviceCommand::SetEnabled {
+        device: foreign_device,
+        enabled: false,
+    };
+    assert_eq!(
+        sender.try_send(foreign_command),
+        Err(NativeDeviceCommandSendError::InvalidTarget {
+            command: foreign_command,
+            source: NativeDeviceTargetError::ForeignDevice(foreign_device),
+        })
+    );
+    assert_eq!(sender.capacity(), MAX_QUEUED_NATIVE_DEVICE_COMMANDS);
+    for _ in 0..MAX_QUEUED_NATIVE_DEVICE_COMMANDS {
+        sender
+            .try_send(NativeDeviceCommand::SetEnabled {
+                device,
+                enabled: false,
+            })
+            .unwrap();
+    }
+    assert!(matches!(
+        sender.try_send(NativeDeviceCommand::SetEnabled {
+            device,
+            enabled: false,
+        }),
+        Err(NativeDeviceCommandSendError::Full(_))
+    ));
+    drop(transport);
+    assert!(sender.is_disconnected());
+    drop(foreign_runtime);
 }
 
 #[test]

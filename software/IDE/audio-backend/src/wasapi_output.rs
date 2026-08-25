@@ -359,14 +359,19 @@ impl WasapiThreadRunner {
                     pending_cycle.set(Some((
                         rendered.snapshot().cycle(),
                         rendered.mixer_parameter_state().copied(),
+                        rendered.native_device_state().copied(),
                     )));
                 })
             },
             || {
-                let (cycle, mixer_parameter_state) = pending_cycle
+                let (cycle, mixer_parameter_state, native_device_state) = pending_cycle
                     .take()
                     .expect("a rendered WASAPI block has a pending recovery cycle");
-                publisher.publish_cycle(cycle, mixer_parameter_state.as_ref());
+                publisher.publish_cycle_with_native_device_state(
+                    cycle,
+                    mixer_parameter_state.as_ref(),
+                    native_device_state.as_ref(),
+                );
             },
         )
     }

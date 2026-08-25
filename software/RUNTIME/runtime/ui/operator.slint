@@ -30,6 +30,13 @@ export struct OperatorMixerSendRow {
     controls-enabled: bool,
 }
 
+export struct OperatorNativeDeviceRow {
+    track-name: string,
+    kind: string,
+    enabled: bool,
+    controls-enabled: bool,
+}
+
 component FactCard inherits Rectangle {
     in property <string> label;
     in property <string> value;
@@ -460,6 +467,8 @@ export component OperatorWindow inherits Window {
     in property <bool> stop-interactive-scenes-enabled: false;
     in property <[OperatorMixerRow]> mixer-channels;
     in property <[OperatorMixerSendRow]> mixer-sends;
+    in property <[OperatorNativeDeviceRow]> native-devices;
+    in property <string> native-device-state: "No prepared native devices";
     in property <float> main-gain-percent: 0;
     in property <bool> main-muted: false;
     in property <bool> main-mute-enabled: false;
@@ -488,6 +497,7 @@ export component OperatorWindow inherits Window {
     callback set-mixer-channel-gain-requested(int, float);
     callback set-mixer-channel-pan-requested(int, float);
     callback toggle-mixer-send-requested(int);
+    callback toggle-native-device-requested(int);
     callback set-mixer-send-gain-requested(int, float);
     callback set-mixer-send-pan-requested(int, float);
     callback set-main-gain-requested(float);
@@ -803,6 +813,40 @@ export component OperatorWindow inherits Window {
                         toggle-requested => { root.toggle-mixer-send-requested(index); }
                         gain-requested(value) => { root.set-mixer-send-gain-requested(index, value); }
                         pan-requested(value) => { root.set-mixer-send-pan-requested(index, value); }
+                    }
+                }
+            }
+        }
+
+        if root.native-devices.length > 0 : Rectangle {
+            background: #171b24;
+            border-color: #2c3445;
+            border-width: 1px;
+            border-radius: 8px;
+            min-height: 118px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 7px;
+                HorizontalLayout {
+                    Text { text: "NATIVE DEVICES · SESSION ONLY"; color: #8d99ad; font-size: 11px; font-weight: 700; }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: root.native-device-state; color: #8d99ad; font-size: 10px; overflow: elide; }
+                }
+                ListView {
+                    height: 76px;
+                    for device[index] in root.native-devices : Rectangle {
+                        min-height: 32px;
+                        background: transparent;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text { text: device.track-name + " · " + device.kind; color: #edf2f8; font-size: 11px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                            Button {
+                                text: device.enabled ? "Bypass" : "Enable";
+                                accessible-label: self.text + " " + device.track-name + " " + device.kind;
+                                enabled: device.controls-enabled;
+                                clicked => { root.toggle-native-device-requested(index); }
+                            }
+                        }
                     }
                 }
             }

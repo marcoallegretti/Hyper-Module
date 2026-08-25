@@ -902,7 +902,7 @@ mod playback_session;
 ))]
 pub use playback_session::{
     DesktopControlMappingBuildError, DesktopOutputStartError, DesktopOutputStopError,
-    DesktopMixerSend, DesktopMixerSendTap,
+    DesktopMixerSend, DesktopMixerSendTap, DesktopNativeDevice,
     DesktopPlaybackRecovery, DesktopPlaybackRecoveryPendingStart,
     DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopWait,
     DesktopPlaybackRecoveryPendingWait, DesktopPlaybackRecoveryStartError,

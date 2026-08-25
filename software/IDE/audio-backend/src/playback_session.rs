@@ -33,12 +33,13 @@ use hyper_media_cache::{DecodedMediaCache, PreparePlaybackError};
 use hyper_mixer_runtime::{
     LoudnessCommandSender, MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSender,
     MixerParameterResolveError, MixerParameterStateRestoreError, MixerSendHandle,
+    NativeDeviceCommand, NativeDeviceCommandSender, NativeDeviceHandle, NativeDeviceResolveError,
     MetronomePlan, MetronomePlanError, OutputMeterReceiver, RoutedMainRuntime,
     RoutedTransportRuntime, RuntimeCreationError,
     TransportCommand, TransportCommandSendError, TransportCommandSender, TransportLoopRange,
     TransportLoopRangeError, TransportOutputCreationError, TransportOutputProcessor,
     loudness_command_channel, output_meter_channel,
-    playback_recovery_channel_with_initial_loop_and_metronome,
+    playback_recovery_channel_with_initial_loop_metronome_and_native_device_state,
 };
 use hyper_native_device::DeviceChain;
 use hyper_playback_compiler::graph::GraphLimits;
@@ -67,6 +68,38 @@ pub struct DesktopMixerSend<'a> {
     target_name: &'a str,
     tap: DesktopMixerSendTap,
     handle: MixerSendHandle,
+}
+
+/// Immutable prepared facts and a generation-bound handle for one native
+/// device instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DesktopNativeDevice<'a> {
+    track_name: &'a str,
+    device_id: &'a str,
+    kind_id: &'a str,
+    handle: NativeDeviceHandle,
+}
+
+impl<'a> DesktopNativeDevice<'a> {
+    #[must_use]
+    pub const fn track_name(self) -> &'a str {
+        self.track_name
+    }
+
+    #[must_use]
+    pub const fn device_id(self) -> &'a str {
+        self.device_id
+    }
+
+    #[must_use]
+    pub const fn kind_id(self) -> &'a str {
+        self.kind_id
+    }
+
+    #[must_use]
+    pub const fn handle(self) -> NativeDeviceHandle {
+        self.handle
+    }
 }
 
 impl<'a> DesktopMixerSend<'a> {
@@ -572,6 +605,10 @@ impl SessionControlHandles {
         self.runtime().sink().mixer_sender()
     }
 
+    fn native_devices(&self) -> Option<&NativeDeviceCommandSender> {
+        self.runtime().sink().native_device_sender()
+    }
+
     fn mapping_statuses(&self) -> &[hyper_control_runtime::ControlBindingStatus] {
         self.runtime().statuses()
     }
@@ -627,6 +664,24 @@ impl SessionControlHandles {
     ) -> Result<(), DesktopDirectControlError> {
         self.runtime_mut()
             .try_send_direct(DesktopDirectControlCommand::Mixer(command))
+    }
+
+    fn resolve_native_device(
+        &self,
+        track_id: &str,
+        device_id: &str,
+    ) -> Result<NativeDeviceHandle, NativeDeviceResolveError> {
+        self.native_devices()
+            .ok_or(NativeDeviceResolveError::DeviceNotFound)?
+            .resolve_device(track_id, device_id)
+    }
+
+    fn try_send_native_device(
+        &mut self,
+        command: NativeDeviceCommand,
+    ) -> Result<(), DesktopDirectControlError> {
+        self.runtime_mut()
+            .try_send_direct(DesktopDirectControlCommand::NativeDevice(command))
     }
 
     fn try_send_mixer_fence(&mut self) -> Result<Option<u64>, DesktopDirectControlError> {
@@ -1675,6 +1730,74 @@ impl DesktopPlaybackSession {
         }))
     }
 
+    /// Returns the number of prepared native devices in compiled channel and
+    /// chain-processing order. Non-project sessions have no device catalog.
+    #[must_use]
+    pub fn native_device_count(&self) -> usize {
+        let Some(project) = self.prepared_project() else {
+            return 0;
+        };
+        (0..self.mixer_channel_count())
+            .filter_map(|index| self.source.session().mixer_channel_track_id_at(index))
+            .filter_map(|track_id| {
+                project
+                    .device_chains()
+                    .iter()
+                    .find(|chain| chain.track_id() == track_id)
+            })
+            .map(|chain| chain.devices().len())
+            .sum()
+    }
+
+    /// Returns immutable device facts and the matching prepared command
+    /// handle for one flattened Runtime catalog row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-device rejection when project metadata and the live
+    /// prepared control layout disagree.
+    pub fn native_device(
+        &self,
+        index: usize,
+    ) -> Result<Option<DesktopNativeDevice<'_>>, NativeDeviceResolveError> {
+        let Some(project) = self.prepared_project() else {
+            return Ok(None);
+        };
+        let mut current = 0;
+        for channel_index in 0..self.mixer_channel_count() {
+            let Some(track_id) = self.source.session().mixer_channel_track_id_at(channel_index)
+            else {
+                return Ok(None);
+            };
+            let Some(track_name) = self.mixer_channel_name(channel_index) else {
+                return Ok(None);
+            };
+            let Some(chain) = project
+                .device_chains()
+                .iter()
+                .find(|chain| chain.track_id() == track_id)
+            else {
+                continue;
+            };
+            for device in chain.devices() {
+                if current == index {
+                    return self
+                        .resolve_native_device(track_id, device.id())
+                        .map(|handle| {
+                            Some(DesktopNativeDevice {
+                                track_name,
+                                device_id: device.id(),
+                                kind_id: device.device_id(),
+                                handle,
+                            })
+                        });
+                }
+                current += 1;
+            }
+        }
+        Ok(None)
+    }
+
     /// Resolves one compiled channel index through this session's mixer layout.
     ///
     /// # Errors
@@ -1748,6 +1871,34 @@ impl DesktopPlaybackSession {
         command: MixerParameterCommand,
     ) -> Result<(), DesktopDirectControlError> {
         self.controls.try_send_mixer(command)
+    }
+
+    /// Resolves one prepared native device through its owning track and stable
+    /// device identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-device rejection when the current prepared graph does
+    /// not own that device.
+    pub fn resolve_native_device(
+        &self,
+        track_id: &str,
+        device_id: &str,
+    ) -> Result<NativeDeviceHandle, NativeDeviceResolveError> {
+        self.controls.resolve_native_device(track_id, device_id)
+    }
+
+    /// Sends one session-only native-device bypass command through the
+    /// session's sole control owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original target or bounded-queue rejection.
+    pub fn try_send_native_device_command(
+        &mut self,
+        command: NativeDeviceCommand,
+    ) -> Result<(), DesktopDirectControlError> {
+        self.controls.try_send_native_device(command)
     }
 
     /// Allocates and enqueues a FIFO fence after all previously accepted mixer
@@ -2148,8 +2299,10 @@ fn initialize_session(
             .map(|(left, right)| RenderScratchSlot::new(left, right)),
     );
 
-    let (commands, mixer_parameter_commands, mut transport) =
-        RoutedTransportRuntime::with_command_queues_and_metronome(runtime, metronome);
+    let (commands, mixer_parameter_commands, native_device_commands, mut transport) =
+        RoutedTransportRuntime::with_command_queues_native_device_commands_and_metronome(
+            runtime, metronome,
+        );
     prepare_initial_transport_authority(
         &commands,
         &mut transport,
@@ -2158,6 +2311,7 @@ fn initialize_session(
     )
     .or_else(|source| fail_build(publication, source))?;
     let initial_mixer_parameter_state = transport.mixer_parameter_state();
+    let initial_native_device_state = transport.native_device_state();
     let initial_loop_range = transport.loop_range();
     let initial_loop_enabled = transport.loop_enabled();
     let initial_metronome_available = transport.metronome_available();
@@ -2179,9 +2333,10 @@ fn initialize_session(
         .or_else(|source| fail_build(publication, source))?;
     let (preview_control, preview) =
         prepare_audio_preview(media, recordings, sample_rate_hz, publication)?;
-    let (publisher, recovery) = playback_recovery_channel_with_initial_loop_and_metronome(
+    let (publisher, recovery) = playback_recovery_channel_with_initial_loop_metronome_and_native_device_state(
         initial_checkpoint,
         Some(&initial_mixer_parameter_state),
+        Some(&initial_native_device_state),
         initial_loop_range,
         initial_loop_enabled,
         initial_metronome_available,
@@ -2190,6 +2345,7 @@ fn initialize_session(
     let controls = build_session_controls(
         commands,
         mixer_parameter_commands,
+        Some(native_device_commands),
         recovery.clone(),
         control_mapping,
     )
@@ -2295,6 +2451,9 @@ fn restore_transport_checkpoint<R: hyper_mixer_runtime::TrackWindowRenderer>(
     if let Some(mixer_parameter_state) = checkpoint.mixer_parameter_state() {
         transport.restore_mixer_parameter_state(&mixer_parameter_state)?;
     }
+    if let Some(native_device_state) = checkpoint.native_device_state() {
+        transport.restore_native_device_state(&native_device_state)?;
+    }
     Ok(())
 }
 
@@ -2335,6 +2494,7 @@ fn configure_persisted_loop<R: hyper_mixer_runtime::TrackWindowRenderer>(
 fn build_session_controls(
     transport: TransportCommandSender,
     mixer: MixerParameterCommandSender,
+    native_devices: Option<NativeDeviceCommandSender>,
     recovery: PlaybackRecoveryCheckpoint,
     control_mapping: Option<CompiledControlMappingTable>,
 ) -> Result<SessionControlHandles, DesktopPlaybackSessionBuildError> {
@@ -2342,7 +2502,12 @@ fn build_session_controls(
     // sole owner of live mixer shadow state and of any panel bindings, and a
     // panel is discovered hardware rather than something a project declares.
     let table = control_mapping.unwrap_or_else(CompiledControlMappingTable::empty);
-    let sink = DesktopControlSink::new(transport, mixer, recovery);
+    let sink = match native_devices {
+        Some(native_devices) => {
+            DesktopControlSink::new_with_native_devices(transport, mixer, native_devices, recovery)
+        }
+        None => DesktopControlSink::new(transport, mixer, recovery),
+    };
     let runtime =
         ControlRuntime::try_new(table, sink).map_err(classify_control_mapping_build_error)?;
     let mut runtimes = Vec::new();
@@ -3023,6 +3188,7 @@ mod tests {
         let mut controls = build_session_controls(
             transport,
             mixer,
+            None,
             recovery,
             Some(compiled_channel_mute_mapping()),
         )
@@ -3083,6 +3249,7 @@ mod tests {
         let mut controls = build_session_controls(
             transport,
             mixer,
+            None,
             recovery,
             Some(compiled_channel_mute_mapping_with(
                 TriggerBehavior::Momentary,

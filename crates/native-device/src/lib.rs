@@ -1148,6 +1148,17 @@ impl NativeFilterProcessor {
         self.enabled
     }
 
+    /// Changes bypass state without allocating.
+    ///
+    /// A state transition clears filter history so samples from an earlier
+    /// enabled period cannot reappear when the processor is enabled again.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            self.reset();
+        }
+    }
+
     pub fn reset(&mut self) {
         self.channels = [BiquadState::default(); 2];
     }
@@ -1289,6 +1300,17 @@ impl NativeCompressorProcessor {
         self.enabled
     }
 
+    /// Changes bypass state without allocating.
+    ///
+    /// A state transition clears detector history so an old gain reduction
+    /// cannot affect a later enabled period.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            self.reset();
+        }
+    }
+
     pub fn reset(&mut self) {
         self.gain_reduction_decibels = 0.0;
     }
@@ -1360,6 +1382,20 @@ enum NativeDeviceProcessor {
 }
 
 impl NativeDeviceProcessor {
+    const fn enabled(&self) -> bool {
+        match self {
+            Self::Filter(processor) => processor.enabled(),
+            Self::Compressor(processor) => processor.enabled(),
+        }
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        match self {
+            Self::Filter(processor) => processor.set_enabled(enabled),
+            Self::Compressor(processor) => processor.set_enabled(enabled),
+        }
+    }
+
     fn reset(&mut self) {
         match self {
             Self::Filter(processor) => processor.reset(),
@@ -1422,6 +1458,23 @@ impl NativeDeviceChainProcessor {
     #[must_use]
     pub fn device_count(&self) -> usize {
         self.devices.len()
+    }
+
+    /// Returns whether one prepared device is enabled.
+    #[must_use]
+    pub fn device_enabled(&self, index: usize) -> Option<bool> {
+        self.devices.get(index).map(NativeDeviceProcessor::enabled)
+    }
+
+    /// Changes one prepared device's bypass state without allocating.
+    ///
+    /// Returns `false` when `index` is outside this prepared chain.
+    pub fn set_device_enabled(&mut self, index: usize, enabled: bool) -> bool {
+        let Some(device) = self.devices.get_mut(index) else {
+            return false;
+        };
+        device.set_enabled(enabled);
+        true
     }
 
     pub fn reset(&mut self) {
@@ -2004,6 +2057,66 @@ mod tests {
             [1.0_f32, 2.0].map(f32::to_bits)
         );
         assert_eq!(short.map(f32::to_bits), [3.0_f32].map(f32::to_bits));
+    }
+
+    #[test]
+    fn prepared_chain_bypass_is_exact_and_resets_transient_processor_state() {
+        let filter = NativeDeviceInstance::try_new_filter(
+            DEVICE_ID.to_owned(),
+            true,
+            state(NativeFilterMode::LowPass),
+        )
+        .unwrap();
+        let compressor = NativeDeviceInstance::try_new_compressor(
+            "018f47a2-6b2d-7c11-8a44-001122334492".to_owned(),
+            true,
+            compressor_state(),
+        )
+        .unwrap();
+        let chain = DeviceChain::try_new(
+            CHAIN_ID.to_owned(),
+            PROJECT_ID.to_owned(),
+            TRACK_ID.to_owned(),
+            vec![filter, compressor],
+        )
+        .unwrap();
+        let mut processor = NativeDeviceChainProcessor::try_new(&chain, PROJECT_SAMPLE_RATE_HZ).unwrap();
+
+        assert_eq!(processor.device_enabled(0), Some(true));
+        assert_eq!(processor.device_enabled(1), Some(true));
+        assert_eq!(processor.device_enabled(2), None);
+        assert!(processor.set_device_enabled(0, false));
+        assert!(processor.set_device_enabled(1, false));
+        assert!(!processor.set_device_enabled(2, true));
+        assert_eq!(processor.device_enabled(0), Some(false));
+        assert_eq!(processor.device_enabled(1), Some(false));
+
+        let expected_left = [0.25_f32, -0.5, 0.75];
+        let expected_right = [-0.125_f32, 0.375, -0.625];
+        let mut left = expected_left;
+        let mut right = expected_right;
+        processor.process_in_place(&mut left, &mut right).unwrap();
+        assert_eq!(left.map(f32::to_bits), expected_left.map(f32::to_bits));
+        assert_eq!(right.map(f32::to_bits), expected_right.map(f32::to_bits));
+
+        assert!(processor.set_device_enabled(0, true));
+        assert!(processor.set_device_enabled(1, true));
+        let mut replay_left = [0.0_f32; 64];
+        replay_left[0] = 1.0;
+        let mut replay_right = replay_left;
+        processor
+            .process_in_place(&mut replay_left, &mut replay_right)
+            .unwrap();
+
+        let mut fresh = NativeDeviceChainProcessor::try_new(&chain, PROJECT_SAMPLE_RATE_HZ).unwrap();
+        let mut fresh_left = [0.0_f32; 64];
+        fresh_left[0] = 1.0;
+        let mut fresh_right = fresh_left;
+        fresh
+            .process_in_place(&mut fresh_left, &mut fresh_right)
+            .unwrap();
+        assert_eq!(replay_left.map(f32::to_bits), fresh_left.map(f32::to_bits));
+        assert_eq!(replay_right.map(f32::to_bits), fresh_right.map(f32::to_bits));
     }
 
     #[test]

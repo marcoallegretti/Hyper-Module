@@ -19,7 +19,7 @@ use hyper_audio_engine::{
 use hyper_media_cache::{PreparedPlayback, PreparedSceneAvailability, PreparedSchedule};
 use hyper_native_device::{
     DeviceChain, NativeDeviceChainProcessor, NativeDeviceCreationError,
-    NativeDeviceProcessError, PROJECT_SAMPLE_RATE_HZ,
+    NativeDeviceProcessError, MAX_DEVICES_PER_CHAIN, PROJECT_SAMPLE_RATE_HZ,
 };
 use hyper_playback_compiler::FrameTimelineError;
 use hyper_playback_compiler::scene::{SceneRuntimeCheckpoint, SceneRuntimeError};
@@ -52,17 +52,21 @@ pub use recovery::{
     PlaybackRecoverySnapshot, PlaybackRecoveryTransportState, playback_recovery_channel,
     playback_recovery_channel_with_initial_loop,
     playback_recovery_channel_with_initial_loop_and_metronome,
+    playback_recovery_channel_with_initial_loop_metronome_and_native_device_state,
 };
 
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;
 pub const MAX_MIXER_SENDS_PER_SLOT: usize = 2;
 pub const MAX_QUEUED_TRANSPORT_COMMANDS: usize = 64;
 pub const MAX_QUEUED_MIXER_PARAMETER_COMMANDS: usize = 64;
+pub const MAX_QUEUED_NATIVE_DEVICE_COMMANDS: usize = 64;
 pub const MAX_QUEUED_LOUDNESS_COMMANDS: usize = 32;
 pub const MAX_QUEUED_OUTPUT_METER_SNAPSHOTS: usize = 64;
 const MIXER_PARAMETER_LAYOUT_SIGNATURE_VERSION: &[u8] = b"hyper-mixer-parameter-layout-v1";
+const NATIVE_DEVICE_LAYOUT_SIGNATURE_VERSION: &[u8] = b"hyper-native-device-layout-v1";
 static NEXT_OUTPUT_METER_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MIXER_PARAMETER_LAYOUT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_NATIVE_DEVICE_LAYOUT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_output_meter_channel_id() -> u64 {
     NEXT_OUTPUT_METER_CHANNEL_ID
@@ -78,6 +82,14 @@ fn next_mixer_parameter_layout_id() -> u64 {
             current.checked_add(1)
         })
         .expect("mixer parameter layout identity space exhausted")
+}
+
+fn next_native_device_layout_id() -> u64 {
+    NEXT_NATIVE_DEVICE_LAYOUT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("native device layout identity space exhausted")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -465,6 +477,108 @@ pub struct MixerSendHandle {
     layout_id: u64,
     slot: usize,
     send: usize,
+}
+
+/// Opaque native-device target bound to one prepared playback runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeDeviceHandle {
+    layout_id: u64,
+    slot: usize,
+    device: usize,
+}
+
+impl NativeDeviceHandle {
+    #[must_use]
+    pub const fn slot(self) -> usize {
+        self.slot
+    }
+
+    #[must_use]
+    pub const fn device(self) -> usize {
+        self.device
+    }
+}
+
+/// One session-only native-device bypass command.
+///
+/// The target is resolved from a prepared device-chain layout and is accepted
+/// only at the next process-cycle boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeDeviceCommand {
+    SetEnabled {
+        device: NativeDeviceHandle,
+        enabled: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeDeviceResolveError {
+    DeviceNotFound,
+}
+
+impl fmt::Display for NativeDeviceResolveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("native device identity was not found")
+    }
+}
+
+impl Error for NativeDeviceResolveError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeDeviceTargetError {
+    ForeignDevice(NativeDeviceHandle),
+}
+
+impl fmt::Display for NativeDeviceTargetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("native device handle belongs to another runtime")
+    }
+}
+
+impl Error for NativeDeviceTargetError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeDeviceCommandSendError {
+    InvalidTarget {
+        command: NativeDeviceCommand,
+        source: NativeDeviceTargetError,
+    },
+    Full(NativeDeviceCommand),
+    Disconnected(NativeDeviceCommand),
+}
+
+impl NativeDeviceCommandSendError {
+    #[must_use]
+    pub const fn command(self) -> NativeDeviceCommand {
+        match self {
+            Self::InvalidTarget { command, .. }
+            | Self::Full(command)
+            | Self::Disconnected(command) => command,
+        }
+    }
+}
+
+impl fmt::Display for NativeDeviceCommandSendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTarget { source, .. } => {
+                write!(formatter, "invalid native device target: {source}")
+            }
+            Self::Full(_) => formatter.write_str("native device command queue is full"),
+            Self::Disconnected(_) => {
+                formatter.write_str("native device command receiver is disconnected")
+            }
+        }
+    }
+}
+
+impl Error for NativeDeviceCommandSendError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidTarget { source, .. } => Some(source),
+            Self::Full(_) | Self::Disconnected(_) => None,
+        }
+    }
 }
 
 /// One live mixer-state change resolved to the runtime's fixed slot layout.
@@ -1004,6 +1118,179 @@ impl MixerParameterLayout {
     }
 }
 
+#[derive(Debug)]
+struct NativeDeviceLayout {
+    id: u64,
+    signature: [u8; 32],
+    slots: Vec<NativeDeviceSlotLayout>,
+}
+
+#[derive(Debug)]
+struct NativeDeviceSlotLayout {
+    track_id: String,
+    devices: Vec<NativeDeviceLayoutEntry>,
+}
+
+#[derive(Debug)]
+struct NativeDeviceLayoutEntry {
+    id: String,
+    handle: NativeDeviceHandle,
+}
+
+impl NativeDeviceLayout {
+    fn resolve_device(
+        &self,
+        track_id: &str,
+        device_id: &str,
+    ) -> Result<NativeDeviceHandle, NativeDeviceResolveError> {
+        self.slots
+            .iter()
+            .find(|slot| slot.track_id == track_id)
+            .and_then(|slot| slot.devices.iter().find(|device| device.id == device_id))
+            .map(|device| device.handle)
+            .ok_or(NativeDeviceResolveError::DeviceNotFound)
+    }
+
+    fn validate(&self, command: NativeDeviceCommand) -> Result<(), NativeDeviceTargetError> {
+        let NativeDeviceCommand::SetEnabled { device, .. } = command;
+        self.slots
+            .get(device.slot)
+            .and_then(|slot| slot.devices.get(device.device))
+            .filter(|resolved| self.id == device.layout_id && resolved.handle == device)
+            .map(|_| ())
+            .ok_or(NativeDeviceTargetError::ForeignDevice(device))
+    }
+}
+
+/// Exact session-only bypass state bound to one prepared native-device layout.
+///
+/// The snapshot is private to the playback runtime's construction and recovery
+/// path, preventing callers from forging state for another prepared graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeDeviceStateSnapshot {
+    layout_signature: [u8; 32],
+    enabled: [[bool; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS],
+    device_counts: [usize; MAX_MAIN_MIXER_SLOTS],
+}
+
+impl NativeDeviceStateSnapshot {
+    #[must_use]
+    pub(crate) fn from_recovery_parts(
+        layout_signature: [u8; 32],
+        enabled: [[bool; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS],
+        device_counts: [usize; MAX_MAIN_MIXER_SLOTS],
+    ) -> Option<Self> {
+        if device_counts
+            .iter()
+            .all(|count| *count <= MAX_DEVICES_PER_CHAIN)
+        {
+            Some(Self {
+                layout_signature,
+                enabled,
+                device_counts,
+            })
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn layout_signature(&self) -> [u8; 32] {
+        self.layout_signature
+    }
+
+    #[must_use]
+    pub const fn device_count(&self, slot: usize) -> Option<usize> {
+        if slot < MAX_MAIN_MIXER_SLOTS {
+            Some(self.device_counts[slot])
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn enabled(&self, slot: usize, device: usize) -> Option<bool> {
+        if slot < MAX_MAIN_MIXER_SLOTS && device < self.device_counts[slot] {
+            Some(self.enabled[slot][device])
+        } else {
+            None
+        }
+    }
+}
+
+/// Application-thread half of the bounded native-device command queue.
+#[derive(Debug)]
+pub struct NativeDeviceCommandSender {
+    producer: Producer<NativeDeviceCommand>,
+    layout: NativeDeviceLayout,
+}
+
+impl NativeDeviceCommandSender {
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        MAX_QUEUED_NATIVE_DEVICE_COMMANDS
+    }
+
+    #[must_use]
+    pub fn is_disconnected(&self) -> bool {
+        let disconnected = self.producer.is_abandoned();
+        if disconnected {
+            fence(Ordering::Acquire);
+        }
+        disconnected
+    }
+
+    /// Resolves a persisted device identity within its persisted owning track.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeDeviceResolveError::DeviceNotFound`] when the prepared
+    /// graph has no matching owned device instance.
+    pub fn resolve_device(
+        &self,
+        track_id: &str,
+        device_id: &str,
+    ) -> Result<NativeDeviceHandle, NativeDeviceResolveError> {
+        self.layout.resolve_device(track_id, device_id)
+    }
+
+    /// Validates a command against this sender's immutable prepared layout.
+    ///
+    /// This does not enqueue it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeDeviceTargetError::ForeignDevice`] when the command was
+    /// resolved by another prepared runtime.
+    pub fn validate_command(
+        &self,
+        command: NativeDeviceCommand,
+    ) -> Result<(), NativeDeviceTargetError> {
+        self.layout.validate(command)
+    }
+
+    /// Attempts to enqueue one bypass command without waiting or allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original command when its target is foreign, the bounded
+    /// queue is full, or the playback runtime has been destroyed.
+    pub fn try_send(
+        &mut self,
+        command: NativeDeviceCommand,
+    ) -> Result<(), NativeDeviceCommandSendError> {
+        self.validate_command(command)
+            .map_err(|source| NativeDeviceCommandSendError::InvalidTarget { command, source })?;
+        if self.producer.is_abandoned() {
+            fence(Ordering::Acquire);
+            return Err(NativeDeviceCommandSendError::Disconnected(command));
+        }
+        self.producer.push(command).map_err(|error| match error {
+            PushError::Full(command) => NativeDeviceCommandSendError::Full(command),
+        })
+    }
+}
+
 /// Application-thread half of the bounded live mixer-control queue.
 #[derive(Debug)]
 pub struct MixerParameterCommandSender {
@@ -1420,6 +1707,8 @@ pub struct TransportCycle {
     command_sender_disconnected: bool,
     applied_mixer_parameter_command_count: usize,
     mixer_parameter_command_sender_disconnected: bool,
+    applied_native_device_command_count: usize,
+    native_device_command_sender_disconnected: bool,
 }
 
 impl TransportCycle {
@@ -1506,6 +1795,17 @@ impl TransportCycle {
     #[must_use]
     pub const fn mixer_parameter_command_sender_disconnected(self) -> bool {
         self.mixer_parameter_command_sender_disconnected
+    }
+
+    /// Session-only native-device commands applied at this cycle boundary.
+    #[must_use]
+    pub const fn applied_native_device_command_count(self) -> usize {
+        self.applied_native_device_command_count
+    }
+
+    #[must_use]
+    pub const fn native_device_command_sender_disconnected(self) -> bool {
+        self.native_device_command_sender_disconnected
     }
 }
 
@@ -1859,6 +2159,7 @@ pub struct InterleavedTransportCycle {
     snapshot: OutputMeterSnapshot,
     publication: OutputMeterPublication,
     mixer_parameter_state: Option<MixerParameterStateSnapshot>,
+    native_device_state: Option<NativeDeviceStateSnapshot>,
 }
 
 impl InterleavedTransportCycle {
@@ -1877,6 +2178,14 @@ impl InterleavedTransportCycle {
     #[must_use]
     pub const fn mixer_parameter_state(&self) -> Option<&MixerParameterStateSnapshot> {
         self.mixer_parameter_state.as_ref()
+    }
+
+    /// Returns newly committed bypass state when this callback applied native
+    /// device commands. Callbacks without device changes omit the duplicate
+    /// snapshot.
+    #[must_use]
+    pub const fn native_device_state(&self) -> Option<&NativeDeviceStateSnapshot> {
+        self.native_device_state.as_ref()
     }
 }
 
@@ -2226,6 +2535,8 @@ pub struct RoutedMainRuntime<R> {
     automation: Option<CompiledAutomation>,
     parameter_layout: Option<MixerParameterLayout>,
     parameter_layout_signature: [u8; 32],
+    native_device_layout: Option<NativeDeviceLayout>,
+    native_device_layout_signature: [u8; 32],
     live_parameters_enabled: bool,
     max_block_frames: usize,
 }
@@ -2611,6 +2922,8 @@ fn build_routed_main_runtime<R>(
     let control_frame_count = max_block_frames;
     let parameter_layout = build_mixer_parameter_layout(compiled)?;
     let parameter_layout_signature = parameter_layout.signature;
+    let native_device_layout = build_native_device_layout(compiled, device_chains)?;
+    let native_device_layout_signature = native_device_layout.signature;
     let mut slots = Vec::new();
     slots
         .try_reserve_exact(slot_count)
@@ -2695,6 +3008,8 @@ fn build_routed_main_runtime<R>(
         automation,
         parameter_layout: Some(parameter_layout),
         parameter_layout_signature,
+        native_device_layout: Some(native_device_layout),
+        native_device_layout_signature,
         live_parameters_enabled: false,
         max_block_frames,
     })
@@ -2736,6 +3051,77 @@ fn build_mixer_parameter_layout(
         signature,
         channels,
     })
+}
+
+fn build_native_device_layout(
+    compiled: &CompiledMixerGraph,
+    device_chains: &[DeviceChain],
+) -> Result<NativeDeviceLayout, RuntimeCreationError> {
+    let layout_id = next_native_device_layout_id();
+    let signature = native_device_layout_signature(compiled, device_chains);
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(compiled.slots().len())
+        .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
+    for (slot, compiled_slot) in compiled.slots().iter().enumerate() {
+        let chain = device_chains
+            .iter()
+            .find(|chain| chain.track_id() == compiled_slot.track_id());
+        let devices = if let Some(chain) = chain {
+            let mut devices = Vec::new();
+            devices
+                .try_reserve_exact(chain.devices().len())
+                .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
+            for (device, instance) in chain.devices().iter().enumerate() {
+                devices.push(NativeDeviceLayoutEntry {
+                    id: try_runtime_identity(instance.id())?,
+                    handle: NativeDeviceHandle {
+                        layout_id,
+                        slot,
+                        device,
+                    },
+                });
+            }
+            devices
+        } else {
+            Vec::new()
+        };
+        slots.push(NativeDeviceSlotLayout {
+            track_id: try_runtime_identity(compiled_slot.track_id())?,
+            devices,
+        });
+    }
+    Ok(NativeDeviceLayout {
+        id: layout_id,
+        signature,
+        slots,
+    })
+}
+
+fn native_device_layout_signature(
+    compiled: &CompiledMixerGraph,
+    device_chains: &[DeviceChain],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hash_identity(&mut hasher, NATIVE_DEVICE_LAYOUT_SIGNATURE_VERSION);
+    hash_identity(&mut hasher, compiled.project_id().as_bytes());
+    hasher.update((compiled.slots().len() as u64).to_le_bytes());
+    for slot in compiled.slots() {
+        hash_identity(&mut hasher, slot.track_id().as_bytes());
+        let chain = device_chains
+            .iter()
+            .find(|chain| chain.track_id() == slot.track_id());
+        hasher.update([u8::from(chain.is_some())]);
+        if let Some(chain) = chain {
+            hash_identity(&mut hasher, chain.id().as_bytes());
+            hasher.update((chain.devices().len() as u64).to_le_bytes());
+            for device in chain.devices() {
+                hash_identity(&mut hasher, device.id().as_bytes());
+                hash_identity(&mut hasher, device.device_id().as_bytes());
+            }
+        }
+    }
+    hasher.finalize().into()
 }
 
 fn mixer_parameter_layout_signature(compiled: &CompiledMixerGraph) -> [u8; 32] {
@@ -2843,6 +3229,12 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
             .expect("a routed runtime owns its parameter identity layout")
     }
 
+    fn take_native_device_layout(&mut self) -> NativeDeviceLayout {
+        self.native_device_layout
+            .take()
+            .expect("a routed runtime owns its native device identity layout")
+    }
+
     const fn controls_enabled(&self) -> bool {
         self.live_parameters_enabled || self.automation.is_some()
     }
@@ -2877,6 +3269,79 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
             MixerParameterCommand::MainGain { gain } => self.main_gain = gain,
             MixerParameterCommand::MainMute { muted } => self.main_muted = muted,
             MixerParameterCommand::Fence(_) => {}
+        }
+    }
+
+    fn apply_native_device_command(&mut self, command: NativeDeviceCommand) {
+        let NativeDeviceCommand::SetEnabled { device, enabled } = command;
+        let processor = self.slots[device.slot]
+            .device
+            .as_mut()
+            .expect("a validated native device command targets a prepared chain");
+        assert!(
+            processor.processor.set_device_enabled(device.device, enabled),
+            "a validated native device command targets a prepared device"
+        );
+    }
+
+    fn capture_native_device_state(&self) -> NativeDeviceStateSnapshot {
+        let mut enabled = [[false; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS];
+        let mut device_counts = [0; MAX_MAIN_MIXER_SLOTS];
+        for (slot_index, slot) in self.slots.iter().enumerate() {
+            let Some(device) = &slot.device else {
+                continue;
+            };
+            device_counts[slot_index] = device.processor.device_count();
+            for (device_index, state) in enabled[slot_index]
+                .iter_mut()
+                .take(device_counts[slot_index])
+                .enumerate()
+            {
+                *state = device
+                    .processor
+                    .device_enabled(device_index)
+                    .expect("a native device count is derived from its processor");
+            }
+        }
+        NativeDeviceStateSnapshot::from_recovery_parts(
+            self.native_device_layout_signature,
+            enabled,
+            device_counts,
+        )
+        .expect("prepared native device chains stay within their declared bounds")
+    }
+
+    fn restore_native_device_state(
+        &mut self,
+        state: &NativeDeviceStateSnapshot,
+    ) -> Result<(), MixerParameterStateRestoreError> {
+        let current = self.capture_native_device_state();
+        if state.layout_signature != self.native_device_layout_signature
+            || state.device_counts != current.device_counts
+        {
+            return Err(MixerParameterStateRestoreError::LayoutMismatch);
+        }
+        self.restore_native_device_state_unchecked(state);
+        Ok(())
+    }
+
+    fn restore_native_device_state_unchecked(&mut self, state: &NativeDeviceStateSnapshot) {
+        for (slot_index, count) in state.device_counts.iter().copied().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let processor = self.slots[slot_index]
+                .device
+                .as_mut()
+                .expect("a matching native device count has a prepared chain");
+            for device_index in 0..count {
+                debug_assert!(
+                    processor
+                        .processor
+                        .set_device_enabled(device_index, state.enabled[slot_index][device_index]),
+                    "a matching native device state addresses a prepared device"
+                );
+            }
         }
     }
 
@@ -3424,6 +3889,7 @@ pub struct RoutedTransportRuntime<R> {
     metronome: Option<Metronome>,
     command_consumer: Option<Consumer<TransportCommand>>,
     mixer_parameter_command_consumer: Option<Consumer<MixerParameterCommand>>,
+    native_device_command_consumer: Option<Consumer<NativeDeviceCommand>>,
     mixer_parameter_fence: Option<Arc<AtomicU64>>,
 }
 
@@ -3457,6 +3923,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             metronome: None,
             command_consumer: None,
             mixer_parameter_command_consumer: None,
+            native_device_command_consumer: None,
             mixer_parameter_fence: None,
         }
     }
@@ -3489,6 +3956,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 metronome: None,
                 command_consumer: Some(consumer),
                 mixer_parameter_command_consumer: None,
+                native_device_command_consumer: None,
                 mixer_parameter_fence: None,
             },
         )
@@ -3552,6 +4020,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 metronome: None,
                 command_consumer: Some(transport_consumer),
                 mixer_parameter_command_consumer: Some(parameter_consumer),
+                native_device_command_consumer: None,
                 mixer_parameter_fence: Some(committed_fence),
             },
         )
@@ -3569,6 +4038,54 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         commands.metronome_available = true;
         transport.metronome = Some(Metronome::new(plan));
         (commands, mixer_commands, transport)
+    }
+
+    /// Creates one transport with bounded transport, mixer, and native-device
+    /// queues. Native-device targets are resolved against the same immutable
+    /// graph that owns callback processing.
+    #[must_use]
+    pub fn with_command_queues_and_native_device_commands(
+        mut runtime: RoutedMainRuntime<R>,
+    ) -> (
+        TransportCommandSender,
+        MixerParameterCommandSender,
+        NativeDeviceCommandSender,
+        Self,
+    ) {
+        let layout = runtime.take_native_device_layout();
+        let (transport_commands, mixer_commands, mut transport) = Self::with_command_queues(runtime);
+        let (producer, consumer) = RingBuffer::new(MAX_QUEUED_NATIVE_DEVICE_COMMANDS);
+        transport.native_device_command_consumer = Some(consumer);
+        (
+            transport_commands,
+            mixer_commands,
+            NativeDeviceCommandSender { producer, layout },
+            transport,
+        )
+    }
+
+    /// Creates one transport with all live command queues and a prepared
+    /// session metronome.
+    #[must_use]
+    pub fn with_command_queues_native_device_commands_and_metronome(
+        runtime: RoutedMainRuntime<R>,
+        plan: MetronomePlan,
+    ) -> (
+        TransportCommandSender,
+        MixerParameterCommandSender,
+        NativeDeviceCommandSender,
+        Self,
+    ) {
+        let (mut transport_commands, mixer_commands, native_device_commands, mut transport) =
+            Self::with_command_queues_and_native_device_commands(runtime);
+        transport_commands.metronome_available = true;
+        transport.metronome = Some(Metronome::new(plan));
+        (
+            transport_commands,
+            mixer_commands,
+            native_device_commands,
+            transport,
+        )
     }
 
     #[must_use]
@@ -3636,6 +4153,25 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     #[must_use]
     pub fn mixer_parameter_state(&self) -> MixerParameterStateSnapshot {
         self.runtime.capture_parameter_state()
+    }
+
+    /// Restores one session-only native-device bypass snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MixerParameterStateRestoreError::LayoutMismatch`] before any
+    /// state changes when the snapshot belongs to another prepared layout.
+    pub fn restore_native_device_state(
+        &mut self,
+        snapshot: &NativeDeviceStateSnapshot,
+    ) -> Result<(), MixerParameterStateRestoreError> {
+        self.runtime.restore_native_device_state(snapshot)
+    }
+
+    /// Captures current session-only native-device bypass state.
+    #[must_use]
+    pub fn native_device_state(&self) -> NativeDeviceStateSnapshot {
+        self.runtime.capture_native_device_state()
     }
 
     /// Applies one transport command for the next process cycle.
@@ -3776,7 +4312,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     /// Output shape and block capacity are validated before queued commands are
     /// consumed. A valid cycle applies bounded FIFO batches provisionally
     /// before it captures the cycle's state and start frame. If later work
-    /// fails, transport state, renderer position, and mixer base parameters
+    /// fails, transport state, renderer position, mixer base parameters, and
+    /// native-device bypass state
     /// return to their preceding committed values; consumed commands are not
     /// replayed. Arbitrary mixer processor state is not transactional, so
     /// callers must not continue processing after a mixer failure.
@@ -3789,8 +4326,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     ///
     /// Returns [`RuntimeProcessError`] for output shape, block capacity, frame
     /// range, rendering, automation, or mixer failures. A failed cycle never
-    /// commits queued transport or mixer base state and never advances the
-    /// transport position.
+    /// commits queued transport, mixer base state, or native-device bypass
+    /// state and never advances the transport position.
     #[allow(
         clippy::too_many_lines,
         reason = "the transactional transport rollback remains auditable when its state fences are co-located"
@@ -3819,6 +4356,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         let committed_loop_enabled = self.loop_enabled;
         let committed_metronome = self.metronome.as_ref().map(Metronome::checkpoint);
         let committed_parameters = self.runtime.capture_parameter_state();
+        let committed_native_devices = self.runtime.capture_native_device_state();
         let committed_renderer = self.runtime.renderer_checkpoint();
         let applied_command_count = match self.drain_commands() {
             Ok(count) => count,
@@ -3835,6 +4373,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 self.runtime.restore_renderer(committed_renderer);
                 self.runtime
                     .restore_parameter_state_unchecked(&committed_parameters);
+                self.runtime
+                    .restore_native_device_state_unchecked(&committed_native_devices);
                 return Err(match source {
                     TransportCommandApplyError::Scene(source) => RuntimeProcessError::Scene(source),
                     source @ TransportCommandApplyError::MetronomeUnavailable { .. } => {
@@ -3848,6 +4388,9 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         let applied_mixer_parameter_command_count = mixer_parameter_drain.applied_command_count;
         let mixer_parameter_command_sender_disconnected =
             self.mixer_parameter_command_sender_disconnected();
+        let applied_native_device_command_count = self.drain_native_device_commands();
+        let native_device_command_sender_disconnected =
+            self.native_device_command_sender_disconnected();
         let start_frame = self.position_frame;
         if self.state == TransportState::Stopped {
             output.left.fill(0.0);
@@ -3869,6 +4412,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 command_sender_disconnected,
                 applied_mixer_parameter_command_count,
                 mixer_parameter_command_sender_disconnected,
+                applied_native_device_command_count,
+                native_device_command_sender_disconnected,
             });
         }
         let rendered = self.render_cycle(start_frame, frame_count, scratch, output);
@@ -3887,6 +4432,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 self.runtime.restore_renderer(committed_renderer);
                 self.runtime
                     .restore_parameter_state_unchecked(&committed_parameters);
+                self.runtime
+                    .restore_native_device_state_unchecked(&committed_native_devices);
                 return Err(source);
             }
         };
@@ -3908,6 +4455,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             command_sender_disconnected,
             applied_mixer_parameter_command_count,
             mixer_parameter_command_sender_disconnected,
+            applied_native_device_command_count,
+            native_device_command_sender_disconnected,
         })
     }
 
@@ -3998,6 +4547,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         let (cycle, meter) = processed.into_parts();
         let mixer_parameter_state = (cycle.applied_mixer_parameter_command_count() > 0)
             .then(|| self.runtime.capture_parameter_state());
+        let native_device_state = (cycle.applied_native_device_command_count() > 0)
+            .then(|| self.runtime.capture_native_device_state());
         let snapshot = OutputMeterSnapshot {
             cycle,
             meter,
@@ -4019,6 +4570,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             snapshot,
             publication,
             mixer_parameter_state,
+            native_device_state,
         })
     }
 
@@ -4079,6 +4631,33 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     fn mixer_parameter_command_sender_disconnected(&self) -> bool {
         let disconnected = self
             .mixer_parameter_command_consumer
+            .as_ref()
+            .is_some_and(Consumer::is_abandoned);
+        if disconnected {
+            fence(Ordering::Acquire);
+        }
+        disconnected
+    }
+
+    fn drain_native_device_commands(&mut self) -> usize {
+        let mut applied = 0;
+        for _ in 0..MAX_QUEUED_NATIVE_DEVICE_COMMANDS {
+            let command = self
+                .native_device_command_consumer
+                .as_mut()
+                .and_then(|consumer| consumer.pop().ok());
+            let Some(command) = command else {
+                break;
+            };
+            self.runtime.apply_native_device_command(command);
+            applied += 1;
+        }
+        applied
+    }
+
+    fn native_device_command_sender_disconnected(&self) -> bool {
+        let disconnected = self
+            .native_device_command_consumer
             .as_ref()
             .is_some_and(Consumer::is_abandoned);
         if disconnected {

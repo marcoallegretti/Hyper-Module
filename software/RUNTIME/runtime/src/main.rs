@@ -19,15 +19,16 @@ use hyper_control_runtime::{
     PanelDisplay, PanelReleaseFailure,
 };
 use hyper_desktop_audio::{
-    DesktopControlSinkError, DesktopMixerSendTap, DesktopOutputConfig, DesktopPlaybackSession,
-    DesktopSceneAvailability, OutputStreamCounters, OutputStreamSnapshot, OutputStreamState,
-    OutputStreamStatus,
+    DesktopControlSinkError, DesktopMixerSendTap, DesktopNativeDevice, DesktopOutputConfig,
+    DesktopPlaybackSession, DesktopSceneAvailability, OutputStreamCounters, OutputStreamSnapshot,
+    OutputStreamState, OutputStreamStatus,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
     ChannelSamplePeakBallistics, EbuLoudnessPresentationConfig, LocateState,
     LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay, MixerChannelHandle,
     MixerParameterCommand, MixerParameterStateSnapshot, MixerSendHandle, OutputMeterReceiver,
+    NativeDeviceCommand, NativeDeviceHandle, NativeDeviceStateSnapshot,
     PlaybackCycleObservation, PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
     PlaybackRecoveryTransportState, SamplePeakBallisticsConfig, ScaledLoudnessValue,
     StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot, TransportCommand,
@@ -204,6 +205,7 @@ struct OperatorReady {
     scenes: Vec<OperatorScene>,
     mixer_channels: Vec<OperatorMixerChannel>,
     mixer_sends: Vec<OperatorMixerSend>,
+    native_devices: Vec<OperatorNativeDevice>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -229,6 +231,13 @@ struct OperatorMixerSend {
     target_name: String,
     tap: DesktopMixerSendTap,
     handle: MixerSendHandle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperatorNativeDevice {
+    track_name: String,
+    kind: String,
+    handle: NativeDeviceHandle,
 }
 
 struct OperatorWorker {
@@ -354,6 +363,10 @@ enum OperatorCommand {
         send: MixerSendHandle,
         enabled: bool,
     },
+    SetNativeDeviceEnabled {
+        device: NativeDeviceHandle,
+        enabled: bool,
+    },
     SetMainMute {
         muted: bool,
     },
@@ -411,12 +424,19 @@ struct OperatorMixerSendAuthority {
     enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OperatorNativeDeviceAuthority {
+    handle: NativeDeviceHandle,
+    enabled: bool,
+}
+
 const OPERATOR_COMMAND_CAPACITY: usize = 8;
 
 trait RuntimeOperatorControl {
     fn queue_transport(&mut self, command: TransportCommand) -> Result<(), String>;
     fn queue_loudness(&mut self, command: LoudnessMeasurementCommand) -> Result<(), String>;
     fn queue_mixer(&mut self, command: MixerParameterCommand) -> Result<(), String>;
+    fn queue_native_device(&mut self, command: NativeDeviceCommand) -> Result<(), String>;
 }
 
 trait RuntimeOutputObservation {
@@ -446,6 +466,12 @@ impl RuntimeOperatorControl for SessionHost {
     fn queue_mixer(&mut self, command: MixerParameterCommand) -> Result<(), String> {
         self.session
             .try_send_mixer_parameter_command(command)
+            .map_err(|error| error.to_string())
+    }
+
+    fn queue_native_device(&mut self, command: NativeDeviceCommand) -> Result<(), String> {
+        self.session
+            .try_send_native_device_command(command)
             .map_err(|error| error.to_string())
     }
 }
@@ -785,6 +811,16 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
             | OperatorCommand::SetMainMute { .. }) => {
                 drain_operator_mixer_boolean_command(host, command, diagnostic);
             }
+            OperatorCommand::SetNativeDeviceEnabled { device, enabled } => {
+                match host.queue_native_device(NativeDeviceCommand::SetEnabled { device, enabled }) {
+                    Ok(()) => diagnostic(if enabled {
+                        "native device enable queued".to_owned()
+                    } else {
+                        "native device bypass queued".to_owned()
+                    }),
+                    Err(error) => diagnostic(format!("native device bypass refused: {error}")),
+                }
+            }
             OperatorCommand::Quit => stop.store(true, Ordering::Release),
         }
     }
@@ -1010,6 +1046,36 @@ fn operator_mixer_send_catalog(
     )
 }
 
+fn operator_native_device_catalog(
+    session: &DesktopPlaybackSession,
+) -> Result<Vec<OperatorNativeDevice>, String> {
+    let count = session.native_device_count();
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(count)
+        .map_err(|_| "operator native device catalog capacity is unavailable".to_owned())?;
+    for index in 0..count {
+        let device = session
+            .native_device(index)
+            .map_err(|error| format!("prepared native device {index} cannot be controlled: {error}"))?
+            .ok_or_else(|| format!("prepared native device {index} has no retained facts"))?;
+        devices.push(operator_native_device(device));
+    }
+    Ok(devices)
+}
+
+fn operator_native_device(device: DesktopNativeDevice<'_>) -> OperatorNativeDevice {
+    OperatorNativeDevice {
+        track_name: device.track_name().to_owned(),
+        kind: match device.kind_id() {
+            "org.hyper-module.native-filter" => "Filter".to_owned(),
+            "org.hyper-module.native-compressor" => "Compressor".to_owned(),
+            _ => device.kind_id().to_owned(),
+        },
+        handle: device.handle(),
+    }
+}
+
 fn build_operator_mixer_send_catalog(
     channels: &[OperatorMixerChannel],
     mut send_count: impl FnMut(usize) -> Option<usize>,
@@ -1103,7 +1169,7 @@ fn spawn_operator_worker(
                     operator_scene_catalog(&runtime.host.session).and_then(|scenes| {
                         operator_mixer_catalog(&runtime.host.session).and_then(|mixer_channels| {
                             operator_mixer_send_catalog(&runtime.host.session, &mixer_channels)
-                                .and_then(|mixer_sends| {
+                                .and_then(|mixer_sends| operator_native_device_catalog(&runtime.host.session).and_then(|native_devices| {
                                     runtime
                                         .host
                                         .take_meter_receiver()
@@ -1113,12 +1179,13 @@ fn spawn_operator_worker(
                                             scenes,
                                             mixer_channels,
                                             mixer_sends,
+                                            native_devices,
                                         })
                                         .ok_or_else(|| {
                                             "operator output meter authority was already transferred"
                                                 .to_owned()
                                         })
-                                })
+                                }))
                         })
                     });
                 match ready_model {
@@ -1200,6 +1267,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         scenes,
         mixer_channels,
         mixer_sends,
+        native_devices,
     } = ready;
     let meter_observer = Rc::new(RefCell::new(OperatorMeterObserver::new(
         meters,
@@ -1208,6 +1276,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let scene_model = Rc::new(VecModel::from(operator_scene_rows(&scenes)));
     let mixer_model = Rc::new(VecModel::from(operator_mixer_rows(&mixer_channels)));
     let mixer_send_model = Rc::new(VecModel::from(operator_mixer_send_rows(&mixer_sends)));
+    let native_device_model = Rc::new(VecModel::from(operator_native_device_rows(&native_devices)));
     let transport_authority = Rc::new(Cell::new(None));
     let loop_authority = Rc::new(Cell::new(None));
     let metronome_authority = Rc::new(Cell::new(None));
@@ -1217,9 +1286,11 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let scene_stop_authority = Rc::new(Cell::new(false));
     let loudness_authority = Rc::new(Cell::new(None));
     let mixer_authority = Rc::new(RefCell::new(None));
+    let native_device_authority = Rc::new(RefCell::new(None));
     ui.set_scenes(ModelRc::from(Rc::clone(&scene_model)));
     ui.set_mixer_channels(ModelRc::from(Rc::clone(&mixer_model)));
     ui.set_mixer_sends(ModelRc::from(Rc::clone(&mixer_send_model)));
+    ui.set_native_devices(ModelRc::from(Rc::clone(&native_device_model)));
 
     apply_static_facts(&ui, &observers.facts);
     wire_operator_transport_controls(&ui, &commands_tx, &diagnostic, &transport_authority);
@@ -1228,6 +1299,12 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_peak_reset(&ui, &meter_observer, &loudness_authority);
     wire_operator_loudness_controls(&ui, &commands_tx, &diagnostic, &loudness_authority);
     wire_operator_mixer_controls(&ui, &commands_tx, &diagnostic, &mixer_authority);
+    wire_operator_native_device_controls(
+        &ui,
+        &commands_tx,
+        &diagnostic,
+        &native_device_authority,
+    );
     wire_operator_scene_launch(
         &ui,
         &commands_tx,
@@ -1272,6 +1349,14 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &observers.recovery.snapshot(),
         false,
     );
+    apply_operator_native_device_observation(
+        &ui,
+        &native_device_model,
+        &native_devices,
+        &native_device_authority,
+        &observers.recovery.snapshot(),
+        false,
+    );
 
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
@@ -1288,6 +1373,9 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_mixer_model = Rc::clone(&mixer_model);
     let timer_mixer_send_model = Rc::clone(&mixer_send_model);
     let timer_mixer_authority = Rc::clone(&mixer_authority);
+    let timer_native_device_model = Rc::clone(&native_device_model);
+    let timer_native_device_authority = Rc::clone(&native_device_authority);
+    let timer_native_devices = native_devices;
     let timer_mixer_channels = mixer_channels;
     let timer_mixer_sends = mixer_sends;
     let timer_diagnostic = Arc::clone(&diagnostic);
@@ -1325,6 +1413,14 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &timer_mixer_channels,
                 &timer_mixer_sends,
                 &timer_mixer_authority,
+                &timer_observers.recovery.snapshot(),
+                terminal_latched,
+            );
+            apply_operator_native_device_observation(
+                &ui,
+                &timer_native_device_model,
+                &timer_native_devices,
+                &timer_native_device_authority,
                 &timer_observers.recovery.snapshot(),
                 terminal_latched,
             );
@@ -1898,6 +1994,43 @@ fn wire_operator_mixer_controls(
     wire_operator_mixer_channel_boolean_controls(ui, sender, diagnostic, authority);
     wire_operator_mixer_send_controls(ui, sender, diagnostic, authority);
     wire_operator_main_mixer_controls(ui, sender, diagnostic, authority);
+}
+
+fn wire_operator_native_device_controls(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    authority: &Rc<RefCell<Option<Vec<OperatorNativeDeviceAuthority>>>>,
+) {
+    let sender = sender.clone();
+    let diagnostic = Arc::clone(diagnostic);
+    let authority = Rc::clone(authority);
+    ui.on_toggle_native_device_requested(move |row| {
+        let Ok(row) = usize::try_from(row) else {
+            set_diagnostic(&diagnostic, "native device bypass refused: invalid row".to_owned());
+            return;
+        };
+        let Some(current) = authority
+            .borrow()
+            .as_ref()
+            .and_then(|devices| devices.get(row))
+            .copied()
+        else {
+            set_diagnostic(
+                &diagnostic,
+                "native device bypass refused: accepted state is unavailable".to_owned(),
+            );
+            return;
+        };
+        send_operator_command(
+            &sender,
+            OperatorCommand::SetNativeDeviceEnabled {
+                device: current.handle,
+                enabled: !current.enabled,
+            },
+            &diagnostic,
+        );
+    });
 }
 
 fn wire_operator_mixer_send_controls(
@@ -2510,6 +2643,91 @@ fn operator_mixer_send_rows(sends: &[OperatorMixerSend]) -> Vec<OperatorMixerSen
             controls_enabled: false,
         })
         .collect()
+}
+
+fn operator_native_device_rows(devices: &[OperatorNativeDevice]) -> Vec<OperatorNativeDeviceRow> {
+    devices
+        .iter()
+        .map(|device| OperatorNativeDeviceRow {
+            track_name: device.track_name.clone().into(),
+            kind: device.kind.clone().into(),
+            enabled: false,
+            controls_enabled: false,
+        })
+        .collect()
+}
+
+fn native_device_authority(
+    devices: &[OperatorNativeDevice],
+    state: &NativeDeviceStateSnapshot,
+) -> Option<Vec<OperatorNativeDeviceAuthority>> {
+    let mut authority = Vec::new();
+    authority.try_reserve_exact(devices.len()).ok()?;
+    for device in devices {
+        let enabled = state.enabled(device.handle.slot(), device.handle.device())?;
+        authority.push(OperatorNativeDeviceAuthority {
+            handle: device.handle,
+            enabled,
+        });
+    }
+    Some(authority)
+}
+
+fn apply_operator_native_device_observation(
+    ui: &OperatorWindow,
+    model: &VecModel<OperatorNativeDeviceRow>,
+    devices: &[OperatorNativeDevice],
+    authority: &RefCell<Option<Vec<OperatorNativeDeviceAuthority>>>,
+    snapshot: &PlaybackRecoverySnapshot,
+    terminal_latched: bool,
+) {
+    if terminal_latched {
+        revoke_operator_native_device_authority(ui, model, authority, true);
+        return;
+    }
+    let Some(state) = snapshot.native_device_state() else {
+        revoke_operator_native_device_authority(ui, model, authority, false);
+        return;
+    };
+    let Some(next) = native_device_authority(devices, &state) else {
+        revoke_operator_native_device_authority(ui, model, authority, false);
+        return;
+    };
+    if next.len() != model.row_count() {
+        revoke_operator_native_device_authority(ui, model, authority, false);
+        return;
+    }
+    for (row, device) in next.iter().enumerate() {
+        let Some(mut model_row) = model.row_data(row) else {
+            revoke_operator_native_device_authority(ui, model, authority, false);
+            return;
+        };
+        model_row.enabled = device.enabled;
+        model_row.controls_enabled = true;
+        model.set_row_data(row, model_row);
+    }
+    ui.set_native_device_state(format!("Committed cycle {}", snapshot.committed_cycle_count()).into());
+    *authority.borrow_mut() = Some(next);
+}
+
+fn revoke_operator_native_device_authority(
+    ui: &OperatorWindow,
+    model: &VecModel<OperatorNativeDeviceRow>,
+    authority: &RefCell<Option<Vec<OperatorNativeDeviceAuthority>>>,
+    terminal_latched: bool,
+) {
+    authority.borrow_mut().take();
+    for row in 0..model.row_count() {
+        if let Some(mut device) = model.row_data(row) {
+            device.controls_enabled = false;
+            model.set_row_data(row, device);
+        }
+    }
+    ui.set_native_device_state(if terminal_latched {
+        "Final committed devices · Runtime stopped".into()
+    } else {
+        "Native device state unavailable".into()
+    });
 }
 
 fn mixer_authority(
@@ -3874,6 +4092,7 @@ mod tests {
         commands: Vec<TransportCommand>,
         loudness_commands: Vec<LoudnessMeasurementCommand>,
         mixer_commands: Vec<MixerParameterCommand>,
+        native_device_commands: Vec<NativeDeviceCommand>,
         reject: bool,
         disconnects: usize,
     }
@@ -3902,6 +4121,15 @@ mod tests {
                 Err("owner busy".to_owned())
             } else {
                 self.mixer_commands.push(command);
+                Ok(())
+            }
+        }
+
+        fn queue_native_device(&mut self, command: NativeDeviceCommand) -> Result<(), String> {
+            if self.reject {
+                Err("owner busy".to_owned())
+            } else {
+                self.native_device_commands.push(command);
                 Ok(())
             }
         }
@@ -6592,6 +6820,7 @@ mod tests {
         let loop_authority = Rc::new(Cell::new(None));
         let metronome_authority = Rc::new(Cell::new(None));
         let seek_authority = Rc::new(Cell::new(None));
+        let native_device_authority = Rc::new(RefCell::new(None));
         wire_operator_loop_toggle(&ui, &sender, &diagnostic, &loop_authority);
         wire_operator_loop_range(&ui, &sender, &diagnostic, &loop_authority);
         wire_operator_metronome_toggle(&ui, &sender, &diagnostic, &metronome_authority);
@@ -7141,6 +7370,27 @@ mod tests {
         assert_eq!(
             ui.get_diagnostic().as_str(),
             "Runtime worker ended without publishing its result; adapter refused to hide"
+        );
+        let rows = Rc::new(VecModel::from(vec![OperatorNativeDeviceRow {
+            track_name: "Audio".into(),
+            kind: "Filter".into(),
+            enabled: true,
+            controls_enabled: false,
+        }]));
+        ui.set_native_devices(ModelRc::from(rows));
+        wire_operator_native_device_controls(
+            &ui,
+            &sender,
+            &diagnostic,
+            &native_device_authority,
+        );
+
+        ui.invoke_toggle_native_device_requested(0);
+
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "native device bypass refused: accepted state is unavailable"
         );
     }
 

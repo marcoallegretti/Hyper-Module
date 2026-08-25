@@ -12,8 +12,8 @@ use hyper_mixer_runtime::{
     LocateState, MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSendError,
     MixerParameterCommandSender, MixerParameterResolveError, MixerParameterStateSnapshot,
     MixerParameterTargetError, MixerSendHandle, PlaybackRecoveryCheckpoint,
-    PlaybackRecoveryTransportState, TransportCommand, TransportCommandSendError,
-    TransportCommandSender,
+    PlaybackRecoveryTransportState, NativeDeviceCommand, NativeDeviceCommandSendError,
+    NativeDeviceCommandSender, TransportCommand, TransportCommandSendError, TransportCommandSender,
 };
 
 pub type DesktopControlMappingRuntime = ControlRuntime<DesktopControlSink>;
@@ -82,12 +82,15 @@ fn value_from_state(
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DesktopDirectControlCommand {
     Mixer(MixerParameterCommand),
+    NativeDevice(NativeDeviceCommand),
     Transport(TransportCommand),
 }
 
 #[derive(Debug, PartialEq)]
 pub enum DesktopDirectControlError {
     Mixer(MixerParameterCommandSendError),
+    NativeDevice(NativeDeviceCommandSendError),
+    NativeDeviceUnavailable,
     Transport(TransportCommandSendError),
 }
 
@@ -95,6 +98,10 @@ impl fmt::Display for DesktopDirectControlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Mixer(source) => source.fmt(formatter),
+            Self::NativeDevice(source) => source.fmt(formatter),
+            Self::NativeDeviceUnavailable => {
+                formatter.write_str("native device control is unavailable for this session")
+            }
             Self::Transport(source) => source.fmt(formatter),
         }
     }
@@ -104,6 +111,8 @@ impl Error for DesktopDirectControlError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Mixer(source) => Some(source),
+            Self::NativeDevice(source) => Some(source),
+            Self::NativeDeviceUnavailable => None,
             Self::Transport(source) => Some(source),
         }
     }
@@ -149,6 +158,7 @@ impl Error for DesktopControlSinkError {
 pub struct DesktopControlSink {
     transport: TransportCommandSender,
     mixer: MixerParameterCommandSender,
+    native_devices: Option<NativeDeviceCommandSender>,
     recovery: PlaybackRecoveryCheckpoint,
 }
 
@@ -162,6 +172,22 @@ impl DesktopControlSink {
         Self {
             transport,
             mixer,
+            native_devices: None,
+            recovery,
+        }
+    }
+
+    #[must_use]
+    pub const fn new_with_native_devices(
+        transport: TransportCommandSender,
+        mixer: MixerParameterCommandSender,
+        native_devices: NativeDeviceCommandSender,
+        recovery: PlaybackRecoveryCheckpoint,
+    ) -> Self {
+        Self {
+            transport,
+            mixer,
+            native_devices: Some(native_devices),
             recovery,
         }
     }
@@ -196,6 +222,10 @@ impl DesktopControlSink {
 
     pub(crate) const fn mixer_sender(&self) -> &MixerParameterCommandSender {
         &self.mixer
+    }
+
+    pub(crate) fn native_device_sender(&self) -> Option<&NativeDeviceCommandSender> {
+        self.native_devices.as_ref()
     }
 
     pub(crate) fn try_send_mixer_fence(
@@ -571,6 +601,15 @@ impl RuntimeControlSink for DesktopControlSink {
                     .try_send(command)
                     .map_err(DesktopDirectControlError::Mixer)?;
                 Ok(update)
+            }
+            DesktopDirectControlCommand::NativeDevice(command) => {
+                let Some(native_devices) = &mut self.native_devices else {
+                    return Err(DesktopDirectControlError::NativeDeviceUnavailable);
+                };
+                native_devices
+                    .try_send(command)
+                    .map_err(DesktopDirectControlError::NativeDevice)?;
+                Ok(DirectControlStateUpdate::Unchanged)
             }
             DesktopDirectControlCommand::Transport(command) => {
                 self.transport

@@ -590,6 +590,15 @@ impl PreparedPlaybackSession {
         self.mixer.slots().len()
     }
 
+    /// Returns one compiled mixer channel's stable project track identity.
+    #[must_use]
+    pub fn mixer_channel_track_id_at(&self, channel_index: usize) -> Option<&str> {
+        self.mixer
+            .slots()
+            .get(channel_index)
+            .map(hyper_playback_json::CompiledGraphSlot::track_id)
+    }
+
     /// Returns one compiled mixer channel's retained project track name.
     #[must_use]
     pub fn mixer_channel_name_at(&self, channel_index: usize) -> Option<&str> {
