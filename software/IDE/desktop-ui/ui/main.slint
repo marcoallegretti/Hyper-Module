@@ -323,6 +323,7 @@ export global IdeActions {
     callback set-audio-clip-source-start(string, string);
     callback trim-audio-clip-source(string, string, string);
     callback inspect-audio-clip-waveform(string);
+    callback toggle-audio-clip-preview(string);
     callback loudness-run();
     callback loudness-standby();
     callback loudness-reset();
@@ -851,6 +852,7 @@ export component MainWindow inherits Window {
     in property <bool> preview-muted: false;
     in property <string> preview-state: "Idle";
     in property <string> preview-progress: "—";
+    in property <string> preview-clip-id: "";
     in property <string> transport-state: "Stopped";
     in property <bool> transport-start-available: false;
     in property <bool> transport-stop-available: false;
@@ -4480,7 +4482,7 @@ export component MainWindow inherits Window {
                                         Text { text: "FADES  " + clip.fade-label; color: #8290a2; font-size: 8px; horizontal-alignment: center; overflow: elide; }
                                     }
                                     VerticalLayout {
-                                        width: 292px;
+                                        width: 380px;
                                         spacing: 4px;
                                         HorizontalLayout {
                                             spacing: 4px;
@@ -4550,6 +4552,13 @@ export component MainWindow inherits Window {
                                                     root.clip-waveform-visible = true;
                                                     IdeActions.inspect-audio-clip-waveform(clip.id);
                                                 }
+                                            }
+                                            Button {
+                                                width: 92px;
+                                                text: root.preview-clip-id == clip.id ? "Stop" : "Preview";
+                                                accessible-label: (root.preview-clip-id == clip.id ? "Stop preview of " : "Preview ") + clip.name + " source view";
+                                                enabled: root.app-mode == AppMode.running || (root.app-mode == AppMode.previewing && root.preview-clip-id == clip.id);
+                                                clicked => { IdeActions.toggle-audio-clip-preview(clip.id); }
                                             }
                                         }
                                         HorizontalLayout {

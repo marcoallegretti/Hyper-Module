@@ -1643,6 +1643,39 @@ impl DesktopPlaybackSession {
             .request_start(recording_index, recording.frame_count())
     }
 
+    /// Starts dry audition of one reusable audio clip's current source view.
+    ///
+    /// Track processing, transport state, clip gain, fades, direction, and
+    /// looping deliberately remain outside this dedicated audition path.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-project sessions, unknown clips, an active audition, or an
+    /// unrepresentable catalog position without changing callback state.
+    pub fn try_start_audio_clip_preview(
+        &self,
+        clip_id: &str,
+    ) -> Result<(), super::DesktopAudioPreviewCommandError> {
+        let project = self
+            .prepared_project()
+            .ok_or(super::DesktopAudioPreviewCommandError::ProjectUnavailable)?;
+        let loaded = project.session().parts().0;
+        let clip_index = (0..loaded.clip_count())
+            .find(|&index| loaded.clip_id_at(index) == Some(clip_id))
+            .ok_or(super::DesktopAudioPreviewCommandError::ClipUnavailable)?;
+        let source_frame_count = loaded
+            .clip_source_frame_count_at(clip_index)
+            .ok_or(super::DesktopAudioPreviewCommandError::ClipUnavailable)?;
+        let target_index = project
+            .recording_metadata()
+            .len()
+            .checked_add(clip_index)
+            .ok_or(super::DesktopAudioPreviewCommandError::SequenceExhausted)?;
+        let total_frames = u64::try_from(source_frame_count)
+            .map_err(|_| super::DesktopAudioPreviewCommandError::SequenceExhausted)?;
+        self.preview.request_start(target_index, total_frames)
+    }
+
     /// Requests a five-millisecond ramp to silence for the active audition.
     ///
     /// # Errors
@@ -2333,7 +2366,7 @@ fn initialize_session(
         .transpose()
         .or_else(|source| fail_build(publication, source))?;
     let (preview_control, preview) =
-        prepare_audio_preview(media, recordings, sample_rate_hz, publication)?;
+        prepare_audio_preview(media, recordings, project, sample_rate_hz, publication)?;
     let (publisher, recovery) =
         playback_recovery_channel_with_initial_loop_metronome_and_native_device_state(
             initial_checkpoint,
@@ -2373,6 +2406,7 @@ fn initialize_session(
 fn prepare_audio_preview<'a>(
     media: &'a DecodedMediaCache,
     recordings: &[hyper_recording_metadata::RecordingMetadataDocument],
+    project: &LoadedPlaybackProject,
     sample_rate_hz: u32,
     publication: &SyncSender<SessionPublication>,
 ) -> Result<
@@ -2383,10 +2417,15 @@ fn prepare_audio_preview<'a>(
     NativeDesktopOutputStartError,
 > {
     let control = super::DesktopAudioPreviewControl::new();
-    let processor =
-        DesktopAudioPreviewProcessor::try_new(media, recordings, sample_rate_hz, control.clone())
-            .map_err(DesktopPlaybackSessionBuildError::AudioPreview)
-            .or_else(|source| fail_build(publication, source))?;
+    let processor = DesktopAudioPreviewProcessor::try_new(
+        media,
+        recordings,
+        project,
+        sample_rate_hz,
+        control.clone(),
+    )
+    .map_err(DesktopPlaybackSessionBuildError::AudioPreview)
+    .or_else(|source| fail_build(publication, source))?;
     Ok((control, processor))
 }
 
@@ -2590,9 +2629,9 @@ fn callback_error(detail: String) -> NativeDesktopOutputStartError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DesktopMonitoringConfigError;
     use crate::monitoring_session::realtime_allocator::HeapMeasurement;
     use crate::{BoundedBackendThread, acquire_backend_thread_permit};
+    use crate::{DesktopAudioPreviewControl, DesktopMonitoringConfigError};
     use hyper_audio_source::DecodeLimits;
     use hyper_audio_source::DecodedAudio;
     use hyper_control_mappings::{
@@ -2983,6 +3022,67 @@ mod tests {
             },
         })
         .unwrap()
+    }
+
+    #[test]
+    fn clip_audition_uses_the_current_source_view_not_the_full_asset() {
+        let clip = String::from_utf8(LIVE_CLIP.to_vec())
+            .unwrap()
+            .replace(
+                "\"start_frame\":0,\"frame_count\":100",
+                "\"start_frame\":600,\"frame_count\":500",
+            )
+            .replace("\"source_frame_offset\":100", "\"source_frame_offset\":500");
+        let session = assemble_playback_session(PlaybackSessionAssemblyInput {
+            documents: PlaybackDocumentBytes {
+                project_id: LIVE_PROJECT_ID.to_owned(),
+                sample_rate_hz: 48_000,
+                timeline: LIVE_TIMELINE.to_vec(),
+                tracks: vec![LIVE_TRACK.to_vec()],
+                clips: vec![clip.into_bytes()],
+                scenes: Vec::new(),
+                arrangement: None,
+                mixer: LIVE_MIXER.to_vec(),
+                automation_takes: Vec::new(),
+            },
+            decoded_assets: vec![DecodedPlaybackAsset::new(
+                LIVE_ASSET_ID.to_owned(),
+                DecodedAudio::from_mono(
+                    48_000,
+                    (0..1_200)
+                        .map(|frame| if frame < 600 { 0.0 } else { 1.0 })
+                        .collect(),
+                )
+                .unwrap(),
+            )],
+            limits: PlaybackSessionAssemblyLimits {
+                documents: LoaderLimits::VERSION_1,
+                media_cache: CacheLimits {
+                    max_assets: 1,
+                    max_frames_per_asset: 1_200,
+                    max_decoded_sample_bytes: 4_800,
+                },
+            },
+        })
+        .unwrap();
+        let (project, _, _, media) = session.parts();
+        let control = DesktopAudioPreviewControl::new();
+        let mut preview =
+            DesktopAudioPreviewProcessor::try_new(media, &[], project, 48_000, control.clone())
+                .unwrap();
+        control.request_start(0, 500).unwrap();
+        let mut left = [0.0_f32; 400];
+        let mut right = [0.0_f32; 400];
+
+        assert!(preview.process(&mut StereoOutput {
+            left: &mut left,
+            right: &mut right,
+        }));
+        assert!(
+            left[300] > 0.0,
+            "audition must begin at the clip source offset"
+        );
+        assert_eq!(left, right);
     }
 
     #[test]

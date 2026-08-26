@@ -14106,6 +14106,40 @@ impl RunningDesktopIdeApplication {
             ))
     }
 
+    #[allow(
+        clippy::infallible_destructuring_match,
+        reason = "the test-only session variant makes this match fallible in test builds"
+    )]
+    pub(crate) fn validate_audio_clip_preview(
+        &self,
+        clip_id: &str,
+    ) -> Result<(), IdeAudioPreviewError> {
+        let session = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => {
+                return Err(IdeAudioPreviewError::Unavailable);
+            }
+        };
+        if session.audio_preview_snapshot().state().is_active() {
+            return Err(IdeAudioPreviewError::Command(
+                DesktopAudioPreviewCommandError::PreviewBusy,
+            ));
+        }
+        let project = session
+            .prepared_project()
+            .ok_or(IdeAudioPreviewError::Command(
+                DesktopAudioPreviewCommandError::ProjectUnavailable,
+            ))?;
+        let loaded = project.session().parts().0;
+        (0..loaded.clip_count())
+            .any(|index| loaded.clip_id_at(index) == Some(clip_id))
+            .then_some(())
+            .ok_or(IdeAudioPreviewError::Command(
+                DesktopAudioPreviewCommandError::ClipUnavailable,
+            ))
+    }
+
     /// Starts one verified recorded take on the session's dry audition path.
     ///
     /// # Errors
@@ -14116,6 +14150,22 @@ impl RunningDesktopIdeApplication {
         match &self.session {
             IdePlaybackSessionOwner::Native(session) => session
                 .try_start_audio_preview(asset_id)
+                .map_err(IdeAudioPreviewError::Command),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => Err(IdeAudioPreviewError::Unavailable),
+        }
+    }
+
+    /// Starts dry audition of one reusable audio clip's current source view.
+    ///
+    /// # Errors
+    ///
+    /// Rejects test-only/non-project sessions, unknown clips, and overlapping
+    /// previews without changing the active callback state.
+    pub fn try_start_audio_clip_preview(&self, clip_id: &str) -> Result<(), IdeAudioPreviewError> {
+        match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session
+                .try_start_audio_clip_preview(clip_id)
                 .map_err(IdeAudioPreviewError::Command),
             #[cfg(test)]
             IdePlaybackSessionOwner::Test(_) => Err(IdeAudioPreviewError::Unavailable),

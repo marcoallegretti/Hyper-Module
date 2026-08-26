@@ -3,6 +3,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use hyper_audio_engine::StereoOutput;
 use hyper_media_cache::DecodedMediaCache;
+use hyper_playback_json::LoadedPlaybackProject;
 use hyper_recording_metadata::RecordingMetadataDocument;
 use std::sync::Arc;
 
@@ -68,6 +69,7 @@ impl Error for DesktopAudioPreviewControlError {}
 pub enum DesktopAudioPreviewCommandError {
     ProjectUnavailable,
     RecordingUnavailable,
+    ClipUnavailable,
     PreviewBusy,
     PreviewInactive,
     SequenceExhausted,
@@ -78,6 +80,7 @@ impl fmt::Display for DesktopAudioPreviewCommandError {
         formatter.write_str(match self {
             Self::ProjectUnavailable => "audio preview requires a verified project",
             Self::RecordingUnavailable => "audio preview target is not a verified recording",
+            Self::ClipUnavailable => "audio preview target is not a verified audio clip",
             Self::PreviewBusy => "another audio preview is active",
             Self::PreviewInactive => "no audio preview is active",
             Self::SequenceExhausted => "audio preview command sequence is exhausted",
@@ -99,6 +102,21 @@ pub enum DesktopAudioPreviewBuildError {
     },
     SampleRateMismatch {
         recording_index: usize,
+        source_hz: u32,
+        output_hz: u32,
+    },
+    ClipMediaUnavailable {
+        clip_index: usize,
+    },
+    ClipSourceViewUnavailable {
+        clip_index: usize,
+    },
+    ClipUnsupportedChannels {
+        clip_index: usize,
+        channels: usize,
+    },
+    ClipSampleRateMismatch {
+        clip_index: usize,
         source_hz: u32,
         output_hz: u32,
     },
@@ -128,6 +146,29 @@ impl fmt::Display for DesktopAudioPreviewBuildError {
             } => write!(
                 formatter,
                 "audio preview recording {recording_index} is {source_hz} Hz; output is {output_hz} Hz"
+            ),
+            Self::ClipMediaUnavailable { clip_index } => write!(
+                formatter,
+                "audio preview clip {clip_index} has no decoded media"
+            ),
+            Self::ClipSourceViewUnavailable { clip_index } => write!(
+                formatter,
+                "audio preview clip {clip_index} has no valid source view"
+            ),
+            Self::ClipUnsupportedChannels {
+                clip_index,
+                channels,
+            } => write!(
+                formatter,
+                "audio preview clip {clip_index} has unsupported channel count {channels}"
+            ),
+            Self::ClipSampleRateMismatch {
+                clip_index,
+                source_hz,
+                output_hz,
+            } => write!(
+                formatter,
+                "audio preview clip {clip_index} is {source_hz} Hz; output is {output_hz} Hz"
             ),
         }
     }
@@ -336,7 +377,7 @@ impl DesktopAudioPreviewSnapshot {
     }
 
     #[must_use]
-    pub const fn recording_index(self) -> Option<usize> {
+    pub const fn target_index(self) -> Option<usize> {
         self.recording_index
     }
 
@@ -571,12 +612,17 @@ impl<'a> DesktopAudioPreviewProcessor<'a> {
     pub(crate) fn try_new(
         media: &'a DecodedMediaCache,
         recordings: &[RecordingMetadataDocument],
+        project: &LoadedPlaybackProject,
         sample_rate_hz: u32,
         control: DesktopAudioPreviewControl,
     ) -> Result<Self, DesktopAudioPreviewBuildError> {
         let mut sources = Vec::new();
+        let source_count = recordings
+            .len()
+            .checked_add(project.clip_count())
+            .ok_or(DesktopAudioPreviewBuildError::CapacityUnavailable)?;
         sources
-            .try_reserve_exact(recordings.len())
+            .try_reserve_exact(source_count)
             .map_err(|_| DesktopAudioPreviewBuildError::CapacityUnavailable)?;
         for (recording_index, recording) in recordings.iter().enumerate() {
             let audio = media
@@ -599,6 +645,57 @@ impl<'a> DesktopAudioPreviewProcessor<'a> {
                     });
                 }
             };
+            sources.push(source);
+        }
+        for clip_index in 0..project.clip_count() {
+            let asset_id = project
+                .clip_asset_id_at(clip_index)
+                .ok_or(DesktopAudioPreviewBuildError::ClipSourceViewUnavailable { clip_index })?;
+            let source_start = project
+                .clip_source_start_frame_at(clip_index)
+                .ok_or(DesktopAudioPreviewBuildError::ClipSourceViewUnavailable { clip_index })?;
+            let source_frame_count = project
+                .clip_source_frame_count_at(clip_index)
+                .ok_or(DesktopAudioPreviewBuildError::ClipSourceViewUnavailable { clip_index })?;
+            let source_end = source_start
+                .checked_add(source_frame_count)
+                .ok_or(DesktopAudioPreviewBuildError::ClipSourceViewUnavailable { clip_index })?;
+            let audio = media
+                .decoded_audio(asset_id)
+                .ok_or(DesktopAudioPreviewBuildError::ClipMediaUnavailable { clip_index })?;
+            if audio.sample_rate_hz() != sample_rate_hz {
+                return Err(DesktopAudioPreviewBuildError::ClipSampleRateMismatch {
+                    clip_index,
+                    source_hz: audio.sample_rate_hz(),
+                    output_hz: sample_rate_hz,
+                });
+            }
+            let source = match (audio.channels(), audio.plane(0), audio.plane(1)) {
+                (1, Some(mono), None) => {
+                    StereoPreviewSource::Mono(mono.get(source_start..source_end).ok_or(
+                        DesktopAudioPreviewBuildError::ClipSourceViewUnavailable { clip_index },
+                    )?)
+                }
+                (2, Some(left), Some(right)) => StereoPreviewSource::Stereo {
+                    left: left.get(source_start..source_end).ok_or(
+                        DesktopAudioPreviewBuildError::ClipSourceViewUnavailable { clip_index },
+                    )?,
+                    right: right.get(source_start..source_end).ok_or(
+                        DesktopAudioPreviewBuildError::ClipSourceViewUnavailable { clip_index },
+                    )?,
+                },
+                (channels, _, _) => {
+                    return Err(DesktopAudioPreviewBuildError::ClipUnsupportedChannels {
+                        clip_index,
+                        channels,
+                    });
+                }
+            };
+            if source.frame_count() != Some(source_frame_count) || source_frame_count == 0 {
+                return Err(DesktopAudioPreviewBuildError::ClipSourceViewUnavailable {
+                    clip_index,
+                });
+            }
             sources.push(source);
         }
         Ok(Self {

@@ -222,6 +222,7 @@ pub enum IdeWorkerCommandKind {
     StopRecording,
     AbortRecording,
     StartAudioPreview,
+    StartAudioClipPreview,
     StopAudioPreview,
     AudioPreviewControl,
     Observe,
@@ -516,6 +517,9 @@ pub enum IdeWorkerCommand {
     StartAudioPreview {
         asset_id: String,
     },
+    StartAudioClipPreview {
+        clip_id: String,
+    },
     StopAudioPreview,
     AudioPreviewControl(IdeAudioPreviewControlCommand),
     Observe,
@@ -646,6 +650,7 @@ impl IdeWorkerCommand {
             Self::StopRecording => IdeWorkerCommandKind::StopRecording,
             Self::AbortRecording => IdeWorkerCommandKind::AbortRecording,
             Self::StartAudioPreview { .. } => IdeWorkerCommandKind::StartAudioPreview,
+            Self::StartAudioClipPreview { .. } => IdeWorkerCommandKind::StartAudioClipPreview,
             Self::StopAudioPreview => IdeWorkerCommandKind::StopAudioPreview,
             Self::AudioPreviewControl(_) => IdeWorkerCommandKind::AudioPreviewControl,
             Self::Observe => IdeWorkerCommandKind::Observe,
@@ -789,6 +794,7 @@ impl IdeRecordingTake {
 pub struct IdeAudioPreviewObservation {
     snapshot: DesktopAudioPreviewSnapshot,
     asset_id: Option<String>,
+    clip_id: Option<String>,
 }
 
 impl IdeAudioPreviewObservation {
@@ -800,6 +806,11 @@ impl IdeAudioPreviewObservation {
     #[must_use]
     pub fn asset_id(&self) -> Option<&str> {
         self.asset_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn clip_id(&self) -> Option<&str> {
+        self.clip_id.as_deref()
     }
 
     #[must_use]
@@ -1557,6 +1568,7 @@ impl IdeRunningObservation {
             preview: IdeAudioPreviewObservation {
                 snapshot: DesktopAudioPreviewSnapshot::idle(),
                 asset_id: None,
+                clip_id: None,
             },
             scenes: Vec::new(),
             track_count: 0,
@@ -2182,6 +2194,12 @@ impl Error for IdeProjectCloseError {
             | Self::DiscardNotAuthorized => None,
         }
     }
+}
+
+#[derive(Debug)]
+enum IdeAudioPreviewTarget {
+    RecordingAsset(String),
+    Clip(String),
 }
 
 #[allow(
@@ -3298,7 +3316,7 @@ enum WorkerState {
     },
     AudioPreviewFence {
         application: RunningDesktopIdeApplication,
-        asset_id: String,
+        target: IdeAudioPreviewTarget,
         sequence: u64,
         deadline: Instant,
     },
@@ -4051,6 +4069,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::StopRecording
         | IdeWorkerCommandKind::AbortRecording
         | IdeWorkerCommandKind::StartAudioPreview
+        | IdeWorkerCommandKind::StartAudioClipPreview
         | IdeWorkerCommandKind::StopAudioPreview
         | IdeWorkerCommandKind::AudioPreviewControl
         | IdeWorkerCommandKind::InspectAudioClipWaveform
@@ -4425,6 +4444,7 @@ fn process_command(
             inspect_audio_clip_waveform(state, &clip_id, events)
         }
         command @ (IdeWorkerCommand::StartAudioPreview { .. }
+        | IdeWorkerCommand::StartAudioClipPreview { .. }
         | IdeWorkerCommand::StopAudioPreview
         | IdeWorkerCommand::AudioPreviewControl(_)) => {
             process_audio_preview_command(state, command, events)
@@ -5390,6 +5410,9 @@ fn process_audio_preview_command(
         IdeWorkerCommand::StartAudioPreview { asset_id } => {
             start_audio_preview(state, asset_id, events)
         }
+        IdeWorkerCommand::StartAudioClipPreview { clip_id } => {
+            start_audio_clip_preview(state, clip_id, events)
+        }
         IdeWorkerCommand::StopAudioPreview => stop_audio_preview(state, events),
         IdeWorkerCommand::AudioPreviewControl(command) => {
             process_audio_preview_control(state, command, events)
@@ -5451,33 +5474,56 @@ fn start_audio_preview(
     asset_id: String,
     events: &SyncSender<IdeWorkerEvent>,
 ) -> bool {
+    start_audio_preview_target(
+        state,
+        IdeAudioPreviewTarget::RecordingAsset(asset_id),
+        events,
+    )
+}
+
+fn start_audio_clip_preview(
+    state: &mut WorkerState,
+    clip_id: String,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    start_audio_preview_target(state, IdeAudioPreviewTarget::Clip(clip_id), events)
+}
+
+fn start_audio_preview_target(
+    state: &mut WorkerState,
+    target: IdeAudioPreviewTarget,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
     let WorkerState::Running(application) = state else {
         return publish_failure(
             events,
-            IdeWorkerCommandKind::StartAudioPreview,
+            audio_preview_command_kind(&target),
             IdeWorkerCommandFailure::InvalidState,
         );
     };
-    if let Err(reason) = application.validate_audio_preview_asset(&asset_id) {
+    let command = audio_preview_command_kind(&target);
+    let validation = match &target {
+        IdeAudioPreviewTarget::RecordingAsset(asset_id) => {
+            application.validate_audio_preview_asset(asset_id)
+        }
+        IdeAudioPreviewTarget::Clip(clip_id) => application.validate_audio_clip_preview(clip_id),
+    };
+    if let Err(reason) = validation {
         return publish_failure(
             events,
-            IdeWorkerCommandKind::StartAudioPreview,
+            command,
             IdeWorkerCommandFailure::AudioPreview(reason),
         );
     }
     if let Err(reason) = application.try_send_transport(TransportCommand::Stop) {
-        return publish_failure(
-            events,
-            IdeWorkerCommandKind::StartAudioPreview,
-            IdeWorkerCommandFailure::Transport(reason),
-        );
+        return publish_failure(events, command, IdeWorkerCommandFailure::Transport(reason));
     }
     let sequence = match application.try_send_mixer_fence() {
         Ok(Some(sequence)) => sequence,
         Ok(None) => {
             return publish_failure(
                 events,
-                IdeWorkerCommandKind::StartAudioPreview,
+                command,
                 IdeWorkerCommandFailure::AudioPreview(
                     IdeAudioPreviewError::MixerFenceSequenceUnavailable,
                 ),
@@ -5486,7 +5532,7 @@ fn start_audio_preview(
         Err(reason) => {
             return publish_failure(
                 events,
-                IdeWorkerCommandKind::StartAudioPreview,
+                command,
                 IdeWorkerCommandFailure::AudioPreview(IdeAudioPreviewError::MixerCommit(reason)),
             );
         }
@@ -5496,11 +5542,18 @@ fn start_audio_preview(
     };
     *state = WorkerState::AudioPreviewFence {
         application,
-        asset_id,
+        target,
         sequence,
         deadline: Instant::now() + MIXER_SAVE_COMMIT_TIMEOUT,
     };
     send_event(events, IdeWorkerEvent::AudioPreviewPreparing)
+}
+
+const fn audio_preview_command_kind(target: &IdeAudioPreviewTarget) -> IdeWorkerCommandKind {
+    match target {
+        IdeAudioPreviewTarget::RecordingAsset(_) => IdeWorkerCommandKind::StartAudioPreview,
+        IdeAudioPreviewTarget::Clip(_) => IdeWorkerCommandKind::StartAudioClipPreview,
+    }
 }
 
 fn stop_audio_preview(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) -> bool {
@@ -14315,10 +14368,10 @@ fn poll_pending_state(
         }
         WorkerState::AudioPreviewFence {
             application,
-            asset_id,
+            target,
             sequence,
             deadline,
-        } => poll_audio_preview_fence(state, application, asset_id, sequence, deadline, events),
+        } => poll_audio_preview_fence(state, application, target, sequence, deadline, events),
         WorkerState::CloseFence {
             application,
             sequence,
@@ -14408,13 +14461,21 @@ fn poll_output_test_shutdown(
 fn poll_audio_preview_fence(
     state: &mut WorkerState,
     application: RunningDesktopIdeApplication,
-    asset_id: String,
+    target: IdeAudioPreviewTarget,
     sequence: u64,
     deadline: Instant,
     events: &SyncSender<IdeWorkerEvent>,
 ) -> bool {
     if application.committed_mixer_fence() >= sequence {
-        let attempt = application.try_start_audio_preview(&asset_id);
+        let command = audio_preview_command_kind(&target);
+        let attempt = match &target {
+            IdeAudioPreviewTarget::RecordingAsset(asset_id) => {
+                application.try_start_audio_preview(asset_id)
+            }
+            IdeAudioPreviewTarget::Clip(clip_id) => {
+                application.try_start_audio_clip_preview(clip_id)
+            }
+        };
         *state = WorkerState::Running(application);
         let mut no_native_failure = None;
         if !publish_state(state, events, &mut no_native_failure) {
@@ -14424,7 +14485,7 @@ fn poll_audio_preview_fence(
             Ok(()) => true,
             Err(reason) => publish_failure(
                 events,
-                IdeWorkerCommandKind::StartAudioPreview,
+                command,
                 IdeWorkerCommandFailure::AudioPreview(reason),
             ),
         }
@@ -14432,13 +14493,13 @@ fn poll_audio_preview_fence(
         *state = WorkerState::Running(application);
         publish_failure(
             events,
-            IdeWorkerCommandKind::StartAudioPreview,
+            audio_preview_command_kind(&target),
             IdeWorkerCommandFailure::AudioPreview(IdeAudioPreviewError::MixerCommitTimeout),
         )
     } else {
         *state = WorkerState::AudioPreviewFence {
             application,
-            asset_id,
+            target,
             sequence,
             deadline,
         };
@@ -14633,15 +14694,25 @@ fn running_observation(
                 .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)?,
         });
     }
-    let preview_asset_id = snapshot
-        .preview
-        .recording_index()
+    let preview_target_index = snapshot.preview.target_index();
+    let preview_asset_id = preview_target_index
+        .filter(|target_index| *target_index < snapshot.recording_metadata.len())
         .map(|recording_index| {
             snapshot
                 .recording_metadata
                 .get(recording_index)
                 .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)
                 .and_then(|recording| try_project_owned(recording.asset_id()))
+        })
+        .transpose()?;
+    let preview_clip_id = preview_target_index
+        .and_then(|target_index| target_index.checked_sub(snapshot.recording_metadata.len()))
+        .map(|clip_index| {
+            snapshot
+                .loaded
+                .clip_id_at(clip_index)
+                .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)
+                .and_then(try_project_owned)
         })
         .transpose()?;
     let mut recording_takes = Vec::new();
@@ -14856,6 +14927,7 @@ fn running_observation(
         preview: IdeAudioPreviewObservation {
             snapshot: snapshot.preview,
             asset_id: preview_asset_id,
+            clip_id: preview_clip_id,
         },
         scenes,
         track_count: snapshot.track_count,

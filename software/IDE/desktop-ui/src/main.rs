@@ -3873,8 +3873,44 @@ fn bind_audio_clip_callback(
     bind_audio_clip_source_slip_callback(ui, worker, project_state);
     bind_audio_clip_source_trim_callback(ui, worker, project_state);
     bind_audio_clip_waveform_callback(ui, worker, project_state);
+    bind_audio_clip_preview_callback(ui, worker, project_state);
 
     bind_arrangement_placement_addition_callback(ui, worker, project_state);
+}
+
+fn bind_audio_clip_preview_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    let project_state = Rc::clone(project_state);
+    actions.on_toggle_audio_clip_preview(move |clip_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() == AppMode::Previewing && ui.get_preview_clip_id() == clip_id {
+            submit_to_ui(&ui, &worker, IdeWorkerCommand::StopAudioPreview);
+            return;
+        }
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        let clips = project_state.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            ui.set_error_text("Audio clip selection is no longer available".into());
+            return;
+        };
+        submit_to_ui(
+            &ui,
+            &worker,
+            IdeWorkerCommand::StartAudioClipPreview {
+                clip_id: clip.id().to_owned(),
+            },
+        );
+    });
 }
 
 fn bind_audio_clip_waveform_callback(
@@ -4806,6 +4842,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
             AppMode::FinalizingRecording
         }
         IdeWorkerCommandKind::StartAudioPreview => AppMode::PreparingPreview,
+        IdeWorkerCommandKind::StartAudioClipPreview => AppMode::PreparingPreview,
         _ => current,
     }
 }
@@ -5026,8 +5063,11 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::StartAudioPreview => {
             "Stopping transport and preparing dry take audition…"
         }
-        IdeWorkerCommandKind::StopAudioPreview => "Stopping take audition…",
-        IdeWorkerCommandKind::AudioPreviewControl => "Applying take audition control…",
+        IdeWorkerCommandKind::StartAudioClipPreview => {
+            "Stopping transport and preparing dry clip audition…"
+        }
+        IdeWorkerCommandKind::StopAudioPreview => "Stopping audio audition…",
+        IdeWorkerCommandKind::AudioPreviewControl => "Applying audio audition control…",
         IdeWorkerCommandKind::Observe => "Refreshing runtime evidence…",
         IdeWorkerCommandKind::CloseProject => "Closing project and native output…",
         IdeWorkerCommandKind::Shutdown => "Shutting down…",
@@ -7492,7 +7532,11 @@ fn apply_running_event(
     );
     ui.set_transport_state(
         if observation.preview().state().is_active() {
-            "Auditioning take · transport stopped"
+            if observation.preview().clip_id().is_some() {
+                "Auditioning clip source · transport stopped"
+            } else {
+                "Auditioning take · transport stopped"
+            }
         } else {
             match transport_state {
                 PlaybackRecoveryTransportState::Stopped => "Stopped",
@@ -7507,18 +7551,39 @@ fn apply_running_event(
         | DesktopAudioPreviewState::Playing
         | DesktopAudioPreviewState::Stopping => {
             ui.set_app_mode(AppMode::Previewing);
-            ui.set_status_text("Dry take audition · input cue temporarily suppressed".into());
+            ui.set_status_text(
+                if observation.preview().clip_id().is_some() {
+                    "Dry clip-source audition · input cue temporarily suppressed"
+                } else {
+                    "Dry take audition · input cue temporarily suppressed"
+                }
+                .into(),
+            );
             ui.set_error_text(SharedString::default());
         }
         DesktopAudioPreviewState::Complete => {
             ui.set_app_mode(AppMode::Running);
-            ui.set_status_text("Take audition complete".into());
+            ui.set_status_text(
+                if observation.preview().clip_id().is_some() {
+                    "Clip-source audition complete"
+                } else {
+                    "Take audition complete"
+                }
+                .into(),
+            );
             ui.set_error_text(SharedString::default());
         }
         DesktopAudioPreviewState::Failed => {
             ui.set_app_mode(AppMode::Running);
-            ui.set_status_text("Take audition stopped".into());
-            ui.set_error_text("The audio callback could not render this recorded take".into());
+            ui.set_status_text("Audio audition stopped".into());
+            ui.set_error_text(
+                if observation.preview().clip_id().is_some() {
+                    "The audio callback could not render this clip source view"
+                } else {
+                    "The audio callback could not render this recorded take"
+                }
+                .into(),
+            );
         }
         DesktopAudioPreviewState::Idle => {
             apply_idle_running_event(ui);
@@ -7704,6 +7769,7 @@ fn set_recording_takes(
     *take_routes.borrow_mut() = routes;
     ui.set_recording_takes(ModelRc::from(Rc::new(VecModel::from(rows))));
     ui.set_preview_active(preview.state().is_active());
+    ui.set_preview_clip_id(preview.clip_id().unwrap_or_default().into());
     ui.set_preview_gain_percent(preview.gain() * 100.0);
     ui.set_preview_muted(preview.muted());
     ui.set_preview_state(format!("{:?}", preview.state()).into());
@@ -8655,6 +8721,7 @@ fn reset_project(
     ui.set_preview_muted(false);
     ui.set_preview_state("Idle".into());
     ui.set_preview_progress("—".into());
+    ui.set_preview_clip_id(SharedString::default());
     *project_state.playback_end_frame.borrow_mut() = None;
     *project_state.arrangement.borrow_mut() = None;
     project_state.audio_clips.borrow_mut().clear();
@@ -8972,7 +9039,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         {
             AppMode::Running
         }
-        IdeWorkerCommandKind::StartAudioPreview if current == AppMode::PreparingPreview => {
+        IdeWorkerCommandKind::StartAudioPreview | IdeWorkerCommandKind::StartAudioClipPreview
+            if current == AppMode::PreparingPreview =>
+        {
             AppMode::Running
         }
         IdeWorkerCommandKind::StartOutputTest if current == AppMode::StartingOutputTest => {
@@ -18543,11 +18612,18 @@ mod tests {
     }
 
     #[test]
-    fn preview_preparation_failure_restores_running_mode() {
+    fn audition_preparation_failure_restores_running_mode() {
         assert_eq!(
             mode_after_failure(
                 AppMode::PreparingPreview,
                 IdeWorkerCommandKind::StartAudioPreview,
+            ),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::PreparingPreview,
+                IdeWorkerCommandKind::StartAudioClipPreview,
             ),
             AppMode::Running
         );
