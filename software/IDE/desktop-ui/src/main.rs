@@ -18166,6 +18166,7 @@ mod tests {
 
     #[test]
     fn recorded_take_rows_preserve_discard_protection_and_reset_confirmation_on_reopen() {
+        i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();
         let routes: TakeRoutes = Rc::new(RefCell::new(Vec::new()));
         let observation = IdeRunningObservation::for_ui_test(PlaybackRecoverySnapshot::for_test(
