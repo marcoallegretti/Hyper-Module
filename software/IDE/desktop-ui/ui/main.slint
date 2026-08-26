@@ -4555,8 +4555,8 @@ export component MainWindow inherits Window {
                                             }
                                             Button {
                                                 width: 92px;
-                                                text: root.preview-clip-id == clip.id ? "Stop" : "Preview";
-                                                accessible-label: (root.preview-clip-id == clip.id ? "Stop preview of " : "Preview ") + clip.name + " source view";
+                                                text: root.preview-active && root.preview-clip-id == clip.id ? "Stop" : "Preview";
+                                                accessible-label: (root.preview-active && root.preview-clip-id == clip.id ? "Stop preview of " : "Preview ") + clip.name + " source view";
                                                 enabled: root.app-mode == AppMode.running || (root.app-mode == AppMode.previewing && root.preview-clip-id == clip.id);
                                                 clicked => { IdeActions.toggle-audio-clip-preview(clip.id); }
                                             }
