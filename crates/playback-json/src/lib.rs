@@ -680,16 +680,6 @@ pub struct AudioClipAdditionDocuments {
     duration_ticks: u64,
 }
 
-/// Canonical version-1 resources required to promote one recorded take to an
-/// owned reusable clip and one linear arrangement occurrence.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecordedTakePromotionDocuments {
-    track: Vec<u8>,
-    clip: Vec<u8>,
-    arrangement: Vec<u8>,
-    duration_ticks: u64,
-}
-
 /// Canonical version-1 resources required to duplicate one reusable audio clip.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioClipDuplicationDocuments {
@@ -770,33 +760,6 @@ impl AudioClipAdditionDocuments {
     #[must_use]
     pub fn into_parts(self) -> (Vec<u8>, Vec<u8>, u64) {
         (self.track, self.clip, self.duration_ticks)
-    }
-}
-
-impl RecordedTakePromotionDocuments {
-    #[must_use]
-    pub fn track(&self) -> &[u8] {
-        &self.track
-    }
-
-    #[must_use]
-    pub fn clip(&self) -> &[u8] {
-        &self.clip
-    }
-
-    #[must_use]
-    pub fn arrangement(&self) -> &[u8] {
-        &self.arrangement
-    }
-
-    #[must_use]
-    pub const fn duration_ticks(&self) -> u64 {
-        self.duration_ticks
-    }
-
-    #[must_use]
-    pub fn into_parts(self) -> (Vec<u8>, Vec<u8>, Vec<u8>, u64) {
-        (self.track, self.clip, self.arrangement, self.duration_ticks)
     }
 }
 
@@ -986,14 +949,6 @@ pub enum AudioClipAdditionSerializationError {
     InvalidDocumentShape,
     Serialization(serde_json::Error),
     ProjectCompilation(AdapterCompileError),
-}
-
-/// Failure to promote one finalized recording into a reusable clip and its
-/// initial linear arrangement placement.
-#[derive(Debug)]
-pub enum RecordedTakePromotionSerializationError {
-    Clip(AudioClipAdditionSerializationError),
-    Arrangement(ArrangementPlacementAdditionSerializationError),
 }
 
 #[derive(Debug)]
@@ -2254,24 +2209,6 @@ impl Error for AudioClipAdditionSerializationError {
     }
 }
 
-impl fmt::Display for RecordedTakePromotionSerializationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Clip(source) => source.fmt(formatter),
-            Self::Arrangement(source) => source.fmt(formatter),
-        }
-    }
-}
-
-impl Error for RecordedTakePromotionSerializationError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Clip(source) => Some(source),
-            Self::Arrangement(source) => Some(source),
-        }
-    }
-}
-
 impl fmt::Display for AudioClipDuplicationSerializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3491,7 +3428,7 @@ pub fn serialize_routing_bus_removal(
     clippy::too_many_lines,
     reason = "the creation boundary keeps track authority, exact frame-to-tick conversion, canonical clip construction, and candidate compilation in one reviewable transaction"
 )]
-fn serialize_recording_audio_clip_addition_with_project(
+pub fn serialize_recording_audio_clip_addition(
     project: &LoadedPlaybackProject,
     assets: &[MediaAssetFact<'_>],
     source_track: &[u8],
@@ -3502,8 +3439,7 @@ fn serialize_recording_audio_clip_addition_with_project(
     clip_id: &str,
     clip_name: &str,
     limits: LoaderLimits,
-) -> Result<(AudioClipAdditionDocuments, LoadedPlaybackProject), AudioClipAdditionSerializationError>
-{
+) -> Result<AudioClipAdditionDocuments, AudioClipAdditionSerializationError> {
     if project.clips.len() >= limits.max_clip_documents {
         return Err(AudioClipAdditionSerializationError::ClipCapacity);
     }
@@ -3659,117 +3595,10 @@ fn serialize_recording_audio_clip_addition_with_project(
     extended
         .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
         .map_err(AudioClipAdditionSerializationError::ProjectCompilation)?;
-    Ok((
-        AudioClipAdditionDocuments {
-            track,
-            clip,
-            duration_ticks,
-        },
-        extended,
-    ))
-}
-
-/// Creates one complete reusable audio-clip view from a verified recorded asset
-/// and appends its identity to the owning audio track.
-///
-/// The clip spans the whole asset, is enabled, has identity playback controls,
-/// and stores an explicit two-point warp from its integer musical duration to
-/// the exact captured frame count. The duration ends at the first project tick
-/// at or after the recorded frame end; no arrangement placement is created.
-///
-/// # Errors
-///
-/// Returns a classified rejection for stale track bytes, mismatched recorded
-/// asset facts, invalid identity or name input, exhausted capacity, timeline
-/// conversion failure, or a candidate project that cannot compile.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "the creation boundary keeps track authority, exact frame-to-tick conversion, canonical clip construction, and candidate compilation in one reviewable transaction"
-)]
-pub fn serialize_recording_audio_clip_addition(
-    project: &LoadedPlaybackProject,
-    assets: &[MediaAssetFact<'_>],
-    source_track: &[u8],
-    track_id: &str,
-    asset_id: &str,
-    timeline_start_tick: u64,
-    frame_count: u64,
-    clip_id: &str,
-    clip_name: &str,
-    limits: LoaderLimits,
-) -> Result<AudioClipAdditionDocuments, AudioClipAdditionSerializationError> {
-    serialize_recording_audio_clip_addition_with_project(
-        project,
-        assets,
-        source_track,
-        track_id,
-        asset_id,
-        timeline_start_tick,
-        frame_count,
-        clip_id,
-        clip_name,
-        limits,
-    )
-    .map(|(documents, _)| documents)
-}
-
-/// Promotes one finalized recording to a reusable clip and an exact linear
-/// arrangement placement without requiring a caller to publish an observable
-/// intermediate clip-only project state.
-///
-/// # Errors
-///
-/// Returns a classified rejection when the recorded asset cannot produce a
-/// valid clip or its requested arrangement occurrence is not executable.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the promotion boundary binds one recorded asset, its owning track, and the exact arrangement occurrence"
-)]
-pub fn serialize_recorded_take_promotion(
-    project: &LoadedPlaybackProject,
-    assets: &[MediaAssetFact<'_>],
-    source_track: &[u8],
-    source_arrangement: Option<&[u8]>,
-    track_id: &str,
-    asset_id: &str,
-    timeline_start_tick: u64,
-    frame_count: u64,
-    clip_id: &str,
-    clip_name: &str,
-    arrangement_id: &str,
-    placement_id: &str,
-    limits: LoaderLimits,
-) -> Result<RecordedTakePromotionDocuments, RecordedTakePromotionSerializationError> {
-    let (documents, extended) = serialize_recording_audio_clip_addition_with_project(
-        project,
-        assets,
-        source_track,
-        track_id,
-        asset_id,
-        timeline_start_tick,
-        frame_count,
-        clip_id,
-        clip_name,
-        limits,
-    )
-    .map_err(RecordedTakePromotionSerializationError::Clip)?;
-    let arrangement = serialize_arrangement_placement_addition(
-        &extended,
-        assets,
-        source_arrangement,
-        arrangement_id,
-        placement_id,
-        clip_id,
-        timeline_start_tick,
-        limits,
-    )
-    .map_err(RecordedTakePromotionSerializationError::Arrangement)?;
-    Ok(RecordedTakePromotionDocuments {
-        track: documents.track,
-        clip: documents.clip,
-        arrangement,
-        duration_ticks: documents.duration_ticks,
+    Ok(AudioClipAdditionDocuments {
+        track,
+        clip,
+        duration_ticks,
     })
 }
 
@@ -10439,77 +10268,6 @@ mod tests {
             LoaderLimits::VERSION_1,
         )
         .unwrap();
-        reopened
-            .compile_playback(
-                &asset_facts(),
-                GraphLimits::VERSION_1,
-                SceneLimits::VERSION_1,
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn recorded_take_promotion_creates_one_clip_and_placement_at_capture_start() {
-        let mut source: Value = serde_json::from_slice(TRACK).unwrap();
-        source["clip_ids"] = json!([]);
-        source["extensions"]["org.example.track"] = json!({"opaque": true});
-        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
-        let tracks: [&[u8]; 1] = [&source];
-        let loaded = load(input(TIMELINE, &tracks, &[], None), LoaderLimits::VERSION_1).unwrap();
-        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334469";
-        let arrangement_id = "018f47a2-6b2d-7c11-8a44-00112233446a";
-        let placement_id = "018f47a2-6b2d-7c11-8a44-00112233446b";
-
-        let documents = serialize_recorded_take_promotion(
-            &loaded,
-            &asset_facts(),
-            &source,
-            None,
-            "018f47a2-6b2d-7c11-8a44-001122334456",
-            "018f47a2-6b2d-7c11-8a44-001122334457",
-            1_920,
-            100,
-            clip_id,
-            "Recorded Take",
-            arrangement_id,
-            placement_id,
-            LoaderLimits::VERSION_1,
-        )
-        .unwrap();
-        let arrangement: Value = serde_json::from_slice(documents.arrangement()).unwrap();
-
-        assert_eq!(documents.duration_ticks(), 4);
-        assert_eq!(arrangement["id"], arrangement_id);
-        assert_eq!(
-            arrangement["placements"],
-            json!([{
-                "id": placement_id,
-                "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
-                "clip_id": clip_id,
-                "start_tick": 1_920,
-                "clip_start_tick": 0,
-                "duration_ticks": 4,
-                "enabled": true
-            }])
-        );
-        assert_eq!(
-            serde_json_canonicalizer::to_vec(&arrangement).unwrap(),
-            documents.arrangement()
-        );
-
-        let promoted_tracks: [&[u8]; 1] = [documents.track()];
-        let promoted_clips: [&[u8]; 1] = [documents.clip()];
-        let reopened = load(
-            input(
-                TIMELINE,
-                &promoted_tracks,
-                &promoted_clips,
-                Some(documents.arrangement()),
-            ),
-            LoaderLimits::VERSION_1,
-        )
-        .unwrap();
-        assert_eq!(reopened.placement_count(), 1);
         reopened
             .compile_playback(
                 &asset_facts(),
