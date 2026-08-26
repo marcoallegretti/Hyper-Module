@@ -82,12 +82,15 @@ pub use capture::{
     CaptureStreamSnapshot, InterleavedStereoCaptureProcessor,
 };
 pub use offline_export::{
-    OfflineExportError, OfflineExportReport, OfflineExportSpec, OfflineTrackStem,
-    OfflineTrackStemExportFile, OfflineTrackStemExportFormat, OfflineTrackStemExportReport,
-    export_prepared_project_flac_with_mixer, export_prepared_project_track_stems_with_mixer,
-    export_prepared_project_wav_with_mixer, export_project_wav, export_project_wav_with_mixer,
-    render_prepared_project_offline_with_mixer, render_prepared_project_track_stems_with_mixer,
-    render_project_offline, render_project_offline_with_mixer,
+    OfflineExportError, OfflineExportRange, OfflineExportRangeError, OfflineExportReport,
+    OfflineExportSpec, OfflineTrackStem, OfflineTrackStemExportFile, OfflineTrackStemExportFormat,
+    OfflineTrackStemExportReport, export_prepared_project_flac_with_mixer,
+    export_prepared_project_range_flac_with_mixer, export_prepared_project_range_wav_with_mixer,
+    export_prepared_project_track_stems_with_mixer, export_prepared_project_wav_with_mixer,
+    export_project_wav, export_project_wav_with_mixer,
+    render_prepared_project_offline_range_with_mixer, render_prepared_project_offline_with_mixer,
+    render_prepared_project_track_stems_with_mixer, render_project_offline,
+    render_project_offline_range_with_mixer, render_project_offline_with_mixer,
     render_project_track_stems_with_mixer,
 };
 

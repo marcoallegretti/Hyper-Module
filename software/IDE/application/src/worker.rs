@@ -484,6 +484,7 @@ pub enum IdeWorkerCommand {
         destination_path: std::path::PathBuf,
         format: IdeProjectExportFormat,
         block_frames: usize,
+        range: Option<super::OfflineExportRange>,
     },
     ExportTrackStems {
         destination_directory: std::path::PathBuf,
@@ -4453,7 +4454,15 @@ fn process_command(
             destination_path,
             format,
             block_frames,
-        } => export_project(state, events, &destination_path, format, block_frames),
+            range,
+        } => export_project(
+            state,
+            events,
+            &destination_path,
+            format,
+            block_frames,
+            range,
+        ),
         IdeWorkerCommand::ExportTrackStems {
             destination_directory,
             format,
@@ -7545,6 +7554,7 @@ fn export_project(
     destination_path: &std::path::Path,
     format: IdeProjectExportFormat,
     block_frames: usize,
+    range: Option<super::OfflineExportRange>,
 ) -> bool {
     let WorkerState::Running(running) = state else {
         return publish_failure(
@@ -7558,7 +7568,10 @@ fn export_project(
     if !send_event(events, IdeWorkerEvent::ProjectExporting) {
         return false;
     }
-    match running.export_project(destination_path, format, block_frames) {
+    match range.map_or_else(
+        || running.export_project(destination_path, format, block_frames),
+        |range| running.export_project_range(destination_path, format, block_frames, range),
+    ) {
         Ok(report) => send_event(events, IdeWorkerEvent::ProjectExported { report }),
         Err(reason) => publish_failure(
             events,
@@ -19709,6 +19722,7 @@ mod tests {
                 destination_path: baseline_path.clone(),
                 format: IdeProjectExportFormat::Wav,
                 block_frames: 64,
+                range: None,
             })
             .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectExporting));
@@ -19718,12 +19732,44 @@ mod tests {
             "unexpected baseline export result: {baseline_export:?}"
         );
 
+        let exported_range = crate::OfflineExportRange::new(75, 225).unwrap();
+        let ranged_path = fixture.join("loop.wav");
+        worker
+            .try_send(IdeWorkerCommand::ExportProject {
+                destination_path: ranged_path.clone(),
+                format: IdeProjectExportFormat::Wav,
+                block_frames: 64,
+                range: Some(exported_range),
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectExporting));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ProjectExported { report } if report.frame_count == exported_range.frame_count()
+        ));
+
+        let ranged_flac_path = fixture.join("loop.flac");
+        worker
+            .try_send(IdeWorkerCommand::ExportProject {
+                destination_path: ranged_flac_path.clone(),
+                format: IdeProjectExportFormat::Flac,
+                block_frames: 64,
+                range: Some(exported_range),
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectExporting));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ProjectExported { report } if report.frame_count == exported_range.frame_count()
+        ));
+
         let flac_path = fixture.join("baseline.flac");
         worker
             .try_send(IdeWorkerCommand::ExportProject {
                 destination_path: flac_path.clone(),
                 format: IdeProjectExportFormat::Flac,
                 block_frames: 64,
+                range: None,
             })
             .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectExporting));
@@ -19797,6 +19843,7 @@ mod tests {
                 destination_path: mismatched_path.clone(),
                 format: IdeProjectExportFormat::Wav,
                 block_frames: 64,
+                range: None,
             })
             .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectExporting));
@@ -19839,6 +19886,7 @@ mod tests {
                 destination_path: filtered_path.clone(),
                 format: IdeProjectExportFormat::Wav,
                 block_frames: 64,
+                range: None,
             })
             .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectExporting));
@@ -19859,6 +19907,20 @@ mod tests {
         let filtered = decode_bytes(
             std::fs::read(&filtered_path).unwrap(),
             AudioContainer::Wav,
+            48_000,
+            decode_limits,
+        )
+        .unwrap();
+        let ranged = decode_bytes(
+            std::fs::read(&ranged_path).unwrap(),
+            AudioContainer::Wav,
+            48_000,
+            decode_limits,
+        )
+        .unwrap();
+        let ranged_flac = decode_bytes(
+            std::fs::read(&ranged_flac_path).unwrap(),
+            AudioContainer::Flac,
             48_000,
             decode_limits,
         )
@@ -19885,6 +19947,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(baseline.frame_count(), 500);
+        assert_eq!(ranged.frame_count(), exported_range.frame_count());
+        for plane in 0..2 {
+            assert_eq!(
+                ranged.plane(plane).unwrap(),
+                &baseline.plane(plane).unwrap()
+                    [exported_range.start_frame()..exported_range.end_frame()]
+            );
+            for (&wav, &flac) in ranged
+                .plane(plane)
+                .unwrap()
+                .iter()
+                .zip(ranged_flac.plane(plane).unwrap())
+            {
+                assert!((wav - flac).abs() <= 1.5 / 8_388_607.0);
+            }
+        }
         assert_eq!(filtered.frame_count(), baseline.frame_count());
         assert_eq!(flac.frame_count(), baseline.frame_count());
         assert_eq!(group_stem.frame_count(), baseline.frame_count());
@@ -24262,6 +24340,7 @@ mod tests {
                 destination_path: std::path::PathBuf::from("export.wav"),
                 format: IdeProjectExportFormat::Wav,
                 block_frames: 1_024,
+                range: None,
             })
             .unwrap();
         assert!(
@@ -24298,6 +24377,7 @@ mod tests {
                 destination_path: std::path::PathBuf::from("export.flac"),
                 format: IdeProjectExportFormat::Wav,
                 block_frames: 1_024,
+                range: None,
             })
             .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectExporting));

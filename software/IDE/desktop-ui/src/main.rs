@@ -35,10 +35,10 @@ use hyper_desktop_ide::{
     MAX_IDE_SCENES, MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
     MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
     MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MIN_FILTER_CUTOFF_MILLIHERTZ,
-    MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, NativeFilterMode, OfflineExportReport,
-    OfflineTrackStemExportFormat, PlaybackRecoveryTransportState, ProjectHistory, RecentProject,
-    SceneAction, TempoEvent, TimelineMapEdit, TransportAction, TransportCommand,
-    TransportLoopRange, TriggerBehavior, audio_import_file_extensions,
+    MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, NativeFilterMode, OfflineExportRange,
+    OfflineExportReport, OfflineTrackStemExportFormat, PlaybackRecoveryTransportState,
+    ProjectHistory, RecentProject, SceneAction, TempoEvent, TimelineMapEdit, TransportAction,
+    TransportCommand, TransportLoopRange, TriggerBehavior, audio_import_file_extensions,
     bpm_for_microseconds_per_quarter, desktop_ide_application_config,
     ide_audio_clip_gain_is_supported, meter_is_in_version_one_domain,
     microseconds_per_quarter_for_bpm, musical_position, musical_position_at_frame,
@@ -3121,7 +3121,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_automation_take_activation_callback(ui, worker);
     bind_automation_take_removal_callback(ui, worker, project_state);
     bind_control_mapping_callbacks(ui, worker, project_state);
-    bind_project_export_callback(ui, worker);
+    bind_project_export_callback(ui, worker, project_state);
     bind_project_stem_export_callback(ui, worker);
     bind_undo_callbacks(ui, worker);
     bind_loop_callbacks(ui, worker, project_state);
@@ -11747,52 +11747,100 @@ fn bind_undo_callbacks_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
     actions.on_redo_edit(restore(true));
 }
 
-fn bind_project_export_callback(ui: &MainWindow, worker: &WorkerCell) {
+fn bind_project_export_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_export = Rc::clone(worker);
     actions.on_export_project(move || {
-        let weak = weak.clone();
-        let worker = Rc::clone(&worker_for_export);
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        if ui.get_app_mode() != AppMode::Running {
-            return;
-        }
-        ui.set_error_text(SharedString::default());
-        ui.set_status_text("Waiting for export destination…".into());
-        let spawn_result = slint::spawn_local(async move {
-            let selection = rfd::AsyncFileDialog::new()
-                .set_title("Export project audio")
-                .set_file_name("export.wav")
-                .add_filter("WAV or FLAC", &["wav", "flac"])
-                .save_file()
-                .await;
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            let Some(selection) = selection else {
-                ui.set_status_text("Export cancelled".into());
-                return;
-            };
-            let path = selection.path().to_path_buf();
-            ui.set_export_destination(path.display().to_string().into());
-            ui.set_export_summary(SharedString::default());
-            let command = match project_export_command(path) {
-                Ok(command) => command,
-                Err(error) => {
-                    ui.set_error_text(error.into());
-                    ui.set_status_text("Export destination must end in .wav or .flac".into());
-                    return;
-                }
-            };
-            submit_to_ui(&ui, &worker, command);
-        });
-        if spawn_result.is_err() {
-            ui.set_status_text("Export destination selection is unavailable".into());
-        }
+        begin_project_export_destination_selection(&ui, &worker_for_export, None);
     });
+
+    let weak = ui.as_weak();
+    let worker_for_loop_export = Rc::clone(worker);
+    let state_for_loop_export = Rc::clone(project_state);
+    actions.on_export_loop_project(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let persisted_range = state_for_loop_export
+            .arrangement
+            .borrow()
+            .as_ref()
+            .and_then(|binding| binding.owner.loop_range());
+        let Some(loop_range) = persisted_range else {
+            ui.set_error_text("Save a nonempty loop range before exporting it".into());
+            return;
+        };
+        let range = OfflineExportRange::new(loop_range.start_frame(), loop_range.end_frame())
+            .expect("a TransportLoopRange is always nonempty");
+        begin_project_export_destination_selection(&ui, &worker_for_loop_export, Some(range));
+    });
+}
+
+fn begin_project_export_destination_selection(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    range: Option<OfflineExportRange>,
+) {
+    if ui.get_app_mode() != AppMode::Running || !ui.get_export_available() {
+        return;
+    }
+    let (title, file_name, waiting, cancelled) = if range.is_some() {
+        (
+            "Export persisted loop range",
+            "loop-export.wav",
+            "Waiting for loop export destination…",
+            "Loop export cancelled",
+        )
+    } else {
+        (
+            "Export project audio",
+            "export.wav",
+            "Waiting for export destination…",
+            "Export cancelled",
+        )
+    };
+    ui.set_error_text(SharedString::default());
+    ui.set_status_text(waiting.into());
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    let spawn_result = slint::spawn_local(async move {
+        let selection = rfd::AsyncFileDialog::new()
+            .set_title(title)
+            .set_file_name(file_name)
+            .add_filter("WAV or FLAC", &["wav", "flac"])
+            .save_file()
+            .await;
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let Some(selection) = selection else {
+            ui.set_status_text(cancelled.into());
+            return;
+        };
+        let path = selection.path().to_path_buf();
+        ui.set_export_destination(path.display().to_string().into());
+        ui.set_export_summary(SharedString::default());
+        let command = match project_export_command(path, range) {
+            Ok(command) => command,
+            Err(error) => {
+                ui.set_error_text(error.into());
+                ui.set_status_text("Export destination must end in .wav or .flac".into());
+                return;
+            }
+        };
+        submit_to_ui(&ui, &worker, command);
+    });
+    if spawn_result.is_err() {
+        ui.set_status_text("Export destination selection is unavailable".into());
+    }
 }
 
 fn bind_project_stem_export_callback(ui: &MainWindow, worker: &WorkerCell) {
@@ -11843,13 +11891,17 @@ fn bind_project_stem_export_callback(ui: &MainWindow, worker: &WorkerCell) {
     });
 }
 
-fn project_export_command(destination_path: PathBuf) -> Result<IdeWorkerCommand, String> {
+fn project_export_command(
+    destination_path: PathBuf,
+    range: Option<OfflineExportRange>,
+) -> Result<IdeWorkerCommand, String> {
     let format = IdeProjectExportFormat::from_destination(&destination_path)
         .map_err(|error| error.to_string())?;
     Ok(IdeWorkerCommand::ExportProject {
         destination_path,
         format,
         block_frames: EXPORT_BLOCK_FRAMES,
+        range,
     })
 }
 
@@ -12622,20 +12674,28 @@ mod tests {
     #[test]
     fn export_picker_selection_builds_one_typed_command_or_refuses() {
         assert!(matches!(
-            project_export_command(PathBuf::from("C:/Renders/mix.WAV")),
+            project_export_command(PathBuf::from("C:/Renders/mix.WAV"), None),
             Ok(IdeWorkerCommand::ExportProject {
                 format: IdeProjectExportFormat::Wav,
                 ..
             })
         ));
         assert!(matches!(
-            project_export_command(PathBuf::from("C:/Renders/mix.flac")),
+            project_export_command(PathBuf::from("C:/Renders/mix.flac"), None),
             Ok(IdeWorkerCommand::ExportProject {
                 format: IdeProjectExportFormat::Flac,
                 ..
             })
         ));
-        assert!(project_export_command(PathBuf::from("C:/Renders/mix.aiff")).is_err());
+        let loop_range = OfflineExportRange::new(480, 960).unwrap();
+        assert!(matches!(
+            project_export_command(PathBuf::from("C:/Renders/loop.wav"), Some(loop_range)),
+            Ok(IdeWorkerCommand::ExportProject {
+                range: Some(observed),
+                ..
+            }) if observed == loop_range
+        ));
+        assert!(project_export_command(PathBuf::from("C:/Renders/mix.aiff"), None).is_err());
         assert!(matches!(
             track_stem_export_command(PathBuf::from("C:/Renders/Session stems"), false),
             IdeWorkerCommand::ExportTrackStems {

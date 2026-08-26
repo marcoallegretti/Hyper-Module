@@ -2,7 +2,8 @@ use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::StereoOutput;
 use hyper_audio_source::DecodedAudio;
 use hyper_desktop_audio::{
-    OfflineExportError, OfflineExportSpec, export_project_wav, render_project_offline,
+    OfflineExportError, OfflineExportRange, OfflineExportSpec, export_project_wav,
+    render_project_offline, render_project_offline_range_with_mixer,
     render_project_offline_with_mixer, render_project_track_stems_with_mixer,
 };
 use hyper_media_cache::CacheLimits;
@@ -228,6 +229,52 @@ fn offline_export_is_independent_of_the_block_size() {
             "plane {plane} differs between block sizes"
         );
     }
+}
+
+#[test]
+fn range_export_prerolls_automation_and_returns_the_exact_full_mix_window() {
+    let session = session(Some(ARRANGEMENT), vec![AUTOMATION.to_vec()]);
+    let full = render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
+    let range = OfflineExportRange::new(17, 83).unwrap();
+
+    for block_frames in [16, 64] {
+        let window = render_project_offline_range_with_mixer(
+            &session,
+            OfflineExportSpec { block_frames },
+            range,
+            None,
+        )
+        .unwrap();
+        assert_eq!(window.frame_count(), range.frame_count());
+        for plane in 0..2 {
+            assert_eq!(
+                window.plane(plane).unwrap(),
+                &full.plane(plane).unwrap()[range.start_frame()..range.end_frame()],
+                "plane {plane} differs from linear playback for block size {block_frames}"
+            );
+        }
+    }
+}
+
+#[test]
+fn range_export_refuses_empty_and_out_of_extent_windows() {
+    assert!(OfflineExportRange::new(20, 20).is_err());
+
+    let session = session(Some(ARRANGEMENT), Vec::new());
+    let range = OfflineExportRange::new(50, 101).unwrap();
+    assert!(matches!(
+        render_project_offline_range_with_mixer(
+            &session,
+            OfflineExportSpec { block_frames: 32 },
+            range,
+            None,
+        ),
+        Err(OfflineExportError::RangeOutsideProject {
+            start_frame: 50,
+            end_frame: 101,
+            project_end_frame: 100,
+        })
+    ));
 }
 
 #[test]

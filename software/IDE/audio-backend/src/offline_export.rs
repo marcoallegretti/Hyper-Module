@@ -46,6 +46,72 @@ pub struct OfflineExportSpec {
     pub block_frames: usize,
 }
 
+/// A nonempty half-open `[start_frame, end_frame)` window for an offline mix
+/// export.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OfflineExportRange {
+    start_frame: usize,
+    end_frame: usize,
+}
+
+impl OfflineExportRange {
+    /// Returns an export range when `end_frame` is strictly after
+    /// `start_frame`.
+    pub const fn new(
+        start_frame: usize,
+        end_frame: usize,
+    ) -> Result<Self, OfflineExportRangeError> {
+        if end_frame <= start_frame {
+            return Err(OfflineExportRangeError::EmptyRange {
+                start_frame,
+                end_frame,
+            });
+        }
+        Ok(Self {
+            start_frame,
+            end_frame,
+        })
+    }
+
+    #[must_use]
+    pub const fn start_frame(self) -> usize {
+        self.start_frame
+    }
+
+    #[must_use]
+    pub const fn end_frame(self) -> usize {
+        self.end_frame
+    }
+
+    #[must_use]
+    pub const fn frame_count(self) -> usize {
+        self.end_frame - self.start_frame
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OfflineExportRangeError {
+    EmptyRange {
+        start_frame: usize,
+        end_frame: usize,
+    },
+}
+
+impl fmt::Display for OfflineExportRangeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self::EmptyRange {
+            start_frame,
+            end_frame,
+        } = self;
+        write!(
+            formatter,
+            "export range [{start_frame}, {end_frame}) is empty or inverted"
+        )
+    }
+}
+
+impl Error for OfflineExportRangeError {}
+
 /// One aligned mixer-channel render from a verified project.
 ///
 /// For an audio channel, `audio` includes its device chain, automation, mute,
@@ -99,6 +165,11 @@ pub struct OfflineTrackStemExportReport {
 pub enum OfflineExportError {
     UnboundedExtent,
     EmptyExtent,
+    RangeOutsideProject {
+        start_frame: usize,
+        end_frame: usize,
+        project_end_frame: usize,
+    },
     InvalidBlockFrames,
     CapacityUnavailable,
     Playback(AdapterCompileError),
@@ -132,6 +203,14 @@ impl fmt::Display for OfflineExportError {
                 formatter.write_str("an unbounded project has no end to export")
             }
             Self::EmptyExtent => formatter.write_str("this project renders no audio"),
+            Self::RangeOutsideProject {
+                start_frame,
+                end_frame,
+                project_end_frame,
+            } => write!(
+                formatter,
+                "export range [{start_frame}, {end_frame}) is outside project extent [0, {project_end_frame})"
+            ),
             Self::InvalidBlockFrames => {
                 formatter.write_str("the export block size is outside the supported range")
             }
@@ -196,6 +275,7 @@ impl Error for OfflineExportError {
             | Self::StemPublicationCommittedWithWarning { source, .. } => Some(source),
             Self::UnboundedExtent
             | Self::EmptyExtent
+            | Self::RangeOutsideProject { .. }
             | Self::InvalidBlockFrames
             | Self::CapacityUnavailable
             | Self::MixerLayoutMismatch
@@ -257,7 +337,27 @@ pub fn render_project_offline_with_mixer(
     spec: OfflineExportSpec,
     live_mixer: Option<&CompiledMixerGraph>,
 ) -> Result<DecodedAudio, OfflineExportError> {
-    render_project_offline_with_devices(session, &[], spec, live_mixer)
+    render_project_offline_with_devices(session, &[], spec, None, live_mixer)
+}
+
+/// Renders one half-open window of a prepared project through the same runtime
+/// as the desktop output.
+///
+/// Rendering begins at project frame zero even when the returned audio begins
+/// later. This preroll is required to preserve automation and stateful native
+/// device state at the requested window start.
+///
+/// # Errors
+///
+/// Returns the usual offline-render errors, or a classified refusal when the
+/// range is outside the verified project extent.
+pub fn render_project_offline_range_with_mixer(
+    session: &PreparedPlaybackSession,
+    spec: OfflineExportSpec,
+    range: OfflineExportRange,
+    live_mixer: Option<&CompiledMixerGraph>,
+) -> Result<DecodedAudio, OfflineExportError> {
+    render_project_offline_with_devices(session, &[], spec, Some(range), live_mixer)
 }
 
 /// Renders a structurally verified project, including its native device chains.
@@ -274,6 +374,27 @@ pub fn render_prepared_project_offline_with_mixer(
         project.session(),
         project.device_chains(),
         spec,
+        None,
+        live_mixer,
+    )
+}
+
+/// Renders one half-open window of a structurally verified project, including
+/// its native device chains.
+///
+/// The renderer prerolls from frame zero so the window matches linear project
+/// playback at every returned frame.
+pub fn render_prepared_project_offline_range_with_mixer(
+    project: &PreparedProjectPlayback,
+    spec: OfflineExportSpec,
+    range: OfflineExportRange,
+    live_mixer: Option<&CompiledMixerGraph>,
+) -> Result<DecodedAudio, OfflineExportError> {
+    render_project_offline_with_devices(
+        project.session(),
+        project.device_chains(),
+        spec,
+        Some(range),
         live_mixer,
     )
 }
@@ -282,6 +403,7 @@ fn render_project_offline_with_devices(
     session: &PreparedPlaybackSession,
     device_chains: &[DeviceChain],
     spec: OfflineExportSpec,
+    range: Option<OfflineExportRange>,
     live_mixer: Option<&CompiledMixerGraph>,
 ) -> Result<DecodedAudio, OfflineExportError> {
     let PlaybackExtent::Bounded { end_frame } = session.extent() else {
@@ -289,6 +411,17 @@ fn render_project_offline_with_devices(
     };
     if end_frame == 0 {
         return Err(OfflineExportError::EmptyExtent);
+    }
+    let range = range.unwrap_or_else(|| {
+        OfflineExportRange::new(0, end_frame)
+            .expect("a nonempty bounded playback extent is a valid full export range")
+    });
+    if range.end_frame() > end_frame {
+        return Err(OfflineExportError::RangeOutsideProject {
+            start_frame: range.start_frame(),
+            end_frame: range.end_frame(),
+            project_end_frame: end_frame,
+        });
     }
     if spec.block_frames == 0 || spec.block_frames > hyper_audio_engine::MAX_PROCESS_FRAMES {
         return Err(OfflineExportError::InvalidBlockFrames);
@@ -343,14 +476,14 @@ fn render_project_offline_with_devices(
     sender
         .try_send(TransportCommand::Start)
         .map_err(|_| OfflineExportError::CapacityUnavailable)?;
-    let mut left = allocate_silence(end_frame)?;
-    let mut right = allocate_silence(end_frame)?;
+    let mut left = allocate_silence(range.frame_count())?;
+    let mut right = allocate_silence(range.frame_count())?;
     let mut block_left = vec![0.0_f32; block_frames];
     let mut block_right = vec![0.0_f32; block_frames];
 
     let mut rendered = 0_usize;
-    while rendered < end_frame {
-        let frames = block_frames.min(end_frame - rendered);
+    while rendered < range.end_frame() {
+        let frames = block_frames.min(range.end_frame() - rendered);
         let cycle = transport
             .process_cycle(
                 &mut scratch,
@@ -365,8 +498,19 @@ fn render_project_offline_with_devices(
             TransportState::Rolling,
             "the export queues one Start and no command that could stop it"
         );
-        left[rendered..rendered + frames].copy_from_slice(&block_left[..frames]);
-        right[rendered..rendered + frames].copy_from_slice(&block_right[..frames]);
+        let block_end = rendered + frames;
+        let copy_start = rendered.max(range.start_frame());
+        let copy_end = block_end.min(range.end_frame());
+        if copy_start < copy_end {
+            let source_start = copy_start - rendered;
+            let source_end = copy_end - rendered;
+            let destination_start = copy_start - range.start_frame();
+            let destination_end = copy_end - range.start_frame();
+            left[destination_start..destination_end]
+                .copy_from_slice(&block_left[source_start..source_end]);
+            right[destination_start..destination_end]
+                .copy_from_slice(&block_right[source_start..source_end]);
+        }
         rendered += frames;
     }
 
@@ -1481,6 +1625,23 @@ pub fn export_prepared_project_wav_with_mixer(
     publish_rendered_wav(&rendered, spec, journal_path, wav_path)
 }
 
+/// Renders a verified project window and publishes it as one float WAV.
+///
+/// The requested window is preroll-rendered from frame zero before it is
+/// written, so automation and native device state match ordinary playback.
+pub fn export_prepared_project_range_wav_with_mixer(
+    project: &PreparedProjectPlayback,
+    spec: OfflineExportSpec,
+    range: OfflineExportRange,
+    live_mixer: Option<&CompiledMixerGraph>,
+    journal_path: &Path,
+    wav_path: &Path,
+) -> Result<OfflineExportReport, OfflineExportError> {
+    let rendered =
+        render_prepared_project_offline_range_with_mixer(project, spec, range, live_mixer)?;
+    publish_rendered_wav(&rendered, spec, journal_path, wav_path)
+}
+
 /// Renders a structurally verified project and atomically publishes a native
 /// 24-bit FLAC export to a new destination.
 ///
@@ -1506,6 +1667,22 @@ pub fn export_prepared_project_flac_with_mixer(
     flac_path: &Path,
 ) -> Result<OfflineExportReport, OfflineExportError> {
     let rendered = render_prepared_project_offline_with_mixer(project, spec, live_mixer)?;
+    publish_rendered_flac(&rendered, spec, flac_path)
+}
+
+/// Renders a verified project window and publishes it as one 24-bit FLAC.
+///
+/// The requested window is preroll-rendered from frame zero before it is
+/// encoded, so automation and native device state match ordinary playback.
+pub fn export_prepared_project_range_flac_with_mixer(
+    project: &PreparedProjectPlayback,
+    spec: OfflineExportSpec,
+    range: OfflineExportRange,
+    live_mixer: Option<&CompiledMixerGraph>,
+    flac_path: &Path,
+) -> Result<OfflineExportReport, OfflineExportError> {
+    let rendered =
+        render_prepared_project_offline_range_with_mixer(project, spec, range, live_mixer)?;
     publish_rendered_flac(&rendered, spec, flac_path)
 }
 

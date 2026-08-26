@@ -36,14 +36,16 @@ use hyper_desktop_audio::{
     MonitoringSnapshot, OfflineExportError, OfflineExportSpec, OutputStreamSnapshot,
     OutputStreamState, PendingNativeShutdown, PendingNativeShutdownWait, StreamState,
     discover_desktop_input_targets, discover_desktop_output_targets,
-    export_prepared_project_flac_with_mixer, export_prepared_project_track_stems_with_mixer,
+    export_prepared_project_flac_with_mixer, export_prepared_project_range_flac_with_mixer,
+    export_prepared_project_range_wav_with_mixer, export_prepared_project_track_stems_with_mixer,
     export_prepared_project_wav_with_mixer,
 };
 pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
 };
 pub use hyper_desktop_audio::{
-    OfflineExportReport, OfflineTrackStemExportFormat, OfflineTrackStemExportReport,
+    OfflineExportRange, OfflineExportRangeError, OfflineExportReport, OfflineTrackStemExportFormat,
+    OfflineTrackStemExportReport,
 };
 
 /// Version-1 maximum number of return sends authored by one source channel.
@@ -11915,6 +11917,37 @@ impl RunningDesktopIdeApplication {
         format: IdeProjectExportFormat,
         block_frames: usize,
     ) -> Result<OfflineExportReport, IdeProjectExportError> {
+        self.export_project_window(destination_path, format, block_frames, None)
+    }
+
+    /// Renders one verified half-open project window to the selected WAV or
+    /// FLAC destination.
+    ///
+    /// The renderer prerolls from frame zero before writing `range`, so its
+    /// automation and native devices match the audible linear playback state
+    /// at the window start. This does not alter project or transport state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same classified rejection as [`Self::export_project`], or
+    /// a range rejection when the requested frames are outside the project.
+    pub fn export_project_range(
+        &self,
+        destination_path: &Path,
+        format: IdeProjectExportFormat,
+        block_frames: usize,
+        range: OfflineExportRange,
+    ) -> Result<OfflineExportReport, IdeProjectExportError> {
+        self.export_project_window(destination_path, format, block_frames, Some(range))
+    }
+
+    fn export_project_window(
+        &self,
+        destination_path: &Path,
+        format: IdeProjectExportFormat,
+        block_frames: usize,
+        range: Option<OfflineExportRange>,
+    ) -> Result<OfflineExportReport, IdeProjectExportError> {
         if IdeProjectExportFormat::from_destination(destination_path)? != format {
             return Err(IdeProjectExportError::DestinationUnavailable);
         }
@@ -11929,20 +11962,39 @@ impl RunningDesktopIdeApplication {
             IdeProjectExportFormat::Wav => {
                 let journal_path = export_journal_path(destination_path)
                     .ok_or(IdeProjectExportError::DestinationUnavailable)?;
-                export_prepared_project_wav_with_mixer(
+                match range {
+                    Some(range) => export_prepared_project_range_wav_with_mixer(
+                        prepared,
+                        OfflineExportSpec { block_frames },
+                        range,
+                        live_mixer.as_ref(),
+                        &journal_path,
+                        destination_path,
+                    ),
+                    None => export_prepared_project_wav_with_mixer(
+                        prepared,
+                        OfflineExportSpec { block_frames },
+                        live_mixer.as_ref(),
+                        &journal_path,
+                        destination_path,
+                    ),
+                }
+            }
+            IdeProjectExportFormat::Flac => match range {
+                Some(range) => export_prepared_project_range_flac_with_mixer(
+                    prepared,
+                    OfflineExportSpec { block_frames },
+                    range,
+                    live_mixer.as_ref(),
+                    destination_path,
+                ),
+                None => export_prepared_project_flac_with_mixer(
                     prepared,
                     OfflineExportSpec { block_frames },
                     live_mixer.as_ref(),
-                    &journal_path,
                     destination_path,
-                )
-            }
-            IdeProjectExportFormat::Flac => export_prepared_project_flac_with_mixer(
-                prepared,
-                OfflineExportSpec { block_frames },
-                live_mixer.as_ref(),
-                destination_path,
-            ),
+                ),
+            },
         }
         .map_err(|source| IdeProjectExportError::Export(Box::new(source)))?;
         Ok(report)
