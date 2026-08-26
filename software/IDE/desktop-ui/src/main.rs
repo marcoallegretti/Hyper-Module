@@ -1127,6 +1127,35 @@ fn bind_audio_preview_callbacks(ui: &MainWindow, worker: &WorkerCell, take_route
         };
         submit_to_ui(&ui, &worker_for_discard, command);
     });
+
+    let weak = ui.as_weak();
+    let worker_for_rename = Rc::clone(worker);
+    let routes_for_rename = Rc::clone(take_routes);
+    actions.on_rename_recording_take(move |index, label| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_take_rename_visible() {
+            return;
+        }
+        let label = label.trim();
+        if label.is_empty() || label.chars().count() > 120 {
+            ui.set_error_text("Recorded-take label must contain 1 through 120 characters".into());
+            return;
+        }
+        let Some(route) = take_route(&routes_for_rename, index) else {
+            ui.set_error_text("Recorded take selection is no longer available".into());
+            return;
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_rename,
+            IdeWorkerCommand::RenameRecordingTake {
+                recording_id: route.recording_id,
+                label: label.to_owned(),
+            },
+        );
+    });
 }
 
 fn take_route(routes: &TakeRoutes, index: i32) -> Option<TakeRoute> {
@@ -4877,6 +4906,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::DiscardRecordingTake => {
             "Preserving mixer state, permanently discarding the unpromoted recorded take, and reopening project…"
         }
+        IdeWorkerCommandKind::RenameRecordingTake => {
+            "Preserving mixer state, saving the recorded-take label, and reopening project…"
+        }
         IdeWorkerCommandKind::SetAudioClipActive => {
             "Preserving mixer state, updating audio-clip activation, and reopening project…"
         }
@@ -5492,6 +5524,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::RecordingTakeDiscarding
         | IdeWorkerEvent::RecordingTakeDiscarded { .. }) => {
             apply_recording_take_discard_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::RecordingTakeRenaming
+        | IdeWorkerEvent::RecordingTakeRenamed { .. }) => {
+            apply_recording_take_rename_event(ui, &event);
         }
         IdeWorkerEvent::RecordingPreparing => {
             ui.set_app_mode(AppMode::PreparingRecording);
@@ -7105,6 +7141,39 @@ fn apply_recording_take_discard_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     }
 }
 
+fn apply_recording_take_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::RecordingTakeRenaming => {
+            ui.set_app_mode(AppMode::Saving);
+            ui.set_status_text(
+                "Waiting for native output before renaming the recorded take…".into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RecordingTakeRenamed {
+            revision,
+            changed,
+            label,
+        } => {
+            ui.set_take_rename_visible(false);
+            ui.set_take_rename_index(-1);
+            ui.set_take_rename_label(SharedString::default());
+            ui.set_status_text(
+                if *changed {
+                    format!("Recorded take renamed to {label} in project revision {revision}")
+                } else {
+                    format!(
+                        "Recorded take was already named {label} in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("recording-take rename dispatcher received another event"),
+    }
+}
+
 fn apply_output_test_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::OutputTest(snapshot) => {
@@ -7528,6 +7597,7 @@ fn set_recording_takes(
         rows.push(TakeRow {
             index: i32::try_from(index).unwrap_or(-1),
             track_name: take.track_name().into(),
+            label: take.label().unwrap_or(take.track_name()).into(),
             captured_at: format_capture_time(take.captured_at_utc()).into(),
             detail: format_take_detail(take).into(),
             timeline_start: format!(
@@ -8463,6 +8533,9 @@ fn reset_project(
     ui.set_recording_takes(ModelRc::default());
     ui.set_take_clip_visible(false);
     ui.set_take_clip_index(-1);
+    ui.set_take_rename_visible(false);
+    ui.set_take_rename_index(-1);
+    ui.set_take_rename_label(SharedString::default());
     ui.set_take_clip_track_name(SharedString::default());
     ui.set_take_clip_name(SharedString::default());
     ui.set_takes_visible(false);
@@ -8627,6 +8700,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
         IdeWorkerCommandKind::SaveProject
         | IdeWorkerCommandKind::DiscardRecordingTake
+        | IdeWorkerCommandKind::RenameRecordingTake
         | IdeWorkerCommandKind::ReorderMixerStrips
         | IdeWorkerCommandKind::AddReturnSend
         | IdeWorkerCommandKind::RemoveReturnSend
@@ -18193,6 +18267,7 @@ mod tests {
         set_recording_takes(&ui, &routes, &observation);
         let rows = ui.get_recording_takes();
         assert_eq!(rows.row_count(), 2);
+        assert_eq!(rows.row_data(0).unwrap().label, "Audio A");
         assert!(rows.row_data(0).unwrap().discardable);
         assert!(!rows.row_data(1).unwrap().discardable);
         assert!(matches!(
@@ -18232,6 +18307,14 @@ mod tests {
     fn recording_take_discard_failure_restores_running_mode() {
         assert_eq!(
             mode_after_failure(AppMode::Saving, IdeWorkerCommandKind::DiscardRecordingTake),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn recording_take_rename_failure_restores_running_mode() {
+        assert_eq!(
+            mode_after_failure(AppMode::Saving, IdeWorkerCommandKind::RenameRecordingTake),
             AppMode::Running
         );
     }

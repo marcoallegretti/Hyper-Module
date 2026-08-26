@@ -177,6 +177,7 @@ export struct NativeDeviceRow {
 export struct TakeRow {
     index: int,
     track-name: string,
+    label: string,
     captured-at: string,
     detail: string,
     timeline-start: string,
@@ -388,6 +389,7 @@ export global IdeActions {
     callback create-audio-clip-from-take(int, string);
     callback create-and-place-audio-clip-from-take(int, string);
     callback discard-recording-take(int);
+    callback rename-recording-take(int, string);
     callback choose-audio-import(int);
     callback preview-gain(float);
     callback preview-mute();
@@ -560,6 +562,9 @@ export component MainWindow inherits Window {
     in-out property <bool> takes-visible: false;
     in-out property <bool> take-clip-visible: false;
     in-out property <int> take-clip-index: -1;
+    in-out property <bool> take-rename-visible: false;
+    in-out property <int> take-rename-index: -1;
+    in-out property <string> take-rename-label: "";
     in-out property <int> take-discard-confirming-index: -1;
     in-out property <string> take-clip-track-name: "";
     in-out property <string> take-clip-name: "";
@@ -671,6 +676,7 @@ export component MainWindow inherits Window {
         || root.remove-track-content-visible
         || root.routing-bus-removal-visible
         || root.take-clip-visible
+        || root.take-rename-visible
         || root.take-discard-confirming-index >= 0
         || root.add-arrangement-scene-launch-visible
         || root.move-arrangement-scene-launch-visible
@@ -3519,7 +3525,27 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        if !root.take-clip-visible && root.recording-takes.length == 0 : Text {
+                        if root.take-rename-visible : Rectangle {
+                            height: 176px;
+                            background: #0e141b;
+                            border-color: #37769a;
+                            border-width: 1px;
+                            border-radius: 6px;
+                            VerticalLayout {
+                                padding: 18px;
+                                spacing: 10px;
+                                Text { text: "RENAME RECORDED TAKE"; color: #7dcfff; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                                Text { text: "This label is saved with the recorded take and becomes the default clip name."; color: #aebccc; font-size: 11px; wrap: word-wrap; }
+                                IdeLineEdit { text <=> root.take-rename-label; accessible-label: "Recorded take label"; }
+                                HorizontalLayout {
+                                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    Button { width: 86px; text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.take-rename-visible = false; } }
+                                    Button { width: 104px; text: "Rename"; enabled: root.app-mode == AppMode.running && root.take-rename-label != ""; clicked => { IdeActions.rename-recording-take(root.take-rename-index, root.take-rename-label); } }
+                                }
+                            }
+                        }
+
+                        if !root.take-clip-visible && !root.take-rename-visible && root.recording-takes.length == 0 : Text {
                             text: "No verified recorded takes are present in this project.";
                             color: #8fa0b4;
                             font-size: 13px;
@@ -3528,7 +3554,7 @@ export component MainWindow inherits Window {
                             vertical-stretch: 1;
                         }
 
-                        if !root.take-clip-visible && root.recording-takes.length > 0 : ListView {
+                        if !root.take-clip-visible && !root.take-rename-visible && root.recording-takes.length > 0 : ListView {
                             vertical-stretch: 1;
                             for take in root.recording-takes : Rectangle {
                                 height: 74px;
@@ -3543,7 +3569,7 @@ export component MainWindow inherits Window {
                                     VerticalLayout {
                                         width: 164px;
                                         spacing: 2px;
-                                        Text { text: take.track-name; color: #edf2f8; font-size: 13px; font-weight: 600; overflow: elide; }
+                                        Text { text: take.label; color: #edf2f8; font-size: 13px; font-weight: 600; overflow: elide; }
                                         Text { text: take.captured-at; color: #8290a2; font-size: 9px; overflow: elide; }
                                     }
                                     VerticalLayout {
@@ -3575,8 +3601,19 @@ export component MainWindow inherits Window {
                                         clicked => {
                                             root.take-clip-index = take.index;
                                             root.take-clip-track-name = take.track-name;
-                                            root.take-clip-name = take.track-name;
+                                            root.take-clip-name = take.label;
                                             root.take-clip-visible = true;
+                                        }
+                                    }
+                                    Button {
+                                        width: 78px;
+                                        text: "Rename";
+                                        accessible-label: "Rename recorded take " + take.label;
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => {
+                                            root.take-rename-index = take.index;
+                                            root.take-rename-label = take.label;
+                                            root.take-rename-visible = true;
                                         }
                                     }
                                     Button {
@@ -3597,8 +3634,8 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        if !root.take-clip-visible : Rectangle { height: 1px; background: #27313d; }
-                        if !root.take-clip-visible : HorizontalLayout {
+                        if !root.take-clip-visible && !root.take-rename-visible : Rectangle { height: 1px; background: #27313d; }
+                        if !root.take-clip-visible && !root.take-rename-visible : HorizontalLayout {
                             height: 58px;
                             spacing: 10px;
                             VerticalLayout {
@@ -3633,7 +3670,7 @@ export component MainWindow inherits Window {
                                 vertical-alignment: center;
                             }
                         }
-                        if !root.take-clip-visible : Text {
+                        if !root.take-clip-visible && !root.take-rename-visible : Text {
                             text: "Audition is dry. Creating a reusable clip still does not place it in the arrangement.";
                             color: #65758a;
                             font-size: 9px;

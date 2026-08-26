@@ -10573,6 +10573,74 @@ impl RunningDesktopIdeApplication {
         })
     }
 
+    /// Prepares an atomic user-label replacement for one verified recorded
+    /// take. The metadata crate owns the label schema and canonical rewrite;
+    /// this layer owns project identity fencing and candidate validation.
+    fn prepare_recording_take_label(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        recording_id: &str,
+        label: &str,
+    ) -> Result<IdeResourceRestorePlan, IdeResourceRestoreError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeResourceRestoreError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeResourceRestoreError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Self::prepare_recording_take_label_from_project(
+            application,
+            mixer,
+            prepared,
+            recording_id,
+            label,
+        )
+    }
+
+    fn prepare_recording_take_label_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        recording_id: &str,
+        label: &str,
+    ) -> Result<IdeResourceRestorePlan, IdeResourceRestoreError> {
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == recording_id)
+            .ok_or(IdeResourceRestoreError::ResourceMissing)?;
+        if descriptor.role() != ResourceRole::RecordingMetadata {
+            return Err(IdeResourceRestoreError::CandidateInvalid(Box::new(
+                std::io::Error::other("selected resource is not recorded-take metadata"),
+            )));
+        }
+        let source = package
+            .read_resource(recording_id)
+            .map_err(IdeResourceRestoreError::Storage)?;
+        let metadata = hyper_recording_metadata::RecordingMetadataDocument::parse(&source)
+            .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
+        if metadata.id() != recording_id {
+            return Err(IdeResourceRestoreError::CandidateInvalid(Box::new(
+                std::io::Error::other(
+                    "recorded-take metadata identity does not match its resource",
+                ),
+            )));
+        }
+        let replacement = metadata
+            .with_take_label(label)
+            .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
+        Self::prepare_resource_restore_from_project(
+            application,
+            mixer,
+            prepared,
+            recording_id,
+            &replacement,
+        )
+    }
+
     fn prepare_recorded_take_placement(
         application: &DesktopIdeApplication,
         recovery: &DesktopPlaybackRecovery,
@@ -16907,6 +16975,128 @@ mod tests {
                 .iter()
                 .any(|asset| asset.id() == ASSET_ID)
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the label lifecycle test keeps import, transactional replacement, undo evidence, and reopen evidence together"
+    )]
+    fn recorded_take_label_publishes_preserves_extensions_and_can_be_restored() {
+        const METADATA_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338528";
+        const ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338529";
+        let parent = TestDirectory::new();
+        let created = hyper_storage_engine::create_project(
+            &parent.0,
+            hyper_storage_engine::ProjectCreationRequest {
+                directory_name: "Project",
+                project_name: "Recorded Take Label Test",
+            },
+        )
+        .unwrap();
+        let project_path = created.project().root().to_path_buf();
+        let project_id = created.project().manifest().project_id().to_owned();
+        let track_id = created
+            .project()
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Track)
+            .unwrap()
+            .id()
+            .to_owned();
+        drop(created);
+        let recording = arrangement_test_wav(&[0; 63]);
+        let recording_path = parent.0.join("capture.wav");
+        std::fs::write(&recording_path, &recording).unwrap();
+        let metadata = arrangement_test_canonical(&json!({
+            "format":"hyper-recording-metadata", "format_version":1,
+            "id":METADATA_ID, "project_id":project_id, "asset_id":ASSET_ID,
+            "track_id":track_id, "capture_kind":"new",
+            "captured_at_utc":"2026-08-09T12:00:00.000Z",
+            "timeline_start_tick":0, "source_input_indices":[0],
+            "sample_rate_hz":48_000, "channels":1, "frame_count":63,
+            "extensions":{"org.example.fixture":{"retained":true}}
+        }));
+        hyper_storage_engine::import_recording(
+            &project_path,
+            hyper_storage_engine::RecordingImportRequest {
+                recording_path: &recording_path,
+                recording_byte_length: recording.len() as u64,
+                recording_sha256: Sha256::digest(&recording).into(),
+                metadata_bytes: &metadata,
+            },
+        )
+        .unwrap();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let application = DesktopIdeApplication::from_inventories(
+            desktop_ide_application_config().unwrap(),
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let plan = RunningDesktopIdeApplication::prepare_recording_take_label_from_project(
+            &application,
+            IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: *package.manifest_sha256(),
+                resource_id: mixer_id.clone(),
+                resource_bytes: mixer_bytes.clone(),
+            },
+            &prepared,
+            METADATA_ID,
+            "Lead vocal",
+        )
+        .unwrap();
+        drop(prepared);
+        let outcome = plan.publish().unwrap();
+        assert!(outcome.changed());
+        assert_eq!(outcome.project_revision(), 3);
+        let undo = outcome.previous_resource().unwrap().to_vec();
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let edited = reopened
+            .recording_metadata()
+            .iter()
+            .find(|metadata| metadata.id() == METADATA_ID)
+            .unwrap();
+        assert_eq!(edited.take_label(), Some("Lead vocal"));
+        assert_eq!(
+            edited.extensions()["org.example.fixture"],
+            json!({"retained":true})
+        );
+        let package = reopened.package();
+        let active_mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let restore = RunningDesktopIdeApplication::prepare_resource_restore_from_project(
+            &application,
+            IdeMixerSavePlan {
+                project_path,
+                expected_project_sha256: *package.manifest_sha256(),
+                resource_id: mixer_id,
+                resource_bytes: active_mixer_bytes,
+            },
+            &reopened,
+            METADATA_ID,
+            &undo,
+        )
+        .unwrap();
+        drop(reopened);
+        restore.publish().unwrap();
+        let restored =
+            hyper_project_loader::prepare_project_playback(&restore.mixer.project_path, limits)
+                .unwrap();
+        assert_eq!(restored.recording_metadata()[0].take_label(), None);
     }
 
     #[test]

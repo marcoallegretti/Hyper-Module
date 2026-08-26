@@ -16,6 +16,9 @@ const MAX_HANDOFF_PATH_UTF8_BYTES: usize = 4096;
 const VERSION_ONE_SAMPLE_RATE: u32 = 48_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_METADATA_BYTES: usize = 1_048_576;
+const TAKE_LABEL_EXTENSION: &str = "io.hypermodule.recording-take";
+const TAKE_LABEL_FIELD: &str = "label";
+const MAX_TAKE_LABEL_CHARACTERS: usize = 120;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -113,6 +116,87 @@ impl RecordingMetadataDocument {
     #[must_use]
     pub const fn extensions(&self) -> &BTreeMap<String, serde_json::Value> {
         &self.extensions
+    }
+
+    /// Returns the user-assigned label for this recorded take, if present.
+    #[must_use]
+    pub fn take_label(&self) -> Option<&str> {
+        take_label_from_extensions(&self.extensions)
+    }
+
+    /// Rewrites this metadata document with one validated user-facing take
+    /// label while preserving every unrelated extension value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `label` is not a trimmed 1 through 120 character
+    /// string or canonical JSON serialization fails.
+    pub fn with_take_label(&self, label: &str) -> Result<Vec<u8>, RecordingMetadataEditError> {
+        if !valid_take_label(label) {
+            return Err(RecordingMetadataEditError::InvalidTakeLabel);
+        }
+        let mut extensions = self.extensions.clone();
+        let mut take_extension = extensions
+            .get(TAKE_LABEL_EXTENSION)
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        take_extension.insert(
+            TAKE_LABEL_FIELD.to_owned(),
+            serde_json::Value::String(label.to_owned()),
+        );
+        extensions.insert(
+            TAKE_LABEL_EXTENSION.to_owned(),
+            serde_json::Value::Object(take_extension),
+        );
+        serde_json_canonicalizer::to_vec(&CanonicalDocument {
+            asset_id: &self.asset_id,
+            capture_kind: self.capture_kind,
+            captured_at_utc: &self.captured_at_utc,
+            channels: self.channels,
+            extensions,
+            format: FORMAT,
+            format_version: FORMAT_VERSION,
+            frame_count: self.frame_count,
+            id: &self.id,
+            project_id: &self.project_id,
+            sample_rate_hz: self.sample_rate_hz,
+            source_input_indices: &self.source_input_indices,
+            timeline_start_tick: self.timeline_start_tick,
+            track_id: &self.track_id,
+        })
+        .map_err(RecordingMetadataEditError::Serialization)
+    }
+}
+
+#[derive(Debug)]
+pub enum RecordingMetadataEditError {
+    InvalidTakeLabel,
+    Serialization(serde_json::Error),
+}
+
+impl fmt::Display for RecordingMetadataEditError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTakeLabel => {
+                formatter.write_str("recorded-take label must contain 1 to 120 trimmed characters")
+            }
+            Self::Serialization(source) => {
+                write!(
+                    formatter,
+                    "recording metadata cannot be canonicalized: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for RecordingMetadataEditError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Serialization(source) => Some(source),
+            Self::InvalidTakeLabel => None,
+        }
     }
 }
 
@@ -517,6 +601,7 @@ fn validate_document(
         raw.extensions.keys().all(|key| valid_extension_key(key)),
         "recording metadata extensions contain an invalid key",
     )?;
+    validate_take_label_extension(&raw.extensions)?;
 
     Ok(RecordingMetadataDocument {
         id: raw.id,
@@ -532,6 +617,35 @@ fn validate_document(
         frame_count: raw.frame_count,
         extensions: raw.extensions,
     })
+}
+
+fn take_label_from_extensions(extensions: &BTreeMap<String, serde_json::Value>) -> Option<&str> {
+    extensions
+        .get(TAKE_LABEL_EXTENSION)
+        .and_then(serde_json::Value::as_object)
+        .and_then(|extension| extension.get(TAKE_LABEL_FIELD))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn validate_take_label_extension(
+    extensions: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), RecordingMetadataParseError> {
+    let Some(extension) = extensions.get(TAKE_LABEL_EXTENSION) else {
+        return Ok(());
+    };
+    let label = extension
+        .as_object()
+        .and_then(|extension| extension.get(TAKE_LABEL_FIELD))
+        .and_then(serde_json::Value::as_str);
+    require_document(
+        label.is_some_and(valid_take_label),
+        "recording metadata take label extension is invalid",
+    )
+}
+
+fn valid_take_label(value: &str) -> bool {
+    let count = value.chars().count();
+    value.trim() == value && (1..=MAX_TAKE_LABEL_CHARACTERS).contains(&count)
 }
 
 fn require_document(
@@ -598,6 +712,24 @@ struct CanonicalMetadata<'a> {
     capture_kind: RecordingCaptureKind,
     captured_at_utc: &'a str,
     channels: u16,
+    extensions: BTreeMap<String, serde_json::Value>,
+    format: &'static str,
+    format_version: u8,
+    frame_count: u64,
+    id: &'a str,
+    project_id: &'a str,
+    sample_rate_hz: u32,
+    source_input_indices: &'a [u8],
+    timeline_start_tick: u64,
+    track_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct CanonicalDocument<'a> {
+    asset_id: &'a str,
+    capture_kind: RecordingCaptureKind,
+    captured_at_utc: &'a str,
+    channels: u8,
     extensions: BTreeMap<String, serde_json::Value>,
     format: &'static str,
     format_version: u8,
@@ -738,6 +870,89 @@ mod tests {
     const ABSOLUTE_PREFIX: &str = "/";
     #[cfg(windows)]
     const ABSOLUTE_PREFIX: &str = "C:\\";
+
+    fn recording_metadata_with_extensions(extensions: serde_json::Value) -> Vec<u8> {
+        serde_json_canonicalizer::to_vec(&serde_json::json!({
+            "format": FORMAT,
+            "format_version": FORMAT_VERSION,
+            "id": "018f47a2-6b2d-7c11-8a44-001122334456",
+            "project_id": "018f47a2-6b2d-7c11-8a44-001122334457",
+            "asset_id": "018f47a2-6b2d-7c11-8a44-001122334458",
+            "track_id": "018f47a2-6b2d-7c11-8a44-001122334459",
+            "capture_kind": "new",
+            "captured_at_utc": "2026-08-26T12:00:00.000Z",
+            "timeline_start_tick": 0,
+            "source_input_indices": [0],
+            "sample_rate_hz": VERSION_ONE_SAMPLE_RATE,
+            "channels": 1,
+            "frame_count": 48_000,
+            "extensions": extensions,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn take_label_rewrite_is_canonical_and_preserves_extensions() {
+        let source = recording_metadata_with_extensions(serde_json::json!({
+            "org.example.fixture": { "retained": true },
+            TAKE_LABEL_EXTENSION: { "label": "Original", "future": 7 },
+        }));
+        let parsed = RecordingMetadataDocument::parse(&source).unwrap();
+        assert_eq!(parsed.take_label(), Some("Original"));
+
+        let renamed = parsed.with_take_label("Lead vocal").unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&renamed).unwrap();
+        assert_eq!(
+            value["extensions"]["org.example.fixture"],
+            serde_json::json!({ "retained": true })
+        );
+        assert_eq!(
+            value["extensions"][TAKE_LABEL_EXTENSION]["future"],
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            value["extensions"][TAKE_LABEL_EXTENSION]["label"],
+            serde_json::json!("Lead vocal")
+        );
+        assert_eq!(
+            renamed,
+            serde_json_canonicalizer::to_vec(&value).unwrap(),
+            "the rewrite must remain RFC 8785 canonical"
+        );
+        assert_eq!(
+            RecordingMetadataDocument::parse(&renamed)
+                .unwrap()
+                .take_label(),
+            Some("Lead vocal")
+        );
+    }
+
+    #[test]
+    fn take_label_extension_rejects_invalid_values() {
+        for extension in [
+            serde_json::json!(false),
+            serde_json::json!({}),
+            serde_json::json!({ "label": 1 }),
+            serde_json::json!({ "label": " leading" }),
+            serde_json::json!({ "label": "x".repeat(121) }),
+        ] {
+            let source = recording_metadata_with_extensions(serde_json::json!({
+                TAKE_LABEL_EXTENSION: extension,
+            }));
+            assert!(RecordingMetadataDocument::parse(&source).is_err());
+        }
+
+        let parsed = RecordingMetadataDocument::parse(&recording_metadata_with_extensions(
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        for label in ["", " ", " label", "label "] {
+            assert!(matches!(
+                parsed.with_take_label(label),
+                Err(RecordingMetadataEditError::InvalidTakeLabel)
+            ));
+        }
+    }
 
     #[test]
     fn handoff_paths_share_one_utf8_boundary_contract() {

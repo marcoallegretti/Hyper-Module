@@ -177,6 +177,7 @@ pub enum IdeWorkerCommandKind {
     RemoveAudioClip,
     CleanUnusedSamples,
     DiscardRecordingTake,
+    RenameRecordingTake,
     AddArrangementPlacement,
     AddArrangementSceneLaunch,
     MoveArrangementSceneLaunch,
@@ -351,6 +352,10 @@ pub enum IdeWorkerCommand {
     },
     DiscardRecordingTake {
         recording_id: String,
+    },
+    RenameRecordingTake {
+        recording_id: String,
+        label: String,
     },
     AddArrangementPlacement {
         clip_id: String,
@@ -572,6 +577,7 @@ impl IdeWorkerCommand {
             Self::RemoveAudioClip { .. } => IdeWorkerCommandKind::RemoveAudioClip,
             Self::CleanUnusedSamples { .. } => IdeWorkerCommandKind::CleanUnusedSamples,
             Self::DiscardRecordingTake { .. } => IdeWorkerCommandKind::DiscardRecordingTake,
+            Self::RenameRecordingTake { .. } => IdeWorkerCommandKind::RenameRecordingTake,
             Self::AddArrangementPlacement { .. } => IdeWorkerCommandKind::AddArrangementPlacement,
             Self::AddArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::AddArrangementSceneLaunch
@@ -702,6 +708,7 @@ pub struct IdeRecordingTake {
     asset_id: String,
     track_id: String,
     track_name: String,
+    label: Option<String>,
     capture_kind: IdeRecordingCaptureKind,
     captured_at_utc: String,
     timeline_start_tick: u64,
@@ -730,6 +737,11 @@ impl IdeRecordingTake {
     #[must_use]
     pub fn track_name(&self) -> &str {
         &self.track_name
+    }
+
+    #[must_use]
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
     }
 
     #[must_use]
@@ -1578,6 +1590,7 @@ impl IdeRunningObservation {
                     asset_id: asset_id.to_owned(),
                     track_id: track_id.to_owned(),
                     track_name: track_name.to_owned(),
+                    label: None,
                     capture_kind: IdeRecordingCaptureKind::New,
                     captured_at_utc: "2026-08-26T12:00:00.000Z".to_owned(),
                     timeline_start_tick: 0,
@@ -2537,6 +2550,12 @@ pub enum IdeWorkerEvent {
         revision: u64,
         recording_id: String,
     },
+    RecordingTakeRenaming,
+    RecordingTakeRenamed {
+        revision: u64,
+        changed: bool,
+        label: String,
+    },
     UnusedSampleCleanupStarting {
         assets: usize,
         bytes: u64,
@@ -3381,6 +3400,10 @@ enum ProjectMutation {
     DiscardRecordingTake {
         recording_id: String,
     },
+    RenameRecordingTake {
+        recording_id: String,
+        label: String,
+    },
     AddArrangementPlacement {
         clip_id: String,
         start_tick: u64,
@@ -3555,6 +3578,7 @@ impl ProjectMutation {
             Self::RemoveAudioClip { .. } => IdeWorkerCommandKind::RemoveAudioClip,
             Self::CleanUnusedSamples { .. } => IdeWorkerCommandKind::CleanUnusedSamples,
             Self::DiscardRecordingTake { .. } => IdeWorkerCommandKind::DiscardRecordingTake,
+            Self::RenameRecordingTake { .. } => IdeWorkerCommandKind::RenameRecordingTake,
             Self::AddArrangementPlacement { .. } => IdeWorkerCommandKind::AddArrangementPlacement,
             Self::AddArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::AddArrangementSceneLaunch
@@ -3652,6 +3676,7 @@ impl ProjectMutation {
                 }
             }
             Self::DiscardRecordingTake { .. } => IdeWorkerEvent::RecordingTakeDiscarding,
+            Self::RenameRecordingTake { .. } => IdeWorkerEvent::RecordingTakeRenaming,
             Self::AddArrangementPlacement { start_tick, .. } => {
                 IdeWorkerEvent::ArrangementPlacementAdding {
                     start_tick: *start_tick,
@@ -3953,6 +3978,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => "scene marker reassignment",
         IdeWorkerCommandKind::RemoveArrangementSceneLaunch => "scene marker removal",
         IdeWorkerCommandKind::RenameAudioClip => "clip rename",
+        IdeWorkerCommandKind::RenameRecordingTake => "recorded-take rename",
         IdeWorkerCommandKind::SetAudioClipActive => "clip activation",
         IdeWorkerCommandKind::SetAudioClipGain => "clip gain",
         IdeWorkerCommandKind::SetAudioClipFades => "clip fades",
@@ -4340,6 +4366,7 @@ fn process_command(
         | IdeWorkerCommand::RemoveAudioClip { .. }
         | IdeWorkerCommand::CleanUnusedSamples { .. }
         | IdeWorkerCommand::DiscardRecordingTake { .. }
+        | IdeWorkerCommand::RenameRecordingTake { .. }
         | IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
@@ -4566,6 +4593,10 @@ fn process_project_mutation_command(
             events,
             ProjectMutation::DiscardRecordingTake { recording_id },
         ),
+        IdeWorkerCommand::RenameRecordingTake {
+            recording_id,
+            label,
+        } => rename_recording_take(state, events, &recording_id, &label),
         command @ (IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
@@ -7209,6 +7240,51 @@ fn rename_audio_clip(
     )
 }
 
+fn rename_recording_take(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    recording_id: &str,
+    label: &str,
+) -> bool {
+    let label = label.trim();
+    if recording_id.is_empty() || label.is_empty() || label.chars().count() > 120 {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RenameRecordingTake,
+            IdeWorkerCommandFailure::EditRestore(Box::new(
+                IdeResourceRestoreError::CandidateInvalid(Box::new(std::io::Error::other(
+                    "recorded-take rename requires an identity and a label of 1 to 120 characters",
+                ))),
+            )),
+        );
+    }
+    let mut owned_recording_id = String::new();
+    let mut owned_label = String::new();
+    if owned_recording_id
+        .try_reserve_exact(recording_id.len())
+        .is_err()
+        || owned_label.try_reserve_exact(label.len()).is_err()
+    {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RenameRecordingTake,
+            IdeWorkerCommandFailure::EditRestore(Box::new(
+                IdeResourceRestoreError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_recording_id.push_str(recording_id);
+    owned_label.push_str(label);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::RenameRecordingTake {
+            recording_id: owned_recording_id,
+            label: owned_label,
+        },
+    )
+}
+
 fn set_audio_clip_active(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -7720,6 +7796,10 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             result: Ok(outcome),
             ..
         }
+        | ProjectMutationAttempt::RenameRecordingTake {
+            result: Ok(outcome),
+            ..
+        }
         | ProjectMutationAttempt::SetAudioClipActive {
             result: Ok(outcome),
             ..
@@ -7884,6 +7964,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::SetArrangementPlacementDuration { result: Err(_), .. }
         | ProjectMutationAttempt::TrimArrangementPlacementFront { result: Err(_), .. }
         | ProjectMutationAttempt::RenameAudioClip { result: Err(_), .. }
+        | ProjectMutationAttempt::RenameRecordingTake { result: Err(_), .. }
         | ProjectMutationAttempt::SetAudioClipActive { result: Err(_), .. }
         | ProjectMutationAttempt::SetAudioClipGain { result: Err(_), .. }
         | ProjectMutationAttempt::SetAudioClipFades { result: Err(_), .. }
@@ -8665,6 +8746,9 @@ fn project_mutation_save_failure(
         ProjectMutation::DiscardRecordingTake { .. } => IdeWorkerCommandFailure::RecordingDiscard(
             Box::new(IdeRecordingDiscardError::MixerSave(Box::new(reason))),
         ),
+        ProjectMutation::RenameRecordingTake { .. } => IdeWorkerCommandFailure::EditRestore(
+            Box::new(IdeResourceRestoreError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::AddArrangementPlacement { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementAddition(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -8974,6 +9058,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::DiscardRecordingTake { .. } => IdeWorkerCommandFailure::RecordingDiscard(
             Box::new(IdeRecordingDiscardError::NativeClose(failure)),
         ),
+        ProjectMutation::RenameRecordingTake { .. } => IdeWorkerCommandFailure::EditRestore(
+            Box::new(IdeResourceRestoreError::NativeClose(failure)),
+        ),
         ProjectMutation::AddArrangementPlacement { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementAddition(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
@@ -9214,6 +9301,13 @@ enum ProjectMutationAttempt {
     DiscardRecordingTake(
         Result<hyper_storage_engine::RecordingDiscardOutcome, IdeRecordingDiscardError>,
     ),
+    RenameRecordingTake {
+        label: String,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeResourceRestoreError,
+        >,
+    },
     AddArrangementPlacement {
         start_tick: u64,
         result: Result<ArrangementPlacementCreationPublication, IdeArrangementPlacementEditError>,
@@ -10117,6 +10211,25 @@ fn complete_project_mutation(
                     events,
                     IdeWorkerCommandKind::DiscardRecordingTake,
                     IdeWorkerCommandFailure::RecordingDiscard(Box::new(reason)),
+                ),
+                ProjectMutationAttempt::RenameRecordingTake {
+                    label,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::RecordingTakeRenamed {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                        label,
+                    },
+                ),
+                ProjectMutationAttempt::RenameRecordingTake {
+                    result: Err(reason),
+                    ..
+                } => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::RenameRecordingTake,
+                    IdeWorkerCommandFailure::EditRestore(Box::new(reason)),
                 ),
                 ProjectMutationAttempt::AddArrangementPlacement {
                     start_tick,
@@ -11469,6 +11582,23 @@ fn attempt_project_mutation(
                 .and_then(|plan| plan.publish())
             })
         }
+        ProjectMutation::RenameRecordingTake {
+            recording_id,
+            label,
+        } => ProjectMutationAttempt::RenameRecordingTake {
+            label: label.clone(),
+            result: if let Some(failure) = native_failure {
+                Err(IdeResourceRestoreError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_recording_take_label(
+                    application,
+                    recovery,
+                    &recording_id,
+                    &label,
+                )
+                .and_then(|plan| plan.publish())
+            },
+        },
         ProjectMutation::AddArrangementPlacement {
             clip_id,
             start_tick,
@@ -12970,6 +13100,19 @@ fn project_mutation_reopen_failure(
                     source: Box::new(reopen),
                 },
             ))
+        }
+        ProjectMutationAttempt::RenameRecordingTake { result, .. } => {
+            let reason = match result {
+                Ok(outcome) => IdeResourceRestoreError::ReopenAfterPublication {
+                    outcome: Box::new(outcome),
+                    source: Box::new(reopen),
+                },
+                Err(preparation) => IdeResourceRestoreError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
+                    reopen: Box::new(reopen),
+                },
+            };
+            IdeWorkerCommandFailure::EditRestore(Box::new(reason))
         }
         ProjectMutationAttempt::AddArrangementPlacement { result, .. } => {
             arrangement_placement_creation_reopen_failure(
@@ -14480,6 +14623,7 @@ fn running_observation(
             asset_id: try_project_owned(recording.asset_id())?,
             track_id: try_project_owned(recording.track_id())?,
             track_name: try_project_owned(track_name)?,
+            label: recording.take_label().map(try_project_owned).transpose()?,
             capture_kind: recording.capture_kind().into(),
             captured_at_utc: try_project_owned(recording.captured_at_utc())?,
             timeline_start_tick: recording.timeline_start_tick(),
