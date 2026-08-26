@@ -12,26 +12,27 @@ use hyper_desktop_ide::{
     AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
     AutomationSendParameter, AutomationTarget, AutomationValue, ControlScope, ControlSource,
     ControlTarget, ControlTransform, DesktopAudioPreviewState, DesktopIdeWorker, Edge,
-    IdeApplicationConfig, IdeAudioClip, IdeAudioInputInventory, IdeAudioOutputInventory,
-    IdeAudioPreviewControlCommand, IdeAutomationTakeRequest, IdeAutomationTarget,
-    IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
-    IdeControlMappingEdit, IdeInputSelection, IdeLoopRangeFrames, IdeLoudnessCommand,
-    IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState, IdeLoudnessPresentationConfig,
-    IdeLoudnessScale, IdeLoudnessScaleRegion, IdeMaximumTruePeakDisplay, IdeMixerChannel,
-    IdeMixerChannelDestination, IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap,
-    IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice, IdeNativeFilterEdit,
-    IdeOutputSelection, IdeOutputTestState, IdePlaybackArrangement, IdePlaybackAutomation,
-    IdePlaybackAutomationLane, IdePlaybackExtent, IdeProjectExportFormat, IdeRecordingAbortOutcome,
-    IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeResourceRestoreError,
-    IdeRoutingBusKind, IdeRunningObservation, IdeScaledLoudnessValue, IdeScene,
-    IdeSceneAvailability, IdeSceneLaunchQuantization, IdeSceneLaunchState, IdeSceneSlotEdit,
-    IdeSceneTrackAction, IdeUnusedSampleCleanupSummary, IdeWorkerCommand, IdeWorkerCommandKind,
-    IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
-    IdeWorkerShutdownReport, LocateState, MAX_COMPRESSOR_ATTACK_MICROSECONDS,
-    MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS, MAX_COMPRESSOR_RATIO_MILLIONTHS,
-    MAX_COMPRESSOR_RELEASE_MICROSECONDS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
-    MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL,
-    MAX_IDE_SCENES, MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    IdeApplicationConfig, IdeAudioClip, IdeAudioClipWaveform, IdeAudioInputInventory,
+    IdeAudioOutputInventory, IdeAudioPreviewControlCommand, IdeAutomationTakeRequest,
+    IdeAutomationTarget, IdeControlBindingRequest, IdeControlChannelParameter,
+    IdeControlMainParameter, IdeControlMappingEdit, IdeInputSelection, IdeLoopRangeFrames,
+    IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
+    IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
+    IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerChannelKind,
+    IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice,
+    IdeNativeFilterEdit, IdeOutputSelection, IdeOutputTestState, IdePlaybackArrangement,
+    IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeProjectExportFormat,
+    IdeRecordingAbortOutcome, IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake,
+    IdeResourceRestoreError, IdeRoutingBusKind, IdeRunningObservation, IdeScaledLoudnessValue,
+    IdeScene, IdeSceneAvailability, IdeSceneLaunchQuantization, IdeSceneLaunchState,
+    IdeSceneSlotEdit, IdeSceneTrackAction, IdeUnusedSampleCleanupSummary, IdeWorkerCommand,
+    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
+    IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState,
+    MAX_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    MAX_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RELEASE_MICROSECONDS,
+    MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MAX_FILTER_CUTOFF_MILLIHERTZ,
+    MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL, MAX_IDE_SCENES,
+    MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
     MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
     MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MIN_FILTER_CUTOFF_MILLIHERTZ,
     MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, NativeFilterMode, OfflineExportReport,
@@ -3871,8 +3872,48 @@ fn bind_audio_clip_callback(
     bind_audio_clip_reverse_callback(ui, worker, project_state);
     bind_audio_clip_source_slip_callback(ui, worker, project_state);
     bind_audio_clip_source_trim_callback(ui, worker, project_state);
+    bind_audio_clip_waveform_callback(ui, worker, project_state);
 
     bind_arrangement_placement_addition_callback(ui, worker, project_state);
+}
+
+fn bind_audio_clip_waveform_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    let project_state = Rc::clone(project_state);
+    actions.on_inspect_audio_clip_waveform(move |clip_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            reset_audio_clip_waveform_dialog(&ui);
+            ui.set_error_text(
+                "Audio-clip waveform inspection is not available in the current state".into(),
+            );
+            return;
+        }
+        let clips = project_state.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            drop(clips);
+            reset_audio_clip_waveform_dialog(&ui);
+            ui.set_error_text("The selected audio clip is no longer available".into());
+            return;
+        };
+        let owned_clip_id = clip.id().to_owned();
+        drop(clips);
+        submit_to_ui(
+            &ui,
+            &worker,
+            IdeWorkerCommand::InspectAudioClipWaveform {
+                clip_id: owned_clip_id,
+            },
+        );
+    });
 }
 
 fn bind_audio_clip_reverse_callback(
@@ -4966,6 +5007,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::TrimAudioClipSource => {
             "Preserving mixer state, trimming the reusable audio-clip source, and reopening project..."
         }
+        IdeWorkerCommandKind::InspectAudioClipWaveform => {
+            "Reading the current reusable audio-clip source view…"
+        }
         IdeWorkerCommandKind::RenameScene => "Renaming the scene and reopening project…",
         IdeWorkerCommandKind::SetSceneActive => "Updating scene activation and reopening project…",
         IdeWorkerCommandKind::CreateAudioClipFromTake => {
@@ -5301,6 +5345,9 @@ fn apply_event(
         | IdeWorkerEvent::AudioClipRemovalCommittedWithWarning { .. }
         | IdeWorkerEvent::AudioClipRemoving) => {
             apply_audio_clip_removal_event(ui, &event);
+        }
+        IdeWorkerEvent::AudioClipWaveform(waveform) => {
+            apply_audio_clip_waveform(ui, &waveform);
         }
         event @ (IdeWorkerEvent::UnusedSamplesCleaned { .. }
         | IdeWorkerEvent::UnusedSampleCleanupCommittedWithWarning { .. }
@@ -7072,6 +7119,45 @@ fn reset_audio_clip_source_trim_form(ui: &MainWindow) {
     ui.set_clip_source_trim_frame_count(SharedString::default());
 }
 
+fn apply_audio_clip_waveform(ui: &MainWindow, waveform: &IdeAudioClipWaveform) {
+    if !ui.get_clip_waveform_visible() || ui.get_clip_waveform_id() != waveform.clip_id() {
+        return;
+    }
+    ui.set_clip_waveform_commands(waveform_path_commands(waveform).into());
+    ui.set_clip_waveform_bin_count(waveform.bins().len().to_string().into());
+    ui.set_clip_waveform_loading(false);
+    ui.set_status_text("Audio-clip source waveform ready".into());
+    ui.set_error_text(SharedString::default());
+}
+
+fn waveform_path_commands(waveform: &IdeAudioClipWaveform) -> String {
+    let bins = waveform.bins();
+    if bins.is_empty() {
+        return String::new();
+    }
+    let bin_width = 128.0_f32 / bins.len() as f32;
+    let mut commands = String::new();
+    for (index, bin) in bins.iter().enumerate() {
+        let left = index as f32 * bin_width;
+        let right = (index as f32 + 0.78) * bin_width;
+        let top = 1.0 - bin.maximum().clamp(-1.0, 1.0);
+        let bottom = 1.0 - bin.minimum().clamp(-1.0, 1.0);
+        commands.push_str(&format!(
+            "M {left} {top} L {right} {top} L {right} {bottom} L {left} {bottom} Z "
+        ));
+    }
+    commands
+}
+
+fn reset_audio_clip_waveform_dialog(ui: &MainWindow) {
+    ui.set_clip_waveform_visible(false);
+    ui.set_clip_waveform_loading(false);
+    ui.set_clip_waveform_id(SharedString::default());
+    ui.set_clip_waveform_name(SharedString::default());
+    ui.set_clip_waveform_commands(SharedString::default());
+    ui.set_clip_waveform_bin_count("0".into());
+}
+
 fn apply_recording_clip_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::AudioClipCreatedFromTake { revision, clip_id } => {
@@ -7816,6 +7902,7 @@ fn set_audio_clips(
     if project_state.audio_clips.borrow().as_slice() == clips {
         return false;
     }
+    reset_audio_clip_waveform_dialog(ui);
     let rows: Vec<ClipRow> = clips
         .iter()
         .map(|clip| ClipRow {
@@ -8558,6 +8645,7 @@ fn reset_project(
     reset_audio_clip_loop_form(ui);
     reset_audio_clip_source_slip_form(ui);
     reset_audio_clip_source_trim_form(ui);
+    reset_audio_clip_waveform_dialog(ui);
     ui.set_audio_clips(ModelRc::default());
     ui.set_loudness_visible(false);
     ui.set_loudness_reset_confirming(false);

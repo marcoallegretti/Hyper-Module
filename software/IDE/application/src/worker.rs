@@ -202,6 +202,7 @@ pub enum IdeWorkerCommandKind {
     SetAudioClipReverse,
     SetAudioClipSourceStart,
     TrimAudioClipSource,
+    InspectAudioClipWaveform,
     AddScene,
     RemoveScene,
     DuplicateScene,
@@ -452,6 +453,9 @@ pub enum IdeWorkerCommand {
         source_start_frame: u64,
         source_frame_count: u64,
     },
+    InspectAudioClipWaveform {
+        clip_id: String,
+    },
     AddScene {
         name: String,
         quantization: IdeSceneLaunchQuantization,
@@ -622,6 +626,7 @@ impl IdeWorkerCommand {
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
             Self::TrimAudioClipSource { .. } => IdeWorkerCommandKind::TrimAudioClipSource,
+            Self::InspectAudioClipWaveform { .. } => IdeWorkerCommandKind::InspectAudioClipWaveform,
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::RemoveScene { .. } => IdeWorkerCommandKind::RemoveScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
@@ -2109,6 +2114,7 @@ pub enum IdeWorkerCommandFailure {
     AudioClipReverse(Box<IdeAudioClipReverseEditError>),
     AudioClipSourceSlip(Box<IdeAudioClipSourceSlipEditError>),
     AudioClipSourceTrim(Box<IdeAudioClipSourceTrimEditError>),
+    AudioClipWaveform(super::IdeAudioClipWaveformError),
     SceneCreation(Box<IdeSceneCreationError>),
     SceneRemoval(Box<IdeSceneRemovalError>),
     AutomationTakeCreation(Box<IdeAutomationTakeCreationError>),
@@ -2261,6 +2267,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipReverse(source) => source.fmt(formatter),
             Self::AudioClipSourceSlip(source) => source.fmt(formatter),
             Self::AudioClipSourceTrim(source) => source.fmt(formatter),
+            Self::AudioClipWaveform(source) => source.fmt(formatter),
             Self::SceneCreation(source) => source.fmt(formatter),
             Self::SceneRemoval(source) => source.fmt(formatter),
             Self::AutomationTakeCreation(source) => source.fmt(formatter),
@@ -2354,6 +2361,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipReverse(source) => Some(source),
             Self::AudioClipSourceSlip(source) => Some(source),
             Self::AudioClipSourceTrim(source) => Some(source),
+            Self::AudioClipWaveform(source) => Some(source),
             Self::SceneCreation(source) => Some(source),
             Self::SceneRemoval(source) => Some(source),
             Self::AutomationTakeCreation(source) => Some(source),
@@ -2811,6 +2819,7 @@ pub enum IdeWorkerEvent {
     RecordingFinalizing,
     RecordingImported(IdeRecordingImportOutcome),
     RecordingAborted(IdeRecordingAbortOutcome),
+    AudioClipWaveform(super::IdeAudioClipWaveform),
     AudioPreviewPreparing,
     AudioPreviewStopRequested,
     AudioPreviewControlApplied(IdeAudioPreviewControlCommand),
@@ -4044,6 +4053,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::StartAudioPreview
         | IdeWorkerCommandKind::StopAudioPreview
         | IdeWorkerCommandKind::AudioPreviewControl
+        | IdeWorkerCommandKind::InspectAudioClipWaveform
         | IdeWorkerCommandKind::Observe
         | IdeWorkerCommandKind::CloseProject
         | IdeWorkerCommandKind::Shutdown => "edit",
@@ -4411,6 +4421,9 @@ fn process_command(
         }
         IdeWorkerCommand::StopRecording => finalize_recording(state, events),
         IdeWorkerCommand::AbortRecording => abort_recording(state, events),
+        IdeWorkerCommand::InspectAudioClipWaveform { clip_id } => {
+            inspect_audio_clip_waveform(state, &clip_id, events)
+        }
         command @ (IdeWorkerCommand::StartAudioPreview { .. }
         | IdeWorkerCommand::StopAudioPreview
         | IdeWorkerCommand::AudioPreviewControl(_)) => {
@@ -5382,6 +5395,28 @@ fn process_audio_preview_command(
             process_audio_preview_control(state, command, events)
         }
         _ => unreachable!("only audio-preview commands are routed to this handler"),
+    }
+}
+
+fn inspect_audio_clip_waveform(
+    state: &mut WorkerState,
+    clip_id: &str,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let WorkerState::Running(application) = state else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::InspectAudioClipWaveform,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    };
+    match application.inspect_audio_clip_waveform(clip_id) {
+        Ok(waveform) => send_event(events, IdeWorkerEvent::AudioClipWaveform(waveform)),
+        Err(reason) => publish_failure(
+            events,
+            IdeWorkerCommandKind::InspectAudioClipWaveform,
+            IdeWorkerCommandFailure::AudioClipWaveform(reason),
+        ),
     }
 }
 

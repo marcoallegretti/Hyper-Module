@@ -322,6 +322,7 @@ export global IdeActions {
     callback set-audio-clip-reverse(string, bool);
     callback set-audio-clip-source-start(string, string);
     callback trim-audio-clip-source(string, string, string);
+    callback inspect-audio-clip-waveform(string);
     callback loudness-run();
     callback loudness-standby();
     callback loudness-reset();
@@ -656,6 +657,12 @@ export component MainWindow inherits Window {
     in-out property <string> clip-source-trim-original-frame-count: "";
     in-out property <string> clip-source-trim-start: "";
     in-out property <string> clip-source-trim-frame-count: "";
+    in-out property <bool> clip-waveform-visible: false;
+    in-out property <bool> clip-waveform-loading: false;
+    in-out property <string> clip-waveform-id: "";
+    in-out property <string> clip-waveform-name: "";
+    in-out property <string> clip-waveform-commands: "";
+    in-out property <string> clip-waveform-bin-count: "0";
     in-out property <bool> add-arrangement-placement-visible: false;
     private property <bool> project-form-visible:
         root.new-project-visible
@@ -692,6 +699,7 @@ export component MainWindow inherits Window {
         || root.clip-loop-visible
         || root.clip-source-slip-visible
         || root.clip-source-trim-visible
+        || root.clip-waveform-visible
         || root.add-arrangement-placement-visible
         || root.native-filter-add-visible
         || root.native-filter-edit-visible
@@ -716,6 +724,7 @@ export component MainWindow inherits Window {
         && !root.clip-loop-visible
         && !root.clip-source-slip-visible
         && !root.clip-source-trim-visible
+        && !root.clip-waveform-visible
         && !root.add-arrangement-placement-visible
         && root.selected-audio-import-track-index >= 0
         && root.selected-audio-import-track-index < root.audio-import-track-names.length;
@@ -4355,7 +4364,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-remove-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && !root.clip-source-slip-visible && !root.clip-source-trim-visible && !root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-remove-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && !root.clip-source-slip-visible && !root.clip-source-trim-visible && !root.clip-waveform-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -4371,12 +4380,12 @@ export component MainWindow inherits Window {
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                 Button {
                                     text: "Performance";
-                                    clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.clip-source-trim-visible = false; root.add-arrangement-placement-visible = false; }
+                                    clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.clip-source-trim-visible = false; root.clip-waveform-visible = false; root.add-arrangement-placement-visible = false; }
                                 }
                                 Button {
                                     text: "Mixer";
                                     enabled: root.app-mode == AppMode.running;
-                                    clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.clip-source-trim-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
+                                    clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.clip-source-trim-visible = false; root.clip-waveform-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
                                 }
                             }
                             HorizontalLayout {
@@ -4525,6 +4534,21 @@ export component MainWindow inherits Window {
                                                     root.clip-remove-id = clip.id;
                                                     root.clip-remove-name = clip.name;
                                                     root.clip-remove-visible = true;
+                                                }
+                                            }
+                                            Button {
+                                                width: 92px;
+                                                text: "Waveform";
+                                                accessible-label: "Inspect the current immutable source view for " + clip.name;
+                                                enabled: root.app-mode == AppMode.running;
+                                                clicked => {
+                                                    root.clip-waveform-id = clip.id;
+                                                    root.clip-waveform-name = clip.name;
+                                                    root.clip-waveform-commands = "";
+                                                    root.clip-waveform-bin-count = "0";
+                                                    root.clip-waveform-loading = true;
+                                                    root.clip-waveform-visible = true;
+                                                    IdeActions.inspect-audio-clip-waveform(clip.id);
                                                 }
                                             }
                                         }
@@ -5052,6 +5076,82 @@ export component MainWindow inherits Window {
                                         || root.clip-source-trim-frame-count != root.clip-source-trim-original-frame-count);
                                 clicked => { IdeActions.trim-audio-clip-source(root.clip-source-trim-id, root.clip-source-trim-start, root.clip-source-trim-frame-count); }
                             }
+                        }
+                    }
+                }
+
+                if root.clips-visible && root.clip-waveform-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 14px;
+                        Text { text: "CLIP SOURCE WAVEFORM"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.clip-waveform-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Text {
+                            text: root.clip-waveform-loading
+                                ? "Reading the verified immutable source view…"
+                                : root.clip-waveform-bin-count + " combined-channel peak ranges · current source view";
+                            color: #aebccc;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+                        Rectangle {
+                            height: 220px;
+                            background: #0a0f15;
+                            border-color: #27313d;
+                            border-width: 1px;
+                            border-radius: 6px;
+                            clip: true;
+                            Rectangle {
+                                x: 10px;
+                                y: parent.height / 2;
+                                width: parent.width - 20px;
+                                height: 1px;
+                                background: #27313d;
+                            }
+                            Path {
+                                x: 10px;
+                                y: 10px;
+                                width: parent.width - 20px;
+                                height: parent.height - 20px;
+                                commands: root.clip-waveform-commands;
+                                fill: #59c5eb;
+                                viewbox-width: 128;
+                                viewbox-height: 2;
+                                fit: fill;
+                                clip: true;
+                            }
+                            if root.clip-waveform-loading : Text {
+                                width: parent.width;
+                                height: parent.height;
+                                text: "Preparing waveform…";
+                                color: #8fa0b4;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Text {
+                            text: "This read-only envelope is derived once from the selected clip's committed source view. It does not apply clip gain, fades, direction, looping, or transport state, and it does not modify project media.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            Button {
+                                text: "Close";
+                                clicked => {
+                                    root.clip-waveform-visible = false;
+                                    root.clip-waveform-loading = false;
+                                    root.clip-waveform-id = "";
+                                    root.clip-waveform-name = "";
+                                    root.clip-waveform-commands = "";
+                                    root.clip-waveform-bin-count = "0";
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
                         }
                     }
                 }

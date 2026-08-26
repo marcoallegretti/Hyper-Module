@@ -14,8 +14,8 @@ use hyper_audio_engine::{
     LinearGain, LoudnessMeasurementCommand, Pan, ParameterError, StereoSineTestToneConfigError,
 };
 use hyper_audio_source::{
-    AudioContainer, DecodeError, DecodeLimits, decode_bytes_at_source_rate, encode_float_wav,
-    float_wav_encoded_capacity, plan_resampling_memory, resample_audio,
+    AudioContainer, DecodeError, DecodeLimits, DecodedAudio, decode_bytes_at_source_rate,
+    encode_float_wav, float_wav_encoded_capacity, plan_resampling_memory, resample_audio,
 };
 pub use hyper_control_mappings::{
     ChannelParameter as IdeControlChannelParameter, ControlBinding, ControlMappingDocument,
@@ -213,6 +213,11 @@ const MONITOR_GAIN_MILLIONTHS_MAXIMUM: u32 = 1_000_000;
 const PREVIEW_GAIN_MILLIONTHS_MAXIMUM: u32 = 1_000_000;
 pub const IDE_OUTPUT_TEST_FREQUENCY_HZ: f64 = 1_000.0;
 pub const IDE_OUTPUT_TEST_LEVEL_DBFS: f32 = -18.0;
+/// Fixed number of visual extrema returned for one inspected clip source view.
+///
+/// The inspector is explicitly on-demand. This bound prevents a selected
+/// waveform from scaling with source duration or with project clip count.
+pub const IDE_AUDIO_CLIP_WAVEFORM_BINS: usize = 128;
 const DESKTOP_RECORDING_TRANSPORT_FRAMES: usize = DESKTOP_MAXIMUM_BLOCK_FRAMES * 4;
 const DESKTOP_RECORDING_DRAIN_FRAMES: usize = DESKTOP_MAXIMUM_BLOCK_FRAMES;
 const DESKTOP_RECORDING_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -224,6 +229,127 @@ const DESKTOP_MAX_AUDIO_DECODED_BYTES: usize = 2 * 43_200_000 * size_of::<f32>()
 const DESKTOP_MAX_PROJECT_RESOURCE_BYTES: usize = 1_024 * 1_024 * 1_024;
 const DESKTOP_MAX_PROJECT_DECODED_BYTES: usize = 1_024 * 1_024 * 1_024;
 const DESKTOP_MAX_AUDIO_IMPORT_WORKING_BYTES: usize = 7 * 256 * 1_024 * 1_024;
+
+/// A fixed-resolution peak envelope for one reusable clip's current source view.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdeAudioClipWaveform {
+    clip_id: String,
+    bins: Vec<IdeAudioClipWaveformBin>,
+}
+
+impl IdeAudioClipWaveform {
+    #[must_use]
+    pub fn clip_id(&self) -> &str {
+        &self.clip_id
+    }
+
+    #[must_use]
+    pub fn bins(&self) -> &[IdeAudioClipWaveformBin] {
+        &self.bins
+    }
+}
+
+/// Combined-channel extrema for one contiguous portion of a source view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IdeAudioClipWaveformBin {
+    minimum: f32,
+    maximum: f32,
+}
+
+impl IdeAudioClipWaveformBin {
+    #[must_use]
+    pub const fn minimum(self) -> f32 {
+        self.minimum
+    }
+
+    #[must_use]
+    pub const fn maximum(self) -> f32 {
+        self.maximum
+    }
+}
+
+/// A read-only clip waveform request could not be formed from verified media.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeAudioClipWaveformError {
+    InvalidClipIdentity,
+    ProjectSnapshotUnavailable,
+    ClipUnavailable,
+    AssetUnavailable,
+    SourceRangeOverflow,
+    SourceViewUnavailable,
+    CapacityUnavailable,
+}
+
+impl fmt::Display for IdeAudioClipWaveformError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidClipIdentity => "audio-clip identity is empty",
+            Self::ProjectSnapshotUnavailable => {
+                "running playback exposes no verified project snapshot"
+            }
+            Self::ClipUnavailable => "audio clip is no longer available",
+            Self::AssetUnavailable => "audio clip source media is unavailable",
+            Self::SourceRangeOverflow => "audio clip source range arithmetic overflowed",
+            Self::SourceViewUnavailable => "audio clip source view is unavailable",
+            Self::CapacityUnavailable => "audio clip waveform capacity is unavailable",
+        })
+    }
+}
+
+impl Error for IdeAudioClipWaveformError {}
+
+fn summarize_audio_source_view(
+    source: &DecodedAudio,
+    source_start_frame: usize,
+    source_frame_count: usize,
+) -> Result<Vec<IdeAudioClipWaveformBin>, IdeAudioClipWaveformError> {
+    let source_end = source_start_frame
+        .checked_add(source_frame_count)
+        .ok_or(IdeAudioClipWaveformError::SourceRangeOverflow)?;
+    if source_frame_count == 0 || source_end > source.frame_count() {
+        return Err(IdeAudioClipWaveformError::SourceViewUnavailable);
+    }
+    let bin_count = source_frame_count.min(IDE_AUDIO_CLIP_WAVEFORM_BINS);
+    let mut bins = Vec::new();
+    bins.try_reserve_exact(bin_count)
+        .map_err(|_| IdeAudioClipWaveformError::CapacityUnavailable)?;
+    for bin_index in 0..bin_count {
+        let relative_start = bin_index
+            .checked_mul(source_frame_count)
+            .ok_or(IdeAudioClipWaveformError::SourceRangeOverflow)?
+            / bin_count;
+        let relative_end = bin_index
+            .checked_add(1)
+            .and_then(|index| index.checked_mul(source_frame_count))
+            .ok_or(IdeAudioClipWaveformError::SourceRangeOverflow)?
+            / bin_count;
+        let start = source_start_frame
+            .checked_add(relative_start)
+            .ok_or(IdeAudioClipWaveformError::SourceRangeOverflow)?;
+        let end = source_start_frame
+            .checked_add(relative_end)
+            .ok_or(IdeAudioClipWaveformError::SourceRangeOverflow)?;
+        if start >= end || end > source_end {
+            return Err(IdeAudioClipWaveformError::SourceViewUnavailable);
+        }
+        let mut minimum = f32::INFINITY;
+        let mut maximum = f32::NEG_INFINITY;
+        for channel in 0..source.channels() {
+            let plane = source
+                .plane(channel)
+                .ok_or(IdeAudioClipWaveformError::SourceViewUnavailable)?;
+            for sample in &plane[start..end] {
+                minimum = minimum.min(*sample);
+                maximum = maximum.max(*sample);
+            }
+        }
+        if !minimum.is_finite() || !maximum.is_finite() {
+            return Err(IdeAudioClipWaveformError::SourceViewUnavailable);
+        }
+        bins.push(IdeAudioClipWaveformBin { minimum, maximum });
+    }
+    Ok(bins)
+}
 /// Maximum scene metadata rows published by the version-1 desktop IDE.
 pub const MAX_IDE_SCENES: usize = LoaderLimits::VERSION_1.max_scene_documents;
 /// Maximum channel rows published by the version-1 desktop IDE mixer.
@@ -13594,6 +13720,55 @@ impl RunningDesktopIdeApplication {
         })
     }
 
+    /// Builds one bounded, read-only peak envelope from the exact immutable
+    /// source view currently committed for an audio clip.
+    ///
+    /// This work is intentionally requested outside the real-time path and is
+    /// not part of periodic runtime observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified rejection when the selected clip or its verified
+    /// source view is unavailable, or when a bounded envelope cannot be built.
+    pub fn inspect_audio_clip_waveform(
+        &self,
+        clip_id: &str,
+    ) -> Result<IdeAudioClipWaveform, IdeAudioClipWaveformError> {
+        if clip_id.is_empty() {
+            return Err(IdeAudioClipWaveformError::InvalidClipIdentity);
+        }
+        let project = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session
+                .prepared_project()
+                .ok_or(IdeAudioClipWaveformError::ProjectSnapshotUnavailable)?,
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => {
+                return Err(IdeAudioClipWaveformError::ProjectSnapshotUnavailable);
+            }
+        };
+        let (loaded, _, _, media) = project.session().parts();
+        let clip_index = (0..loaded.clip_count())
+            .find(|&index| loaded.clip_id_at(index) == Some(clip_id))
+            .ok_or(IdeAudioClipWaveformError::ClipUnavailable)?;
+        let asset_id = loaded
+            .clip_asset_id_at(clip_index)
+            .ok_or(IdeAudioClipWaveformError::ClipUnavailable)?;
+        let source_start_frame = loaded
+            .clip_source_start_frame_at(clip_index)
+            .ok_or(IdeAudioClipWaveformError::ClipUnavailable)?;
+        let source_frame_count = loaded
+            .clip_source_frame_count_at(clip_index)
+            .ok_or(IdeAudioClipWaveformError::ClipUnavailable)?;
+        let source = media
+            .decoded_audio(asset_id)
+            .ok_or(IdeAudioClipWaveformError::AssetUnavailable)?;
+        let bins = summarize_audio_source_view(source, source_start_frame, source_frame_count)?;
+        Ok(IdeAudioClipWaveform {
+            clip_id: clip_id.to_owned(),
+            bins,
+        })
+    }
+
     /// Sends a bounded transport or scene command through the only live owner.
     ///
     /// # Errors
@@ -20596,5 +20771,41 @@ mod tests {
             unreachable!("test constructed the deterministic session owner");
         };
         assert_eq!(session.mixer_commands, commands);
+    }
+
+    #[test]
+    fn waveform_summary_uses_the_exact_source_view_and_combines_channels() {
+        let source = DecodedAudio::from_stereo(
+            48_000,
+            vec![0.1, -0.6, 0.2, 0.4, -0.2, 0.7],
+            vec![-0.8, 0.1, 0.9, -0.3, 0.5, -0.1],
+        )
+        .unwrap();
+
+        let bins = summarize_audio_source_view(&source, 1, 4).unwrap();
+
+        assert_eq!(bins.len(), 4);
+        assert_eq!((bins[0].minimum(), bins[0].maximum()), (-0.6, 0.1));
+        assert_eq!((bins[1].minimum(), bins[1].maximum()), (0.2, 0.9));
+        assert_eq!((bins[2].minimum(), bins[2].maximum()), (-0.3, 0.4));
+        assert_eq!((bins[3].minimum(), bins[3].maximum()), (-0.2, 0.5));
+    }
+
+    #[test]
+    fn waveform_summary_stays_bounded_and_rejects_invalid_views() {
+        let source = DecodedAudio::from_mono(48_000, vec![0.25; 256]).unwrap();
+
+        assert_eq!(
+            summarize_audio_source_view(&source, 0, 256).unwrap().len(),
+            IDE_AUDIO_CLIP_WAVEFORM_BINS
+        );
+        assert_eq!(
+            summarize_audio_source_view(&source, 0, 0),
+            Err(IdeAudioClipWaveformError::SourceViewUnavailable)
+        );
+        assert_eq!(
+            summarize_audio_source_view(&source, 255, 2),
+            Err(IdeAudioClipWaveformError::SourceViewUnavailable)
+        );
     }
 }
