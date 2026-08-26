@@ -3669,6 +3669,11 @@ pub fn serialize_recording_audio_clip_addition(
 /// deliberately non-ripple. Existing arrangement content is preserved; when
 /// no arrangement exists, the supplied identity creates the first `Main`
 /// arrangement.
+///
+/// # Errors
+///
+/// Returns an error when either the recorded clip or its full-duration
+/// placement cannot form one valid compiled project candidate.
 #[allow(
     clippy::too_many_arguments,
     reason = "the atomic candidate binds recording authority, both new identities, and the exact capture start"
@@ -9044,9 +9049,8 @@ fn clip_timebase(
     location: DocumentLocation,
 ) -> Result<ClipTimebase, LoadError> {
     match (document.format_version, document.timebase) {
-        (1, None) => Ok(ClipTimebase::Musical),
         (1, Some(_)) => domain_error(location, "version 1 clips cannot declare a timebase"),
-        (2, Some(ClipTimebaseDocument::Musical)) => Ok(ClipTimebase::Musical),
+        (1, None) | (2, Some(ClipTimebaseDocument::Musical)) => Ok(ClipTimebase::Musical),
         (2, Some(ClipTimebaseDocument::SampleLocked)) => Ok(ClipTimebase::SampleLocked),
         (2, None) => domain_error(location, "version 2 clips must declare a timebase"),
         _ => domain_error(location, "clip timebase version is unsupported"),
