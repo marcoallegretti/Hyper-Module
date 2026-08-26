@@ -170,10 +170,11 @@ use hyper_storage_engine::{
     ImportedAudioClipPublicationRequest, MixerRecoverySnapshotError, MixerRecoverySnapshotRequest,
     ProjectResourcePublicationError, ProjectResourcePublicationOutcome,
     ProjectResourcePublicationRequest, RecordedTakePlacementPublicationRequest,
-    RequiredControlCapabilities, RoutingBusPublicationKind, RoutingBusPublicationRequest,
-    RoutingBusRemovalKind, RoutingBusRemovalOutcome, RoutingBusRemovalRequest,
-    SampleCleanupOutcome, SampleCleanupRequest, ScenePublicationRequest, SceneRemovalRequest,
-    StorageError, TrackOrderPublicationOutcome, TrackOrderPublicationRequest, clean_unused_samples,
+    RecordingDiscardOutcome, RecordingDiscardRequest, RequiredControlCapabilities,
+    RoutingBusPublicationKind, RoutingBusPublicationRequest, RoutingBusRemovalKind,
+    RoutingBusRemovalOutcome, RoutingBusRemovalRequest, SampleCleanupOutcome, SampleCleanupRequest,
+    ScenePublicationRequest, SceneRemovalRequest, StorageError, TrackOrderPublicationOutcome,
+    TrackOrderPublicationRequest, clean_unused_samples, discard_recording_take,
     publish_arrangement, publish_audio_clip, publish_audio_track,
     publish_audio_track_content_removal, publish_audio_track_duplication, publish_automation_take,
     publish_control_mapping, publish_device_chain, publish_imported_audio_clip,
@@ -3807,6 +3808,96 @@ impl Error for IdeUnusedSampleCleanupError {
     }
 }
 
+#[derive(Debug)]
+pub enum IdeRecordingDiscardError {
+    InvalidRecordingIdentity,
+    RecordingUnavailable,
+    RecordingPromoted,
+    MixerSave(Box<IdeProjectSaveError>),
+    NativeClose(IdeNativeCloseFailure),
+    Publication(Box<ProjectResourcePublicationError>),
+    PublicationCommittedWithWarning(Box<ProjectResourcePublicationError>),
+    ReopenAfterPublication {
+        outcome: RecordingDiscardOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterFailure {
+        discard: Box<IdeRecordingDiscardError>,
+        source: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeRecordingDiscardError {
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        match self {
+            Self::PublicationCommittedWithWarning(_) | Self::ReopenAfterPublication { .. } => true,
+            Self::ReopenAfterFailure { discard, .. } => discard.publication_committed(),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeRecordingDiscardError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRecordingIdentity => {
+                formatter.write_str("recording discard requires a recording identity")
+            }
+            Self::RecordingUnavailable => {
+                formatter.write_str("the selected recorded take is unavailable")
+            }
+            Self::RecordingPromoted => formatter.write_str(
+                "the selected recorded take is retained because a reusable clip references it",
+            ),
+            Self::MixerSave(source) => write!(
+                formatter,
+                "live mixer state could not be preserved: {source}"
+            ),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before recording discard: {source:?}"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "recorded take {} was discarded in project revision {}, but the project could not be reopened: {source}",
+                outcome.recording_id(),
+                outcome.project_revision()
+            ),
+            Self::ReopenAfterFailure { discard, source } if discard.publication_committed() => {
+                write!(
+                    formatter,
+                    "recorded take discard committed with incomplete recovery ({discard}), and the project could not be reopened ({source})"
+                )
+            }
+            Self::ReopenAfterFailure { discard, source } => write!(
+                formatter,
+                "recorded take discard failed ({discard}), and the unchanged project could not be reopened ({source})"
+            ),
+            Self::Publication(source) | Self::PublicationCommittedWithWarning(source) => {
+                source.fmt(formatter)
+            }
+        }
+    }
+}
+
+impl Error for IdeRecordingDiscardError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Publication(source) | Self::PublicationCommittedWithWarning(source) => {
+                Some(source.as_ref())
+            }
+            Self::ReopenAfterPublication { source, .. }
+            | Self::ReopenAfterFailure { source, .. } => Some(source.as_ref()),
+            Self::InvalidRecordingIdentity
+            | Self::RecordingUnavailable
+            | Self::RecordingPromoted
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
 impl IdeAudioClipRemovalCommittedWarning {
     fn new(source: impl Error + Send + Sync + 'static) -> Self {
         Self {
@@ -7394,6 +7485,12 @@ struct IdeUnusedSampleCleanupPlan {
     asset_ids: Vec<String>,
 }
 
+#[derive(Debug)]
+struct IdeRecordingDiscardPlan {
+    mixer: IdeMixerSavePlan,
+    recording_id: String,
+}
+
 impl IdeUnusedSampleCleanupPlan {
     fn publish(&self) -> Result<SampleCleanupOutcome, IdeUnusedSampleCleanupError> {
         let mixer = self.mixer.publish().map_err(|source| {
@@ -7415,6 +7512,30 @@ impl IdeUnusedSampleCleanupPlan {
                 )
             } else {
                 IdeUnusedSampleCleanupError::Publication(Box::new(source))
+            }
+        })
+    }
+}
+
+impl IdeRecordingDiscardPlan {
+    fn publish(&self) -> Result<RecordingDiscardOutcome, IdeRecordingDiscardError> {
+        let mixer = self.mixer.publish().map_err(|source| {
+            IdeRecordingDiscardError::MixerSave(Box::new(IdeProjectSaveError::Publication(
+                Box::new(source),
+            )))
+        })?;
+        discard_recording_take(
+            &self.mixer.project_path,
+            RecordingDiscardRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                recording_id: &self.recording_id,
+            },
+        )
+        .map_err(|source| {
+            if source.published() {
+                IdeRecordingDiscardError::PublicationCommittedWithWarning(Box::new(source))
+            } else {
+                IdeRecordingDiscardError::Publication(Box::new(source))
             }
         })
     }
@@ -10631,6 +10752,43 @@ impl RunningDesktopIdeApplication {
         let mixer = Self::prepare_mixer_save(application, recovery)
             .map_err(|source| IdeUnusedSampleCleanupError::MixerSave(Box::new(source)))?;
         Ok(IdeUnusedSampleCleanupPlan { mixer, asset_ids })
+    }
+
+    fn prepare_recording_discard(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        recording_id: &str,
+    ) -> Result<IdeRecordingDiscardPlan, IdeRecordingDiscardError> {
+        if recording_id.is_empty() {
+            return Err(IdeRecordingDiscardError::InvalidRecordingIdentity);
+        }
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeRecordingDiscardError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let mut matches = prepared
+            .recording_metadata()
+            .iter()
+            .filter(|metadata| metadata.id() == recording_id);
+        let metadata = matches
+            .next()
+            .ok_or(IdeRecordingDiscardError::RecordingUnavailable)?;
+        if matches.next().is_some() {
+            return Err(IdeRecordingDiscardError::RecordingUnavailable);
+        }
+        let loaded = prepared.session().parts().0;
+        if (0..loaded.clip_count())
+            .any(|clip_index| loaded.clip_asset_id_at(clip_index) == Some(metadata.asset_id()))
+        {
+            return Err(IdeRecordingDiscardError::RecordingPromoted);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeRecordingDiscardError::MixerSave(Box::new(source)))?;
+        Ok(IdeRecordingDiscardPlan {
+            mixer,
+            recording_id: recording_id.to_owned(),
+        })
     }
 
     fn prepare_audio_clip_removal_from_project(

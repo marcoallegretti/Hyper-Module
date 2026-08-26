@@ -182,6 +182,7 @@ export struct TakeRow {
     timeline-start: string,
     active: bool,
     state: string,
+    discardable: bool,
 }
 
 export struct ArrangementRow {
@@ -386,6 +387,7 @@ export global IdeActions {
     callback toggle-take-preview(int);
     callback create-audio-clip-from-take(int, string);
     callback create-and-place-audio-clip-from-take(int, string);
+    callback discard-recording-take(int);
     callback choose-audio-import(int);
     callback preview-gain(float);
     callback preview-mute();
@@ -558,6 +560,7 @@ export component MainWindow inherits Window {
     in-out property <bool> takes-visible: false;
     in-out property <bool> take-clip-visible: false;
     in-out property <int> take-clip-index: -1;
+    in-out property <int> take-discard-confirming-index: -1;
     in-out property <string> take-clip-track-name: "";
     in-out property <string> take-clip-name: "";
     in-out property <bool> arrangement-visible: false;
@@ -668,6 +671,7 @@ export component MainWindow inherits Window {
         || root.remove-track-content-visible
         || root.routing-bus-removal-visible
         || root.take-clip-visible
+        || root.take-discard-confirming-index >= 0
         || root.add-arrangement-scene-launch-visible
         || root.move-arrangement-scene-launch-visible
         || root.set-arrangement-scene-launch-scene-visible
@@ -3573,6 +3577,20 @@ export component MainWindow inherits Window {
                                             root.take-clip-track-name = take.track-name;
                                             root.take-clip-name = take.track-name;
                                             root.take-clip-visible = true;
+                                        }
+                                    }
+                                    Button {
+                                        width: 104px;
+                                        text: root.take-discard-confirming-index == take.index ? "Confirm discard" : "Discard";
+                                        accessible-label: take.discardable ? "Permanently discard recorded take on " + take.track-name : "Recorded take is retained because a reusable clip references it";
+                                        enabled: root.app-mode == AppMode.running && take.discardable;
+                                        clicked => {
+                                            if root.take-discard-confirming-index == take.index {
+                                                root.take-discard-confirming-index = -1;
+                                                IdeActions.discard-recording-take(take.index);
+                                            } else {
+                                                root.take-discard-confirming-index = take.index;
+                                            }
                                         }
                                     }
                                 }

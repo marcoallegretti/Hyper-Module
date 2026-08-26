@@ -1110,6 +1110,23 @@ fn bind_audio_preview_callbacks(ui: &MainWindow, worker: &WorkerCell, take_route
         };
         submit_to_ui(&ui, &worker_for_placement, command);
     });
+
+    let weak = ui.as_weak();
+    let worker_for_discard = Rc::clone(worker);
+    let routes_for_discard = Rc::clone(take_routes);
+    actions.on_discard_recording_take(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        let Some(command) = take_discard_command(&routes_for_discard, index) else {
+            ui.set_error_text("Recorded take selection is no longer available".into());
+            return;
+        };
+        submit_to_ui(&ui, &worker_for_discard, command);
+    });
 }
 
 fn take_route(routes: &TakeRoutes, index: i32) -> Option<TakeRoute> {
@@ -1137,6 +1154,12 @@ fn take_clip_placement_command(
     take_route(routes, index).map(|route| IdeWorkerCommand::CreateAndPlaceAudioClipFromTake {
         recording_id: route.recording_id,
         name: name.to_owned(),
+    })
+}
+
+fn take_discard_command(routes: &TakeRoutes, index: i32) -> Option<IdeWorkerCommand> {
+    take_route(routes, index).map(|route| IdeWorkerCommand::DiscardRecordingTake {
+        recording_id: route.recording_id,
     })
 }
 
@@ -4851,6 +4874,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::CleanUnusedSamples => {
             "Preserving mixer state, permanently removing unused sample copies, and reopening project…"
         }
+        IdeWorkerCommandKind::DiscardRecordingTake => {
+            "Preserving mixer state, permanently discarding the unpromoted recorded take, and reopening project…"
+        }
         IdeWorkerCommandKind::SetAudioClipActive => {
             "Preserving mixer state, updating audio-clip activation, and reopening project…"
         }
@@ -5462,6 +5488,10 @@ fn apply_event(
         | IdeWorkerEvent::AudioClipCreatedAndPlacedFromTake { .. }
         | IdeWorkerEvent::AudioClipCreatingAndPlacingFromTake) => {
             apply_recording_clip_creation_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::RecordingTakeDiscarding
+        | IdeWorkerEvent::RecordingTakeDiscarded { .. }) => {
+            apply_recording_take_discard_event(ui, &event);
         }
         IdeWorkerEvent::RecordingPreparing => {
             ui.set_app_mode(AppMode::PreparingRecording);
@@ -7052,6 +7082,29 @@ fn apply_recording_clip_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) 
     }
 }
 
+fn apply_recording_take_discard_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::RecordingTakeDiscarding => {
+            ui.set_app_mode(AppMode::Saving);
+            ui.set_status_text(
+                "Waiting for native output before discarding the recorded take…".into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RecordingTakeDiscarded {
+            revision,
+            recording_id,
+        } => {
+            ui.set_take_discard_confirming_index(-1);
+            ui.set_status_text(
+                format!("Recorded take {recording_id} was permanently discarded in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("recording-take discard dispatcher received another event"),
+    }
+}
+
 fn apply_output_test_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::OutputTest(snapshot) => {
@@ -7460,6 +7513,7 @@ fn set_recording_takes(
     take_routes: &TakeRoutes,
     observation: &IdeRunningObservation,
 ) {
+    ui.set_take_discard_confirming_index(-1);
     let preview = observation.preview();
     let active_asset_id = preview.asset_id();
     let takes = observation.recording_takes();
@@ -7488,6 +7542,7 @@ fn set_recording_takes(
             } else {
                 SharedString::default()
             },
+            discardable: take.discardable(),
         });
     }
     *take_routes.borrow_mut() = routes;
@@ -8571,6 +8626,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::Observe if current == AppMode::Opening => AppMode::Running,
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
         IdeWorkerCommandKind::SaveProject
+        | IdeWorkerCommandKind::DiscardRecordingTake
         | IdeWorkerCommandKind::ReorderMixerStrips
         | IdeWorkerCommandKind::AddReturnSend
         | IdeWorkerCommandKind::RemoveReturnSend
@@ -18100,6 +18156,12 @@ mod tests {
                 name,
             }) if recording_id == "recording-a" && name == "Lead take"
         ));
+        assert!(matches!(
+            take_discard_command(&routes, 0),
+            Some(IdeWorkerCommand::DiscardRecordingTake { recording_id })
+                if recording_id == "recording-a"
+        ));
+        assert!(take_discard_command(&routes, -1).is_none());
     }
 
     #[test]
@@ -18116,6 +18178,14 @@ mod tests {
                 AppMode::CreatingClip,
                 IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake,
             ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn recording_take_discard_failure_restores_running_mode() {
+        assert_eq!(
+            mode_after_failure(AppMode::Saving, IdeWorkerCommandKind::DiscardRecordingTake),
             AppMode::Running
         );
     }

@@ -55,15 +55,15 @@ use super::{
     IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
     IdePendingSaveCloseWait, IdeProjectExportError, IdeProjectExportFormat, IdeProjectOpenError,
     IdeProjectSaveError, IdeRecordingAbortError, IdeRecordingAbortOutcome,
-    IdeRecordingClipCreationError, IdeRecordingError, IdeRecordingImportOutcome,
-    IdeRecordingObservation, IdeResourceRestoreError, IdeReturnSendEditError,
-    IdeRoutingBusCreationError, IdeRoutingBusKind, IdeRoutingBusRemovalError,
-    IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability, IdeSceneCreationError,
-    IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRemovalError,
-    IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError, IdeTempoEditError,
-    IdeTransportSeekError, IdeUnusedSampleCleanupError, IdeUnusedSampleCleanupSummary,
-    InputInventoryError, LocateState, MAX_DEVICES_PER_CHAIN, NativeFilterMode,
-    OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
+    IdeRecordingClipCreationError, IdeRecordingDiscardError, IdeRecordingError,
+    IdeRecordingImportOutcome, IdeRecordingObservation, IdeResourceRestoreError,
+    IdeReturnSendEditError, IdeRoutingBusCreationError, IdeRoutingBusKind,
+    IdeRoutingBusRemovalError, IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability,
+    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization,
+    IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError,
+    IdeTempoEditError, IdeTransportSeekError, IdeUnusedSampleCleanupError,
+    IdeUnusedSampleCleanupSummary, InputInventoryError, LocateState, MAX_DEVICES_PER_CHAIN,
+    NativeFilterMode, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
     OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication, RunningIdeSnapshot,
     TimelineMapEdit, control_binding_references_scene,
 };
@@ -176,6 +176,7 @@ pub enum IdeWorkerCommandKind {
     DuplicateAudioClip,
     RemoveAudioClip,
     CleanUnusedSamples,
+    DiscardRecordingTake,
     AddArrangementPlacement,
     AddArrangementSceneLaunch,
     MoveArrangementSceneLaunch,
@@ -347,6 +348,9 @@ pub enum IdeWorkerCommand {
     },
     CleanUnusedSamples {
         confirmation: IdeUnusedSampleCleanupSummary,
+    },
+    DiscardRecordingTake {
+        recording_id: String,
     },
     AddArrangementPlacement {
         clip_id: String,
@@ -567,6 +571,7 @@ impl IdeWorkerCommand {
             Self::DuplicateAudioClip { .. } => IdeWorkerCommandKind::DuplicateAudioClip,
             Self::RemoveAudioClip { .. } => IdeWorkerCommandKind::RemoveAudioClip,
             Self::CleanUnusedSamples { .. } => IdeWorkerCommandKind::CleanUnusedSamples,
+            Self::DiscardRecordingTake { .. } => IdeWorkerCommandKind::DiscardRecordingTake,
             Self::AddArrangementPlacement { .. } => IdeWorkerCommandKind::AddArrangementPlacement,
             Self::AddArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::AddArrangementSceneLaunch
@@ -703,6 +708,7 @@ pub struct IdeRecordingTake {
     sample_rate_hz: u32,
     channels: u8,
     frame_count: u64,
+    discardable: bool,
 }
 
 impl IdeRecordingTake {
@@ -754,6 +760,11 @@ impl IdeRecordingTake {
     #[must_use]
     pub const fn frame_count(&self) -> u64 {
         self.frame_count
+    }
+
+    #[must_use]
+    pub const fn discardable(&self) -> bool {
+        self.discardable
     }
 }
 
@@ -2034,6 +2045,7 @@ pub enum IdeWorkerCommandFailure {
     AudioClipDuplication(Box<IdeAudioClipDuplicationError>),
     AudioClipRemoval(Box<IdeAudioClipRemovalError>),
     UnusedSampleCleanup(Box<IdeUnusedSampleCleanupError>),
+    RecordingDiscard(Box<IdeRecordingDiscardError>),
     ArrangementPlacementAddition(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchAddition(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchMove(Box<IdeArrangementPlacementEditError>),
@@ -2186,6 +2198,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipDuplication(source) => source.fmt(formatter),
             Self::AudioClipRemoval(source) => source.fmt(formatter),
             Self::UnusedSampleCleanup(source) => source.fmt(formatter),
+            Self::RecordingDiscard(source) => source.fmt(formatter),
             Self::ArrangementPlacementAddition(source)
             | Self::ArrangementSceneLaunchAddition(source)
             | Self::ArrangementSceneLaunchMove(source)
@@ -2278,6 +2291,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipDuplication(source) => Some(source),
             Self::AudioClipRemoval(source) => Some(source),
             Self::UnusedSampleCleanup(source) => Some(source),
+            Self::RecordingDiscard(source) => Some(source),
             Self::ArrangementPlacementAddition(source)
             | Self::ArrangementSceneLaunchAddition(source)
             | Self::ArrangementSceneLaunchMove(source)
@@ -2489,6 +2503,11 @@ pub enum IdeWorkerEvent {
     },
     AudioClipRemovalCommittedWithWarning {
         warning: Box<IdeAudioClipRemovalError>,
+    },
+    RecordingTakeDiscarding,
+    RecordingTakeDiscarded {
+        revision: u64,
+        recording_id: String,
     },
     UnusedSampleCleanupStarting {
         assets: usize,
@@ -3331,6 +3350,9 @@ enum ProjectMutation {
     CleanUnusedSamples {
         confirmation: IdeUnusedSampleCleanupSummary,
     },
+    DiscardRecordingTake {
+        recording_id: String,
+    },
     AddArrangementPlacement {
         clip_id: String,
         start_tick: u64,
@@ -3504,6 +3526,7 @@ impl ProjectMutation {
             Self::DuplicateAudioClip { .. } => IdeWorkerCommandKind::DuplicateAudioClip,
             Self::RemoveAudioClip { .. } => IdeWorkerCommandKind::RemoveAudioClip,
             Self::CleanUnusedSamples { .. } => IdeWorkerCommandKind::CleanUnusedSamples,
+            Self::DiscardRecordingTake { .. } => IdeWorkerCommandKind::DiscardRecordingTake,
             Self::AddArrangementPlacement { .. } => IdeWorkerCommandKind::AddArrangementPlacement,
             Self::AddArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::AddArrangementSceneLaunch
@@ -3600,6 +3623,7 @@ impl ProjectMutation {
                     bytes: confirmation.bytes(),
                 }
             }
+            Self::DiscardRecordingTake { .. } => IdeWorkerEvent::RecordingTakeDiscarding,
             Self::AddArrangementPlacement { start_tick, .. } => {
                 IdeWorkerEvent::ArrangementPlacementAdding {
                     start_tick: *start_tick,
@@ -3954,6 +3978,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::DuplicateAudioClip
         | IdeWorkerCommandKind::RemoveAudioClip
         | IdeWorkerCommandKind::CleanUnusedSamples
+        | IdeWorkerCommandKind::DiscardRecordingTake
         | IdeWorkerCommandKind::EditControlMapping
         | IdeWorkerCommandKind::ExportProject
         | IdeWorkerCommandKind::ExportTrackStems
@@ -4286,6 +4311,7 @@ fn process_command(
         | IdeWorkerCommand::DuplicateAudioClip { .. }
         | IdeWorkerCommand::RemoveAudioClip { .. }
         | IdeWorkerCommand::CleanUnusedSamples { .. }
+        | IdeWorkerCommand::DiscardRecordingTake { .. }
         | IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
@@ -4506,6 +4532,11 @@ fn process_project_mutation_command(
             state,
             events,
             ProjectMutation::CleanUnusedSamples { confirmation },
+        ),
+        IdeWorkerCommand::DiscardRecordingTake { recording_id } => begin_project_mutation_request(
+            state,
+            events,
+            ProjectMutation::DiscardRecordingTake { recording_id },
         ),
         command @ (IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
@@ -7745,6 +7776,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::RemoveAudioClip(Ok(_))
         | ProjectMutationAttempt::RemoveScene { result: Ok(_), .. }
         | ProjectMutationAttempt::CleanUnusedSamples(Ok(_))
+        | ProjectMutationAttempt::DiscardRecordingTake(Ok(_))
         | ProjectMutationAttempt::EditControlMapping { result: Ok(_), .. } => {
             HistoryEffect::Invalidate
         }
@@ -7756,6 +7788,11 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             ..
         } if reason.publication_committed() => HistoryEffect::Invalidate,
         ProjectMutationAttempt::CleanUnusedSamples(Err(reason))
+            if reason.publication_committed() =>
+        {
+            HistoryEffect::Invalidate
+        }
+        ProjectMutationAttempt::DiscardRecordingTake(Err(reason))
             if reason.publication_committed() =>
         {
             HistoryEffect::Invalidate
@@ -7801,6 +7838,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::DuplicateAudioClip { result: Err(_), .. }
         | ProjectMutationAttempt::RemoveAudioClip(Err(_))
         | ProjectMutationAttempt::CleanUnusedSamples(Err(_))
+        | ProjectMutationAttempt::DiscardRecordingTake(Err(_))
         | ProjectMutationAttempt::AddArrangementPlacement { result: Err(_), .. }
         | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Err(_), .. }
@@ -8596,6 +8634,9 @@ fn project_mutation_save_failure(
         ProjectMutation::CleanUnusedSamples { .. } => IdeWorkerCommandFailure::UnusedSampleCleanup(
             Box::new(IdeUnusedSampleCleanupError::MixerSave(Box::new(reason))),
         ),
+        ProjectMutation::DiscardRecordingTake { .. } => IdeWorkerCommandFailure::RecordingDiscard(
+            Box::new(IdeRecordingDiscardError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::AddArrangementPlacement { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementAddition(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -8902,6 +8943,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::CleanUnusedSamples { .. } => IdeWorkerCommandFailure::UnusedSampleCleanup(
             Box::new(IdeUnusedSampleCleanupError::NativeClose(failure)),
         ),
+        ProjectMutation::DiscardRecordingTake { .. } => IdeWorkerCommandFailure::RecordingDiscard(
+            Box::new(IdeRecordingDiscardError::NativeClose(failure)),
+        ),
         ProjectMutation::AddArrangementPlacement { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementAddition(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
@@ -9138,6 +9182,9 @@ enum ProjectMutationAttempt {
     ),
     CleanUnusedSamples(
         Result<hyper_storage_engine::SampleCleanupOutcome, IdeUnusedSampleCleanupError>,
+    ),
+    DiscardRecordingTake(
+        Result<hyper_storage_engine::RecordingDiscardOutcome, IdeRecordingDiscardError>,
     ),
     AddArrangementPlacement {
         start_tick: u64,
@@ -10031,6 +10078,18 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::CleanUnusedSamples(Err(reason)) => {
                     send_event(events, unused_sample_cleanup_failure_event(reason))
                 }
+                ProjectMutationAttempt::DiscardRecordingTake(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::RecordingTakeDiscarded {
+                        revision: outcome.project_revision(),
+                        recording_id: outcome.recording_id().to_owned(),
+                    },
+                ),
+                ProjectMutationAttempt::DiscardRecordingTake(Err(reason)) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::DiscardRecordingTake,
+                    IdeWorkerCommandFailure::RecordingDiscard(Box::new(reason)),
+                ),
                 ProjectMutationAttempt::AddArrangementPlacement {
                     start_tick,
                     result: Ok(publication),
@@ -11366,6 +11425,18 @@ fn attempt_project_mutation(
                     application,
                     recovery,
                     confirmation,
+                )
+                .and_then(|plan| plan.publish())
+            })
+        }
+        ProjectMutation::DiscardRecordingTake { recording_id } => {
+            ProjectMutationAttempt::DiscardRecordingTake(if let Some(failure) = native_failure {
+                Err(IdeRecordingDiscardError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_recording_discard(
+                    application,
+                    recovery,
+                    &recording_id,
                 )
                 .and_then(|plan| plan.publish())
             })
@@ -12852,6 +12923,22 @@ fn project_mutation_reopen_failure(
             IdeWorkerCommandFailure::UnusedSampleCleanup(Box::new(
                 IdeUnusedSampleCleanupError::ReopenAfterFailure {
                     cleanup: Box::new(cleanup),
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::DiscardRecordingTake(Ok(outcome)) => {
+            IdeWorkerCommandFailure::RecordingDiscard(Box::new(
+                IdeRecordingDiscardError::ReopenAfterPublication {
+                    outcome,
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::DiscardRecordingTake(Err(discard)) => {
+            IdeWorkerCommandFailure::RecordingDiscard(Box::new(
+                IdeRecordingDiscardError::ReopenAfterFailure {
+                    discard: Box::new(discard),
                     source: Box::new(reopen),
                 },
             ))
@@ -14371,6 +14458,9 @@ fn running_observation(
             sample_rate_hz: recording.sample_rate_hz(),
             channels: recording.channels(),
             frame_count: recording.frame_count(),
+            discardable: !(0..snapshot.loaded.clip_count()).any(|clip_index| {
+                snapshot.loaded.clip_asset_id_at(clip_index) == Some(recording.asset_id())
+            }),
         });
     }
     recording_takes.sort_unstable_by(|left, right| {

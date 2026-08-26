@@ -7,12 +7,12 @@ use super::{
     AudioTrackDuplicationPublicationRecovery, AudioTrackPublicationRecovery,
     ControlMappingPublicationError, ControlMappingPublicationRecovery, ProjectRenameError,
     ProjectRenameRecovery, ProjectResourcePublicationError, ProjectResourcePublicationRecovery,
-    RecordingImportError, RecordingImportRecovery, SampleCleanupRecovery,
+    RecordingDiscardRecovery, RecordingImportError, RecordingImportRecovery, SampleCleanupRecovery,
     TrackOrderPublicationRecovery, recover_audio_clip_publications,
     recover_audio_track_content_removals, recover_audio_track_duplications,
     recover_audio_track_publications, recover_control_mapping_publications,
-    recover_project_renames, recover_project_resource_publications, recover_recording_imports,
-    recover_sample_cleanups, recover_track_order_publications,
+    recover_project_renames, recover_project_resource_publications, recover_recording_discards,
+    recover_recording_imports, recover_sample_cleanups, recover_track_order_publications,
 };
 
 /// Complete transaction-recovery evidence produced before an editable project
@@ -33,6 +33,7 @@ struct ProjectTransactionRecoveryFamilies {
     audio_clips: Vec<AudioClipPublicationRecovery>,
     control_mappings: Vec<ControlMappingPublicationRecovery>,
     recordings: Vec<RecordingImportRecovery>,
+    recording_discards: Vec<RecordingDiscardRecovery>,
     renames: Vec<ProjectRenameRecovery>,
 }
 
@@ -62,6 +63,7 @@ impl ProjectTransactionRecoveryReport {
                 audio_clips,
                 control_mappings,
                 recordings,
+                recording_discards: Vec::new(),
                 renames,
             }),
         }
@@ -80,6 +82,14 @@ impl ProjectTransactionRecoveryReport {
         audio_track_content_removals: Vec<AudioTrackContentRemovalPublicationRecovery>,
     ) -> Self {
         self.families.audio_track_content_removals = audio_track_content_removals;
+        self
+    }
+
+    fn with_recording_discards(
+        mut self,
+        recording_discards: Vec<RecordingDiscardRecovery>,
+    ) -> Self {
+        self.families.recording_discards = recording_discards;
         self
     }
 
@@ -129,6 +139,11 @@ impl ProjectTransactionRecoveryReport {
     }
 
     #[must_use]
+    pub fn recording_discards(&self) -> &[RecordingDiscardRecovery] {
+        &self.families.recording_discards
+    }
+
+    #[must_use]
     pub fn renames(&self) -> &[ProjectRenameRecovery] {
         &self.families.renames
     }
@@ -144,6 +159,7 @@ impl ProjectTransactionRecoveryReport {
             && self.families.audio_clips.is_empty()
             && self.families.control_mappings.is_empty()
             && self.families.recordings.is_empty()
+            && self.families.recording_discards.is_empty()
             && self.families.renames.is_empty()
     }
 }
@@ -159,6 +175,7 @@ pub enum ProjectTransactionRecoveryErrorSource {
     AudioClip(ProjectResourcePublicationError),
     ControlMapping(ControlMappingPublicationError),
     Recording(RecordingImportError),
+    RecordingDiscard(ProjectResourcePublicationError),
     Rename(ProjectRenameError),
 }
 
@@ -188,6 +205,9 @@ impl fmt::Display for ProjectTransactionRecoveryErrorSource {
                 write!(formatter, "control-mapping recovery failed: {source}")
             }
             Self::Recording(source) => write!(formatter, "recording recovery failed: {source}"),
+            Self::RecordingDiscard(source) => {
+                write!(formatter, "recording-discard recovery failed: {source}")
+            }
             Self::Rename(source) => write!(formatter, "project-rename recovery failed: {source}"),
         }
     }
@@ -205,6 +225,7 @@ impl Error for ProjectTransactionRecoveryErrorSource {
             | Self::AudioClip(source) => Some(source),
             Self::ControlMapping(source) => Some(source),
             Self::Recording(source) => Some(source),
+            Self::RecordingDiscard(source) => Some(source),
             Self::Rename(source) => Some(source),
         }
     }
@@ -258,7 +279,7 @@ impl Error for ProjectTransactionRecoveryError {
 /// Sample cleanup is recovered first because it may restore asset files needed
 /// by later package verification. Existing-resource, audio-track, track-order,
 /// audio-clip, mapping, audio-track-duplication, audio-track-content-removal,
-/// recording, and manifest-name
+/// recording, recorded-take discard, and manifest-name
 /// transactions then follow in that order through the same shared lock.
 ///
 /// Recovery is fail-closed when another project storage transaction owns that
@@ -436,6 +457,28 @@ pub fn recover_project_transactions(
             });
         }
     };
+    let recording_discards = match recover_recording_discards(project_path) {
+        Ok(recording_discards) => recording_discards,
+        Err(source) => {
+            return Err(ProjectTransactionRecoveryError {
+                completed: ProjectTransactionRecoveryReport::from_parts(
+                    sample_cleanups,
+                    resources,
+                    audio_tracks,
+                    track_orders,
+                    audio_clips,
+                    control_mappings,
+                    recordings,
+                    Vec::new(),
+                )
+                .with_audio_track_duplications(audio_track_duplications)
+                .with_audio_track_content_removals(audio_track_content_removals),
+                source: Box::new(ProjectTransactionRecoveryErrorSource::RecordingDiscard(
+                    source,
+                )),
+            });
+        }
+    };
     let renames = match recover_project_renames(project_path) {
         Ok(renames) => renames,
         Err(source) => {
@@ -451,7 +494,8 @@ pub fn recover_project_transactions(
                     Vec::new(),
                 )
                 .with_audio_track_duplications(audio_track_duplications)
-                .with_audio_track_content_removals(audio_track_content_removals),
+                .with_audio_track_content_removals(audio_track_content_removals)
+                .with_recording_discards(recording_discards),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::Rename(source)),
             });
         }
@@ -467,7 +511,8 @@ pub fn recover_project_transactions(
         renames,
     )
     .with_audio_track_duplications(audio_track_duplications)
-    .with_audio_track_content_removals(audio_track_content_removals))
+    .with_audio_track_content_removals(audio_track_content_removals)
+    .with_recording_discards(recording_discards))
 }
 
 #[cfg(test)]

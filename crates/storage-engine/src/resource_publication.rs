@@ -17,6 +17,7 @@ use uuid::Uuid;
 mod audio_clip_publication;
 mod audio_track_content_removal;
 mod audio_track_duplication;
+mod recording_discard;
 mod sample_cleanup;
 
 pub use audio_clip_publication::{
@@ -37,6 +38,10 @@ pub use audio_track_duplication::{
     AudioTrackDuplicationPublicationRecoveryDisposition, AudioTrackDuplicationPublicationRequest,
     RoutingBusDuplicationPublicationRequest, publish_audio_track_duplication,
     publish_routing_bus_duplication, recover_audio_track_duplications,
+};
+pub use recording_discard::{
+    RecordingDiscardOutcome, RecordingDiscardRecovery, RecordingDiscardRecoveryDisposition,
+    RecordingDiscardRequest, discard_recording_take, recover_recording_discards,
 };
 pub use sample_cleanup::{
     SampleCleanupOutcome, SampleCleanupRecovery, SampleCleanupRecoveryDisposition,
