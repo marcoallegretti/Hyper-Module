@@ -866,6 +866,7 @@ export component MainWindow inherits Window {
     in property <string> loop-summary: "";
     in property <bool> loop-marking-available: false;
     in property <bool> loop-toggle-available: false;
+    in property <bool> loop-export-available: false;
     in property <bool> loop-engaged: false;
     in property <bool> metronome-available: false;
     in property <bool> metronome-enabled: false;
@@ -1601,7 +1602,7 @@ export component MainWindow inherits Window {
                         }
                         if !root.new-project-visible && !root.new-track-visible : Button {
                             text: root.app-mode == AppMode.exporting-project ? "Exporting…" : "Export loop";
-                            enabled: root.app-mode == AppMode.running && root.export-available && root.loop-toggle-available;
+                            enabled: root.app-mode == AppMode.running && root.export-available && root.loop-export-available;
                             accessible-label: "Export the persisted loop range as a WAV or FLAC file";
                             clicked => { IdeActions.export-loop-project(); }
                         }

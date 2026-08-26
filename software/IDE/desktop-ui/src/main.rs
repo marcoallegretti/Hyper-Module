@@ -7959,6 +7959,7 @@ fn set_arrangement(
         sample_rate_hz: observation.sample_rate_hz(),
         scene_ids,
     });
+    ui.set_loop_export_available(current_persisted_loop_export_range(project_state).is_some());
 }
 
 fn set_audio_clips(
@@ -8821,6 +8822,7 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_timeline_map_source_tick(SharedString::default());
     ui.set_loop_marking_available(false);
     ui.set_loop_toggle_available(false);
+    ui.set_loop_export_available(false);
     ui.set_loop_engaged(false);
     ui.set_metronome_available(false);
     ui.set_metronome_enabled(false);
@@ -11140,6 +11142,22 @@ fn loop_toggle_available(mode: AppMode, marks: LoopMarks) -> bool {
     loop_marking_available(mode) && marks.range().is_some()
 }
 
+fn offline_export_range_from_frames(
+    start_frame: usize,
+    end_frame: usize,
+) -> Option<OfflineExportRange> {
+    OfflineExportRange::new(start_frame, end_frame).ok()
+}
+
+fn current_persisted_loop_export_range(state: &ProjectUiStateCell) -> Option<OfflineExportRange> {
+    state
+        .arrangement
+        .borrow()
+        .as_ref()
+        .and_then(|binding| binding.owner.loop_range())
+        .and_then(|range| offline_export_range_from_frames(range.start_frame(), range.end_frame()))
+}
+
 /// The marks a reopened project should show. The user's own marks win once they
 /// have set any, so reopening seeds but never overwrites.
 fn seeded_loop_marks(
@@ -11769,17 +11787,10 @@ fn bind_project_export_callback(
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        let persisted_range = state_for_loop_export
-            .arrangement
-            .borrow()
-            .as_ref()
-            .and_then(|binding| binding.owner.loop_range());
-        let Some(loop_range) = persisted_range else {
+        let Some(range) = current_persisted_loop_export_range(&state_for_loop_export) else {
             ui.set_error_text("Save a nonempty loop range before exporting it".into());
             return;
         };
-        let range = OfflineExportRange::new(loop_range.start_frame(), loop_range.end_frame())
-            .expect("a TransportLoopRange is always nonempty");
         begin_project_export_destination_selection(&ui, &worker_for_loop_export, Some(range));
     });
 }
@@ -12752,6 +12763,53 @@ mod tests {
             &[false, true],
             "revoked export authority cannot enqueue a speculative stem request"
         );
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn loop_export_button_follows_persisted_range_authority_not_live_marks() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_export_available(true);
+        ui.set_loop_toggle_available(true);
+        ui.set_loop_export_available(false);
+        let exports = Rc::new(Cell::new(0_usize));
+        let exports_by_callback = Rc::clone(&exports);
+        ui.global::<IdeActions>().on_export_loop_project(move || {
+            exports_by_callback.set(exports_by_callback.get() + 1);
+        });
+        ui.show().unwrap();
+
+        let export_loop = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Export the persisted loop range as a WAV or FLAC file",
+        )
+        .next()
+        .expect("the persisted loop export action is visible for a running verified project");
+        assert_eq!(export_loop.accessible_enabled(), Some(false));
+        export_loop.mock_single_click(PointerEventButton::Left);
+        assert_eq!(
+            exports.get(),
+            0,
+            "unsaved live marks cannot enable an export of a range they do not own"
+        );
+
+        ui.set_loop_toggle_available(false);
+        ui.set_loop_export_available(true);
+        assert_eq!(export_loop.accessible_enabled(), Some(true));
+        export_loop.mock_single_click(PointerEventButton::Left);
+        assert_eq!(
+            exports.get(),
+            1,
+            "a persisted range remains exportable even when the live marks are partial"
+        );
+
+        ui.set_loop_toggle_available(true);
+        ui.set_loop_export_available(false);
+        assert_eq!(export_loop.accessible_enabled(), Some(false));
+        export_loop.mock_single_click(PointerEventButton::Left);
+        assert_eq!(exports.get(), 1);
         ui.hide().unwrap();
     }
 
@@ -15132,6 +15190,15 @@ mod tests {
         assert_eq!(range.start_frame(), 48_000);
         assert_eq!(range.end_frame(), 96_000);
         assert!(usable.summary(48_000).contains('→'));
+    }
+
+    #[test]
+    fn offline_export_range_from_frames_accepts_only_a_nonempty_range() {
+        assert_eq!(
+            offline_export_range_from_frames(480, 960),
+            Some(OfflineExportRange::new(480, 960).unwrap())
+        );
+        assert_eq!(offline_export_range_from_frames(960, 960), None);
     }
 
     #[test]
