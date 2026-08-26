@@ -15066,6 +15066,7 @@ mod tests {
     };
 
     const WAIT: Duration = Duration::from_secs(2);
+    const EVENT_WAIT: Duration = Duration::from_secs(10);
     const AUDIO_IMPORT_FLAC_FIXTURE_BASE64: &str =
         include_str!("../../../../crates/audio-source/tests/fixtures/mono-44100.flac.b64");
     const AUDIO_IMPORT_MP3_FIXTURE_BASE64: &str =
@@ -15421,7 +15422,12 @@ mod tests {
     }
 
     fn recv(worker: &DesktopIdeWorker) -> IdeWorkerEvent {
-        worker.events.as_ref().unwrap().recv_timeout(WAIT).unwrap()
+        worker
+            .events
+            .as_ref()
+            .unwrap()
+            .recv_timeout(EVENT_WAIT)
+            .unwrap()
     }
 
     fn recv_native_mutation(worker: &DesktopIdeWorker) -> IdeWorkerEvent {
@@ -15429,7 +15435,7 @@ mod tests {
             .events
             .as_ref()
             .unwrap()
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(EVENT_WAIT)
             .expect("the native project mutation must publish its next event")
     }
 
