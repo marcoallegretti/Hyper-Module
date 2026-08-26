@@ -3471,6 +3471,10 @@ export component MainWindow inherits Window {
                             border-width: 1px;
                             border-radius: 6px;
                             VerticalLayout {
+                                x: 0;
+                                y: 0;
+                                width: parent.width;
+                                height: 242px;
                                 padding: 18px;
                                 spacing: 12px;
                                 Text { text: "CREATE RECORDED TAKE CLIP"; color: #7dcfff; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
@@ -3486,7 +3490,6 @@ export component MainWindow inherits Window {
                                     text <=> root.take-clip-name;
                                     accessible-label: "Reusable audio clip name";
                                 }
-                                Rectangle { vertical-stretch: 1; background: transparent; }
                                 HorizontalLayout {
                                     spacing: 10px;
                                     Rectangle { horizontal-stretch: 1; background: transparent; }

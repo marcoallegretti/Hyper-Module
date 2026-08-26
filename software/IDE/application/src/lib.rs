@@ -10465,6 +10465,22 @@ impl RunningDesktopIdeApplication {
                 IdeProjectSaveError::ProjectSnapshotUnavailable,
             ))
         })?;
+        Self::prepare_recorded_take_placement_from_project(
+            application,
+            mixer,
+            prepared,
+            recording_id,
+            clip_name,
+        )
+    }
+
+    fn prepare_recorded_take_placement_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        recording_id: &str,
+        clip_name: &str,
+    ) -> Result<IdeRecordedTakePlacementPlan, IdeRecordingClipCreationError> {
         let mut recordings = prepared
             .recording_metadata()
             .iter()
@@ -16617,6 +16633,127 @@ mod tests {
             serde_json::from_slice(&reopened.package().read_resource(&clip_id).unwrap()).unwrap();
         assert_eq!(clip["source"]["asset_id"], ASSET_ID);
         assert_eq!(clip["duration_ticks"], duration_ticks);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the end-to-end test keeps recording import, atomic placement publication, and reopen evidence together"
+    )]
+    fn recorded_take_placement_plan_publishes_and_reopens_at_the_captured_tick() {
+        const METADATA_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338530";
+        const ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338531";
+        const CAPTURE_START_TICK: u64 = 12;
+        let parent = TestDirectory::new();
+        let created = hyper_storage_engine::create_project(
+            &parent.0,
+            hyper_storage_engine::ProjectCreationRequest {
+                directory_name: "Project",
+                project_name: "Recorded Take Placement Test",
+            },
+        )
+        .unwrap();
+        let project_path = created.project().root().to_path_buf();
+        let project_id = created.project().manifest().project_id().to_owned();
+        let track_id = created
+            .project()
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Track)
+            .unwrap()
+            .id()
+            .to_owned();
+        drop(created);
+        let recording = arrangement_test_wav(&[0; 63]);
+        let recording_path = parent.0.join("capture.wav");
+        std::fs::write(&recording_path, &recording).unwrap();
+        let metadata = arrangement_test_canonical(&json!({
+            "format":"hyper-recording-metadata", "format_version":1,
+            "id":METADATA_ID, "project_id":project_id, "asset_id":ASSET_ID,
+            "track_id":track_id, "capture_kind":"new",
+            "captured_at_utc":"2026-08-09T12:00:00.000Z",
+            "timeline_start_tick":CAPTURE_START_TICK, "source_input_indices":[0],
+            "sample_rate_hz":48_000, "channels":1, "frame_count":63,
+            "extensions":{}
+        }));
+        hyper_storage_engine::import_recording(
+            &project_path,
+            hyper_storage_engine::RecordingImportRequest {
+                recording_path: &recording_path,
+                recording_byte_length: recording.len() as u64,
+                recording_sha256: Sha256::digest(&recording).into(),
+                metadata_bytes: &metadata,
+            },
+        )
+        .unwrap();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let source_mixer = package.read_resource(&mixer_id).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let application = DesktopIdeApplication::from_inventories(
+            desktop_ide_application_config().unwrap(),
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let plan = RunningDesktopIdeApplication::prepare_recorded_take_placement_from_project(
+            &application,
+            IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256,
+                resource_id: mixer_id.clone(),
+                resource_bytes: source_mixer.clone(),
+            },
+            &prepared,
+            METADATA_ID,
+            "Vocal take",
+        )
+        .unwrap();
+        let clip_id = plan.clip.clip_id.clone();
+        let arrangement_id = plan.arrangement_id.clone();
+        let clip: Value = serde_json::from_slice(&plan.clip.clip_bytes).unwrap();
+        assert_eq!(clip["timebase"], "sample-locked");
+        drop(prepared);
+
+        let outcome = plan.publish().unwrap();
+
+        assert_eq!(outcome.project_revision(), 3);
+        assert_eq!(outcome.clip_id(), clip_id);
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let (project, _, _, _) = reopened.session().parts();
+        assert_eq!(project.clip_count(), 1);
+        assert_eq!(project.placement_count(), 1);
+        assert_eq!(project.clip_id_at(0), Some(clip_id.as_str()));
+        let placement = &reopened.session().arrangement().placements()[0];
+        assert_eq!(placement.start_tick(), CAPTURE_START_TICK);
+        assert_eq!(placement.clip_start_tick(), 0);
+        assert_eq!(placement.duration_ticks(), 6);
+        assert_eq!(placement.clip_index(), 0);
+        assert_eq!(
+            reopened.package().read_resource(&mixer_id).unwrap(),
+            source_mixer
+        );
+        let track: Value =
+            serde_json::from_slice(&reopened.package().read_resource(&track_id).unwrap()).unwrap();
+        assert_eq!(track["clip_ids"], json!([clip_id]));
+        let arrangement: Value =
+            serde_json::from_slice(&reopened.package().read_resource(&arrangement_id).unwrap())
+                .unwrap();
+        assert_eq!(arrangement["placements"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            arrangement["placements"][0]["start_tick"],
+            CAPTURE_START_TICK
+        );
     }
 
     #[test]
