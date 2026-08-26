@@ -1563,6 +1563,34 @@ impl IdeRunningObservation {
         self
     }
 
+    /// Adds coherent recorded-take rows to a generated UI test observation.
+    #[cfg(feature = "ui-test-support")]
+    #[must_use]
+    pub fn with_recording_takes_for_ui_test(
+        mut self,
+        takes: Vec<(&str, &str, &str, &str, bool)>,
+    ) -> Self {
+        self.recording_takes = takes
+            .into_iter()
+            .map(
+                |(id, asset_id, track_id, track_name, discardable)| IdeRecordingTake {
+                    id: id.to_owned(),
+                    asset_id: asset_id.to_owned(),
+                    track_id: track_id.to_owned(),
+                    track_name: track_name.to_owned(),
+                    capture_kind: IdeRecordingCaptureKind::New,
+                    captured_at_utc: "2026-08-26T12:00:00.000Z".to_owned(),
+                    timeline_start_tick: 0,
+                    sample_rate_hz: 48_000,
+                    channels: 2,
+                    frame_count: 48_000,
+                    discardable,
+                },
+            )
+            .collect();
+        self
+    }
+
     /// Identifies the playback session that produced this observation.
     ///
     /// The value changes whenever project playback is closed and reopened,

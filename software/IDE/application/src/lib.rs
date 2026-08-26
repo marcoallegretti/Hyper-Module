@@ -10759,14 +10759,24 @@ impl RunningDesktopIdeApplication {
         recovery: &DesktopPlaybackRecovery,
         recording_id: &str,
     ) -> Result<IdeRecordingDiscardPlan, IdeRecordingDiscardError> {
-        if recording_id.is_empty() {
-            return Err(IdeRecordingDiscardError::InvalidRecordingIdentity);
-        }
         let prepared = recovery.prepared_project().ok_or_else(|| {
             IdeRecordingDiscardError::MixerSave(Box::new(
                 IdeProjectSaveError::ProjectSnapshotUnavailable,
             ))
         })?;
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeRecordingDiscardError::MixerSave(Box::new(source)))?;
+        Self::prepare_recording_discard_from_project(mixer, prepared, recording_id)
+    }
+
+    fn prepare_recording_discard_from_project(
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        recording_id: &str,
+    ) -> Result<IdeRecordingDiscardPlan, IdeRecordingDiscardError> {
+        if recording_id.is_empty() {
+            return Err(IdeRecordingDiscardError::InvalidRecordingIdentity);
+        }
         let mut matches = prepared
             .recording_metadata()
             .iter()
@@ -10783,8 +10793,6 @@ impl RunningDesktopIdeApplication {
         {
             return Err(IdeRecordingDiscardError::RecordingPromoted);
         }
-        let mixer = Self::prepare_mixer_save(application, recovery)
-            .map_err(|source| IdeRecordingDiscardError::MixerSave(Box::new(source)))?;
         Ok(IdeRecordingDiscardPlan {
             mixer,
             recording_id: recording_id.to_owned(),
@@ -16791,6 +16799,114 @@ mod tests {
             serde_json::from_slice(&reopened.package().read_resource(&clip_id).unwrap()).unwrap();
         assert_eq!(clip["source"]["asset_id"], ASSET_ID);
         assert_eq!(clip["duration_ticks"], duration_ticks);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the end-to-end test keeps recording import, discard publication, and reopen evidence together"
+    )]
+    fn recorded_take_discard_plan_publishes_and_reopens_without_media_or_metadata() {
+        const METADATA_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338525";
+        const ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338526";
+        let parent = TestDirectory::new();
+        let created = hyper_storage_engine::create_project(
+            &parent.0,
+            hyper_storage_engine::ProjectCreationRequest {
+                directory_name: "Project",
+                project_name: "Recorded Take Discard Test",
+            },
+        )
+        .unwrap();
+        let project_path = created.project().root().to_path_buf();
+        let project_id = created.project().manifest().project_id().to_owned();
+        let track_id = created
+            .project()
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Track)
+            .unwrap()
+            .id()
+            .to_owned();
+        drop(created);
+
+        let recording = arrangement_test_wav(&[0; 63]);
+        let recording_path = parent.0.join("capture.wav");
+        std::fs::write(&recording_path, &recording).unwrap();
+        let metadata = arrangement_test_canonical(&json!({
+            "format":"hyper-recording-metadata", "format_version":1,
+            "id":METADATA_ID, "project_id":project_id, "asset_id":ASSET_ID,
+            "track_id":track_id, "capture_kind":"new",
+            "captured_at_utc":"2026-08-09T12:00:00.000Z",
+            "timeline_start_tick":0, "source_input_indices":[0],
+            "sample_rate_hz":48_000, "channels":1, "frame_count":63,
+            "extensions":{}
+        }));
+        hyper_storage_engine::import_recording(
+            &project_path,
+            hyper_storage_engine::RecordingImportRequest {
+                recording_path: &recording_path,
+                recording_byte_length: recording.len() as u64,
+                recording_sha256: Sha256::digest(&recording).into(),
+                metadata_bytes: &metadata,
+            },
+        )
+        .unwrap();
+
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let plan = RunningDesktopIdeApplication::prepare_recording_discard_from_project(
+            IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: *package.manifest_sha256(),
+                resource_id: mixer_id.clone(),
+                resource_bytes: mixer_bytes.clone(),
+            },
+            &prepared,
+            METADATA_ID,
+        )
+        .unwrap();
+        drop(prepared);
+
+        let outcome = plan.publish().unwrap();
+        assert_eq!(outcome.project_revision(), 3);
+        assert_eq!(outcome.recording_id(), METADATA_ID);
+        assert_eq!(outcome.asset_id(), ASSET_ID);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert!(reopened.recording_metadata().is_empty());
+        assert_eq!(
+            reopened.package().read_resource(&mixer_id).unwrap(),
+            mixer_bytes
+        );
+        assert!(
+            !reopened
+                .package()
+                .manifest()
+                .resources()
+                .iter()
+                .any(|resource| resource.id() == METADATA_ID)
+        );
+        assert!(
+            !reopened
+                .package()
+                .manifest()
+                .assets()
+                .iter()
+                .any(|asset| asset.id() == ASSET_ID)
+        );
     }
 
     #[test]

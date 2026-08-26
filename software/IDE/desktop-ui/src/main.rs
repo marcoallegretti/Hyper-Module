@@ -18165,6 +18165,51 @@ mod tests {
     }
 
     #[test]
+    fn recorded_take_rows_preserve_discard_protection_and_reset_confirmation_on_reopen() {
+        let ui = MainWindow::new().unwrap();
+        let routes: TakeRoutes = Rc::new(RefCell::new(Vec::new()));
+        let observation = IdeRunningObservation::for_ui_test(PlaybackRecoverySnapshot::for_test(
+            PlaybackRecoveryTransportState::Stopped,
+            0,
+        ))
+        .with_recording_takes_for_ui_test(vec![
+            (
+                "recording-discardable",
+                "asset-discardable",
+                "track-a",
+                "Audio A",
+                true,
+            ),
+            (
+                "recording-protected",
+                "asset-protected",
+                "track-b",
+                "Audio B",
+                false,
+            ),
+        ]);
+
+        set_recording_takes(&ui, &routes, &observation);
+        let rows = ui.get_recording_takes();
+        assert_eq!(rows.row_count(), 2);
+        assert!(rows.row_data(0).unwrap().discardable);
+        assert!(!rows.row_data(1).unwrap().discardable);
+        assert!(matches!(
+            take_discard_command(&routes, 0),
+            Some(IdeWorkerCommand::DiscardRecordingTake { recording_id })
+                if recording_id == "recording-discardable"
+        ));
+        assert_eq!(
+            take_route(&routes, 1).unwrap().recording_id,
+            "recording-protected"
+        );
+
+        ui.set_take_discard_confirming_index(0);
+        set_recording_takes(&ui, &routes, &observation);
+        assert_eq!(ui.get_take_discard_confirming_index(), -1);
+    }
+
+    #[test]
     fn recording_clip_creation_failure_keeps_the_form_recoverable() {
         assert_eq!(
             mode_after_failure(
