@@ -12767,6 +12767,40 @@ mod tests {
     }
 
     #[test]
+    fn project_export_button_matches_its_supported_destination_formats() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_export_available(true);
+        let exports = Rc::new(Cell::new(0_usize));
+        let exports_by_callback = Rc::clone(&exports);
+        ui.global::<IdeActions>().on_export_project(move || {
+            exports_by_callback.set(exports_by_callback.get() + 1);
+        });
+        ui.show().unwrap();
+
+        let export_project = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Export the project mix as a WAV or FLAC file",
+        )
+        .next()
+        .expect("the project export action describes every supported container");
+        assert_eq!(export_project.accessible_enabled(), Some(true));
+        export_project.mock_single_click(PointerEventButton::Left);
+        assert_eq!(exports.get(), 1);
+
+        ui.set_export_available(false);
+        assert_eq!(export_project.accessible_enabled(), Some(false));
+        export_project.mock_single_click(PointerEventButton::Left);
+        assert_eq!(
+            exports.get(),
+            1,
+            "revoked export authority cannot enqueue a project export"
+        );
+        ui.hide().unwrap();
+    }
+
+    #[test]
     fn loop_export_button_follows_persisted_range_authority_not_live_marks() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();

@@ -1595,9 +1595,9 @@ export component MainWindow inherits Window {
                             }
                         }
                         if !root.new-project-visible && !root.new-track-visible : Button {
-                            text: root.app-mode == AppMode.exporting-project ? "Exporting…" : "Export WAV";
+                            text: root.app-mode == AppMode.exporting-project ? "Exporting…" : "Export mix";
                             enabled: root.app-mode == AppMode.running && root.export-available;
-                            accessible-label: "Export the project as a WAV file";
+                            accessible-label: "Export the project mix as a WAV or FLAC file";
                             clicked => { IdeActions.export-project(); }
                         }
                         if !root.new-project-visible && !root.new-track-visible : Button {
