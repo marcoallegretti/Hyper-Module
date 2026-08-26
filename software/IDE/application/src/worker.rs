@@ -15033,6 +15033,8 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(2);
     const AUDIO_IMPORT_FLAC_FIXTURE_BASE64: &str =
         include_str!("../../../../crates/audio-source/tests/fixtures/mono-44100.flac.b64");
+    const AUDIO_IMPORT_MP3_FIXTURE_BASE64: &str =
+        include_str!("../../../../crates/audio-source/tests/fixtures/mono-8000-id3v23.mp3.b64");
 
     fn application_config() -> IdeApplicationConfig {
         IdeApplicationConfig::try_new(
@@ -17772,6 +17774,91 @@ mod tests {
     }
 
     #[test]
+    fn running_worker_imports_gapless_mp3_as_a_canonical_project_asset() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-audio-import-mp3-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        let initial_revision = created.project().manifest().revision();
+        drop(created);
+        let source = fixture.join("Short.mp3");
+        std::fs::write(
+            &source,
+            decode_base64_fixture(AUDIO_IMPORT_MP3_FIXTURE_BASE64),
+        )
+        .unwrap();
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 5)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the verified project must open before import");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: vec![source],
+                track_id: track_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioImporting { files: 1 }
+        ));
+        let IdeWorkerEvent::Running(reopened) = recv(&worker) else {
+            panic!("the committed MP3 import must reopen the project");
+        };
+        let IdeWorkerEvent::AudioImported(outcome) = recv(&worker) else {
+            panic!("the reopened MP3 import must report completion");
+        };
+        assert_eq!(outcome.imported(), 1);
+        assert_eq!(outcome.final_revision(), initial_revision + 1);
+        assert_eq!(reopened.audio_clips().len(), 1);
+        let clip = &reopened.audio_clips()[0];
+        assert_eq!(clip.name(), "Short");
+        assert_eq!(clip.track_id(), track_id);
+        assert_eq!(clip.source_frame_count(), 12_000);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+
+        let verified = verify_project_package(&project).unwrap();
+        assert_eq!(verified.manifest().revision(), initial_revision + 1);
+        assert_eq!(verified.manifest().assets().len(), 1);
+        let asset = &verified.manifest().assets()[0];
+        let decoded = decode_bytes(
+            verified.read_asset(asset.id(), 2_097_152).unwrap(),
+            AudioContainer::Wav,
+            48_000,
+            DecodeLimits::new(2_097_152, 300_000, 2_400_000).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded.channels(), 1);
+        assert_eq!(decoded.frame_count(), 12_000);
+        drop(verified);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
     fn native_compressor_edits_reopen_and_undo_through_the_real_worker() {
         let fixture = std::env::temp_dir().join(format!(
             "hyper-desktop-ide-native-compressor-history-{}",
@@ -19667,7 +19754,7 @@ mod tests {
         let initial_revision = created.project().manifest().revision();
         drop(created);
         let valid = fixture.join("Bass.wav");
-        let unsupported = fixture.join("Lead.mp3");
+        let unsupported = fixture.join("Lead.ogg");
         std::fs::write(&valid, mono_pcm16_wav(48_000, &[500; 48])).unwrap();
         std::fs::write(&unsupported, b"not an accepted container").unwrap();
 
@@ -19821,7 +19908,7 @@ mod tests {
         let initial_revision = created.project().manifest().revision();
         drop(created);
         let valid = fixture.join("Bass.wav");
-        let unsupported = fixture.join("Lead.mp3");
+        let unsupported = fixture.join("Lead.ogg");
         std::fs::write(&valid, mono_pcm16_wav(48_000, &[500; 48])).unwrap();
         std::fs::write(&unsupported, b"not an accepted container").unwrap();
 
@@ -19906,7 +19993,7 @@ mod tests {
             .to_owned();
         let original_mixer = package.read_resource(&mixer_id).unwrap();
         drop(package);
-        let unsupported = fixture.join("Lead.mp3");
+        let unsupported = fixture.join("Lead.ogg");
         std::fs::write(&unsupported, b"not an accepted container").unwrap();
 
         let worker =

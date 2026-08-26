@@ -1,4 +1,4 @@
-#![doc = "Bounded offline WAV and FLAC decoding for Hyper Module."]
+#![doc = "Bounded offline WAV, FLAC, and MP3 decoding for Hyper Module."]
 #![forbid(unsafe_code)]
 
 use std::error::Error;
@@ -27,6 +27,7 @@ const RESAMPLER_CONSTRUCTION_TABLE_COPIES: usize = 5;
 pub enum AudioContainer {
     Wav,
     Flac,
+    Mp3,
 }
 
 impl AudioContainer {
@@ -34,6 +35,7 @@ impl AudioContainer {
         match self {
             Self::Wav => "wav",
             Self::Flac => "flac",
+            Self::Mp3 => "mp3",
         }
     }
 }
@@ -357,7 +359,8 @@ impl From<hound::Error> for DecodeError {
     }
 }
 
-/// Decodes one complete WAV or native FLAC file outside the real-time path.
+/// Decodes one complete WAV, native FLAC, or MP3 file outside the real-time
+/// path.
 ///
 /// # Errors
 ///
@@ -378,7 +381,8 @@ pub fn decode_file(
     )
 }
 
-/// Decodes one complete WAV or native FLAC file from an already-open file.
+/// Decodes one complete WAV, native FLAC, or MP3 file from an already-open
+/// file.
 ///
 /// This entry point preserves the caller's filesystem object identity across
 /// package hashing and production decoding.
@@ -406,7 +410,8 @@ pub fn decode_open_file(
     )
 }
 
-/// Decodes one complete WAV or native FLAC file at its declared source rate.
+/// Decodes one complete WAV, native FLAC, or MP3 file at its declared source
+/// rate.
 ///
 /// This is intended for offline import before explicit conversion to the
 /// project's sample rate. Playback loaders should continue to use
@@ -424,7 +429,7 @@ pub fn decode_file_at_source_rate(
     decode_open_file_at_source_rate(File::open(path)?, container, limits)
 }
 
-/// Decodes an already-open WAV or FLAC file at its declared source rate.
+/// Decodes an already-open WAV, FLAC, or MP3 file at its declared source rate.
 ///
 /// # Errors
 ///
@@ -443,7 +448,8 @@ pub fn decode_open_file_at_source_rate(
     decode_source(Box::new(file), container, None, limits)
 }
 
-/// Decodes exact bounded WAV or FLAC bytes at their declared source rate.
+/// Decodes exact bounded WAV, FLAC, or MP3 bytes at their declared source
+/// rate.
 ///
 /// This entry point lets an external-file authority snapshot and audio decoding
 /// share the same immutable encoded payload.
@@ -465,8 +471,8 @@ pub fn decode_bytes_at_source_rate(
     decode_source(Box::new(cursor), container, None, limits)
 }
 
-/// Decodes complete verified WAV or native FLAC bytes outside the real-time
-/// path.
+/// Decodes complete verified WAV, native FLAC, or MP3 bytes outside the
+/// real-time path.
 ///
 /// Owning the encoded bytes keeps the decoded media tied to the exact package
 /// payload that was hashed by the caller.
@@ -878,7 +884,10 @@ fn decode_source(
     let probed = symphonia::default::get_probe().format(
         &hint,
         media_stream,
-        &FormatOptions::default(),
+        &FormatOptions {
+            enable_gapless: matches!(container, AudioContainer::Mp3),
+            ..FormatOptions::default()
+        },
         &MetadataOptions::default(),
     )?;
     let mut format = probed.format;
@@ -1098,19 +1107,20 @@ fn validate_channel_layout(channels: Channels) -> Result<usize, DecodeError> {
     }
 }
 
-fn verify_container_signature<R: Read>(
+fn verify_container_signature<R: Read + Seek>(
     file: &mut R,
     container: AudioContainer,
 ) -> Result<(), DecodeError> {
-    let mut header = [0_u8; 12];
-    let read = match file.read_exact(&mut header) {
-        Ok(()) => header.len(),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => 0,
-        Err(error) => return Err(error.into()),
-    };
     let valid = match container {
-        AudioContainer::Wav => read >= 12 && &header[0..4] == b"RIFF" && &header[8..12] == b"WAVE",
-        AudioContainer::Flac => read >= 4 && &header[0..4] == b"fLaC",
+        AudioContainer::Wav => {
+            let mut header = [0_u8; 12];
+            read_header(file, &mut header)? && &header[0..4] == b"RIFF" && &header[8..12] == b"WAVE"
+        }
+        AudioContainer::Flac => {
+            let mut header = [0_u8; 4];
+            read_header(file, &mut header)? && &header == b"fLaC"
+        }
+        AudioContainer::Mp3 => verify_mp3_signature(file)?,
     };
     if valid {
         Ok(())
@@ -1119,4 +1129,67 @@ fn verify_container_signature<R: Read>(
             expected: container,
         })
     }
+}
+
+fn read_header<R: Read>(file: &mut R, header: &mut [u8]) -> Result<bool, DecodeError> {
+    match file.read_exact(header) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn verify_mp3_signature<R: Read + Seek>(file: &mut R) -> Result<bool, DecodeError> {
+    let mut prefix = [0_u8; 3];
+    if !read_header(file, &mut prefix)? {
+        return Ok(false);
+    }
+    if prefix == *b"ID3" {
+        let mut id3_header = [0_u8; 10];
+        id3_header[..3].copy_from_slice(&prefix);
+        if !read_header(file, &mut id3_header[3..])? {
+            return Ok(false);
+        }
+        let version = id3_header[3];
+        let flags = id3_header[5];
+        let flags_are_valid = match version {
+            2 => flags & !0b1100_0000 == 0,
+            3 => flags & !0b1110_0000 == 0,
+            4 => flags & !0b1111_0000 == 0,
+            _ => false,
+        };
+        if !flags_are_valid || id3_header[6..].iter().any(|byte| byte & 0x80 != 0) {
+            return Ok(false);
+        }
+        let tag_size = (u64::from(id3_header[6]) << 21)
+            | (u64::from(id3_header[7]) << 14)
+            | (u64::from(id3_header[8]) << 7)
+            | u64::from(id3_header[9]);
+        let footer_bytes = u64::from(version == 4 && flags & 0b0001_0000 != 0) * 10;
+        let media_offset = 10_u64
+            .checked_add(tag_size)
+            .and_then(|offset| offset.checked_add(footer_bytes))
+            .ok_or(DecodeError::ContainerMismatch {
+                expected: AudioContainer::Mp3,
+            })?;
+        file.seek(SeekFrom::Start(media_offset))?;
+    } else {
+        file.seek(SeekFrom::Start(0))?;
+    }
+    let mut frame_header = [0_u8; 4];
+    Ok(read_header(file, &mut frame_header)? && is_mpeg_layer_3_frame_header(frame_header))
+}
+
+const fn is_mpeg_layer_3_frame_header(header: [u8; 4]) -> bool {
+    let header = u32::from_be_bytes(header);
+    let sync = header & 0xffe0_0000 == 0xffe0_0000;
+    let version = (header >> 19) & 0b11;
+    let layer = (header >> 17) & 0b11;
+    let bitrate_index = (header >> 12) & 0b1111;
+    let sample_rate_index = (header >> 10) & 0b11;
+    sync && version != 0b01
+        && layer == 0b01
+        && bitrate_index != 0
+        && bitrate_index != 0b1111
+        && sample_rate_index != 0b11
 }

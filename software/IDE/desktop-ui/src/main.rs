@@ -433,7 +433,7 @@ fn bind_audio_import_callback(ui: &MainWindow, worker: &WorkerCell, routes: &Aud
         let spawn_result = slint::spawn_local(async move {
             let selection = rfd::AsyncFileDialog::new()
                 .set_title("Import audio into project")
-                .add_filter("WAV and FLAC audio", &["wav", "flac"])
+                .add_filter("WAV, FLAC, and MP3 audio", &["wav", "flac", "mp3"])
                 .pick_files()
                 .await;
             let Some(ui) = weak_for_dialog.upgrade() else {

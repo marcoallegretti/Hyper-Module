@@ -238,6 +238,8 @@ fn audio_import_container(path: &Path) -> Result<AudioContainer, IdeAudioImportE
         Ok(AudioContainer::Wav)
     } else if extension.eq_ignore_ascii_case("flac") {
         Ok(AudioContainer::Flac)
+    } else if extension.eq_ignore_ascii_case("mp3") {
+        Ok(AudioContainer::Mp3)
     } else {
         Err(IdeAudioImportError::UnsupportedContainer)
     }
@@ -3346,7 +3348,7 @@ impl fmt::Display for IdeAudioImportError {
                 formatter.write_str("audio import requires an existing audio track")
             }
             Self::UnsupportedContainer => {
-                formatter.write_str("audio import accepts WAV and native FLAC files")
+                formatter.write_str("audio import accepts WAV, native FLAC, and MP3 files")
             }
             Self::InvalidClipName => formatter.write_str(
                 "the imported file name must contain 1 through 120 characters after normalization",

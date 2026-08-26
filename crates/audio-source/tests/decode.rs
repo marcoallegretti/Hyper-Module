@@ -11,6 +11,7 @@ use hyper_audio_source::{
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
 const EPSILON: f32 = 1.0e-6;
 const FLAC_FIXTURE_BASE64: &str = include_str!("fixtures/mono-44100.flac.b64");
+const MP3_ID3V23_FIXTURE_BASE64: &str = include_str!("fixtures/mono-8000-id3v23.mp3.b64");
 
 struct TemporaryAudioFile {
     path: PathBuf,
@@ -133,6 +134,39 @@ fn decodes_and_verifies_pinned_flac_fixture() {
             .iter()
             .all(|sample| sample.is_finite())
     );
+}
+
+#[test]
+fn decodes_id3_prefixed_and_bare_mp3_fixture() {
+    let id3_prefixed = decode_base64(MP3_ID3V23_FIXTURE_BASE64);
+    let tagged_file = TemporaryAudioFile::create("mp3", &id3_prefixed);
+    let tagged =
+        decode_file_at_source_rate(tagged_file.path(), AudioContainer::Mp3, limits()).unwrap();
+    assert_eq!(tagged.sample_rate_hz(), 8_000);
+    assert_eq!(tagged.channels(), 1);
+    assert_eq!(tagged.frame_count(), 2_000);
+    assert!(
+        tagged
+            .plane(0)
+            .unwrap()
+            .iter()
+            .all(|sample| sample.is_finite())
+    );
+
+    let tag_size = id3_prefixed[6..10]
+        .iter()
+        .fold(0_usize, |size, byte| (size << 7) | usize::from(*byte));
+    let bare_file = TemporaryAudioFile::create("mp3", &id3_prefixed[10 + tag_size..]);
+    let bare = decode_file_at_source_rate(bare_file.path(), AudioContainer::Mp3, limits()).unwrap();
+    assert_eq!(bare, tagged);
+
+    let malformed_tag = b"ID3\x03\0\x01\x80\0\0\0\0\xff\xfb\x90\xc0";
+    assert!(matches!(
+        decode_bytes(malformed_tag.to_vec(), AudioContainer::Mp3, 8_000, limits()),
+        Err(DecodeError::ContainerMismatch {
+            expected: AudioContainer::Mp3
+        })
+    ));
 }
 
 #[test]

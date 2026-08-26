@@ -4433,7 +4433,7 @@ export component MainWindow inherits Window {
                         }
 
                         if root.audio-clips.length == 0 : Text {
-                            text: "This project contains no audio clips. Import WAV or FLAC into an audio track to create reusable clips.";
+                            text: "This project contains no audio clips. Import WAV, FLAC, or MP3 into an audio track to create reusable clips.";
                             color: #8fa0b4;
                             font-size: 13px;
                             horizontal-alignment: center;
@@ -4630,7 +4630,7 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: "Import copies WAV or FLAC into project-owned 48 kHz media and creates one full-file reusable clip per file; it creates no arrangement placement. Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Remove unused deletes only an unreferenced reusable clip and keeps its source media. Clean unused media permanently deletes only project-owned sample copies referenced by no clip; recording takes and external originals are never included. Place creates one full-length non-ripple reference. Activation, direction, source slip, source trim, gain, loop, and fades affect every existing reference.";
+                            text: "Import copies WAV, FLAC, or MP3 into project-owned 48 kHz media and creates one full-file reusable clip per file; it creates no arrangement placement. Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Remove unused deletes only an unreferenced reusable clip and keeps its source media. Clean unused media permanently deletes only project-owned sample copies referenced by no clip; recording takes and external originals are never included. Place creates one full-length non-ripple reference. Activation, direction, source slip, source trim, gain, loop, and fades affect every existing reference.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
