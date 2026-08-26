@@ -22,8 +22,9 @@ mod sample_cleanup;
 pub use audio_clip_publication::{
     AudioClipPublicationOutcome, AudioClipPublicationRecovery,
     AudioClipPublicationRecoveryDisposition, AudioClipPublicationRequest, AudioClipRemovalOutcome,
-    AudioClipRemovalRequest, ImportedAudioClipPublicationRequest, publish_audio_clip,
-    publish_imported_audio_clip, recover_audio_clip_publications, remove_audio_clip,
+    AudioClipRemovalRequest, ImportedAudioClipPublicationRequest,
+    RecordedTakePlacementPublicationRequest, publish_audio_clip, publish_imported_audio_clip,
+    publish_recorded_take_placement, recover_audio_clip_publications, remove_audio_clip,
 };
 pub use audio_track_content_removal::{
     AudioTrackContentRemovalPublicationOutcome, AudioTrackContentRemovalPublicationRecovery,

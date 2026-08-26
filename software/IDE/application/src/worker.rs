@@ -172,6 +172,7 @@ pub enum IdeWorkerCommandKind {
     SetAudioTrackActive,
     ImportAudio,
     CreateAudioClipFromTake,
+    CreateAndPlaceAudioClipFromTake,
     DuplicateAudioClip,
     RemoveAudioClip,
     CleanUnusedSamples,
@@ -330,6 +331,10 @@ pub enum IdeWorkerCommand {
         track_id: String,
     },
     CreateAudioClipFromTake {
+        recording_id: String,
+        name: String,
+    },
+    CreateAndPlaceAudioClipFromTake {
         recording_id: String,
         name: String,
     },
@@ -556,6 +561,9 @@ impl IdeWorkerCommand {
             Self::SetAudioTrackActive { .. } => IdeWorkerCommandKind::SetAudioTrackActive,
             Self::ImportAudio { .. } => IdeWorkerCommandKind::ImportAudio,
             Self::CreateAudioClipFromTake { .. } => IdeWorkerCommandKind::CreateAudioClipFromTake,
+            Self::CreateAndPlaceAudioClipFromTake { .. } => {
+                IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake
+            }
             Self::DuplicateAudioClip { .. } => IdeWorkerCommandKind::DuplicateAudioClip,
             Self::RemoveAudioClip { .. } => IdeWorkerCommandKind::RemoveAudioClip,
             Self::CleanUnusedSamples { .. } => IdeWorkerCommandKind::CleanUnusedSamples,
@@ -2466,6 +2474,10 @@ pub enum IdeWorkerEvent {
         revision: u64,
         clip_id: String,
     },
+    AudioClipCreatedAndPlacedFromTake {
+        revision: u64,
+        clip_id: String,
+    },
     AudioClipDuplicated {
         revision: u64,
         clip_id: String,
@@ -2755,6 +2767,7 @@ pub enum IdeWorkerEvent {
         files: usize,
     },
     AudioClipCreatingFromTake,
+    AudioClipCreatingAndPlacingFromTake,
     AudioClipDuplicating,
     AudioClipRemoving,
     ArrangementPlacementAdding {
@@ -3304,6 +3317,10 @@ enum ProjectMutation {
         recording_id: String,
         name: String,
     },
+    CreateAndPlaceAudioClipFromTake {
+        recording_id: String,
+        name: String,
+    },
     DuplicateAudioClip {
         clip_id: String,
         name: String,
@@ -3481,6 +3498,9 @@ impl ProjectMutation {
             Self::SetAudioTrackActive { .. } => IdeWorkerCommandKind::SetAudioTrackActive,
             Self::ImportAudio { .. } => IdeWorkerCommandKind::ImportAudio,
             Self::CreateAudioClipFromTake { .. } => IdeWorkerCommandKind::CreateAudioClipFromTake,
+            Self::CreateAndPlaceAudioClipFromTake { .. } => {
+                IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake
+            }
             Self::DuplicateAudioClip { .. } => IdeWorkerCommandKind::DuplicateAudioClip,
             Self::RemoveAudioClip { .. } => IdeWorkerCommandKind::RemoveAudioClip,
             Self::CleanUnusedSamples { .. } => IdeWorkerCommandKind::CleanUnusedSamples,
@@ -3569,6 +3589,9 @@ impl ProjectMutation {
                 IdeWorkerEvent::AudioImporting { files: paths.len() }
             }
             Self::CreateAudioClipFromTake { .. } => IdeWorkerEvent::AudioClipCreatingFromTake,
+            Self::CreateAndPlaceAudioClipFromTake { .. } => {
+                IdeWorkerEvent::AudioClipCreatingAndPlacingFromTake
+            }
             Self::DuplicateAudioClip { .. } => IdeWorkerEvent::AudioClipDuplicating,
             Self::RemoveAudioClip { .. } => IdeWorkerEvent::AudioClipRemoving,
             Self::CleanUnusedSamples { confirmation } => {
@@ -3927,6 +3950,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::DuplicateAudioTrack
         | IdeWorkerCommandKind::ImportAudio
         | IdeWorkerCommandKind::CreateAudioClipFromTake
+        | IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake
         | IdeWorkerCommandKind::DuplicateAudioClip
         | IdeWorkerCommandKind::RemoveAudioClip
         | IdeWorkerCommandKind::CleanUnusedSamples
@@ -4258,6 +4282,7 @@ fn process_command(
         | IdeWorkerCommand::SetAudioTrackActive { .. }
         | IdeWorkerCommand::ImportAudio { .. }
         | IdeWorkerCommand::CreateAudioClipFromTake { .. }
+        | IdeWorkerCommand::CreateAndPlaceAudioClipFromTake { .. }
         | IdeWorkerCommand::DuplicateAudioClip { .. }
         | IdeWorkerCommand::RemoveAudioClip { .. }
         | IdeWorkerCommand::CleanUnusedSamples { .. }
@@ -4469,6 +4494,9 @@ fn process_project_mutation_command(
         }
         IdeWorkerCommand::CreateAudioClipFromTake { recording_id, name } => {
             create_audio_clip_from_take(state, events, &recording_id, &name)
+        }
+        IdeWorkerCommand::CreateAndPlaceAudioClipFromTake { recording_id, name } => {
+            create_and_place_audio_clip_from_take(state, events, &recording_id, &name)
         }
         IdeWorkerCommand::DuplicateAudioClip { clip_id, name } => {
             duplicate_audio_clip(state, events, &clip_id, &name)
@@ -6527,6 +6555,58 @@ fn create_audio_clip_from_take(
     )
 }
 
+fn create_and_place_audio_clip_from_take(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    recording_id: &str,
+    name: &str,
+) -> bool {
+    let name = name.trim();
+    if recording_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake,
+            IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
+                IdeRecordingClipCreationError::InvalidRecordingIdentity,
+            )),
+        );
+    }
+    if name.is_empty() || name.chars().count() > 120 {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake,
+            IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
+                IdeRecordingClipCreationError::InvalidClipName,
+            )),
+        );
+    }
+    let mut owned_recording_id = String::new();
+    let mut normalized_name = String::new();
+    if owned_recording_id
+        .try_reserve_exact(recording_id.len())
+        .is_err()
+        || normalized_name.try_reserve_exact(name.len()).is_err()
+    {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake,
+            IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
+                IdeRecordingClipCreationError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_recording_id.push_str(recording_id);
+    normalized_name.push_str(name);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::CreateAndPlaceAudioClipFromTake {
+            recording_id: owned_recording_id,
+            name: normalized_name,
+        },
+    )
+}
+
 fn duplicate_audio_clip(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -7660,6 +7740,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             Ok(_) | Err(IdeAudioImportBatchFailure { completed: 1.., .. }),
         )
         | ProjectMutationAttempt::CreateAudioClipFromTake(Ok(_))
+        | ProjectMutationAttempt::CreateAndPlaceAudioClipFromTake(Ok(_))
         | ProjectMutationAttempt::DuplicateAudioClip { result: Ok(_), .. }
         | ProjectMutationAttempt::RemoveAudioClip(Ok(_))
         | ProjectMutationAttempt::RemoveScene { result: Ok(_), .. }
@@ -7714,6 +7795,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::RenameAudioTrack(Err(_))
         | ProjectMutationAttempt::RenameRoutingBus(Err(_))
         | ProjectMutationAttempt::CreateAudioClipFromTake(Err(_))
+        | ProjectMutationAttempt::CreateAndPlaceAudioClipFromTake(Err(_))
         | ProjectMutationAttempt::RemoveArrangementPlacement(Err(_))
         | ProjectMutationAttempt::SetAudioTrackActive { result: Err(_), .. }
         | ProjectMutationAttempt::DuplicateAudioClip { result: Err(_), .. }
@@ -8498,6 +8580,11 @@ fn project_mutation_save_failure(
                 IdeRecordingClipCreationError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::CreateAndPlaceAudioClipFromTake { .. } => {
+            IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
+                IdeRecordingClipCreationError::MixerSave(Box::new(reason)),
+            ))
+        }
         ProjectMutation::DuplicateAudioClip { .. } => {
             IdeWorkerCommandFailure::AudioClipDuplication(Box::new(
                 IdeAudioClipDuplicationError::MixerSave(Box::new(reason)),
@@ -8799,6 +8886,11 @@ fn project_mutation_native_close_failure(
                 IdeRecordingClipCreationError::NativeClose(failure),
             ))
         }
+        ProjectMutation::CreateAndPlaceAudioClipFromTake { .. } => {
+            IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
+                IdeRecordingClipCreationError::NativeClose(failure),
+            ))
+        }
         ProjectMutation::DuplicateAudioClip { .. } => {
             IdeWorkerCommandFailure::AudioClipDuplication(Box::new(
                 IdeAudioClipDuplicationError::NativeClose(failure),
@@ -9031,6 +9123,9 @@ enum ProjectMutationAttempt {
     },
     ImportAudio(Result<IdeAudioImportBatchOutcome, IdeAudioImportBatchFailure>),
     CreateAudioClipFromTake(
+        Result<hyper_storage_engine::AudioClipPublicationOutcome, IdeRecordingClipCreationError>,
+    ),
+    CreateAndPlaceAudioClipFromTake(
         Result<hyper_storage_engine::AudioClipPublicationOutcome, IdeRecordingClipCreationError>,
     ),
     DuplicateAudioClip {
@@ -9872,6 +9967,20 @@ fn complete_project_mutation(
                     IdeWorkerCommandKind::CreateAudioClipFromTake,
                     IdeWorkerCommandFailure::RecordingClipCreation(Box::new(reason)),
                 ),
+                ProjectMutationAttempt::CreateAndPlaceAudioClipFromTake(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::AudioClipCreatedAndPlacedFromTake {
+                        revision: outcome.project_revision(),
+                        clip_id: outcome.clip_id().to_owned(),
+                    },
+                ),
+                ProjectMutationAttempt::CreateAndPlaceAudioClipFromTake(Err(reason)) => {
+                    publish_failure(
+                        events,
+                        IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake,
+                        IdeWorkerCommandFailure::RecordingClipCreation(Box::new(reason)),
+                    )
+                }
                 ProjectMutationAttempt::DuplicateAudioClip {
                     name,
                     result: Ok(outcome),
@@ -11201,6 +11310,25 @@ fn attempt_project_mutation(
                     })
                 })
             })
+        }
+        ProjectMutation::CreateAndPlaceAudioClipFromTake { recording_id, name } => {
+            ProjectMutationAttempt::CreateAndPlaceAudioClipFromTake(
+                if let Some(failure) = native_failure {
+                    Err(IdeRecordingClipCreationError::NativeClose(failure))
+                } else {
+                    RunningDesktopIdeApplication::prepare_recorded_take_placement(
+                        application,
+                        recovery,
+                        &recording_id,
+                        &name,
+                    )
+                    .and_then(|plan| {
+                        plan.publish().map_err(|source| {
+                            IdeRecordingClipCreationError::Publication(Box::new(source))
+                        })
+                    })
+                },
+            )
         }
         ProjectMutation::DuplicateAudioClip { clip_id, name } => {
             ProjectMutationAttempt::DuplicateAudioClip {
@@ -12664,6 +12792,9 @@ fn project_mutation_reopen_failure(
             }
         }
         ProjectMutationAttempt::CreateAudioClipFromTake(result) => {
+            recording_clip_creation_reopen_failure(result, reopen)
+        }
+        ProjectMutationAttempt::CreateAndPlaceAudioClipFromTake(result) => {
             recording_clip_creation_reopen_failure(result, reopen)
         }
         ProjectMutationAttempt::DuplicateAudioClip { result, .. } => {
@@ -21156,6 +21287,59 @@ mod tests {
             recv(&worker),
             IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::CreateAudioClipFromTake,
+                reason: IdeWorkerCommandFailure::RecordingClipCreation(reason),
+            } if matches!(reason.as_ref(), IdeRecordingClipCreationError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn recorded_take_clip_and_placement_validates_input_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::CreateAndPlaceAudioClipFromTake {
+                recording_id: String::new(),
+                name: "Take 1".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake,
+                reason: IdeWorkerCommandFailure::RecordingClipCreation(reason),
+            } if matches!(reason.as_ref(), IdeRecordingClipCreationError::InvalidRecordingIdentity)
+        ));
+        worker
+            .try_send(IdeWorkerCommand::CreateAndPlaceAudioClipFromTake {
+                recording_id: "018f47a2-6b2d-7c11-8a44-001122334477".to_owned(),
+                name: "Vocal take".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioClipCreatingAndPlacingFromTake
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake,
                 reason: IdeWorkerCommandFailure::RecordingClipCreation(reason),
             } if matches!(reason.as_ref(), IdeRecordingClipCreationError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))

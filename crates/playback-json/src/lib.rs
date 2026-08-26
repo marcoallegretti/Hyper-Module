@@ -681,6 +681,17 @@ pub struct AudioClipAdditionDocuments {
     duration_ticks: u64,
 }
 
+/// Canonical resources required to create a finalized recorded take and place
+/// its complete range in the linear arrangement in one publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedTakePlacementDocuments {
+    track: Vec<u8>,
+    clip: Vec<u8>,
+    arrangement: Vec<u8>,
+    arrangement_id: String,
+    placement_id: String,
+}
+
 /// Canonical version-1 resources required to duplicate one reusable audio clip.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioClipDuplicationDocuments {
@@ -761,6 +772,44 @@ impl AudioClipAdditionDocuments {
     #[must_use]
     pub fn into_parts(self) -> (Vec<u8>, Vec<u8>, u64) {
         (self.track, self.clip, self.duration_ticks)
+    }
+}
+
+impl RecordedTakePlacementDocuments {
+    #[must_use]
+    pub fn track(&self) -> &[u8] {
+        &self.track
+    }
+
+    #[must_use]
+    pub fn clip(&self) -> &[u8] {
+        &self.clip
+    }
+
+    #[must_use]
+    pub fn arrangement(&self) -> &[u8] {
+        &self.arrangement
+    }
+
+    #[must_use]
+    pub fn arrangement_id(&self) -> &str {
+        &self.arrangement_id
+    }
+
+    #[must_use]
+    pub fn placement_id(&self) -> &str {
+        &self.placement_id
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, Vec<u8>, Vec<u8>, String, String) {
+        (
+            self.track,
+            self.clip,
+            self.arrangement,
+            self.arrangement_id,
+            self.placement_id,
+        )
     }
 }
 
@@ -950,6 +999,14 @@ pub enum AudioClipAdditionSerializationError {
     InvalidDocumentShape,
     Serialization(serde_json::Error),
     ProjectCompilation(AdapterCompileError),
+}
+
+/// Failure to create and place one finalized recorded take as a single
+/// candidate project edit.
+#[derive(Debug)]
+pub enum RecordedTakePlacementSerializationError {
+    Clip(AudioClipAdditionSerializationError),
+    Arrangement(ArrangementPlacementAdditionSerializationError),
 }
 
 #[derive(Debug)]
@@ -3601,6 +3658,99 @@ pub fn serialize_recording_audio_clip_addition(
         track,
         clip,
         duration_ticks,
+    })
+}
+
+/// Creates a sample-locked recorded clip and its full-duration arrangement
+/// placement as one compiled candidate.
+///
+/// The returned documents must be published together. The placement begins at
+/// the capture's timeline tick, starts at clip-local tick zero, and is
+/// deliberately non-ripple. Existing arrangement content is preserved; when
+/// no arrangement exists, the supplied identity creates the first `Main`
+/// arrangement.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the atomic candidate binds recording authority, both new identities, and the exact capture start"
+)]
+pub fn serialize_recording_audio_clip_placement(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_track: &[u8],
+    source_arrangement: Option<&[u8]>,
+    track_id: &str,
+    asset_id: &str,
+    timeline_start_tick: u64,
+    frame_count: u64,
+    clip_id: &str,
+    clip_name: &str,
+    arrangement_id: &str,
+    placement_id: &str,
+    limits: LoaderLimits,
+) -> Result<RecordedTakePlacementDocuments, RecordedTakePlacementSerializationError> {
+    let added = serialize_recording_audio_clip_addition(
+        project,
+        assets,
+        source_track,
+        track_id,
+        asset_id,
+        timeline_start_tick,
+        frame_count,
+        clip_id,
+        clip_name,
+        limits,
+    )
+    .map_err(RecordedTakePlacementSerializationError::Clip)?;
+    let track_index = project
+        .track_index(track_id)
+        .ok_or(AudioClipAdditionSerializationError::TrackMissing)
+        .map_err(RecordedTakePlacementSerializationError::Clip)?;
+    let clip = load_clip(
+        &added.clip,
+        project.clips.len(),
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_warp_markers,
+    )
+    .map_err(AudioClipAdditionSerializationError::Source)
+    .map_err(RecordedTakePlacementSerializationError::Clip)?;
+    let track = load_track(
+        &added.track,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(AudioClipAdditionSerializationError::Source)
+    .map_err(RecordedTakePlacementSerializationError::Clip)?;
+    let mut extended = project.clone();
+    extended.clips.try_reserve(1).map_err(|_| {
+        RecordedTakePlacementSerializationError::Clip(AudioClipAdditionSerializationError::Source(
+            capacity_error(),
+        ))
+    })?;
+    extended.clips.push(clip);
+    extended.tracks[track_index] = track;
+    validate_loaded_identities(&extended)
+        .map_err(AudioClipAdditionSerializationError::Source)
+        .map_err(RecordedTakePlacementSerializationError::Clip)?;
+    let arrangement = serialize_arrangement_placement_addition(
+        &extended,
+        assets,
+        source_arrangement,
+        arrangement_id,
+        placement_id,
+        clip_id,
+        timeline_start_tick,
+        limits,
+    )
+    .map_err(RecordedTakePlacementSerializationError::Arrangement)?;
+    Ok(RecordedTakePlacementDocuments {
+        track: added.track,
+        clip: added.clip,
+        arrangement,
+        arrangement_id: arrangement_id.to_owned(),
+        placement_id: placement_id.to_owned(),
     })
 }
 
@@ -10393,6 +10543,56 @@ mod tests {
 
         assert_eq!(schedule.entries().len(), 1);
         assert_eq!(schedule.entries()[0].compiled.arrangement_start_frame(), 0);
+        assert_eq!(schedule.entries()[0].compiled.arrangement_end_frame(), 63);
+    }
+
+    #[test]
+    fn recorded_take_placement_serializes_one_compiled_sample_locked_candidate() {
+        let mut source: Value = serde_json::from_slice(TRACK).unwrap();
+        source["clip_ids"] = json!([]);
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [&source];
+        let loaded = load(input(TIMELINE, &tracks, &[], None), LoaderLimits::VERSION_1).unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let arrangement_id = "018f47a2-6b2d-7c11-8a44-001122334470";
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334471";
+        let assets = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 63,
+        }];
+
+        let documents = serialize_recording_audio_clip_placement(
+            &loaded,
+            &assets,
+            &source,
+            None,
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            "018f47a2-6b2d-7c11-8a44-001122334457",
+            0,
+            63,
+            clip_id,
+            "Exact Take",
+            arrangement_id,
+            placement_id,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let arrangement: Value = serde_json::from_slice(documents.arrangement()).unwrap();
+        assert_eq!(documents.arrangement_id(), arrangement_id);
+        assert_eq!(documents.placement_id(), placement_id);
+        assert_eq!(arrangement["placements"].as_array().unwrap().len(), 1);
+        assert_eq!(arrangement["placements"][0]["id"], placement_id);
+        assert_eq!(arrangement["placements"][0]["clip_id"], clip_id);
+        let tracks: [&[u8]; 1] = [documents.track()];
+        let clips: [&[u8]; 1] = [documents.clip()];
+        let reopened = load(
+            input(TIMELINE, &tracks, &clips, Some(documents.arrangement())),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let schedule = reopened.compile(&assets, GraphLimits::VERSION_1).unwrap();
         assert_eq!(schedule.entries()[0].compiled.arrangement_end_frame(), 63);
     }
 

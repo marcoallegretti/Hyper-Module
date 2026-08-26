@@ -1091,6 +1091,25 @@ fn bind_audio_preview_callbacks(ui: &MainWindow, worker: &WorkerCell, take_route
         };
         submit_to_ui(&ui, &worker_for_creation, command);
     });
+
+    let weak = ui.as_weak();
+    let worker_for_placement = Rc::clone(worker);
+    let routes_for_placement = Rc::clone(take_routes);
+    actions.on_create_and_place_audio_clip_from_take(move |index, name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_take_clip_visible() {
+            return;
+        }
+        let Some(command) =
+            take_clip_placement_command(&routes_for_placement, index, name.as_str())
+        else {
+            ui.set_error_text("Recorded take selection is no longer available".into());
+            return;
+        };
+        submit_to_ui(&ui, &worker_for_placement, command);
+    });
 }
 
 fn take_route(routes: &TakeRoutes, index: i32) -> Option<TakeRoute> {
@@ -1105,6 +1124,17 @@ fn take_clip_creation_command(
     name: &str,
 ) -> Option<IdeWorkerCommand> {
     take_route(routes, index).map(|route| IdeWorkerCommand::CreateAudioClipFromTake {
+        recording_id: route.recording_id,
+        name: name.to_owned(),
+    })
+}
+
+fn take_clip_placement_command(
+    routes: &TakeRoutes,
+    index: i32,
+    name: &str,
+) -> Option<IdeWorkerCommand> {
+    take_route(routes, index).map(|route| IdeWorkerCommand::CreateAndPlaceAudioClipFromTake {
         recording_id: route.recording_id,
         name: name.to_owned(),
     })
@@ -4677,6 +4707,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::DuplicateScene => AppMode::DuplicatingScene,
         IdeWorkerCommandKind::SetSceneActive => AppMode::ChangingSceneActivation,
         IdeWorkerCommandKind::CreateAudioClipFromTake => AppMode::CreatingClip,
+        IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake => AppMode::CreatingClip,
         IdeWorkerCommandKind::StartRecording => AppMode::PreparingRecording,
         IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
             AppMode::FinalizingRecording
@@ -4881,6 +4912,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetSceneActive => "Updating scene activation and reopening project…",
         IdeWorkerCommandKind::CreateAudioClipFromTake => {
             "Preserving mixer state, creating the reusable audio clip, and reopening project…"
+        }
+        IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake => {
+            "Preserving mixer state, creating and placing the recorded take, and reopening project…"
         }
         IdeWorkerCommandKind::StartRecording => {
             "Stopping playback and preparing an exclusive monitored capture…"
@@ -5424,7 +5458,9 @@ fn apply_event(
             apply_scene_activation_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipCreatedFromTake { .. }
-        | IdeWorkerEvent::AudioClipCreatingFromTake) => {
+        | IdeWorkerEvent::AudioClipCreatingFromTake
+        | IdeWorkerEvent::AudioClipCreatedAndPlacedFromTake { .. }
+        | IdeWorkerEvent::AudioClipCreatingAndPlacingFromTake) => {
             apply_recording_clip_creation_event(ui, &event);
         }
         IdeWorkerEvent::RecordingPreparing => {
@@ -6989,6 +7025,26 @@ fn apply_recording_clip_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) 
             ui.set_app_mode(AppMode::CreatingClip);
             ui.set_status_text(
                 "Waiting for native output before creating the reusable audio clip…".into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipCreatedAndPlacedFromTake { revision, clip_id } => {
+            ui.set_take_clip_visible(false);
+            ui.set_take_clip_index(-1);
+            ui.set_take_clip_track_name(SharedString::default());
+            ui.set_take_clip_name(SharedString::default());
+            ui.set_status_text(
+                format!(
+                    "Recorded take clip {clip_id} was created and placed in project revision {revision}"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipCreatingAndPlacingFromTake => {
+            ui.set_app_mode(AppMode::CreatingClip);
+            ui.set_status_text(
+                "Waiting for native output before creating and placing the recorded take…".into(),
             );
             ui.set_error_text(SharedString::default());
         }
@@ -8683,6 +8739,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::CreateAudioClipFromTake if current == AppMode::CreatingClip => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake
+            if current == AppMode::CreatingClip =>
+        {
             AppMode::Running
         }
         IdeWorkerCommandKind::StartRecording if current == AppMode::PreparingRecording => {
@@ -18032,6 +18093,13 @@ mod tests {
                 name,
             }) if recording_id == "recording-a" && name == "Lead take"
         ));
+        assert!(matches!(
+            take_clip_placement_command(&routes, 0, "Lead take"),
+            Some(IdeWorkerCommand::CreateAndPlaceAudioClipFromTake {
+                recording_id,
+                name,
+            }) if recording_id == "recording-a" && name == "Lead take"
+        ));
     }
 
     #[test]
@@ -18040,6 +18108,13 @@ mod tests {
             mode_after_failure(
                 AppMode::CreatingClip,
                 IdeWorkerCommandKind::CreateAudioClipFromTake,
+            ),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::CreatingClip,
+                IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake,
             ),
             AppMode::Running
         );

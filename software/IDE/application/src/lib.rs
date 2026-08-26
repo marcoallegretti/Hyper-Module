@@ -108,14 +108,14 @@ use hyper_playback_json::{
     AutomationTargetSelection, CompiledMixerDestination, CompiledMixerGraph, CompiledMixerTap,
     CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact,
     MixerBaseState, MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
-    MixerStripReorderSerializationError, ReturnSendSerializationError,
-    RoutingBusCreationSerializationError, RoutingBusDuplicationSerializationError,
-    RoutingBusDuplicationSource, RoutingBusKind as PlaybackRoutingBusKind,
-    RoutingBusRemovalSerializationError, RoutingBusRenameSerializationError,
-    SceneAdditionSerializationError, SceneDocumentSerializationError,
-    SceneDuplicationSerializationError, SceneRemovalBlockers, SceneRemovalSerializationError,
-    SceneRenameSerializationError, SceneSlotEdit, SceneSlotEditSerializationError,
-    TempoSerializationError, serialize_arrangement_loop_range,
+    MixerStripReorderSerializationError, RecordedTakePlacementSerializationError,
+    ReturnSendSerializationError, RoutingBusCreationSerializationError,
+    RoutingBusDuplicationSerializationError, RoutingBusDuplicationSource,
+    RoutingBusKind as PlaybackRoutingBusKind, RoutingBusRemovalSerializationError,
+    RoutingBusRenameSerializationError, SceneAdditionSerializationError,
+    SceneDocumentSerializationError, SceneDuplicationSerializationError, SceneRemovalBlockers,
+    SceneRemovalSerializationError, SceneRenameSerializationError, SceneSlotEdit,
+    SceneSlotEditSerializationError, TempoSerializationError, serialize_arrangement_loop_range,
     serialize_arrangement_placement_activation, serialize_arrangement_placement_addition,
     serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
     serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
@@ -131,8 +131,8 @@ use hyper_playback_json::{
     serialize_audio_track_removal, serialize_audio_track_rename,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_mixer_base_state, serialize_mixer_strip_reorder,
-    serialize_recording_audio_clip_addition, serialize_return_send_addition,
-    serialize_return_send_removal, serialize_routing_bus_creation,
+    serialize_recording_audio_clip_addition, serialize_recording_audio_clip_placement,
+    serialize_return_send_addition, serialize_return_send_removal, serialize_routing_bus_creation,
     serialize_routing_bus_duplication, serialize_routing_bus_removal, serialize_routing_bus_rename,
     serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
     serialize_scene_removal, serialize_scene_rename, serialize_scene_slot_edit,
@@ -169,16 +169,17 @@ use hyper_storage_engine::{
     ControlMappingPublicationRequest, DeviceChainPublicationRequest, DeviceChainRemovalRequest,
     ImportedAudioClipPublicationRequest, MixerRecoverySnapshotError, MixerRecoverySnapshotRequest,
     ProjectResourcePublicationError, ProjectResourcePublicationOutcome,
-    ProjectResourcePublicationRequest, RequiredControlCapabilities, RoutingBusPublicationKind,
-    RoutingBusPublicationRequest, RoutingBusRemovalKind, RoutingBusRemovalOutcome,
-    RoutingBusRemovalRequest, SampleCleanupOutcome, SampleCleanupRequest, ScenePublicationRequest,
-    SceneRemovalRequest, StorageError, TrackOrderPublicationOutcome, TrackOrderPublicationRequest,
-    clean_unused_samples, publish_arrangement, publish_audio_clip, publish_audio_track,
+    ProjectResourcePublicationRequest, RecordedTakePlacementPublicationRequest,
+    RequiredControlCapabilities, RoutingBusPublicationKind, RoutingBusPublicationRequest,
+    RoutingBusRemovalKind, RoutingBusRemovalOutcome, RoutingBusRemovalRequest,
+    SampleCleanupOutcome, SampleCleanupRequest, ScenePublicationRequest, SceneRemovalRequest,
+    StorageError, TrackOrderPublicationOutcome, TrackOrderPublicationRequest, clean_unused_samples,
+    publish_arrangement, publish_audio_clip, publish_audio_track,
     publish_audio_track_content_removal, publish_audio_track_duplication, publish_automation_take,
     publish_control_mapping, publish_device_chain, publish_imported_audio_clip,
-    publish_project_resource, publish_routing_bus, publish_scene, publish_track_order,
-    remove_audio_clip, remove_audio_track, remove_automation_take, remove_device_chain,
-    remove_routing_bus, remove_scene, store_mixer_recovery_snapshot,
+    publish_project_resource, publish_recorded_take_placement, publish_routing_bus, publish_scene,
+    publish_track_order, remove_audio_clip, remove_audio_track, remove_automation_take,
+    remove_device_chain, remove_routing_bus, remove_scene, store_mixer_recovery_snapshot,
 };
 
 mod recording;
@@ -3515,10 +3516,12 @@ pub enum IdeRecordingClipCreationError {
     MixerSave(Box<IdeProjectSaveError>),
     RecordingMetadataMissing,
     RecordingMetadataAmbiguous,
+    ArrangementResourceAmbiguous,
     TrackResourceMissing,
     TrackResourceRoleMismatch,
     Storage(StorageError),
     Serialization(AudioClipAdditionSerializationError),
+    PlacementSerialization(RecordedTakePlacementSerializationError),
     CapacityUnavailable,
     Publication(Box<IdeRecordingClipCreationPublicationError>),
     NativeClose(IdeNativeCloseFailure),
@@ -3561,6 +3564,9 @@ impl fmt::Display for IdeRecordingClipCreationError {
             Self::RecordingMetadataAmbiguous => {
                 formatter.write_str("the selected recorded-take identity is ambiguous")
             }
+            Self::ArrangementResourceAmbiguous => {
+                formatter.write_str("the project has ambiguous arrangement placement authority")
+            }
             Self::TrackResourceMissing => {
                 formatter.write_str("the recorded take's owning track is no longer present")
             }
@@ -3569,6 +3575,12 @@ impl fmt::Display for IdeRecordingClipCreationError {
             }
             Self::Storage(source) => source.fmt(formatter),
             Self::Serialization(source) => source.fmt(formatter),
+            Self::PlacementSerialization(source) => {
+                write!(
+                    formatter,
+                    "recorded-take placement candidate was rejected: {source:?}"
+                )
+            }
             Self::CapacityUnavailable => {
                 formatter.write_str("recorded-take audio-clip creation capacity is unavailable")
             }
@@ -3620,9 +3632,11 @@ impl Error for IdeRecordingClipCreationError {
             | Self::InvalidClipName
             | Self::RecordingMetadataMissing
             | Self::RecordingMetadataAmbiguous
+            | Self::ArrangementResourceAmbiguous
             | Self::TrackResourceMissing
             | Self::TrackResourceRoleMismatch
             | Self::CapacityUnavailable
+            | Self::PlacementSerialization(_)
             | Self::NativeClose(_) => None,
         }
     }
@@ -7270,6 +7284,13 @@ struct IdeAudioClipCreationPlan {
 }
 
 #[derive(Debug)]
+struct IdeRecordedTakePlacementPlan {
+    clip: IdeAudioClipCreationPlan,
+    arrangement_id: String,
+    arrangement_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
 struct IdeImportedAudioClipPlan {
     source_path: PathBuf,
     source_maximum_bytes: u64,
@@ -8499,6 +8520,35 @@ impl IdeAudioClipCreationPlan {
                 track_id: &self.track_id,
                 track_bytes: &self.track_bytes,
                 asset_id: &self.asset_id,
+            },
+        )
+        .map_err(|source| IdeAudioClipCreationPublicationError::Clip {
+            mixer: Box::new(mixer),
+            source: Box::new(source),
+        })
+    }
+}
+
+impl IdeRecordedTakePlacementPlan {
+    fn publish(&self) -> Result<AudioClipPublicationOutcome, IdeAudioClipCreationPublicationError> {
+        let mixer = self
+            .clip
+            .mixer
+            .publish()
+            .map_err(|source| IdeAudioClipCreationPublicationError::Mixer(Box::new(source)))?;
+        publish_recorded_take_placement(
+            &self.clip.mixer.project_path,
+            RecordedTakePlacementPublicationRequest {
+                clip: AudioClipPublicationRequest {
+                    expected_project_sha256: *mixer.project_identity(),
+                    clip_id: &self.clip.clip_id,
+                    clip_bytes: &self.clip.clip_bytes,
+                    track_id: &self.clip.track_id,
+                    track_bytes: &self.clip.track_bytes,
+                    asset_id: &self.clip.asset_id,
+                },
+                arrangement_id: &self.arrangement_id,
+                arrangement_bytes: &self.arrangement_bytes,
             },
         )
         .map_err(|source| IdeAudioClipCreationPublicationError::Clip {
@@ -10399,6 +10449,104 @@ impl RunningDesktopIdeApplication {
             track_id,
             track_bytes,
             asset_id,
+        })
+    }
+
+    fn prepare_recorded_take_placement(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        recording_id: &str,
+        clip_name: &str,
+    ) -> Result<IdeRecordedTakePlacementPlan, IdeRecordingClipCreationError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeRecordingClipCreationError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeRecordingClipCreationError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let mut recordings = prepared
+            .recording_metadata()
+            .iter()
+            .filter(|metadata| metadata.id() == recording_id);
+        let metadata = recordings
+            .next()
+            .ok_or(IdeRecordingClipCreationError::RecordingMetadataMissing)?;
+        if recordings.next().is_some() {
+            return Err(IdeRecordingClipCreationError::RecordingMetadataAmbiguous);
+        }
+        let package = prepared.package();
+        let track_descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == metadata.track_id())
+            .ok_or(IdeRecordingClipCreationError::TrackResourceMissing)?;
+        if track_descriptor.role() != ResourceRole::Track {
+            return Err(IdeRecordingClipCreationError::TrackResourceRoleMismatch);
+        }
+        let source_track = package
+            .read_resource(metadata.track_id())
+            .map_err(IdeRecordingClipCreationError::Storage)?;
+        let mut arrangements = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Arrangement);
+        let arrangement = arrangements.next();
+        if arrangements.next().is_some() {
+            return Err(IdeRecordingClipCreationError::ArrangementResourceAmbiguous);
+        }
+        let arrangement_id = arrangement.map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |descriptor| descriptor.id().to_owned(),
+        );
+        let source_arrangement = arrangement
+            .map(|descriptor| package.read_resource(descriptor.id()))
+            .transpose()
+            .map_err(IdeRecordingClipCreationError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeRecordingClipCreationError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let clip_id = uuid::Uuid::new_v4().to_string();
+        let placement_id = uuid::Uuid::new_v4().to_string();
+        let documents = serialize_recording_audio_clip_placement(
+            project,
+            &assets,
+            &source_track,
+            source_arrangement.as_deref(),
+            metadata.track_id(),
+            metadata.asset_id(),
+            metadata.timeline_start_tick(),
+            metadata.frame_count(),
+            &clip_id,
+            clip_name,
+            &arrangement_id,
+            &placement_id,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(|source| match source {
+            RecordedTakePlacementSerializationError::Clip(
+                AudioClipAdditionSerializationError::InvalidClipName,
+            ) => IdeRecordingClipCreationError::InvalidClipName,
+            source => IdeRecordingClipCreationError::PlacementSerialization(source),
+        })?;
+        let (track_bytes, clip_bytes, arrangement_bytes, arrangement_id, _placement_id) =
+            documents.into_parts();
+        Ok(IdeRecordedTakePlacementPlan {
+            clip: IdeAudioClipCreationPlan {
+                mixer,
+                clip_id,
+                clip_bytes,
+                track_id: metadata.track_id().to_owned(),
+                track_bytes,
+                asset_id: metadata.asset_id().to_owned(),
+            },
+            arrangement_id,
+            arrangement_bytes,
         })
     }
 

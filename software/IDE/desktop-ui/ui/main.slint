@@ -385,6 +385,7 @@ export global IdeActions {
     callback abort-recording();
     callback toggle-take-preview(int);
     callback create-audio-clip-from-take(int, string);
+    callback create-and-place-audio-clip-from-take(int, string);
     callback choose-audio-import(int);
     callback preview-gain(float);
     callback preview-mute();
@@ -3472,10 +3473,10 @@ export component MainWindow inherits Window {
                             VerticalLayout {
                                 padding: 18px;
                                 spacing: 12px;
-                                Text { text: "CREATE REUSABLE AUDIO CLIP"; color: #7dcfff; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                                Text { text: "CREATE RECORDED TAKE CLIP"; color: #7dcfff; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
                                 Text { text: "Source take on " + root.take-clip-track-name; color: #edf2f8; font-size: 15px; font-weight: 600; overflow: elide; }
                                 Text {
-                                    text: "This preserves the verified whole recording and its exact frame-derived duration. The new clip belongs to the take's track; it is not placed in the arrangement.";
+                                    text: "Create clip preserves the verified whole recording without placing it. Create and place also adds the full recorded range at the captured timeline position in the same project save.";
                                     color: #aebccc;
                                     font-size: 11px;
                                     wrap: word-wrap;
@@ -3500,6 +3501,12 @@ export component MainWindow inherits Window {
                                         text: root.app-mode == AppMode.creating-clip ? "Creating…" : "Create clip";
                                         enabled: root.app-mode == AppMode.running && root.take-clip-name != "";
                                         clicked => { IdeActions.create-audio-clip-from-take(root.take-clip-index, root.take-clip-name); }
+                                    }
+                                    Button {
+                                        width: 150px;
+                                        text: root.app-mode == AppMode.creating-clip ? "Creating…" : "Create and place";
+                                        enabled: root.app-mode == AppMode.running && root.take-clip-name != "";
+                                        clicked => { IdeActions.create-and-place-audio-clip-from-take(root.take-clip-index, root.take-clip-name); }
                                     }
                                 }
                             }
