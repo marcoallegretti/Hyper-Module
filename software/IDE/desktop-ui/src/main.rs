@@ -9,11 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper_desktop_ide::{
-    AUDIO_IMPORT_FILE_EXTENSIONS, AUDIO_IMPORT_FILE_FILTER_LABEL, AutomationChannelParameter,
-    AutomationInterpolation, AutomationMainParameter, AutomationPoint, AutomationSendParameter,
-    AutomationTarget, AutomationValue, ControlScope, ControlSource, ControlTarget,
-    ControlTransform, DesktopAudioPreviewState, DesktopIdeWorker, Edge, IdeApplicationConfig,
-    IdeAudioClip, IdeAudioClipWaveform, IdeAudioInputInventory, IdeAudioOutputInventory,
+    AUDIO_IMPORT_FILE_FILTER_LABEL, AutomationChannelParameter, AutomationInterpolation,
+    AutomationMainParameter, AutomationPoint, AutomationSendParameter, AutomationTarget,
+    AutomationValue, ControlScope, ControlSource, ControlTarget, ControlTransform,
+    DesktopAudioPreviewState, DesktopIdeWorker, Edge, IdeApplicationConfig, IdeAudioClip,
+    IdeAudioClipWaveform, IdeAudioInputInventory, IdeAudioOutputInventory,
     IdeAudioPreviewControlCommand, IdeAutomationTakeRequest, IdeAutomationTarget,
     IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
     IdeControlMappingEdit, IdeInputSelection, IdeLoopRangeFrames, IdeLoudnessCommand,
@@ -38,10 +38,10 @@ use hyper_desktop_ide::{
     MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, NativeFilterMode, OfflineExportReport,
     OfflineTrackStemExportFormat, PlaybackRecoveryTransportState, ProjectHistory, RecentProject,
     SceneAction, TempoEvent, TimelineMapEdit, TransportAction, TransportCommand,
-    TransportLoopRange, TriggerBehavior, bpm_for_microseconds_per_quarter,
-    desktop_ide_application_config, ide_audio_clip_gain_is_supported,
-    meter_is_in_version_one_domain, microseconds_per_quarter_for_bpm, musical_position,
-    musical_position_at_frame,
+    TransportLoopRange, TriggerBehavior, audio_import_file_extensions,
+    bpm_for_microseconds_per_quarter, desktop_ide_application_config,
+    ide_audio_clip_gain_is_supported, meter_is_in_version_one_domain,
+    microseconds_per_quarter_for_bpm, musical_position, musical_position_at_frame,
 };
 #[cfg(test)]
 use hyper_desktop_ide::{
@@ -432,12 +432,10 @@ fn bind_audio_import_callback(ui: &MainWindow, worker: &WorkerCell, routes: &Aud
     bind_audio_import_callback_with(ui, worker, routes, |weak, worker, track_id| {
         let weak_for_dialog = weak.clone();
         let spawn_result = slint::spawn_local(async move {
+            let extensions = audio_import_file_extensions().collect::<Vec<_>>();
             let selection = rfd::AsyncFileDialog::new()
                 .set_title("Import audio into project")
-                .add_filter(
-                    AUDIO_IMPORT_FILE_FILTER_LABEL,
-                    &AUDIO_IMPORT_FILE_EXTENSIONS,
-                )
+                .add_filter(AUDIO_IMPORT_FILE_FILTER_LABEL, &extensions)
                 .pick_files()
                 .await;
             let Some(ui) = weak_for_dialog.upgrade() else {

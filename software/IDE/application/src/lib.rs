@@ -354,27 +354,59 @@ fn summarize_audio_source_view(
 pub const MAX_IDE_SCENES: usize = LoaderLimits::VERSION_1.max_scene_documents;
 /// Maximum channel rows published by the version-1 desktop IDE mixer.
 pub const MAX_IDE_MIXER_CHANNELS: usize = hyper_mixer_runtime::MAX_MAIN_MIXER_SLOTS;
+#[derive(Clone, Copy)]
+struct AudioImportFormat {
+    extension: &'static str,
+    container: AudioContainer,
+}
+
+const AUDIO_IMPORT_FORMATS: [AudioImportFormat; 5] = [
+    AudioImportFormat {
+        extension: "wav",
+        container: AudioContainer::Wav,
+    },
+    AudioImportFormat {
+        extension: "flac",
+        container: AudioContainer::Flac,
+    },
+    AudioImportFormat {
+        extension: "mp3",
+        container: AudioContainer::Mp3,
+    },
+    AudioImportFormat {
+        extension: "aiff",
+        container: AudioContainer::Aiff,
+    },
+    AudioImportFormat {
+        extension: "aif",
+        container: AudioContainer::Aiff,
+    },
+];
+
 /// File-dialog label for the audio containers accepted by project import.
 pub const AUDIO_IMPORT_FILE_FILTER_LABEL: &str = "WAV, FLAC, MP3, and AIFF audio";
-/// File extensions accepted by project import, in the order shown by the desktop picker.
-pub const AUDIO_IMPORT_FILE_EXTENSIONS: [&str; 5] = ["wav", "flac", "mp3", "aiff", "aif"];
+
+/// Iterates over file extensions accepted by project import in picker order.
+#[must_use]
+pub fn audio_import_file_extensions() -> impl ExactSizeIterator<Item = &'static str> {
+    AUDIO_IMPORT_FORMATS
+        .into_iter()
+        .map(|format| format.extension)
+}
 
 fn audio_import_container(path: &Path) -> Result<AudioContainer, IdeAudioImportError> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .ok_or(IdeAudioImportError::UnsupportedContainer)?;
-    if extension.eq_ignore_ascii_case("wav") {
-        Ok(AudioContainer::Wav)
-    } else if extension.eq_ignore_ascii_case("flac") {
-        Ok(AudioContainer::Flac)
-    } else if extension.eq_ignore_ascii_case("mp3") {
-        Ok(AudioContainer::Mp3)
-    } else if extension.eq_ignore_ascii_case("aiff") || extension.eq_ignore_ascii_case("aif") {
-        Ok(AudioContainer::Aiff)
-    } else {
-        Err(IdeAudioImportError::UnsupportedContainer)
-    }
+    AUDIO_IMPORT_FORMATS
+        .iter()
+        .find_map(|format| {
+            extension
+                .eq_ignore_ascii_case(format.extension)
+                .then_some(format.container)
+        })
+        .ok_or(IdeAudioImportError::UnsupportedContainer)
 }
 
 fn audio_import_clip_name(path: &Path) -> Result<String, IdeAudioImportError> {
@@ -15434,15 +15466,28 @@ mod tests {
     }
 
     #[test]
-    fn audio_import_container_accepts_aiff_aliases_and_refuses_aifc() {
-        assert!(matches!(
-            audio_import_container(Path::new("source.AIFF")),
-            Ok(AudioContainer::Aiff)
-        ));
-        assert!(matches!(
-            audio_import_container(Path::new("source.aif")),
-            Ok(AudioContainer::Aiff)
-        ));
+    fn audio_import_format_contract_maps_every_advertised_extension() {
+        let expected = [
+            ("wav", AudioContainer::Wav),
+            ("flac", AudioContainer::Flac),
+            ("mp3", AudioContainer::Mp3),
+            ("aiff", AudioContainer::Aiff),
+            ("aif", AudioContainer::Aiff),
+        ];
+        assert_eq!(
+            audio_import_file_extensions().collect::<Vec<_>>(),
+            expected.map(|(extension, _)| extension)
+        );
+        for (extension, container) in expected {
+            assert_eq!(
+                audio_import_container(Path::new(&format!("source.{extension}"))).unwrap(),
+                container
+            );
+        }
+        assert_eq!(
+            audio_import_container(Path::new("source.AIFF")).unwrap(),
+            AudioContainer::Aiff
+        );
         assert!(matches!(
             audio_import_container(Path::new("source.aifc")),
             Err(IdeAudioImportError::UnsupportedContainer)

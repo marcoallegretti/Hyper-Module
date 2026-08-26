@@ -177,6 +177,19 @@ fn decodes_and_verifies_pinned_aiff_fixture() {
     assert_eq!(audio.sample_rate_hz(), 8_000);
     assert_eq!(audio.channels(), 1);
     assert_eq!(audio.frame_count(), 84);
+    assert_samples(
+        &audio.plane(0).unwrap()[..8],
+        &[
+            0.0,
+            2_896.0 / 32_768.0,
+            4_095.0 / 32_768.0,
+            2_896.0 / 32_768.0,
+            0.0,
+            -2_896.0 / 32_768.0,
+            -4_095.0 / 32_768.0,
+            -2_896.0 / 32_768.0,
+        ],
+    );
     assert!(
         audio
             .plane(0)
