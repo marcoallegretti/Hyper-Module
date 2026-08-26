@@ -9,30 +9,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper_desktop_ide::{
-    AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
-    AutomationSendParameter, AutomationTarget, AutomationValue, ControlScope, ControlSource,
-    ControlTarget, ControlTransform, DesktopAudioPreviewState, DesktopIdeWorker, Edge,
-    IdeApplicationConfig, IdeAudioClip, IdeAudioClipWaveform, IdeAudioInputInventory,
-    IdeAudioOutputInventory, IdeAudioPreviewControlCommand, IdeAutomationTakeRequest,
-    IdeAutomationTarget, IdeControlBindingRequest, IdeControlChannelParameter,
-    IdeControlMainParameter, IdeControlMappingEdit, IdeInputSelection, IdeLoopRangeFrames,
-    IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
-    IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
-    IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerChannelKind,
-    IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice,
-    IdeNativeFilterEdit, IdeOutputSelection, IdeOutputTestState, IdePlaybackArrangement,
-    IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeProjectExportFormat,
-    IdeRecordingAbortOutcome, IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake,
-    IdeResourceRestoreError, IdeRoutingBusKind, IdeRunningObservation, IdeScaledLoudnessValue,
-    IdeScene, IdeSceneAvailability, IdeSceneLaunchQuantization, IdeSceneLaunchState,
-    IdeSceneSlotEdit, IdeSceneTrackAction, IdeUnusedSampleCleanupSummary, IdeWorkerCommand,
-    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
-    IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState,
-    MAX_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
-    MAX_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RELEASE_MICROSECONDS,
-    MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MAX_FILTER_CUTOFF_MILLIHERTZ,
-    MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL, MAX_IDE_SCENES,
-    MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    AUDIO_IMPORT_FILE_EXTENSIONS, AUDIO_IMPORT_FILE_FILTER_LABEL, AutomationChannelParameter,
+    AutomationInterpolation, AutomationMainParameter, AutomationPoint, AutomationSendParameter,
+    AutomationTarget, AutomationValue, ControlScope, ControlSource, ControlTarget,
+    ControlTransform, DesktopAudioPreviewState, DesktopIdeWorker, Edge, IdeApplicationConfig,
+    IdeAudioClip, IdeAudioClipWaveform, IdeAudioInputInventory, IdeAudioOutputInventory,
+    IdeAudioPreviewControlCommand, IdeAutomationTakeRequest, IdeAutomationTarget,
+    IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
+    IdeControlMappingEdit, IdeInputSelection, IdeLoopRangeFrames, IdeLoudnessCommand,
+    IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState, IdeLoudnessPresentationConfig,
+    IdeLoudnessScale, IdeLoudnessScaleRegion, IdeMaximumTruePeakDisplay, IdeMixerChannel,
+    IdeMixerChannelDestination, IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap,
+    IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice, IdeNativeFilterEdit,
+    IdeOutputSelection, IdeOutputTestState, IdePlaybackArrangement, IdePlaybackAutomation,
+    IdePlaybackAutomationLane, IdePlaybackExtent, IdeProjectExportFormat, IdeRecordingAbortOutcome,
+    IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeResourceRestoreError,
+    IdeRoutingBusKind, IdeRunningObservation, IdeScaledLoudnessValue, IdeScene,
+    IdeSceneAvailability, IdeSceneLaunchQuantization, IdeSceneLaunchState, IdeSceneSlotEdit,
+    IdeSceneTrackAction, IdeUnusedSampleCleanupSummary, IdeWorkerCommand, IdeWorkerCommandKind,
+    IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeWorkerShutdownReport, LocateState, MAX_COMPRESSOR_ATTACK_MICROSECONDS,
+    MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS, MAX_COMPRESSOR_RATIO_MILLIONTHS,
+    MAX_COMPRESSOR_RELEASE_MICROSECONDS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
+    MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL,
+    MAX_IDE_SCENES, MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
     MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
     MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MIN_FILTER_CUTOFF_MILLIHERTZ,
     MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, NativeFilterMode, OfflineExportReport,
@@ -434,7 +434,10 @@ fn bind_audio_import_callback(ui: &MainWindow, worker: &WorkerCell, routes: &Aud
         let spawn_result = slint::spawn_local(async move {
             let selection = rfd::AsyncFileDialog::new()
                 .set_title("Import audio into project")
-                .add_filter("WAV, FLAC, and MP3 audio", &["wav", "flac", "mp3"])
+                .add_filter(
+                    AUDIO_IMPORT_FILE_FILTER_LABEL,
+                    &AUDIO_IMPORT_FILE_EXTENSIONS,
+                )
                 .pick_files()
                 .await;
             let Some(ui) = weak_for_dialog.upgrade() else {

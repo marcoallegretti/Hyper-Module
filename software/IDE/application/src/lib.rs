@@ -354,6 +354,10 @@ fn summarize_audio_source_view(
 pub const MAX_IDE_SCENES: usize = LoaderLimits::VERSION_1.max_scene_documents;
 /// Maximum channel rows published by the version-1 desktop IDE mixer.
 pub const MAX_IDE_MIXER_CHANNELS: usize = hyper_mixer_runtime::MAX_MAIN_MIXER_SLOTS;
+/// File-dialog label for the audio containers accepted by project import.
+pub const AUDIO_IMPORT_FILE_FILTER_LABEL: &str = "WAV, FLAC, MP3, and AIFF audio";
+/// File extensions accepted by project import, in the order shown by the desktop picker.
+pub const AUDIO_IMPORT_FILE_EXTENSIONS: [&str; 5] = ["wav", "flac", "mp3", "aiff", "aif"];
 
 fn audio_import_container(path: &Path) -> Result<AudioContainer, IdeAudioImportError> {
     let extension = path
@@ -366,6 +370,8 @@ fn audio_import_container(path: &Path) -> Result<AudioContainer, IdeAudioImportE
         Ok(AudioContainer::Flac)
     } else if extension.eq_ignore_ascii_case("mp3") {
         Ok(AudioContainer::Mp3)
+    } else if extension.eq_ignore_ascii_case("aiff") || extension.eq_ignore_ascii_case("aif") {
+        Ok(AudioContainer::Aiff)
     } else {
         Err(IdeAudioImportError::UnsupportedContainer)
     }
@@ -3474,7 +3480,7 @@ impl fmt::Display for IdeAudioImportError {
                 formatter.write_str("audio import requires an existing audio track")
             }
             Self::UnsupportedContainer => {
-                formatter.write_str("audio import accepts WAV, native FLAC, and MP3 files")
+                formatter.write_str("audio import accepts WAV, native FLAC, MP3, and AIFF files")
             }
             Self::InvalidClipName => formatter.write_str(
                 "the imported file name must contain 1 through 120 characters after normalization",
@@ -15425,6 +15431,22 @@ mod tests {
             limits.session.media_cache.max_decoded_sample_bytes
                 >= limits.audio.max_decoded_sample_bytes()
         );
+    }
+
+    #[test]
+    fn audio_import_container_accepts_aiff_aliases_and_refuses_aifc() {
+        assert!(matches!(
+            audio_import_container(Path::new("source.AIFF")),
+            Ok(AudioContainer::Aiff)
+        ));
+        assert!(matches!(
+            audio_import_container(Path::new("source.aif")),
+            Ok(AudioContainer::Aiff)
+        ));
+        assert!(matches!(
+            audio_import_container(Path::new("source.aifc")),
+            Err(IdeAudioImportError::UnsupportedContainer)
+        ));
     }
 
     #[cfg(target_pointer_width = "64")]

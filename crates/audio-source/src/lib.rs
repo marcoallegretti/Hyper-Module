@@ -1,4 +1,4 @@
-#![doc = "Bounded offline WAV, FLAC, and MP3 decoding for Hyper Module."]
+#![doc = "Bounded offline WAV, FLAC, MP3, and AIFF decoding for Hyper Module."]
 #![forbid(unsafe_code)]
 
 use std::error::Error;
@@ -28,6 +28,7 @@ pub enum AudioContainer {
     Wav,
     Flac,
     Mp3,
+    Aiff,
 }
 
 impl AudioContainer {
@@ -36,6 +37,7 @@ impl AudioContainer {
             Self::Wav => "wav",
             Self::Flac => "flac",
             Self::Mp3 => "mp3",
+            Self::Aiff => "aiff",
         }
     }
 }
@@ -359,7 +361,7 @@ impl From<hound::Error> for DecodeError {
     }
 }
 
-/// Decodes one complete WAV, native FLAC, or MP3 file outside the real-time
+/// Decodes one complete WAV, native FLAC, MP3, or AIFF file outside the real-time
 /// path.
 ///
 /// # Errors
@@ -381,7 +383,7 @@ pub fn decode_file(
     )
 }
 
-/// Decodes one complete WAV, native FLAC, or MP3 file from an already-open
+/// Decodes one complete WAV, native FLAC, MP3, or AIFF file from an already-open
 /// file.
 ///
 /// This entry point preserves the caller's filesystem object identity across
@@ -410,7 +412,7 @@ pub fn decode_open_file(
     )
 }
 
-/// Decodes one complete WAV, native FLAC, or MP3 file at its declared source
+/// Decodes one complete WAV, native FLAC, MP3, or AIFF file at its declared source
 /// rate.
 ///
 /// This is intended for offline import before explicit conversion to the
@@ -429,7 +431,7 @@ pub fn decode_file_at_source_rate(
     decode_open_file_at_source_rate(File::open(path)?, container, limits)
 }
 
-/// Decodes an already-open WAV, FLAC, or MP3 file at its declared source rate.
+/// Decodes an already-open WAV, FLAC, MP3, or AIFF file at its declared source rate.
 ///
 /// # Errors
 ///
@@ -448,7 +450,7 @@ pub fn decode_open_file_at_source_rate(
     decode_source(Box::new(file), container, None, limits)
 }
 
-/// Decodes exact bounded WAV, FLAC, or MP3 bytes at their declared source
+/// Decodes exact bounded WAV, FLAC, MP3, or AIFF bytes at their declared source
 /// rate.
 ///
 /// This entry point lets an external-file authority snapshot and audio decoding
@@ -471,7 +473,7 @@ pub fn decode_bytes_at_source_rate(
     decode_source(Box::new(cursor), container, None, limits)
 }
 
-/// Decodes complete verified WAV, native FLAC, or MP3 bytes outside the
+/// Decodes complete verified WAV, native FLAC, MP3, or AIFF bytes outside the
 /// real-time path.
 ///
 /// Owning the encoded bytes keeps the decoded media tied to the exact package
@@ -1121,6 +1123,10 @@ fn verify_container_signature<R: Read + Seek>(
             read_header(file, &mut header)? && &header == b"fLaC"
         }
         AudioContainer::Mp3 => verify_mp3_signature(file)?,
+        AudioContainer::Aiff => {
+            let mut header = [0_u8; 12];
+            read_header(file, &mut header)? && &header[0..4] == b"FORM" && &header[8..12] == b"AIFF"
+        }
     };
     if valid {
         Ok(())

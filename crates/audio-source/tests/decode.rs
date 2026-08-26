@@ -12,6 +12,7 @@ static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
 const EPSILON: f32 = 1.0e-6;
 const FLAC_FIXTURE_BASE64: &str = include_str!("fixtures/mono-44100.flac.b64");
 const MP3_ID3V23_FIXTURE_BASE64: &str = include_str!("fixtures/mono-8000-id3v23.mp3.b64");
+const AIFF_FIXTURE_BASE64: &str = include_str!("fixtures/mono-8000-pcm.aiff.b64");
 
 struct TemporaryAudioFile {
     path: PathBuf,
@@ -170,6 +171,22 @@ fn decodes_id3_prefixed_and_bare_mp3_fixture() {
 }
 
 #[test]
+fn decodes_and_verifies_pinned_aiff_fixture() {
+    let fixture = TemporaryAudioFile::create("aiff", &decode_base64(AIFF_FIXTURE_BASE64));
+    let audio = decode_file_at_source_rate(fixture.path(), AudioContainer::Aiff, limits()).unwrap();
+    assert_eq!(audio.sample_rate_hz(), 8_000);
+    assert_eq!(audio.channels(), 1);
+    assert_eq!(audio.frame_count(), 84);
+    assert!(
+        audio
+            .plane(0)
+            .unwrap()
+            .iter()
+            .all(|sample| sample.is_finite())
+    );
+}
+
+#[test]
 fn rejects_wrong_container_rate_layout_and_limits() {
     let wav = pcm16_wav(1, 48_000, &[0, 1, 2, 3]);
     let file = TemporaryAudioFile::create("wav", &wav);
@@ -177,6 +194,12 @@ fn rejects_wrong_container_rate_layout_and_limits() {
         decode_file(file.path(), AudioContainer::Flac, 48_000, limits()),
         Err(DecodeError::ContainerMismatch {
             expected: AudioContainer::Flac
+        })
+    ));
+    assert!(matches!(
+        decode_file(file.path(), AudioContainer::Aiff, 48_000, limits()),
+        Err(DecodeError::ContainerMismatch {
+            expected: AudioContainer::Aiff
         })
     ));
     assert!(matches!(
