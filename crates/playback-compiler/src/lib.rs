@@ -586,9 +586,21 @@ pub struct TickRange {
     pub end: u64,
 }
 
+/// Time authority for an audio clip.
+///
+/// Musical clips derive their rendered duration from the project tempo map.
+/// Sample-locked clips preserve their decoded source-frame duration exactly;
+/// their tick duration is presentation metadata only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipTimebase {
+    Musical,
+    SampleLocked,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ClipCompileSpec<'a> {
     pub enabled: bool,
+    pub timebase: ClipTimebase,
     pub duration_ticks: u64,
     pub source_start_frame: usize,
     pub source_frame_count: usize,
@@ -849,6 +861,9 @@ pub fn compile_placement(
             ConsolidationReason::Resampling,
         ));
     }
+    if clip.timebase == ClipTimebase::SampleLocked {
+        return compile_sample_locked_placement(timeline, clip, placement);
+    }
     if !warp_is_linear(clip)? {
         return Err(CompileError::ConsolidationRequired(
             ConsolidationReason::TimeStretch,
@@ -950,6 +965,9 @@ pub fn compile_scene_audio_clip(
             ConsolidationReason::Resampling,
         ));
     }
+    if clip.timebase == ClipTimebase::SampleLocked {
+        return compile_sample_locked_scene_audio_clip(timeline, clip, launch_tick);
+    }
     if !warp_is_linear(clip)? {
         return Err(CompileError::ConsolidationRequired(
             ConsolidationReason::TimeStretch,
@@ -1030,6 +1048,9 @@ pub fn compile_interactive_scene_audio_clip(
     clip: ClipCompileSpec<'_>,
 ) -> Result<CompiledSceneAudioClip, CompileError> {
     validate_clip(clip)?;
+    if clip.timebase == ClipTimebase::SampleLocked {
+        return compile_scene_audio_clip(timeline, clip, 0);
+    }
     for event in timeline.tempo_events {
         if !tempo_matches_clip_rate(
             timeline.sample_rate_hz,
@@ -1092,6 +1113,19 @@ fn validate_clip(clip: ClipCompileSpec<'_>) -> Result<(), CompileError> {
             return Err(CompileError::InvalidWarpMap);
         }
     }
+    if clip.timebase == ClipTimebase::SampleLocked {
+        if clip.loop_enabled {
+            return Err(CompileError::InvalidLoopRange);
+        }
+        if clip.fade_in_ticks != 0 || clip.fade_out_ticks != 0 {
+            return Err(CompileError::InvalidFades);
+        }
+        if !warp_is_linear(clip)? {
+            return Err(CompileError::ConsolidationRequired(
+                ConsolidationReason::TimeStretch,
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1113,7 +1147,85 @@ fn validate_placement(
     if !clip.loop_enabled && clip_requested_end > clip.duration_ticks {
         return Err(CompileError::InvalidPlacement);
     }
+    if clip.timebase == ClipTimebase::SampleLocked
+        && (placement.clip_start_tick != 0 || placement.duration_ticks != clip.duration_ticks)
+    {
+        return Err(CompileError::InvalidPlacement);
+    }
     Ok(())
+}
+
+fn compile_sample_locked_placement(
+    timeline: Timeline<'_>,
+    clip: ClipCompileSpec<'_>,
+    placement: PlacementCompileSpec,
+) -> Result<CompiledPlacement, CompileError> {
+    let source_end = clip
+        .source_start_frame
+        .checked_add(clip.source_frame_count)
+        .ok_or(CompileError::ArithmeticOverflow)?;
+    let arrangement_start_frame = timeline.tick_to_frame_ceil(placement.start_tick)?;
+    let arrangement_end_frame = arrangement_start_frame
+        .checked_add(clip.source_frame_count)
+        .ok_or(CompileError::ArithmeticOverflow)?;
+    Ok(CompiledPlacement {
+        arrangement_start_frame,
+        arrangement_end_frame,
+        expected_source_sample_rate_hz: clip.source_sample_rate_hz,
+        expected_source_frame_count: clip.asset_frame_count,
+        clip_spec: NativeClipSpec {
+            enabled: clip.enabled && placement.enabled,
+            source: FrameRange {
+                start: clip.source_start_frame,
+                end: source_end,
+            },
+            loop_range: None,
+            reverse: clip.reverse,
+            gain_decibels: clip.gain_decibels,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            transpose_cents: 0,
+            time_mapping: TimeMapping::NativeRate,
+        },
+        placement_spec: PlacementSpec {
+            clip_start_frame: 0,
+            frame_count: clip.source_frame_count,
+        },
+    })
+}
+
+fn compile_sample_locked_scene_audio_clip(
+    timeline: Timeline<'_>,
+    clip: ClipCompileSpec<'_>,
+    launch_tick: u64,
+) -> Result<CompiledSceneAudioClip, CompileError> {
+    let source_end = clip
+        .source_start_frame
+        .checked_add(clip.source_frame_count)
+        .ok_or(CompileError::ArithmeticOverflow)?;
+    Ok(CompiledSceneAudioClip {
+        launch_frame: timeline.tick_to_frame_ceil(launch_tick)?,
+        expected_source_sample_rate_hz: clip.source_sample_rate_hz,
+        expected_source_frame_count: clip.asset_frame_count,
+        clip_spec: NativeClipSpec {
+            enabled: clip.enabled,
+            source: FrameRange {
+                start: clip.source_start_frame,
+                end: source_end,
+            },
+            loop_range: None,
+            reverse: clip.reverse,
+            gain_decibels: clip.gain_decibels,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            transpose_cents: 0,
+            time_mapping: TimeMapping::NativeRate,
+        },
+        placement_spec: PlacementSpec {
+            clip_start_frame: 0,
+            frame_count: clip.source_frame_count,
+        },
+    })
 }
 
 fn warp_is_linear(clip: ClipCompileSpec<'_>) -> Result<bool, CompileError> {
@@ -1378,6 +1490,7 @@ mod tests {
     fn native_clip(markers: &[WarpMarker]) -> ClipCompileSpec<'_> {
         ClipCompileSpec {
             enabled: true,
+            timebase: ClipTimebase::Musical,
             duration_ticks: 8,
             source_start_frame: 2,
             source_frame_count: 200,

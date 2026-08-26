@@ -1,6 +1,6 @@
 use hyper_clip_engine::ConsolidationReason;
 use hyper_playback_compiler::{
-    ClipCompileSpec, CompileError, TempoEvent, TickRange, Timeline, WarpMarker,
+    ClipCompileSpec, ClipTimebase, CompileError, TempoEvent, TickRange, Timeline, WarpMarker,
     compile_interactive_scene_audio_clip, compile_scene_audio_clip,
 };
 
@@ -29,6 +29,7 @@ fn open_scene_loop_rejects_a_later_incompatible_tempo() {
     ];
     let clip = ClipCompileSpec {
         enabled: true,
+        timebase: ClipTimebase::Musical,
         duration_ticks: 2,
         source_start_frame: 0,
         source_frame_count: 25,
@@ -77,6 +78,7 @@ fn interactive_one_shot_requires_native_rate_on_every_tempo_segment() {
     ];
     let clip = ClipCompileSpec {
         enabled: true,
+        timebase: ClipTimebase::Musical,
         duration_ticks: 2,
         source_start_frame: 0,
         source_frame_count: 25,

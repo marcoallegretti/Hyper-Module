@@ -1,4 +1,5 @@
 use hyper_audio_source::DecodedAudio;
+use hyper_playback_compiler::ClipTimebase;
 use hyper_playback_compiler::TempoEvent;
 use hyper_playback_compiler::TickRange;
 use hyper_playback_compiler::Timeline;
@@ -42,6 +43,7 @@ fn resolved_graph_entry_prepares_and_renders_its_declared_asset() {
         track_id: "track",
         asset_id: "asset",
         enabled: true,
+        timebase: ClipTimebase::Musical,
         duration_ticks: 4,
         source_start_frame: 0,
         source_frame_count: 100,

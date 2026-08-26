@@ -7,8 +7,8 @@ use core::fmt;
 use hyper_clip_engine::ConsolidationReason;
 
 use crate::{
-    ClipCompileSpec, CompileError, CompiledPlacement, PlacementCompileSpec, TickRange, Timeline,
-    WarpMarker, compile_placement,
+    ClipCompileSpec, ClipTimebase, CompileError, CompiledPlacement, PlacementCompileSpec,
+    TickRange, Timeline, WarpMarker, compile_placement,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +42,7 @@ pub struct ClipResource<'a> {
     pub track_id: &'a str,
     pub asset_id: &'a str,
     pub enabled: bool,
+    pub timebase: ClipTimebase,
     pub duration_ticks: u64,
     pub source_start_frame: usize,
     pub source_frame_count: usize,
@@ -549,6 +550,7 @@ fn resolve_placement<'a>(
         timeline,
         ClipCompileSpec {
             enabled: input.arrangement.enabled && track.active && clip.enabled,
+            timebase: clip.timebase,
             duration_ticks: clip.duration_ticks,
             source_start_frame: clip.source_start_frame,
             source_frame_count: clip.source_frame_count,
@@ -758,6 +760,7 @@ mod tests {
         track_id: "track",
         asset_id: "asset",
         enabled: true,
+        timebase: ClipTimebase::Musical,
         duration_ticks: 4,
         source_start_frame: 0,
         source_frame_count: 100,

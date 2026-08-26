@@ -1,7 +1,7 @@
 use hyper_audio_source::DecodedAudio;
 use hyper_playback_compiler::{
-    ClipCompileSpec, PlacementCompileSpec, TempoEvent, TickRange, Timeline, WarpMarker,
-    compile_placement,
+    ClipCompileSpec, ClipTimebase, PlacementCompileSpec, TempoEvent, TickRange, Timeline,
+    WarpMarker, compile_placement,
 };
 
 #[test]
@@ -23,6 +23,7 @@ fn compiled_tick_placement_renders_through_the_clip_engine() {
     ];
     let clip = ClipCompileSpec {
         enabled: true,
+        timebase: ClipTimebase::Musical,
         duration_ticks: 4,
         source_start_frame: 2,
         source_frame_count: 100,
@@ -75,4 +76,55 @@ fn compiled_tick_placement_renders_through_the_clip_engine() {
     assert_eq!(&output[..50], &source.plane(0).unwrap()[52..102]);
     assert_eq!(&output[50..125], &source.plane(0).unwrap()[27..102]);
     assert_eq!(&output[125..], &source.plane(0).unwrap()[27..52]);
+}
+
+#[test]
+fn sample_locked_placement_preserves_an_arbitrary_recorded_frame_count() {
+    let tempos = [TempoEvent {
+        tick: 0,
+        microseconds_per_quarter: 1_000_000,
+    }];
+    let timeline = Timeline::try_new(48_000, &tempos).unwrap();
+    let markers = [
+        WarpMarker {
+            tick: 0,
+            source_frame_offset: 0,
+        },
+        WarpMarker {
+            tick: 4,
+            source_frame_offset: 63,
+        },
+    ];
+    let clip = ClipCompileSpec {
+        enabled: true,
+        timebase: ClipTimebase::SampleLocked,
+        duration_ticks: 4,
+        source_start_frame: 0,
+        source_frame_count: 63,
+        asset_frame_count: 63,
+        source_sample_rate_hz: 48_000,
+        loop_enabled: false,
+        loop_range: TickRange { start: 0, end: 4 },
+        reverse: false,
+        gain_decibels: 0.0,
+        transpose_cents: 0,
+        fade_in_ticks: 0,
+        fade_out_ticks: 0,
+        warp_markers: &markers,
+    };
+    let compiled = compile_placement(
+        timeline,
+        clip,
+        PlacementCompileSpec {
+            enabled: true,
+            start_tick: 0,
+            clip_start_tick: 0,
+            duration_ticks: 4,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(compiled.arrangement_start_frame(), 0);
+    assert_eq!(compiled.arrangement_end_frame(), 63);
+    assert_eq!(compiled.frame_count(), 63);
 }

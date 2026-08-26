@@ -39,9 +39,9 @@ use hyper_playback_compiler::scene::{
     SceneSlotResource, SceneTrackResource, compile_scene_performance,
 };
 use hyper_playback_compiler::{
-    ClipCompileSpec, CompileError, CompiledPlacement, CompiledSceneAudioClip, FrameTimeline,
-    FrameTimelineError, MeterEvent, PlacementCompileSpec, TempoEvent, TickRange, Timeline,
-    TimelineError, WarpMarker, compile_interactive_scene_audio_clip, compile_placement,
+    ClipCompileSpec, ClipTimebase, CompileError, CompiledPlacement, CompiledSceneAudioClip,
+    FrameTimeline, FrameTimelineError, MeterEvent, PlacementCompileSpec, TempoEvent, TickRange,
+    Timeline, TimelineError, WarpMarker, compile_interactive_scene_audio_clip, compile_placement,
     compile_scene_audio_clip,
 };
 use hyper_project_model::{is_valid_entity_id, is_valid_extension_key};
@@ -343,6 +343,7 @@ struct LoadedClip {
     track_id: String,
     asset_id: String,
     enabled: bool,
+    timebase: ClipTimebase,
     duration_ticks: u64,
     source_start_frame: usize,
     source_frame_count: usize,
@@ -3531,12 +3532,13 @@ pub fn serialize_recording_audio_clip_addition(
 
     let clip = serde_json_canonicalizer::to_vec(&json!({
         "format": "hyper-audio-clip",
-        "format_version": 1,
+        "format_version": 2,
         "id": clip_id,
         "project_id": project.project_id,
         "track_id": track_id,
         "name": clip_name,
         "enabled": true,
+        "timebase": "sample-locked",
         "duration_ticks": duration_ticks,
         "source": {
             "asset_id": asset_id,
@@ -6109,6 +6111,7 @@ fn validate_arrangement_placement_execution(
         timeline,
         ClipCompileSpec {
             enabled: clip.enabled,
+            timebase: clip.timebase,
             duration_ticks: clip.duration_ticks,
             source_start_frame: clip.source_start_frame,
             source_frame_count: clip.source_frame_count,
@@ -8017,13 +8020,14 @@ fn load_clip(
         index,
     };
     let document: ClipDocument = parse_document(bytes, location, maximum_bytes)?;
-    validate_header(
+    validate_header_versions(
         &document.format,
         document.format_version,
         "hyper-audio-clip",
         &document.project_id,
         project_id,
         location,
+        &[1, 2],
     )?;
     validate_contract_document(
         &document.id,
@@ -8039,7 +8043,8 @@ fn load_clip(
         maximum_warp_markers,
         Some(location),
     )?;
-    validate_clip_document(&document, location)?;
+    let timebase = clip_timebase(&document, location)?;
+    validate_clip_document(&document, timebase, location)?;
     let source_start_frame = usize::try_from(document.source.start_frame)
         .map_err(|_| domain_error_value(location, "source start frame exceeds platform range"))?;
     let source_frame_count = usize::try_from(document.source.frame_count)
@@ -8062,6 +8067,7 @@ fn load_clip(
         track_id: document.track_id,
         asset_id: document.source.asset_id,
         enabled: document.enabled,
+        timebase,
         duration_ticks: document.duration_ticks,
         source_start_frame,
         source_frame_count,
@@ -8695,6 +8701,26 @@ fn validate_header(
     project_id: &str,
     location: DocumentLocation,
 ) -> Result<(), LoadError> {
+    validate_header_versions(
+        actual_format,
+        version,
+        expected_format,
+        resource_project_id,
+        project_id,
+        location,
+        &[1],
+    )
+}
+
+fn validate_header_versions(
+    actual_format: &str,
+    version: u32,
+    expected_format: &str,
+    resource_project_id: &str,
+    project_id: &str,
+    location: DocumentLocation,
+    supported_versions: &[u32],
+) -> Result<(), LoadError> {
     if actual_format != expected_format {
         return Err(LoadError {
             location: Some(location),
@@ -8702,11 +8728,11 @@ fn validate_header(
             message: format!("expected format {expected_format}"),
         });
     }
-    if version != 1 {
+    if !supported_versions.contains(&version) {
         return Err(LoadError {
             location: Some(location),
             kind: LoadErrorKind::UnsupportedVersion,
-            message: "only format version 1 is supported".to_owned(),
+            message: "resource format version is unsupported".to_owned(),
         });
     }
     if resource_project_id != project_id {
@@ -8802,6 +8828,7 @@ fn validate_meter_events(events: &[MeterEventDocument]) -> Result<(), LoadError>
 
 fn validate_clip_document(
     document: &ClipDocument,
+    timebase: ClipTimebase,
     location: DocumentLocation,
 ) -> Result<(), LoadError> {
     if document.duration_ticks == 0 || document.source.frame_count == 0 {
@@ -8842,7 +8869,38 @@ fn validate_clip_document(
             return domain_error(location, "clip warp markers must be strictly increasing");
         }
     }
+    if timebase == ClipTimebase::SampleLocked {
+        if document.loop_spec.enabled
+            || document.fades.in_ticks != 0
+            || document.fades.out_ticks != 0
+        {
+            return domain_error(
+                location,
+                "sample-locked clips cannot loop or use tick-domain fades",
+            );
+        }
+        if document.warp_markers.len() != 2 {
+            return domain_error(
+                location,
+                "sample-locked clips require one linear source span",
+            );
+        }
+    }
     Ok(())
+}
+
+fn clip_timebase(
+    document: &ClipDocument,
+    location: DocumentLocation,
+) -> Result<ClipTimebase, LoadError> {
+    match (document.format_version, document.timebase) {
+        (1, None) => Ok(ClipTimebase::Musical),
+        (1, Some(_)) => domain_error(location, "version 1 clips cannot declare a timebase"),
+        (2, Some(ClipTimebaseDocument::Musical)) => Ok(ClipTimebase::Musical),
+        (2, Some(ClipTimebaseDocument::SampleLocked)) => Ok(ClipTimebase::SampleLocked),
+        (2, None) => domain_error(location, "version 2 clips must declare a timebase"),
+        _ => domain_error(location, "clip timebase version is unsupported"),
+    }
 }
 
 fn validate_arrangement_document(
@@ -9066,6 +9124,7 @@ fn build_clip_resources(
             track_id: &clip.track_id,
             asset_id: &clip.asset_id,
             enabled: clip.enabled,
+            timebase: clip.timebase,
             duration_ticks: clip.duration_ticks,
             source_start_frame: clip.source_start_frame,
             source_frame_count: clip.source_frame_count,
@@ -9302,6 +9361,7 @@ fn compile_scene_audio_bindings<'project>(
             timeline,
             ClipCompileSpec {
                 enabled: playing.enabled(),
+                timebase: clip.timebase,
                 duration_ticks: clip.duration_ticks,
                 source_start_frame: clip.source_start_frame,
                 source_frame_count: clip.source_frame_count,
@@ -9364,6 +9424,7 @@ fn compile_interactive_scene_audio_bindings<'project>(
             timeline,
             ClipCompileSpec {
                 enabled,
+                timebase: clip.timebase,
                 duration_ticks: clip.duration_ticks,
                 source_start_frame: clip.source_start_frame,
                 source_frame_count: clip.source_frame_count,
@@ -9632,6 +9693,8 @@ struct ClipDocument {
     track_id: String,
     name: String,
     enabled: bool,
+    #[serde(default)]
+    timebase: Option<ClipTimebaseDocument>,
     duration_ticks: u64,
     source: ClipSourceDocument,
     #[serde(rename = "loop")]
@@ -9640,6 +9703,13 @@ struct ClipDocument {
     fades: ClipFadesDocument,
     warp_markers: Vec<WarpMarkerDocument>,
     extensions: ExtensionsDocument,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ClipTimebaseDocument {
+    Musical,
+    SampleLocked,
 }
 
 #[derive(Deserialize)]
@@ -10275,6 +10345,55 @@ mod tests {
                 SceneLimits::VERSION_1,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn sample_locked_recording_clip_compiles_an_arrangement_at_its_exact_frame_end() {
+        let mut source: Value = serde_json::from_slice(TRACK).unwrap();
+        source["clip_ids"] = json!([]);
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [&source];
+        let loaded = load(input(TIMELINE, &tracks, &[], None), LoaderLimits::VERSION_1).unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let assets = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 63,
+        }];
+        let documents = serialize_recording_audio_clip_addition(
+            &loaded,
+            &assets,
+            &source,
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            "018f47a2-6b2d-7c11-8a44-001122334457",
+            0,
+            63,
+            clip_id,
+            "Exact Take",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let clip: Value = serde_json::from_slice(documents.clip()).unwrap();
+        assert_eq!(clip["format_version"], 2);
+        assert_eq!(clip["timebase"], "sample-locked");
+
+        let mut arrangement: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        arrangement["placements"][0]["clip_id"] = clip_id.into();
+        arrangement["placements"][0]["duration_ticks"] = documents.duration_ticks().into();
+        let arrangement = serde_json_canonicalizer::to_vec(&arrangement).unwrap();
+        let tracks: [&[u8]; 1] = [documents.track()];
+        let clips: [&[u8]; 1] = [documents.clip()];
+        let reopened = load(
+            input(TIMELINE, &tracks, &clips, Some(&arrangement)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let schedule = reopened.compile(&assets, GraphLimits::VERSION_1).unwrap();
+
+        assert_eq!(schedule.entries().len(), 1);
+        assert_eq!(schedule.entries()[0].compiled.arrangement_start_frame(), 0);
+        assert_eq!(schedule.entries()[0].compiled.arrangement_end_frame(), 63);
     }
 
     #[test]
