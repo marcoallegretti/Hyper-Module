@@ -10,7 +10,7 @@ const protocolVersion = "2";
 const authorityOperationTimeoutMs = 30_000;
 const transferOperationTimeoutMs = 10 * 60_000;
 
-function helperPath() {
+export function resolveFilesystemAuthorityPath() {
   if (process.env.HYPER_FS_AUTHORITY) {
     return resolve(process.env.HYPER_FS_AUTHORITY);
   }
@@ -43,7 +43,7 @@ function runHelper(
     timeoutMs = authorityOperationTimeoutMs,
   } = {},
 ) {
-  return runNativeProcess(helperPath(), [protocolVersion, ...arguments_], {
+  return runNativeProcess(resolveFilesystemAuthorityPath(), [protocolVersion, ...arguments_], {
     stdio: [
       input === undefined ? "ignore" : "pipe",
       captureOutput ? "pipe" : "ignore",

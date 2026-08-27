@@ -207,7 +207,7 @@ async function readAudioAssetFormat(stream, asset, fileInfo) {
   return { channels, frameCount, sampleRate };
 }
 
-function audioValidatorPath() {
+export function resolveAudioValidatorPath() {
   if (process.env.HYPER_AUDIO_VALIDATOR) {
     return resolve(process.env.HYPER_AUDIO_VALIDATOR);
   }
@@ -237,7 +237,7 @@ async function validateNativeAudio(
   });
   try {
     await runNativeProcess(
-      audioValidatorPath(),
+      resolveAudioValidatorPath(),
       [
         audioValidatorProtocolVersion,
         "-",

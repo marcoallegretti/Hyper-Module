@@ -12,7 +12,7 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import canonicalize from "canonicalize";
@@ -20,6 +20,7 @@ import canonicalize from "canonicalize";
 import { runNativeProcess } from "../lib/native-process.mjs";
 import { verifyDescribedFile } from "./verify-bundle.mjs";
 import {
+  resolveAudioValidatorPath,
   verifyProject,
   verifyProjectCandidate,
 } from "./verify-project.mjs";
@@ -31,16 +32,7 @@ const playbackDomainCases = JSON.parse(
   ),
 );
 
-const audioValidatorExecutable = resolve(
-  import.meta.dirname,
-  "..",
-  "..",
-  "target",
-  "debug",
-  process.platform === "win32"
-    ? "hyper-audio-validate.exe"
-    : "hyper-audio-validate",
-);
+const audioValidatorExecutable = resolveAudioValidatorPath();
 await assert.rejects(
   runNativeProcess(audioValidatorExecutable, ["0"]),
   /unsupported audio validator protocol version/,

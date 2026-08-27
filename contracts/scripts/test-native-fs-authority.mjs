@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 
 import { openRetainedDirectory } from "../lib/durable-files.mjs";
 import { runNativeProcess } from "../lib/native-process.mjs";
@@ -25,22 +25,14 @@ import {
   renameDirectoryBetweenNoReplace,
   renameDirectoryNoReplace,
   renameEntryBetweenReplace,
+  resolveFilesystemAuthorityPath,
   writeRetainedFile,
 } from "../lib/native-fs-authority.mjs";
 
 const temporaryRoot = await mkdtemp(join(tmpdir(), "hyper-fs-authority-"));
 try {
   await preflightFilesystemAuthority("native authority test");
-  const authorityExecutable = resolve(
-    import.meta.dirname,
-    "..",
-    "..",
-    "target",
-    "debug",
-    process.platform === "win32"
-      ? "hyper-fs-authority.exe"
-      : "hyper-fs-authority",
-  );
+  const authorityExecutable = resolveFilesystemAuthorityPath();
   await assert.rejects(
     runNativeProcess(authorityExecutable, ["0"]),
     /unsupported filesystem authority protocol version/,
