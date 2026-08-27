@@ -516,7 +516,7 @@ fn bind_audio_import_callback_with(
             return;
         };
         ui.set_app_mode(AppMode::ImportingAudio);
-        ui.set_status_text("Waiting for WAV or FLAC files…".into());
+        ui.set_status_text("Waiting for audio files…".into());
         ui.set_error_text(SharedString::default());
         choose(weak.clone(), Rc::clone(&worker), track_id);
     });
