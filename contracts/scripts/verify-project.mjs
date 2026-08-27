@@ -479,6 +479,9 @@ async function verifyProjectManifest(
   const tracks = project.resources
     .filter((record) => record.role === "track")
     .map((record) => resources.get(record.id));
+  const timelines = project.resources
+    .filter((record) => record.role === "timeline")
+    .map((record) => resources.get(record.id));
   const clips = project.resources
     .filter((record) => record.role === "clip")
     .map((record) => resources.get(record.id));
@@ -528,6 +531,18 @@ async function verifyProjectManifest(
       audioFormats.set(record.id, verified.inspection);
     } else {
       await verifyDescribedFile(rootPath, rootRealPath, record);
+    }
+  }
+  const timelineMarkerIds = new Set();
+  for (const timeline of timelines) {
+    for (const marker of timeline.markers ?? []) {
+      assert(
+        !resources.has(marker.id) &&
+          !project.assets.some((asset) => asset.id === marker.id) &&
+          !timelineMarkerIds.has(marker.id),
+        "timeline marker identifier collides with a project entity",
+      );
+      timelineMarkerIds.add(marker.id);
     }
   }
   const trackOrders = tracks.map((track) => track.order);
@@ -705,7 +720,8 @@ async function verifyProjectManifest(
     for (const nestedId of nestedIds) {
       assert(
         !resources.has(nestedId) &&
-          !project.assets.some((asset) => asset.id === nestedId),
+          !project.assets.some((asset) => asset.id === nestedId) &&
+          !timelineMarkerIds.has(nestedId),
         `${arrangement.name}: arrangement event identifier collides with a project entity`,
       );
     }
@@ -773,6 +789,10 @@ async function verifyProjectManifest(
       ...arrangement.scene_launches.map((launch) => launch.id),
     ]),
   );
+  const nestedProjectEntityIds = new Set([
+    ...timelineMarkerIds,
+    ...arrangementEventIds,
+  ]);
   const deviceInstanceIds = new Set();
   const deviceTrackIds = new Set();
   const mixableDeviceTrackKinds = new Set([
@@ -796,7 +816,7 @@ async function verifyProjectManifest(
       assert(
         !resources.has(device.id) &&
           !project.assets.some((asset) => asset.id === device.id) &&
-          !arrangementEventIds.has(device.id) &&
+          !nestedProjectEntityIds.has(device.id) &&
           !deviceInstanceIds.has(device.id),
         "native device identifier collides with a project entity",
       );
@@ -831,7 +851,7 @@ async function verifyProjectManifest(
       assert(
         !resources.has(sendId) &&
           !project.assets.some((asset) => asset.id === sendId) &&
-          !arrangementEventIds.has(sendId),
+          !nestedProjectEntityIds.has(sendId),
         "mixer send identifier collides with a project entity",
       );
     }
@@ -894,7 +914,7 @@ async function verifyProjectManifest(
         !resources.has(lane.id) &&
           !project.assets.some((asset) => asset.id === lane.id) &&
           !mixerSendIds.has(lane.id) &&
-          !arrangementEventIds.has(lane.id) &&
+          !nestedProjectEntityIds.has(lane.id) &&
           !mappingBindingIds.has(lane.id) &&
           !automationLaneIds.has(lane.id),
         "automation lane identifier collides with another project entity",
@@ -959,7 +979,7 @@ async function verifyProjectManifest(
         !resources.has(binding.id) &&
           !project.assets.some((asset) => asset.id === binding.id) &&
           !mixerSendIds.has(binding.id) &&
-          !arrangementEventIds.has(binding.id) &&
+          !nestedProjectEntityIds.has(binding.id) &&
           !automationLaneIds.has(binding.id),
         "mapping binding identifier collides with another project entity",
       );

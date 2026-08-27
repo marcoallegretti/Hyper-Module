@@ -89,6 +89,7 @@ pub use hyper_native_device::{
     MIN_FILTER_CUTOFF_MILLIHERTZ, MIN_FILTER_RESONANCE_MILLIONTHS, NativeFilterMode,
 };
 use hyper_playback_compiler::scene::LaunchQuantization;
+use hyper_playback_compiler::{FrameTimeline, FrameTimelineError};
 pub use hyper_playback_compiler::{
     MeterEvent, MusicalPosition, TempoEvent, musical_position, musical_position_at_frame,
 };
@@ -119,16 +120,18 @@ use hyper_playback_json::{
     RoutingBusRenameSerializationError, SceneAdditionSerializationError,
     SceneDocumentSerializationError, SceneDuplicationSerializationError, SceneRemovalBlockers,
     SceneRemovalSerializationError, SceneRenameSerializationError, SceneSlotEdit,
-    SceneSlotEditSerializationError, TempoSerializationError, serialize_arrangement_loop_range,
-    serialize_arrangement_placement_activation, serialize_arrangement_placement_addition,
-    serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
-    serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
-    serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
-    serialize_arrangement_scene_launch_addition, serialize_arrangement_scene_launch_move,
-    serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
-    serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
-    serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_removal,
-    serialize_audio_clip_rename, serialize_audio_clip_reverse, serialize_audio_clip_source_start,
+    SceneSlotEditSerializationError, TempoSerializationError,
+    TimelineMarkerEdit as PlaybackTimelineMarkerEdit, TimelineMarkerSerializationError,
+    serialize_arrangement_loop_range, serialize_arrangement_placement_activation,
+    serialize_arrangement_placement_addition, serialize_arrangement_placement_duplication,
+    serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
+    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
+    serialize_arrangement_placement_split, serialize_arrangement_scene_launch_addition,
+    serialize_arrangement_scene_launch_move, serialize_arrangement_scene_launch_removal,
+    serialize_arrangement_scene_launch_scene_edit, serialize_audio_clip_activation,
+    serialize_audio_clip_duplication, serialize_audio_clip_fades, serialize_audio_clip_gain,
+    serialize_audio_clip_loop, serialize_audio_clip_removal, serialize_audio_clip_rename,
+    serialize_audio_clip_reverse, serialize_audio_clip_source_start,
     serialize_audio_clip_source_view, serialize_audio_primary_route_change,
     serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_content_removal, serialize_audio_track_duplication,
@@ -141,7 +144,8 @@ use hyper_playback_json::{
     serialize_routing_bus_duplication, serialize_routing_bus_removal, serialize_routing_bus_rename,
     serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
     serialize_scene_removal, serialize_scene_rename, serialize_scene_slot_edit,
-    serialize_timeline_map_edit, serialize_timeline_meter, serialize_timeline_tempo,
+    serialize_timeline_map_edit, serialize_timeline_marker_edit, serialize_timeline_meter,
+    serialize_timeline_tempo,
 };
 pub use hyper_playback_json::{
     AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
@@ -1926,6 +1930,15 @@ pub enum IdeArrangementLocateError {
     Send(DesktopDirectControlError),
 }
 
+#[derive(Debug)]
+pub enum IdeTimelineMarkerLocateError {
+    Unavailable,
+    StaleProject,
+    StaleMarker { requested_index: usize },
+    Timeline(FrameTimelineError),
+    Send(DesktopDirectControlError),
+}
+
 /// Programme-loudness controls applied at the next audio process boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdeLoudnessCommand {
@@ -1997,6 +2010,33 @@ impl Error for IdeArrangementLocateError {
             | Self::StaleProject
             | Self::StalePlacement { .. }
             | Self::StaleSceneLaunch { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for IdeTimelineMarkerLocateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("verified timeline markers are unavailable"),
+            Self::StaleProject => {
+                formatter.write_str("timeline marker project authority is no longer current")
+            }
+            Self::StaleMarker { requested_index } => write!(
+                formatter,
+                "timeline marker {requested_index} is no longer current"
+            ),
+            Self::Timeline(source) => source.fmt(formatter),
+            Self::Send(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeTimelineMarkerLocateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Timeline(source) => Some(source),
+            Self::Send(source) => Some(source),
+            Self::Unavailable | Self::StaleProject | Self::StaleMarker { .. } => None,
         }
     }
 }
@@ -5943,6 +5983,43 @@ pub struct IdeLoopRangeFrames {
     pub enabled: bool,
 }
 
+/// One requested edit to a durable, non-executable navigation marker.
+///
+/// The application creates a fresh marker identity only for `Add`; callers
+/// never supply a persistence identity for a new marker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdeTimelineMarkerEdit {
+    Add { tick: u64, name: String },
+    Rename { marker_id: String, name: String },
+    Move { marker_id: String, tick: u64 },
+    Remove { marker_id: String },
+}
+
+/// Immutable observation of one durable navigation marker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdeTimelineMarker {
+    id: String,
+    tick: u64,
+    name: String,
+}
+
+impl IdeTimelineMarker {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn tick(&self) -> u64 {
+        self.tick
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(Debug)]
 pub enum IdeTempoEditError {
     TimelineResourceMissing,
@@ -5951,6 +6028,7 @@ pub enum IdeTempoEditError {
     Storage(StorageError),
     CapacityUnavailable,
     Serialization(Box<TempoSerializationError>),
+    MarkerSerialization(Box<TimelineMarkerSerializationError>),
     MixerPublication(Box<ProjectResourcePublicationError>),
     Publication(Box<ProjectResourcePublicationError>),
     NativeClose(IdeNativeCloseFailure),
@@ -5977,6 +6055,7 @@ impl IdeTempoEditError {
             | Self::Storage(_)
             | Self::CapacityUnavailable
             | Self::Serialization(_)
+            | Self::MarkerSerialization(_)
             | Self::MixerPublication(_)
             | Self::NativeClose(_) => false,
         }
@@ -5997,20 +6076,23 @@ impl fmt::Display for IdeTempoEditError {
                 "live mixer state could not be preserved: {source}"
             ),
             Self::Storage(source) => source.fmt(formatter),
-            Self::CapacityUnavailable => formatter.write_str("tempo edit capacity is unavailable"),
+            Self::CapacityUnavailable => {
+                formatter.write_str("timeline edit capacity is unavailable")
+            }
             Self::Serialization(source) => source.fmt(formatter),
+            Self::MarkerSerialization(source) => source.fmt(formatter),
             Self::MixerPublication(source) => write!(
                 formatter,
-                "live mixer state could not be published before the tempo change: {source}"
+                "live mixer state could not be published before the timeline change: {source}"
             ),
             Self::Publication(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
-                "native playback did not close cleanly before the tempo change: {source:?}"
+                "native playback did not close cleanly before the timeline change: {source:?}"
             ),
             Self::ReopenAfterPublication { outcome, source } => write!(
                 formatter,
-                "the tempo was saved in project revision {} but the project could not be reopened: {source}",
+                "the timeline was saved in project revision {} but the project could not be reopened: {source}",
                 outcome.project_revision()
             ),
             Self::ReopenAfterPreparation {
@@ -6018,7 +6100,7 @@ impl fmt::Display for IdeTempoEditError {
                 reopen,
             } => write!(
                 formatter,
-                "the tempo change failed ({preparation}) and the project could not be reopened ({reopen})"
+                "the timeline change failed ({preparation}) and the project could not be reopened ({reopen})"
             ),
         }
     }
@@ -6030,6 +6112,7 @@ impl Error for IdeTempoEditError {
             Self::MixerSave(source) => Some(source.as_ref()),
             Self::Storage(source) => Some(source),
             Self::Serialization(source) => Some(source.as_ref()),
+            Self::MarkerSerialization(source) => Some(source.as_ref()),
             Self::MixerPublication(source) | Self::Publication(source) => Some(source.as_ref()),
             Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
@@ -9966,6 +10049,8 @@ struct TestPlaybackSession {
     arrangement_project_id: String,
     arrangement_placements: Vec<(String, usize)>,
     arrangement_scene_launches: Vec<(String, usize)>,
+    timeline_marker_project_id: String,
+    timeline_markers: Vec<(String, usize)>,
 }
 
 #[cfg(test)]
@@ -9986,6 +10071,8 @@ impl Default for TestPlaybackSession {
             arrangement_project_id: String::new(),
             arrangement_placements: Vec::new(),
             arrangement_scene_launches: Vec::new(),
+            timeline_marker_project_id: String::new(),
+            timeline_markers: Vec::new(),
         }
     }
 }
@@ -12738,6 +12825,7 @@ impl RunningDesktopIdeApplication {
             |project, facts, source, limits| {
                 serialize_timeline_meter(project, facts, source, numerator, denominator, limits)
             },
+            |source| IdeTempoEditError::Serialization(Box::new(source)),
         )
     }
 
@@ -12758,6 +12846,52 @@ impl RunningDesktopIdeApplication {
             |project, facts, source, limits| {
                 serialize_timeline_map_edit(project, facts, source, limits, edit)
             },
+            |source| IdeTempoEditError::Serialization(Box::new(source)),
+        )
+    }
+
+    /// Prepares one marker publication through the same fenced timeline path
+    /// as tempo and meter edits. A new identity is created only after a
+    /// verified project snapshot is available, then the serializer validates
+    /// it against every existing project and media identity.
+    fn prepare_timeline_marker_edit(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        edit: IdeTimelineMarkerEdit,
+    ) -> Result<IdeTimelineEditPlan, IdeTempoEditError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeTempoEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeTempoEditError::MixerSave(Box::new(IdeProjectSaveError::ProjectSnapshotUnavailable))
+        })?;
+        let edit = match edit {
+            IdeTimelineMarkerEdit::Add { tick, name } => PlaybackTimelineMarkerEdit::Add {
+                id: uuid::Uuid::new_v4().to_string(),
+                tick,
+                name,
+            },
+            IdeTimelineMarkerEdit::Rename { marker_id, name } => {
+                PlaybackTimelineMarkerEdit::Rename {
+                    id: marker_id,
+                    name,
+                }
+            }
+            IdeTimelineMarkerEdit::Move { marker_id, tick } => PlaybackTimelineMarkerEdit::Move {
+                id: marker_id,
+                tick,
+            },
+            IdeTimelineMarkerEdit::Remove { marker_id } => {
+                PlaybackTimelineMarkerEdit::Remove { id: marker_id }
+            }
+        };
+        Self::prepare_timeline_edit_from_project(
+            application,
+            mixer,
+            prepared,
+            |project, facts, source, limits| {
+                serialize_timeline_marker_edit(project, facts, source, limits, &edit)
+            },
+            |source| IdeTempoEditError::MarkerSerialization(Box::new(source)),
         )
     }
 
@@ -12774,10 +12908,11 @@ impl RunningDesktopIdeApplication {
             |project, facts, source, limits| {
                 serialize_timeline_tempo(project, facts, source, microseconds_per_quarter, limits)
             },
+            |source| IdeTempoEditError::Serialization(Box::new(source)),
         )
     }
 
-    fn prepare_timeline_edit_from_project(
+    fn prepare_timeline_edit_from_project<SerializationError>(
         application: &DesktopIdeApplication,
         mixer: IdeMixerSavePlan,
         prepared: &PreparedProjectPlayback,
@@ -12786,7 +12921,8 @@ impl RunningDesktopIdeApplication {
             &[hyper_playback_json::MediaAssetFact<'_>],
             &[u8],
             LoaderLimits,
-        ) -> Result<Vec<u8>, TempoSerializationError>,
+        ) -> Result<Vec<u8>, SerializationError>,
+        map_serialization_error: impl FnOnce(SerializationError) -> IdeTempoEditError,
     ) -> Result<IdeTimelineEditPlan, IdeTempoEditError> {
         let package = prepared.package();
         let mut descriptors = package
@@ -12811,7 +12947,7 @@ impl RunningDesktopIdeApplication {
             &source,
             application.config.project_limits.session.documents,
         )
-        .map_err(|source| IdeTempoEditError::Serialization(Box::new(source)))?;
+        .map_err(map_serialization_error)?;
         let mut timeline_id = String::new();
         timeline_id
             .try_reserve_exact(descriptor.id().len())
@@ -15378,6 +15514,72 @@ impl RunningDesktopIdeApplication {
         };
         self.try_send_transport(TransportCommand::Locate { frame, state })
             .map_err(IdeArrangementLocateError::Send)?;
+        Ok(frame)
+    }
+
+    /// Locates to one durable timeline marker after validating the immutable
+    /// project and marker identities published to the UI.
+    ///
+    /// The conversion rounds forward to the first sample frame at or after the
+    /// marker tick, matching executable scene-launch timing and ensuring
+    /// play-from-marker never begins before the requested musical position.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unavailable project authority, stale marker identity, timeline
+    /// conversion failure, and command delivery failure without queueing a
+    /// locate.
+    pub fn try_locate_timeline_marker(
+        &mut self,
+        project_id: &str,
+        index: usize,
+        marker_id: &str,
+        state: LocateState,
+    ) -> Result<usize, IdeTimelineMarkerLocateError> {
+        let frame = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => {
+                let prepared = session
+                    .prepared_project()
+                    .ok_or(IdeTimelineMarkerLocateError::Unavailable)?;
+                let (project, _, _, _) = prepared.session().parts();
+                if project.project_id() != project_id {
+                    return Err(IdeTimelineMarkerLocateError::StaleProject);
+                }
+                let marker = project.timeline_markers().get(index).ok_or(
+                    IdeTimelineMarkerLocateError::StaleMarker {
+                        requested_index: index,
+                    },
+                )?;
+                if marker.id() != marker_id {
+                    return Err(IdeTimelineMarkerLocateError::StaleMarker {
+                        requested_index: index,
+                    });
+                }
+                FrameTimeline::try_new(project.sample_rate_hz(), project.tempo_events())
+                    .map_err(IdeTimelineMarkerLocateError::Timeline)?
+                    .tick_to_frame_ceil(marker.tick())
+                    .map_err(IdeTimelineMarkerLocateError::Timeline)?
+            }
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => {
+                if session.timeline_marker_project_id != project_id {
+                    return Err(IdeTimelineMarkerLocateError::StaleProject);
+                }
+                let (current_id, frame) = session.timeline_markers.get(index).ok_or(
+                    IdeTimelineMarkerLocateError::StaleMarker {
+                        requested_index: index,
+                    },
+                )?;
+                if current_id != marker_id {
+                    return Err(IdeTimelineMarkerLocateError::StaleMarker {
+                        requested_index: index,
+                    });
+                }
+                *frame
+            }
+        };
+        self.try_send_transport(TransportCommand::Locate { frame, state })
+            .map_err(IdeTimelineMarkerLocateError::Send)?;
         Ok(frame)
     }
 
@@ -22053,7 +22255,7 @@ mod tests {
     }
 
     #[test]
-    fn arrangement_navigation_validates_identity_and_uses_exact_compiled_frames() {
+    fn timeline_navigation_validates_identity_and_uses_exact_compiled_frames() {
         let application = DesktopIdeApplication::from_inventory(
             config(256).unwrap(),
             IdeAudioOutputInventory::default(),
@@ -22126,6 +22328,62 @@ mod tests {
                     state: LocateState::Rolling,
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn timeline_marker_navigation_validates_identity_and_uses_exact_compiled_frames() {
+        let application = DesktopIdeApplication::from_inventory(
+            config(256).unwrap(),
+            IdeAudioOutputInventory::default(),
+        );
+        let mut running = RunningDesktopIdeApplication {
+            application,
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                extent: IdePlaybackExtent::Unbounded,
+                timeline_marker_project_id: "project-a".to_owned(),
+                timeline_markers: vec![("timeline-marker-a".to_owned(), 1_200)],
+                ..TestPlaybackSession::default()
+            }),
+        };
+        assert!(matches!(
+            running.try_locate_timeline_marker(
+                "project-b",
+                0,
+                "timeline-marker-a",
+                LocateState::Preserve,
+            ),
+            Err(IdeTimelineMarkerLocateError::StaleProject)
+        ));
+        assert!(matches!(
+            running.try_locate_timeline_marker(
+                "project-a",
+                0,
+                "stale-timeline-marker",
+                LocateState::Preserve,
+            ),
+            Err(IdeTimelineMarkerLocateError::StaleMarker { requested_index: 0 })
+        ));
+        assert_eq!(
+            running
+                .try_locate_timeline_marker(
+                    "project-a",
+                    0,
+                    "timeline-marker-a",
+                    LocateState::Rolling,
+                )
+                .unwrap(),
+            1_200
+        );
+        let IdePlaybackSessionOwner::Test(session) = &running.session else {
+            unreachable!("test constructed the deterministic session owner");
+        };
+        assert_eq!(
+            session.commands,
+            [TransportCommand::Locate {
+                frame: 1_200,
+                state: LocateState::Rolling,
+            }]
         );
     }
 

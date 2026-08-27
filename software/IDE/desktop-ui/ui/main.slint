@@ -249,6 +249,14 @@ export struct TimelineMeterMarkerRow {
     origin: bool,
 }
 
+export struct TimelineNavigationMarkerRow {
+    index: int,
+    id: string,
+    tick: string,
+    position: string,
+    name: string,
+}
+
 export struct ClipRow {
     id: string,
     name: string,
@@ -302,6 +310,11 @@ export global IdeActions {
     callback update-timeline-meter(string, string);
     callback move-timeline-meter(string, string);
     callback remove-timeline-meter(string);
+    callback add-timeline-marker(string, string);
+    callback rename-timeline-marker(string, string);
+    callback move-timeline-marker(string, string);
+    callback remove-timeline-marker(string);
+    callback locate-timeline-marker(int, string, bool);
     callback locate-placement(int);
     callback set-arrangement-placement-active(int, bool);
     callback move-arrangement-placement(string, string);
@@ -592,6 +605,14 @@ export component MainWindow inherits Window {
     in-out property <bool> timeline-meter-add-visible: false;
     in-out property <bool> timeline-meter-edit-visible: false;
     in-out property <bool> timeline-meter-move-visible: false;
+    in-out property <bool> timeline-marker-add-visible: false;
+    in-out property <bool> timeline-marker-rename-visible: false;
+    in-out property <bool> timeline-marker-move-visible: false;
+    in-out property <string> timeline-marker-id: "";
+    in-out property <string> timeline-marker-source-tick: "";
+    in-out property <string> timeline-marker-tick: "";
+    in-out property <string> timeline-marker-name: "";
+    in-out property <string> timeline-marker-remove-confirming-id: "";
     in-out property <string> timeline-map-tick: "";
     in-out property <string> timeline-map-value: "";
     in-out property <string> timeline-map-source-tick: "";
@@ -854,6 +875,7 @@ export component MainWindow inherits Window {
     in property <[ArrangementSceneLaunchRow]> arrangement-scene-launches: [];
     in property <[TimelineTempoMarkerRow]> timeline-tempo-markers: [];
     in property <[TimelineMeterMarkerRow]> timeline-meter-markers: [];
+    in property <[TimelineNavigationMarkerRow]> timeline-navigation-markers: [];
     in property <[string]> scene-names: [];
     in property <[ClipRow]> audio-clips: [];
     in property <int> unused-sample-assets: 0;
@@ -3823,18 +3845,23 @@ export component MainWindow inherits Window {
                             height: 48px;
                             VerticalLayout {
                                 Text { text: "TIMELINE MAP"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: root.timeline-tempo-markers.length + " tempo markers · " + root.timeline-meter-markers.length + " time signatures"; color: #aebccc; font-size: 12px; }
+                                Text { text: root.timeline-tempo-markers.length + " tempo markers · " + root.timeline-meter-markers.length + " time signatures · " + root.timeline-navigation-markers.length + " navigation markers"; color: #aebccc; font-size: 12px; }
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button {
                                 text: "Add tempo";
                                 enabled: root.app-mode == AppMode.running && root.tempo-available;
-                                clicked => { root.timeline-tempo-edit-visible = false; root.timeline-tempo-move-visible = false; root.timeline-meter-add-visible = false; root.timeline-meter-edit-visible = false; root.timeline-meter-move-visible = false; root.timeline-map-tick = ""; root.timeline-map-value = root.tempo-bpm; root.timeline-tempo-add-visible = true; }
+                                clicked => { root.timeline-tempo-edit-visible = false; root.timeline-tempo-move-visible = false; root.timeline-meter-add-visible = false; root.timeline-meter-edit-visible = false; root.timeline-meter-move-visible = false; root.timeline-marker-add-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = ""; root.timeline-map-tick = ""; root.timeline-map-value = root.tempo-bpm; root.timeline-tempo-add-visible = true; }
                             }
                             Button {
                                 text: "Add signature";
                                 enabled: root.app-mode == AppMode.running;
-                                clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-edit-visible = false; root.timeline-tempo-move-visible = false; root.timeline-meter-edit-visible = false; root.timeline-meter-move-visible = false; root.timeline-map-tick = ""; root.timeline-map-value = root.meter-signature; root.timeline-meter-add-visible = true; }
+                                clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-edit-visible = false; root.timeline-tempo-move-visible = false; root.timeline-meter-edit-visible = false; root.timeline-meter-move-visible = false; root.timeline-marker-add-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = ""; root.timeline-map-tick = ""; root.timeline-map-value = root.meter-signature; root.timeline-meter-add-visible = true; }
+                            }
+                            Button {
+                                text: "Add marker";
+                                enabled: root.app-mode == AppMode.running;
+                                clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-edit-visible = false; root.timeline-tempo-move-visible = false; root.timeline-meter-add-visible = false; root.timeline-meter-edit-visible = false; root.timeline-meter-move-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = ""; root.timeline-marker-id = ""; root.timeline-marker-source-tick = ""; root.timeline-marker-tick = ""; root.timeline-marker-name = ""; root.timeline-marker-add-visible = true; }
                             }
                         }
                         Rectangle { height: 1px; background: #27313d; }
@@ -3899,6 +3926,39 @@ export component MainWindow inherits Window {
                             }
                         }
 
+                        if root.timeline-marker-add-visible : VerticalLayout {
+                            spacing: 10px;
+                            Text { text: "ADD NAVIGATION MARKER"; color: #7fd6a2; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: "A navigation marker is a named point in the timeline. It does not launch a scene or change playback until you choose Locate or Play."; color: #aebccc; font-size: 12px; wrap: word-wrap; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                marker-add-tick-input := IdeLineEdit { width: 130px; text: root.timeline-marker-tick; placeholder-text: "Tick"; input-type: number; accessible-label: "Navigation marker project tick"; enabled: root.app-mode == AppMode.running; accepted => { IdeActions.add-timeline-marker(self.text, marker-add-name-input.text); } }
+                                marker-add-name-input := IdeLineEdit { horizontal-stretch: 1; text: root.timeline-marker-name; placeholder-text: "Marker name"; accessible-label: "Navigation marker name"; enabled: root.app-mode == AppMode.running; accepted => { IdeActions.add-timeline-marker(marker-add-tick-input.text, self.text); } }
+                                Button { text: "Add"; enabled: root.app-mode == AppMode.running; clicked => { IdeActions.add-timeline-marker(marker-add-tick-input.text, marker-add-name-input.text); } }
+                                Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-marker-add-visible = false; root.timeline-marker-tick = ""; root.timeline-marker-name = ""; } }
+                            }
+                        }
+
+                        if root.timeline-marker-rename-visible : VerticalLayout {
+                            spacing: 10px;
+                            Text { text: "RENAME NAVIGATION MARKER · TICK " + root.timeline-marker-source-tick; color: #7fd6a2; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            HorizontalLayout {
+                                marker-rename-name-input := IdeLineEdit { horizontal-stretch: 1; text: root.timeline-marker-name; placeholder-text: "Marker name"; accessible-label: "New navigation marker name"; enabled: root.app-mode == AppMode.running; accepted => { IdeActions.rename-timeline-marker(root.timeline-marker-id, self.text); } }
+                                Button { text: "Save"; enabled: root.app-mode == AppMode.running; clicked => { IdeActions.rename-timeline-marker(root.timeline-marker-id, marker-rename-name-input.text); } }
+                                Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-marker-rename-visible = false; root.timeline-marker-id = ""; root.timeline-marker-source-tick = ""; root.timeline-marker-name = ""; } }
+                            }
+                        }
+
+                        if root.timeline-marker-move-visible : VerticalLayout {
+                            spacing: 10px;
+                            Text { text: "MOVE NAVIGATION MARKER · FROM TICK " + root.timeline-marker-source-tick; color: #7fd6a2; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            HorizontalLayout {
+                                marker-move-tick-input := IdeLineEdit { width: 130px; text: root.timeline-marker-tick; placeholder-text: "Destination tick"; input-type: number; accessible-label: "New navigation marker project tick"; enabled: root.app-mode == AppMode.running; accepted => { IdeActions.move-timeline-marker(root.timeline-marker-id, self.text); } }
+                                Button { text: "Move"; enabled: root.app-mode == AppMode.running; clicked => { IdeActions.move-timeline-marker(root.timeline-marker-id, marker-move-tick-input.text); } }
+                                Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-marker-move-visible = false; root.timeline-marker-id = ""; root.timeline-marker-source-tick = ""; root.timeline-marker-tick = ""; } }
+                            }
+                        }
+
                         Text { text: "TEMPO MARKERS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
                         ListView {
                             height: Math.min(160px, root.timeline-tempo-markers.length * 40px);
@@ -3914,9 +3974,31 @@ export component MainWindow inherits Window {
                                     Text { width: 86px; text: marker.bpm + " BPM"; color: #edf2f8; font-size: 12px; font-weight: 600; vertical-alignment: center; }
                                     Text { width: 45px; text: marker.origin ? "Origin" : ""; color: #728196; font-size: 10px; vertical-alignment: center; }
                                     Rectangle { horizontal-stretch: 1; background: transparent; }
-                                    Button { text: "Edit"; enabled: root.app-mode == AppMode.running && root.tempo-available; clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-move-visible = false; root.timeline-map-source-tick = marker.tick; root.timeline-map-value = marker.bpm; root.timeline-tempo-edit-visible = true; } }
-                                    Button { text: "Move"; enabled: root.app-mode == AppMode.running && root.tempo-available && !marker.origin; clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-edit-visible = false; root.timeline-map-source-tick = marker.tick; root.timeline-map-tick = marker.tick; root.timeline-tempo-move-visible = true; } }
-                                    Button { text: "Remove"; enabled: root.app-mode == AppMode.running && root.tempo-available && !marker.origin; clicked => { IdeActions.remove-timeline-tempo(marker.tick); } }
+                                    Button { text: "Edit"; enabled: root.app-mode == AppMode.running && root.tempo-available; clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-move-visible = false; root.timeline-marker-add-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = ""; root.timeline-map-source-tick = marker.tick; root.timeline-map-value = marker.bpm; root.timeline-tempo-edit-visible = true; } }
+                                    Button { text: "Move"; enabled: root.app-mode == AppMode.running && root.tempo-available && !marker.origin; clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-edit-visible = false; root.timeline-marker-add-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = ""; root.timeline-map-source-tick = marker.tick; root.timeline-map-tick = marker.tick; root.timeline-tempo-move-visible = true; } }
+                                    Button { text: "Remove"; enabled: root.app-mode == AppMode.running && root.tempo-available && !marker.origin; clicked => { root.timeline-marker-add-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = ""; IdeActions.remove-timeline-tempo(marker.tick); } }
+                                }
+                            }
+                        }
+                        Text { text: "NAVIGATION MARKERS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        ListView {
+                            height: Math.min(160px, root.timeline-navigation-markers.length * 40px);
+                            for marker in root.timeline-navigation-markers : Rectangle {
+                                height: 36px;
+                                width: parent.width;
+                                background: #101820;
+                                HorizontalLayout {
+                                    padding: 8px;
+                                    spacing: 10px;
+                                    Text { width: 100px; text: "Tick " + marker.tick; color: #aebccc; font-size: 11px; vertical-alignment: center; }
+                                    Text { width: 110px; text: marker.position; color: #7fd6a2; font-size: 11px; vertical-alignment: center; }
+                                    Text { width: 150px; text: marker.name; color: #edf2f8; font-size: 12px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    Button { text: "Locate"; accessible-label: "Locate navigation marker " + marker.name; enabled: root.app-mode == AppMode.running; clicked => { IdeActions.locate-timeline-marker(marker.index, marker.id, false); } }
+                                    Button { text: "Play"; accessible-label: "Play from navigation marker " + marker.name; enabled: root.app-mode == AppMode.running; clicked => { IdeActions.locate-timeline-marker(marker.index, marker.id, true); } }
+                                    Button { text: "Rename"; accessible-label: "Rename navigation marker " + marker.name; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-edit-visible = false; root.timeline-tempo-move-visible = false; root.timeline-meter-add-visible = false; root.timeline-meter-edit-visible = false; root.timeline-meter-move-visible = false; root.timeline-marker-add-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = ""; root.timeline-marker-id = marker.id; root.timeline-marker-source-tick = marker.tick; root.timeline-marker-name = marker.name; root.timeline-marker-rename-visible = true; } }
+                                    Button { text: "Move"; accessible-label: "Move navigation marker " + marker.name; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-edit-visible = false; root.timeline-tempo-move-visible = false; root.timeline-meter-add-visible = false; root.timeline-meter-edit-visible = false; root.timeline-meter-move-visible = false; root.timeline-marker-add-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-remove-confirming-id = ""; root.timeline-marker-id = marker.id; root.timeline-marker-source-tick = marker.tick; root.timeline-marker-tick = marker.tick; root.timeline-marker-move-visible = true; } }
+                                    Button { text: root.timeline-marker-remove-confirming-id == marker.id ? "Confirm remove" : "Remove"; accessible-label: (root.timeline-marker-remove-confirming-id == marker.id ? "Confirm removal of navigation marker " : "Remove navigation marker ") + marker.name; enabled: root.app-mode == AppMode.running; clicked => { if root.timeline-marker-remove-confirming-id == marker.id { IdeActions.remove-timeline-marker(marker.id); } else { root.timeline-tempo-add-visible = false; root.timeline-tempo-edit-visible = false; root.timeline-tempo-move-visible = false; root.timeline-meter-add-visible = false; root.timeline-meter-edit-visible = false; root.timeline-meter-move-visible = false; root.timeline-marker-add-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = marker.id; } } }
                                 }
                             }
                         }
@@ -3935,9 +4017,9 @@ export component MainWindow inherits Window {
                                     Text { width: 86px; text: marker.signature; color: #edf2f8; font-size: 12px; font-weight: 600; vertical-alignment: center; }
                                     Text { width: 45px; text: marker.origin ? "Origin" : ""; color: #728196; font-size: 10px; vertical-alignment: center; }
                                     Rectangle { horizontal-stretch: 1; background: transparent; }
-                                    Button { text: "Edit"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-meter-add-visible = false; root.timeline-meter-move-visible = false; root.timeline-map-source-tick = marker.tick; root.timeline-map-value = marker.signature; root.timeline-meter-edit-visible = true; } }
-                                    Button { text: "Move"; enabled: root.app-mode == AppMode.running && !marker.origin; clicked => { root.timeline-meter-add-visible = false; root.timeline-meter-edit-visible = false; root.timeline-map-source-tick = marker.tick; root.timeline-map-tick = marker.tick; root.timeline-meter-move-visible = true; } }
-                                    Button { text: "Remove"; enabled: root.app-mode == AppMode.running && !marker.origin; clicked => { IdeActions.remove-timeline-meter(marker.tick); } }
+                                    Button { text: "Edit"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-meter-add-visible = false; root.timeline-meter-move-visible = false; root.timeline-marker-add-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = ""; root.timeline-map-source-tick = marker.tick; root.timeline-map-value = marker.signature; root.timeline-meter-edit-visible = true; } }
+                                    Button { text: "Move"; enabled: root.app-mode == AppMode.running && !marker.origin; clicked => { root.timeline-meter-add-visible = false; root.timeline-meter-edit-visible = false; root.timeline-marker-add-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = ""; root.timeline-map-source-tick = marker.tick; root.timeline-map-tick = marker.tick; root.timeline-meter-move-visible = true; } }
+                                    Button { text: "Remove"; enabled: root.app-mode == AppMode.running && !marker.origin; clicked => { root.timeline-marker-add-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = ""; IdeActions.remove-timeline-meter(marker.tick); } }
                                 }
                             }
                         }

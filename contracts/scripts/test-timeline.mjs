@@ -46,6 +46,63 @@ assert.equal(tickToFrame(fractionalBoundary, 2), 25);
 assert.equal(frameToTick(fractionalBoundary, 25), 1);
 assert.equal(frameToTick(fractionalBoundary, 26), 2);
 
+const markers = {
+  ...timeline,
+  markers: [
+    {
+      id: "018f47a2-6b2d-7c11-8a44-001122334470",
+      tick: 1920,
+      name: "Verse",
+    },
+    {
+      id: "018f47a2-6b2d-7c11-8a44-001122334471",
+      tick: 1920,
+      name: "Verse",
+    },
+  ],
+};
+assertTimelineInvariants(markers);
+assert.throws(
+  () =>
+    assertTimelineInvariants({
+      ...markers,
+      markers: [...markers.markers].reverse(),
+    }),
+  /ordered by tick and identifier/,
+);
+assert.throws(
+  () =>
+    assertTimelineInvariants({
+      ...markers,
+      markers: [
+        markers.markers[0],
+        { ...markers.markers[0], tick: 3840 },
+      ],
+    }),
+  /identifiers must be unique/,
+);
+assert.throws(
+  () =>
+    assertTimelineInvariants({
+      ...markers,
+      markers: [{ ...markers.markers[0], name: "" }],
+    }),
+  /name is outside the version 1 domain/,
+);
+assert.throws(
+  () =>
+    assertTimelineInvariants({
+      ...markers,
+      markers: [
+        {
+          ...markers.markers[0],
+          tick: Number.MAX_SAFE_INTEGER + 1,
+        },
+      ],
+    }),
+  /nonnegative safe integer/,
+);
+
 assert.throws(
   () =>
     assertTimelineInvariants({
@@ -60,4 +117,4 @@ assert.throws(
 assert.throws(() => tickToFrame(timeline, -1), /nonnegative safe integer/);
 assert.throws(() => frameToTick(timeline, -1), /nonnegative safe integer/);
 
-console.log("Timeline conversion passed: 18 deterministic cases");
+console.log("Timeline conversion and marker invariants passed");

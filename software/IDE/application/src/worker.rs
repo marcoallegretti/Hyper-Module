@@ -62,11 +62,12 @@ use super::{
     IdeRoutingBusRemovalError, IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability,
     IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization,
     IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError,
-    IdeTempoEditError, IdeTrackFreezeHistoryAuthority, IdeTransportSeekError,
-    IdeUnusedSampleCleanupError, IdeUnusedSampleCleanupSummary, InputInventoryError, LocateState,
-    MAX_DEVICES_PER_CHAIN, NativeFilterMode, OutputInventoryError, OutputStreamSnapshot,
-    OutputStreamState, OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication,
-    RunningIdeSnapshot, TimelineMapEdit, control_binding_references_scene,
+    IdeTempoEditError, IdeTimelineMarker, IdeTimelineMarkerEdit, IdeTimelineMarkerLocateError,
+    IdeTrackFreezeHistoryAuthority, IdeTransportSeekError, IdeUnusedSampleCleanupError,
+    IdeUnusedSampleCleanupSummary, InputInventoryError, LocateState, MAX_DEVICES_PER_CHAIN,
+    NativeFilterMode, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
+    OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication, RunningIdeSnapshot,
+    TimelineMapEdit, control_binding_references_scene,
 };
 
 #[cfg(test)]
@@ -151,6 +152,7 @@ pub enum IdeWorkerCommandKind {
     Seek,
     LocatePlacement,
     LocateSceneLaunch,
+    LocateTimelineMarker,
     Loudness,
     Mixer,
     Monitoring,
@@ -189,6 +191,7 @@ pub enum IdeWorkerCommandKind {
     SetTempo,
     SetMeter,
     EditTimelineMap,
+    EditTimelineMarker,
     SetArrangementSceneLaunchScene,
     RemoveArrangementSceneLaunch,
     DuplicateArrangementPlacement,
@@ -268,6 +271,12 @@ pub enum IdeWorkerCommand {
         project_id: String,
         index: usize,
         launch_id: String,
+        state: LocateState,
+    },
+    LocateTimelineMarker {
+        project_id: String,
+        index: usize,
+        marker_id: String,
         state: LocateState,
     },
     Loudness(IdeLoudnessCommand),
@@ -393,6 +402,9 @@ pub enum IdeWorkerCommand {
     },
     EditTimelineMap {
         edit: TimelineMapEdit,
+    },
+    EditTimelineMarker {
+        edit: IdeTimelineMarkerEdit,
     },
     SetArrangementLoopRange {
         range: Option<IdeLoopRangeFrames>,
@@ -570,6 +582,7 @@ impl IdeWorkerCommand {
             Self::Seek { .. } => IdeWorkerCommandKind::Seek,
             Self::LocatePlacement { .. } => IdeWorkerCommandKind::LocatePlacement,
             Self::LocateSceneLaunch { .. } => IdeWorkerCommandKind::LocateSceneLaunch,
+            Self::LocateTimelineMarker { .. } => IdeWorkerCommandKind::LocateTimelineMarker,
             Self::Loudness(_) => IdeWorkerCommandKind::Loudness,
             Self::Mixer(_) => IdeWorkerCommandKind::Mixer,
             Self::Monitoring(_) => IdeWorkerCommandKind::Monitoring,
@@ -614,6 +627,7 @@ impl IdeWorkerCommand {
             Self::SetTempo { .. } => IdeWorkerCommandKind::SetTempo,
             Self::SetMeter { .. } => IdeWorkerCommandKind::SetMeter,
             Self::EditTimelineMap { .. } => IdeWorkerCommandKind::EditTimelineMap,
+            Self::EditTimelineMarker { .. } => IdeWorkerCommandKind::EditTimelineMarker,
             Self::SetArrangementSceneLaunchScene { .. } => {
                 IdeWorkerCommandKind::SetArrangementSceneLaunchScene
             }
@@ -860,6 +874,7 @@ pub struct IdeRunningObservation {
     microseconds_per_quarter: u32,
     meter_events: Vec<hyper_playback_compiler::MeterEvent>,
     tempo_events: Vec<hyper_playback_compiler::TempoEvent>,
+    timeline_markers: Vec<IdeTimelineMarker>,
     playback_extent: super::IdePlaybackExtent,
     arrangement: Arc<super::IdePlaybackArrangement>,
     automation: Arc<super::IdePlaybackAutomation>,
@@ -1586,6 +1601,7 @@ impl IdeRunningObservation {
             microseconds_per_quarter: 500_000,
             meter_events: Vec::new(),
             tempo_events: Vec::new(),
+            timeline_markers: Vec::new(),
             playback_extent: super::IdePlaybackExtent::Bounded { end_frame: 0 },
             arrangement: Arc::new(super::IdePlaybackArrangement::empty()),
             automation: Arc::new(super::IdePlaybackAutomation::default()),
@@ -1687,6 +1703,12 @@ impl IdeRunningObservation {
     #[must_use]
     pub fn tempo_events(&self) -> &[hyper_playback_compiler::TempoEvent] {
         &self.tempo_events
+    }
+
+    /// Named navigation points in the durable timeline, ordered by tick then identity.
+    #[must_use]
+    pub fn timeline_markers(&self) -> &[IdeTimelineMarker] {
+        &self.timeline_markers
     }
 
     #[must_use]
@@ -2102,6 +2124,7 @@ pub enum IdeWorkerCommandFailure {
     Transport(super::DesktopDirectControlError),
     Seek(IdeTransportSeekError),
     ArrangementLocate(IdeArrangementLocateError),
+    TimelineMarkerLocate(IdeTimelineMarkerLocateError),
     Loudness(IdeLoudnessCommandError),
     OutputTest(IdeOutputTestError),
     Mixer(IdeMixerCommandError),
@@ -2262,6 +2285,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::Transport(source) => source.fmt(formatter),
             Self::Seek(source) => source.fmt(formatter),
             Self::ArrangementLocate(source) => source.fmt(formatter),
+            Self::TimelineMarkerLocate(source) => source.fmt(formatter),
             Self::Loudness(source) => source.fmt(formatter),
             Self::OutputTest(source) => source.fmt(formatter),
             Self::Mixer(source) => source.fmt(formatter),
@@ -2369,6 +2393,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::Transport(source) => Some(source),
             Self::Seek(source) => Some(source),
             Self::ArrangementLocate(source) => Some(source),
+            Self::TimelineMarkerLocate(source) => Some(source),
             Self::Loudness(source) => Some(source),
             Self::OutputTest(source) => Some(source),
             Self::Mixer(source) => Some(source),
@@ -2942,6 +2967,7 @@ pub enum IdeWorkerEvent {
     TempoChanging,
     MeterChanging,
     TimelineMapChanging,
+    TimelineMarkerChanging,
     MeterChanged {
         revision: u64,
         numerator: u16,
@@ -2961,6 +2987,12 @@ pub enum IdeWorkerEvent {
         revision: u64,
     },
     TimelineMapCommittedWithWarning {
+        warning: Box<IdeTempoEditError>,
+    },
+    TimelineMarkerChanged {
+        revision: u64,
+    },
+    TimelineMarkerCommittedWithWarning {
         warning: Box<IdeTempoEditError>,
     },
     ArrangementLoopRangeChanged {
@@ -3526,6 +3558,9 @@ enum ProjectMutation {
     EditTimelineMap {
         edit: TimelineMapEdit,
     },
+    EditTimelineMarker {
+        edit: IdeTimelineMarkerEdit,
+    },
     SetArrangementLoopRange {
         range: Option<IdeLoopRangeFrames>,
     },
@@ -3652,6 +3687,7 @@ impl ProjectMutation {
             Self::SetTempo { .. } => IdeWorkerCommandKind::SetTempo,
             Self::SetMeter { .. } => IdeWorkerCommandKind::SetMeter,
             Self::EditTimelineMap { .. } => IdeWorkerCommandKind::EditTimelineMap,
+            Self::EditTimelineMarker { .. } => IdeWorkerCommandKind::EditTimelineMarker,
             Self::SaveMixer => IdeWorkerCommandKind::SaveProject,
             Self::SaveProjectAs { .. } => IdeWorkerCommandKind::SaveProjectAs,
             Self::RenameProject { .. } => IdeWorkerCommandKind::RenameProject,
@@ -3801,6 +3837,7 @@ impl ProjectMutation {
             Self::SetTempo { .. } => IdeWorkerEvent::TempoChanging,
             Self::SetMeter { .. } => IdeWorkerEvent::MeterChanging,
             Self::EditTimelineMap { .. } => IdeWorkerEvent::TimelineMapChanging,
+            Self::EditTimelineMarker { .. } => IdeWorkerEvent::TimelineMarkerChanging,
             Self::RemoveArrangementSceneLaunch { .. } => {
                 IdeWorkerEvent::ArrangementSceneLaunchRemoving
             }
@@ -4019,6 +4056,10 @@ fn push_bounded(stack: &mut Vec<UndoEntry>, entry: UndoEntry) {
 }
 
 /// The user-facing name of the durable edit a history entry reverses.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive command table forces every new durable operation to receive an intentional history label"
+)]
 const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
     match command {
         IdeWorkerCommandKind::SaveProject => "mixer save",
@@ -4045,6 +4086,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetTempo => "tempo",
         IdeWorkerCommandKind::SetMeter => "time signature",
         IdeWorkerCommandKind::EditTimelineMap => "timeline map",
+        IdeWorkerCommandKind::EditTimelineMarker => "timeline marker",
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => "scene marker reassignment",
         IdeWorkerCommandKind::RemoveArrangementSceneLaunch => "scene marker removal",
         IdeWorkerCommandKind::RenameAudioClip => "clip rename",
@@ -4087,6 +4129,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::Seek
         | IdeWorkerCommandKind::LocatePlacement
         | IdeWorkerCommandKind::LocateSceneLaunch
+        | IdeWorkerCommandKind::LocateTimelineMarker
         | IdeWorkerCommandKind::Loudness
         | IdeWorkerCommandKind::Mixer
         | IdeWorkerCommandKind::Monitoring
@@ -4403,6 +4446,19 @@ fn process_command(
             locate_state,
             events,
         ),
+        IdeWorkerCommand::LocateTimelineMarker {
+            project_id,
+            index,
+            marker_id,
+            state: locate_state,
+        } => process_timeline_marker_locate_command(
+            state,
+            &project_id,
+            index,
+            &marker_id,
+            locate_state,
+            events,
+        ),
         IdeWorkerCommand::Loudness(command) => process_loudness_command(state, command, events),
         IdeWorkerCommand::Mixer(command) => match state {
             WorkerState::Running(application) => match application.try_send_mixer(command) {
@@ -4449,6 +4505,7 @@ fn process_command(
         | IdeWorkerCommand::SetTempo { .. }
         | IdeWorkerCommand::SetMeter { .. }
         | IdeWorkerCommand::EditTimelineMap { .. }
+        | IdeWorkerCommand::EditTimelineMarker { .. }
         | IdeWorkerCommand::SetArrangementSceneLaunchScene { .. }
         | IdeWorkerCommand::RemoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::DuplicateArrangementPlacement { .. }
@@ -4700,6 +4757,7 @@ fn process_project_mutation_command(
         | IdeWorkerCommand::SetTempo { .. }
         | IdeWorkerCommand::SetMeter { .. }
         | IdeWorkerCommand::EditTimelineMap { .. }
+        | IdeWorkerCommand::EditTimelineMarker { .. }
         | IdeWorkerCommand::SetArrangementSceneLaunchScene { .. }
         | IdeWorkerCommand::RemoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::DuplicateArrangementPlacement { .. }
@@ -4860,6 +4918,11 @@ fn process_arrangement_mutation_command(
         IdeWorkerCommand::EditTimelineMap { edit } => {
             begin_project_mutation_request(state, events, ProjectMutation::EditTimelineMap { edit })
         }
+        IdeWorkerCommand::EditTimelineMarker { edit } => begin_project_mutation_request(
+            state,
+            events,
+            ProjectMutation::EditTimelineMarker { edit },
+        ),
         IdeWorkerCommand::MoveArrangementSceneLaunch { launch_id, tick } => {
             move_arrangement_scene_launch(state, events, &launch_id, tick)
         }
@@ -5428,6 +5491,49 @@ fn process_arrangement_scene_launch_locate_command(
         _ => publish_failure(
             events,
             IdeWorkerCommandKind::LocateSceneLaunch,
+            IdeWorkerCommandFailure::InvalidState,
+        ),
+    }
+}
+
+fn process_timeline_marker_locate_command(
+    state: &mut WorkerState,
+    project_id: &str,
+    index: usize,
+    marker_id: &str,
+    locate_state: LocateState,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    match state {
+        WorkerState::Running(application) if application.audio_preview_is_active() => {
+            publish_failure(
+                events,
+                IdeWorkerCommandKind::LocateTimelineMarker,
+                IdeWorkerCommandFailure::AudioPreview(IdeAudioPreviewError::Command(
+                    hyper_desktop_audio::DesktopAudioPreviewCommandError::PreviewBusy,
+                )),
+            )
+        }
+        WorkerState::Running(application) => {
+            match application.try_locate_timeline_marker(project_id, index, marker_id, locate_state)
+            {
+                Ok(frame) => send_event(
+                    events,
+                    IdeWorkerEvent::TransportQueued(TransportCommand::Locate {
+                        frame,
+                        state: locate_state,
+                    }),
+                ),
+                Err(reason) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::LocateTimelineMarker,
+                    IdeWorkerCommandFailure::TimelineMarkerLocate(reason),
+                ),
+            }
+        }
+        _ => publish_failure(
+            events,
+            IdeWorkerCommandKind::LocateTimelineMarker,
             IdeWorkerCommandFailure::InvalidState,
         ),
     }
@@ -8046,6 +8152,10 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             result: Ok(outcome),
             ..
         }
+        | ProjectMutationAttempt::EditTimelineMarker {
+            result: Ok(outcome),
+            ..
+        }
         | ProjectMutationAttempt::SetArrangementSceneLaunchScene {
             result: Ok(outcome),
             ..
@@ -8248,6 +8358,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::SetTempo { result: Err(_), .. }
         | ProjectMutationAttempt::SetMeter { result: Err(_), .. }
         | ProjectMutationAttempt::EditTimelineMap { result: Err(_), .. }
+        | ProjectMutationAttempt::EditTimelineMarker { result: Err(_), .. }
         | ProjectMutationAttempt::SetArrangementSceneLaunchScene { result: Err(_), .. }
         | ProjectMutationAttempt::RemoveArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::DuplicateArrangementPlacement { result: Err(_), .. }
@@ -9073,7 +9184,8 @@ fn project_mutation_save_failure(
         }
         ProjectMutation::SetTempo { .. }
         | ProjectMutation::SetMeter { .. }
-        | ProjectMutation::EditTimelineMap { .. } => {
+        | ProjectMutation::EditTimelineMap { .. }
+        | ProjectMutation::EditTimelineMarker { .. } => {
             IdeWorkerCommandFailure::Tempo(Box::new(IdeTempoEditError::MixerSave(Box::new(reason))))
         }
         ProjectMutation::SetArrangementSceneLaunchScene { .. } => {
@@ -9389,7 +9501,8 @@ fn project_mutation_native_close_failure(
         }
         ProjectMutation::SetTempo { .. }
         | ProjectMutation::SetMeter { .. }
-        | ProjectMutation::EditTimelineMap { .. } => {
+        | ProjectMutation::EditTimelineMap { .. }
+        | ProjectMutation::EditTimelineMarker { .. } => {
             IdeWorkerCommandFailure::Tempo(Box::new(IdeTempoEditError::NativeClose(failure)))
         }
         ProjectMutation::SetArrangementSceneLaunchScene { .. } => {
@@ -9708,6 +9821,9 @@ enum ProjectMutationAttempt {
         result: Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeTempoEditError>,
     },
     EditTimelineMap {
+        result: Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeTempoEditError>,
+    },
+    EditTimelineMarker {
         result: Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeTempoEditError>,
     },
     SetArrangementLoopRange {
@@ -10788,6 +10904,29 @@ fn complete_project_mutation(
                     } else {
                         IdeWorkerEvent::CommandFailed {
                             command: IdeWorkerCommandKind::EditTimelineMap,
+                            reason: IdeWorkerCommandFailure::Tempo(Box::new(reason)),
+                        }
+                    },
+                ),
+                ProjectMutationAttempt::EditTimelineMarker {
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::TimelineMarkerChanged {
+                        revision: outcome.project_revision(),
+                    },
+                ),
+                ProjectMutationAttempt::EditTimelineMarker {
+                    result: Err(reason),
+                } => send_event(
+                    events,
+                    if reason.publication_committed() {
+                        IdeWorkerEvent::TimelineMarkerCommittedWithWarning {
+                            warning: Box::new(reason),
+                        }
+                    } else {
+                        IdeWorkerEvent::CommandFailed {
+                            command: IdeWorkerCommandKind::EditTimelineMarker,
                             reason: IdeWorkerCommandFailure::Tempo(Box::new(reason)),
                         }
                     },
@@ -12160,6 +12299,20 @@ fn attempt_project_mutation(
                     .and_then(|plan| plan.publish())
             },
         },
+        ProjectMutation::EditTimelineMarker { edit } => {
+            ProjectMutationAttempt::EditTimelineMarker {
+                result: if let Some(failure) = native_failure {
+                    Err(IdeTempoEditError::NativeClose(failure))
+                } else {
+                    RunningDesktopIdeApplication::prepare_timeline_marker_edit(
+                        application,
+                        recovery,
+                        edit,
+                    )
+                    .and_then(|plan| plan.publish())
+                },
+            }
+        }
         ProjectMutation::SetArrangementLoopRange { range } => {
             ProjectMutationAttempt::SetArrangementLoopRange {
                 result: attempt_arrangement_loop_range(
@@ -13770,7 +13923,8 @@ fn project_mutation_reopen_failure(
         }
         ProjectMutationAttempt::SetMeter { result, .. }
         | ProjectMutationAttempt::SetTempo { result, .. }
-        | ProjectMutationAttempt::EditTimelineMap { result } => {
+        | ProjectMutationAttempt::EditTimelineMap { result }
+        | ProjectMutationAttempt::EditTimelineMarker { result } => {
             let reason = match result {
                 Ok(outcome) => IdeTempoEditError::ReopenAfterPublication {
                     outcome: Box::new(outcome),
@@ -15179,6 +15333,17 @@ fn running_observation(
         .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)?;
     let project_id = try_project_owned(snapshot.project_id)?;
     let project_name = try_project_owned(snapshot.project_name)?;
+    let mut timeline_markers = Vec::new();
+    timeline_markers
+        .try_reserve_exact(snapshot.loaded.timeline_markers().len())
+        .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
+    for marker in snapshot.loaded.timeline_markers() {
+        timeline_markers.push(IdeTimelineMarker {
+            id: try_project_owned(marker.id())?,
+            tick: marker.tick(),
+            name: try_project_owned(marker.name())?,
+        });
+    }
     let mut audio_clips = Vec::new();
     audio_clips
         .try_reserve_exact(snapshot.loaded.clip_count())
@@ -15474,6 +15639,7 @@ fn running_observation(
             .map_or(500_000, |event| event.microseconds_per_quarter),
         meter_events: snapshot.loaded.meter_events().to_vec(),
         tempo_events: snapshot.loaded.tempo_events().to_vec(),
+        timeline_markers,
         playback_extent: snapshot.playback_extent,
         arrangement: snapshot.arrangement,
         automation: snapshot.automation,
@@ -22375,6 +22541,61 @@ mod tests {
     }
 
     #[test]
+    fn running_worker_locates_and_plays_only_the_current_timeline_marker_identity() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                extent: IdePlaybackExtent::Unbounded,
+                timeline_marker_project_id: "project-a".to_owned(),
+                timeline_markers: vec![("timeline-marker-a".to_owned(), 3_750)],
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 3, 3).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::LocateTimelineMarker {
+                project_id: "project-a".to_owned(),
+                index: 0,
+                marker_id: "stale".to_owned(),
+                state: LocateState::Preserve,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::LocateTimelineMarker,
+                reason: IdeWorkerCommandFailure::TimelineMarkerLocate(
+                    IdeTimelineMarkerLocateError::StaleMarker { requested_index: 0 }
+                ),
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::LocateTimelineMarker {
+                project_id: "project-a".to_owned(),
+                index: 0,
+                marker_id: "timeline-marker-a".to_owned(),
+                state: LocateState::Rolling,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::TransportQueued(TransportCommand::Locate {
+                frame: 3_750,
+                state: LocateState::Rolling,
+            })
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
     fn running_worker_queues_typed_loudness_controls_in_order() {
         let running = RunningDesktopIdeApplication {
             application: closed_application(),
@@ -24995,6 +25216,13 @@ mod tests {
                 IdeWorkerCommandKind::EditTimelineMap,
             ),
             (
+                ProjectMutationAttempt::EditTimelineMarker {
+                    result: Ok(outcome.clone()),
+                },
+                "timeline marker",
+                IdeWorkerCommandKind::EditTimelineMarker,
+            ),
+            (
                 ProjectMutationAttempt::SetArrangementLoopRange {
                     result: Ok(outcome.clone()),
                 },
@@ -25030,6 +25258,9 @@ mod tests {
                 result: Err(IdeTempoEditError::TimelineResourceMissing),
             },
             ProjectMutationAttempt::EditTimelineMap {
+                result: Err(IdeTempoEditError::TimelineResourceMissing),
+            },
+            ProjectMutationAttempt::EditTimelineMarker {
                 result: Err(IdeTempoEditError::TimelineResourceMissing),
             },
             ProjectMutationAttempt::SetArrangementLoopRange {
@@ -26866,6 +27097,230 @@ mod tests {
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker sequence keeps named-marker persistence, reopen authority, and replacement-history restoration together"
+    )]
+    fn timeline_marker_edits_reopen_and_restore_the_durable_timeline() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-timeline-markers-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        let initial_revision = created.project().manifest().revision();
+        drop(created);
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv_native_mutation(&worker) else {
+            panic!("the verified project must open before timeline marker edits");
+        };
+        assert!(opened.timeline_markers().is_empty());
+
+        worker
+            .try_send(IdeWorkerCommand::EditTimelineMarker {
+                edit: IdeTimelineMarkerEdit::Add {
+                    tick: 0,
+                    name: "Intro".to_owned(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::TimelineMarkerChanging
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("timeline marker"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(added) = recv_native_mutation(&worker) else {
+            panic!("the added marker must reopen before completion");
+        };
+        let marker = added
+            .timeline_markers()
+            .first()
+            .expect("the reopened project must expose the added marker");
+        let marker_id = marker.id().to_owned();
+        assert_eq!(marker.tick(), 0);
+        assert_eq!(marker.name(), "Intro");
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::TimelineMarkerChanged { revision }
+                if revision == initial_revision + 1
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::LocateTimelineMarker {
+                project_id: added.project_id().to_owned(),
+                index: 0,
+                marker_id: marker_id.clone(),
+                state: LocateState::Rolling,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::TransportQueued(TransportCommand::Locate {
+                frame: 0,
+                state: LocateState::Rolling,
+            })
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::EditTimelineMarker {
+                edit: IdeTimelineMarkerEdit::Rename {
+                    marker_id: marker_id.clone(),
+                    name: "Opening".to_owned(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::TimelineMarkerChanging
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("timeline marker"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(renamed) = recv_native_mutation(&worker) else {
+            panic!("the renamed marker must reopen before completion");
+        };
+        assert!(matches!(
+            renamed.timeline_markers(),
+            [marker] if marker.id() == marker_id && marker.tick() == 0 && marker.name() == "Opening"
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::TimelineMarkerChanged { revision }
+                if revision == initial_revision + 2
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::EditTimelineMarker {
+                edit: IdeTimelineMarkerEdit::Move {
+                    marker_id: marker_id.clone(),
+                    tick: 960,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::TimelineMarkerChanging
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("timeline marker"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(moved) = recv_native_mutation(&worker) else {
+            panic!("the moved marker must reopen before completion");
+        };
+        assert!(matches!(
+            moved.timeline_markers(),
+            [marker] if marker.id() == marker_id && marker.tick() == 960 && marker.name() == "Opening"
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::TimelineMarkerChanged { revision }
+                if revision == initial_revision + 3
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::EditTimelineMarker {
+                edit: IdeTimelineMarkerEdit::Remove {
+                    marker_id: marker_id.clone(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::TimelineMarkerChanging
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("timeline marker"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(removed) = recv_native_mutation(&worker) else {
+            panic!("the removed marker must reopen before completion");
+        };
+        assert!(removed.timeline_markers().is_empty());
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::TimelineMarkerChanged { revision }
+                if revision == initial_revision + 4
+        ));
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "timeline marker",
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("timeline marker"),
+                redo_label: Some("timeline marker"),
+            }
+        ));
+        let IdeWorkerEvent::Running(restored) = recv_native_mutation(&worker) else {
+            panic!("the restored marker must reopen before completion");
+        };
+        assert!(matches!(
+            restored.timeline_markers(),
+            [marker] if marker.id() == marker_id && marker.tick() == 960 && marker.name() == "Opening"
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision,
+                redo: false,
+                label: "timeline marker",
+            } if revision == initial_revision + 5
+        ));
+
+        let reopened = hyper_project_loader::prepare_project_playback(
+            &project,
+            closed_application().config.project_limits,
+        )
+        .unwrap();
+        let (loaded, _, _, _) = reopened.session().parts();
+        assert!(matches!(
+            loaded.timeline_markers(),
+            [marker] if marker.id() == marker_id && marker.tick() == 960 && marker.name() == "Opening"
+        ));
+        drop(reopened);
+
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]

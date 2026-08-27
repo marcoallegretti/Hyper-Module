@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 const MICROSECONDS_PER_SECOND = 1_000_000n;
 const MAX_SAFE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 const METER_DENOMINATORS = new Set([1, 2, 4, 8, 16, 32, 64, 128, 256]);
+const ENTITY_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const MAX_TIMELINE_MARKERS = 65_536;
+const MAX_MARKER_NAME_CODE_POINTS = 120;
 
 function assertSafeNonnegativeInteger(value, label) {
   assert(
@@ -36,6 +39,12 @@ export function assertTimelineInvariants(timeline) {
   );
   assert(Array.isArray(timeline.tempo_events), "tempo events must be an array");
   assert(Array.isArray(timeline.meter_events), "meter events must be an array");
+  const markers = timeline.markers ?? [];
+  assert(Array.isArray(markers), "timeline markers must be an array when present");
+  assert(
+    markers.length <= MAX_TIMELINE_MARKERS,
+    "timeline markers exceed the version 1 limit",
+  );
   for (const event of timeline.tempo_events) {
     assertSafeNonnegativeInteger(event.tick, "tempo event tick");
     assert(
@@ -60,6 +69,38 @@ export function assertTimelineInvariants(timeline) {
   }
   assertStrictlyIncreasingFromZero(timeline.tempo_events, "tempo events");
   assertStrictlyIncreasingFromZero(timeline.meter_events, "meter events");
+
+  const markerIds = new Set();
+  for (const [index, marker] of markers.entries()) {
+    assert(
+      marker !== null && typeof marker === "object" && !Array.isArray(marker),
+      "timeline marker must be an object",
+    );
+    assert(
+      typeof marker.id === "string" && ENTITY_ID_PATTERN.test(marker.id),
+      "timeline marker identifier is outside the version 1 domain",
+    );
+    assertSafeNonnegativeInteger(marker.tick, "timeline marker tick");
+    assert(typeof marker.name === "string", "timeline marker name must be a string");
+    const nameLength = Array.from(marker.name).length;
+    assert(
+      nameLength >= 1 && nameLength <= MAX_MARKER_NAME_CODE_POINTS,
+      "timeline marker name is outside the version 1 domain",
+    );
+    assert(
+      !markerIds.has(marker.id),
+      "timeline marker identifiers must be unique",
+    );
+    markerIds.add(marker.id);
+    if (index > 0) {
+      const previous = markers[index - 1];
+      assert(
+        previous.tick < marker.tick ||
+          (previous.tick === marker.tick && previous.id < marker.id),
+        "timeline markers must be ordered by tick and identifier",
+      );
+    }
+  }
 }
 
 function exactFrameNumeratorAtTick(timeline, tick, sampleRateHz) {

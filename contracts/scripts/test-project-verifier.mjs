@@ -718,6 +718,57 @@ try {
   const second = await verifyProject(valid);
   assert.equal(first.identity, second.identity);
 
+  const validTimelineMarker = join(temporaryRoot, "valid-timeline-marker");
+  await cp(valid, validTimelineMarker, { recursive: true });
+  await mutateTimeline(validTimelineMarker, (timeline) => {
+    timeline.markers = [
+      {
+        id: "018f47a2-6b2d-7c11-8a44-001122334465",
+        tick: 1920,
+        name: "Verse",
+      },
+    ];
+  });
+  await verifyProject(validTimelineMarker);
+
+  const markerWithUnsafeTick = join(temporaryRoot, "marker-with-unsafe-tick");
+  await cp(validTimelineMarker, markerWithUnsafeTick, { recursive: true });
+  await mutateTimeline(markerWithUnsafeTick, (timeline) => {
+    timeline.markers[0].tick = Number.MAX_SAFE_INTEGER + 1;
+  });
+  await assert.rejects(
+    verifyProject(markerWithUnsafeTick),
+    /integer must be exactly interoperable/,
+  );
+
+  const markerCollidingWithResource = join(
+    temporaryRoot,
+    "marker-colliding-with-resource",
+  );
+  await cp(validTimelineMarker, markerCollidingWithResource, { recursive: true });
+  await mutateTimeline(markerCollidingWithResource, (timeline) => {
+    timeline.markers[0].id = "018f47a2-6b2d-7c11-8a44-001122334456";
+  });
+  await assert.rejects(
+    verifyProject(markerCollidingWithResource),
+    /timeline marker identifier collides with a project entity/,
+  );
+
+  const markerCollidingWithArrangement = join(
+    temporaryRoot,
+    "marker-colliding-with-arrangement",
+  );
+  await cp(validTimelineMarker, markerCollidingWithArrangement, {
+    recursive: true,
+  });
+  await mutateTimeline(markerCollidingWithArrangement, (timeline) => {
+    timeline.markers[0].id = "018f47a2-6b2d-7c11-8a44-001122334464";
+  });
+  await assert.rejects(
+    verifyProject(markerCollidingWithArrangement),
+    /arrangement event identifier collides with a project entity/,
+  );
+
   const compressedWave = pcm16Wave(128);
   compressedWave.writeUInt16LE(2, 20);
   const unsupportedWave = await createValidProject(

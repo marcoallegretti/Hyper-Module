@@ -45,6 +45,13 @@
         "$ref": "#/$defs/meter_event"
       }
     },
+    "markers": {
+      "type": "array",
+      "maxItems": 65536,
+      "items": {
+        "$ref": "#/$defs/timeline_marker"
+      }
+    },
     "extensions": {
       "$ref": "common.schema.json#/$defs/extensions"
     }
@@ -79,6 +86,24 @@
         },
         "denominator": {
           "enum": [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        }
+      },
+      "additionalProperties": false
+    },
+    "timeline_marker": {
+      "type": "object",
+      "required": ["id", "tick", "name"],
+      "properties": {
+        "id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "tick": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
         }
       },
       "additionalProperties": false

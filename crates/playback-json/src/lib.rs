@@ -103,6 +103,19 @@ pub enum TimelineMapEdit {
     },
 }
 
+/// One atomic edit to a durable, non-executable timeline navigation marker.
+///
+/// Unlike [`TimelineMapEdit`], a marker has a stable identity because several
+/// markers may intentionally share one tick. The document stores markers in
+/// ascending `(tick, id)` order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TimelineMarkerEdit {
+    Add { id: String, tick: u64, name: String },
+    Rename { id: String, name: String },
+    Move { id: String, tick: u64 },
+    Remove { id: String },
+}
+
 #[derive(Debug)]
 struct ExtensionsDocument(BTreeSet<String>);
 
@@ -445,6 +458,31 @@ impl LoadedLoopRange {
     }
 }
 
+/// One durable, non-executable navigation point on the project timeline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoadedTimelineMarker {
+    id: String,
+    tick: u64,
+    name: String,
+}
+
+impl LoadedTimelineMarker {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn tick(&self) -> u64 {
+        self.tick
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LoadedPlaybackProject {
     project_id: String,
@@ -452,6 +490,7 @@ pub struct LoadedPlaybackProject {
     timeline_id: String,
     tempo_events: Vec<TempoEvent>,
     meter_events: Vec<MeterEvent>,
+    timeline_markers: Vec<LoadedTimelineMarker>,
     tracks: Vec<LoadedTrack>,
     clips: Vec<LoadedClip>,
     scenes: Vec<LoadedScene>,
@@ -6359,6 +6398,71 @@ impl Error for TempoSerializationError {
     }
 }
 
+#[derive(Debug)]
+pub enum TimelineMarkerSerializationError {
+    MarkerLimitReached,
+    InvalidMarkerIdentity,
+    InvalidMarkerTick,
+    InvalidMarkerName,
+    MarkerMissing,
+    SourceTimelineMismatch,
+    NonCanonicalSource,
+    InvalidDocumentShape,
+    Source(LoadError),
+    ProjectCompilation(AdapterCompileError),
+    Serialization(serde_json::Error),
+}
+
+impl fmt::Display for TimelineMarkerSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MarkerLimitReached => {
+                formatter.write_str("the timeline has reached the version 1 marker limit")
+            }
+            Self::InvalidMarkerIdentity => {
+                formatter.write_str("the timeline marker identity is invalid or already in use")
+            }
+            Self::InvalidMarkerTick => {
+                formatter.write_str("the timeline marker tick is outside the version 1 domain")
+            }
+            Self::InvalidMarkerName => {
+                formatter.write_str("the timeline marker name is outside the version 1 domain")
+            }
+            Self::MarkerMissing => formatter.write_str("the timeline marker no longer exists"),
+            Self::SourceTimelineMismatch => {
+                formatter.write_str("the source timeline is not the loaded one")
+            }
+            Self::NonCanonicalSource => {
+                formatter.write_str("the source timeline is not canonical JSON")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("the timeline document shape is invalid")
+            }
+            Self::Source(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for TimelineMarkerSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::MarkerLimitReached
+            | Self::InvalidMarkerIdentity
+            | Self::InvalidMarkerTick
+            | Self::InvalidMarkerName
+            | Self::MarkerMissing
+            | Self::SourceTimelineMismatch
+            | Self::NonCanonicalSource
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
 /// Rewrites the tempo at the origin, the event the contract guarantees exists.
 ///
 /// The edited document is reloaded and recompiled before it is returned, so a
@@ -6517,6 +6621,210 @@ pub fn serialize_timeline_map_edit(
         .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
         .map_err(TempoSerializationError::ProjectCompilation)?;
     Ok(output)
+}
+
+/// Applies one complete durable timeline-marker operation after verifying that
+/// the source is the loaded canonical timeline. The result is reloaded and
+/// recompiled before it is returned, so marker metadata can never bypass the
+/// project identity and executable-graph gates.
+///
+/// # Errors
+///
+/// Returns [`TimelineMarkerSerializationError`] when the requested identity,
+/// tick, or name is outside the version-1 domain, the source is stale, or the
+/// resulting project cannot be loaded and compiled.
+pub fn serialize_timeline_marker_edit(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_timeline: &[u8],
+    limits: LoaderLimits,
+    edit: &TimelineMarkerEdit,
+) -> Result<Vec<u8>, TimelineMarkerSerializationError> {
+    validate_timeline_marker_edit_request(project, assets, edit)?;
+
+    let mut value: Value = serde_json::from_slice(source_timeline)
+        .map_err(TimelineMarkerSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&value)
+        .map_err(TimelineMarkerSerializationError::Serialization)?;
+    if canonical_source != source_timeline {
+        return Err(TimelineMarkerSerializationError::NonCanonicalSource);
+    }
+    let document = value
+        .as_object_mut()
+        .ok_or(TimelineMarkerSerializationError::InvalidDocumentShape)?;
+    if document.get("id").and_then(Value::as_str) != Some(project.timeline_id.as_str()) {
+        return Err(TimelineMarkerSerializationError::SourceTimelineMismatch);
+    }
+    apply_timeline_marker_edit(document, edit)?;
+
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(TimelineMarkerSerializationError::Serialization)?;
+    let location = DocumentLocation {
+        kind: DocumentKind::Timeline,
+        index: 0,
+    };
+    let edited: TimelineDocument = parse_document(&output, location, limits.max_document_bytes)
+        .map_err(TimelineMarkerSerializationError::Source)?;
+    if edited.format != "hyper-timeline"
+        || edited.format_version != 1
+        || edited.project_id != project.project_id()
+        || edited.id != project.timeline_id
+    {
+        return Err(TimelineMarkerSerializationError::SourceTimelineMismatch);
+    }
+    validate_timeline_contract(&edited).map_err(TimelineMarkerSerializationError::Source)?;
+    validate_meter_events(&edited.meter_events)
+        .map_err(TimelineMarkerSerializationError::Source)?;
+
+    let mut edited_project = project.clone();
+    edited_project.timeline_markers = loaded_timeline_markers(edited.markers);
+    validate_loaded_identities(&edited_project)
+        .map_err(TimelineMarkerSerializationError::Source)?;
+    edited_project
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(TimelineMarkerSerializationError::ProjectCompilation)?;
+    Ok(output)
+}
+
+fn validate_timeline_marker_edit_request(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    edit: &TimelineMarkerEdit,
+) -> Result<(), TimelineMarkerSerializationError> {
+    match edit {
+        TimelineMarkerEdit::Add { id, tick, name } => {
+            validate_timeline_marker_tick(*tick)?;
+            validate_timeline_marker_name(name)?;
+            if !is_valid_entity_id(id)
+                || id.as_str() == project.project_id()
+                || project_contains_identity(project, id)
+                || assets.iter().any(|asset| asset.id == id)
+            {
+                return Err(TimelineMarkerSerializationError::InvalidMarkerIdentity);
+            }
+        }
+        TimelineMarkerEdit::Rename { name, .. } => validate_timeline_marker_name(name)?,
+        TimelineMarkerEdit::Move { tick, .. } => validate_timeline_marker_tick(*tick)?,
+        TimelineMarkerEdit::Remove { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_timeline_marker_tick(tick: u64) -> Result<(), TimelineMarkerSerializationError> {
+    if tick > MAX_SAFE_INTEGER {
+        return Err(TimelineMarkerSerializationError::InvalidMarkerTick);
+    }
+    Ok(())
+}
+
+fn validate_timeline_marker_name(name: &str) -> Result<(), TimelineMarkerSerializationError> {
+    let name_length = name.chars().count();
+    if name.trim() != name || !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length) {
+        return Err(TimelineMarkerSerializationError::InvalidMarkerName);
+    }
+    Ok(())
+}
+
+fn apply_timeline_marker_edit(
+    document: &mut serde_json::Map<String, Value>,
+    edit: &TimelineMarkerEdit,
+) -> Result<(), TimelineMarkerSerializationError> {
+    match edit {
+        TimelineMarkerEdit::Add { id, tick, name } => {
+            let markers = document
+                .entry("markers".to_owned())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or(TimelineMarkerSerializationError::InvalidDocumentShape)?;
+            if markers.len() >= MAX_VERSION_1_TIMELINE_EVENTS {
+                return Err(TimelineMarkerSerializationError::MarkerLimitReached);
+            }
+            markers.push(json!({"id": id, "tick": tick, "name": name}));
+            sort_timeline_markers(markers);
+            Ok(())
+        }
+        TimelineMarkerEdit::Rename { id, name } => {
+            let markers = document
+                .get_mut("markers")
+                .and_then(Value::as_array_mut)
+                .ok_or(TimelineMarkerSerializationError::MarkerMissing)?;
+            let index = timeline_marker_index(markers, id)?;
+            let marker = markers
+                .get_mut(index)
+                .and_then(Value::as_object_mut)
+                .ok_or(TimelineMarkerSerializationError::InvalidDocumentShape)?;
+            marker.insert("name".to_owned(), Value::String(name.clone()));
+            Ok(())
+        }
+        TimelineMarkerEdit::Move { id, tick } => {
+            let markers = document
+                .get_mut("markers")
+                .and_then(Value::as_array_mut)
+                .ok_or(TimelineMarkerSerializationError::MarkerMissing)?;
+            let index = timeline_marker_index(markers, id)?;
+            let marker = markers
+                .get_mut(index)
+                .and_then(Value::as_object_mut)
+                .ok_or(TimelineMarkerSerializationError::InvalidDocumentShape)?;
+            marker.insert("tick".to_owned(), Value::from(*tick));
+            sort_timeline_markers(markers);
+            Ok(())
+        }
+        TimelineMarkerEdit::Remove { id } => {
+            let empty = {
+                let markers = document
+                    .get_mut("markers")
+                    .and_then(Value::as_array_mut)
+                    .ok_or(TimelineMarkerSerializationError::MarkerMissing)?;
+                let index = timeline_marker_index(markers, id)?;
+                markers.remove(index);
+                markers.is_empty()
+            };
+            if empty {
+                document.remove("markers");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn timeline_marker_index(
+    markers: &[Value],
+    id: &str,
+) -> Result<usize, TimelineMarkerSerializationError> {
+    for (index, marker) in markers.iter().enumerate() {
+        let current_id = marker
+            .as_object()
+            .and_then(|object| object.get("id"))
+            .and_then(Value::as_str)
+            .ok_or(TimelineMarkerSerializationError::InvalidDocumentShape)?;
+        if current_id == id {
+            return Ok(index);
+        }
+    }
+    Err(TimelineMarkerSerializationError::MarkerMissing)
+}
+
+fn sort_timeline_markers(markers: &mut [Value]) {
+    markers.sort_by(|left, right| {
+        let left_document = left.as_object();
+        let left_tick = left_document
+            .and_then(|object| object.get("tick"))
+            .and_then(Value::as_u64);
+        let left_id = left_document
+            .and_then(|object| object.get("id"))
+            .and_then(Value::as_str);
+        let right_document = right.as_object();
+        let right_tick = right_document
+            .and_then(|object| object.get("tick"))
+            .and_then(Value::as_u64);
+        let right_id = right_document
+            .and_then(|object| object.get("id"))
+            .and_then(Value::as_str);
+        left_tick
+            .cmp(&right_tick)
+            .then_with(|| left_id.cmp(&right_id))
+    });
 }
 
 fn apply_timeline_map_edit(
@@ -8445,6 +8753,15 @@ impl LoadedPlaybackProject {
         &self.tempo_events
     }
 
+    /// Returns durable navigation markers in canonical `(tick, id)` order.
+    ///
+    /// Markers carry no scheduled playback authority. They are project
+    /// metadata for deterministic locate and play-from-location commands.
+    #[must_use]
+    pub fn timeline_markers(&self) -> &[LoadedTimelineMarker] {
+        &self.timeline_markers
+    }
+
     #[must_use]
     pub fn track_count(&self) -> usize {
         self.tracks.len()
@@ -9224,6 +9541,7 @@ pub fn load(
             })
             .collect(),
         meter_events: loaded_meter_events(timeline_document.meter_events),
+        timeline_markers: loaded_timeline_markers(timeline_document.markers),
         tracks,
         clips,
         scenes,
@@ -9981,6 +10299,10 @@ const fn mixer_bus(bus: MixerBusDocument) -> MixerBus {
 
 fn project_contains_identity(project: &LoadedPlaybackProject, id: &str) -> bool {
     project.timeline_id == id
+        || project
+            .timeline_markers
+            .iter()
+            .any(|marker| marker.id == id)
         || project.tracks.iter().any(|track| track.id == id)
         || project.clips.iter().any(|clip| clip.id == id)
         || project.scenes.iter().any(|scene| scene.id == id)
@@ -10107,12 +10429,14 @@ fn validate_timeline_contract(document: &TimelineDocument) -> Result<(), LoadErr
     validate_contract_document(&document.id, None, &document.extensions, location)?;
     if !(1..=MAX_VERSION_1_TIMELINE_EVENTS).contains(&document.tempo_events.len())
         || !(1..=MAX_VERSION_1_TIMELINE_EVENTS).contains(&document.meter_events.len())
+        || document.markers.len() > MAX_VERSION_1_TIMELINE_EVENTS
     {
         return domain_error(
             location,
             "timeline event count is outside the version 1 schema domain",
         );
     }
+    validate_timeline_markers(&document.markers)?;
     Ok(())
 }
 
@@ -10135,6 +10459,45 @@ fn loaded_meter_events(documents: Vec<MeterEventDocument>) -> Vec<MeterEvent> {
             denominator: event.denominator,
         })
         .collect()
+}
+
+fn loaded_timeline_markers(documents: Vec<TimelineMarkerDocument>) -> Vec<LoadedTimelineMarker> {
+    documents
+        .into_iter()
+        .map(|marker| LoadedTimelineMarker {
+            id: marker.id,
+            tick: marker.tick,
+            name: marker.name,
+        })
+        .collect()
+}
+
+fn validate_timeline_markers(markers: &[TimelineMarkerDocument]) -> Result<(), LoadError> {
+    let location = DocumentLocation {
+        kind: DocumentKind::Timeline,
+        index: 0,
+    };
+    let mut previous = None;
+    for marker in markers {
+        validate_entity_reference(&marker.id, location)?;
+        let name_length = marker.name.chars().count();
+        if !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length) {
+            return domain_error(
+                location,
+                "timeline marker name is outside the version 1 schema domain",
+            );
+        }
+        if previous.is_some_and(|(tick, id): (u64, &str)| {
+            marker.tick < tick || (marker.tick == tick && marker.id.as_str() <= id)
+        }) {
+            return domain_error(
+                location,
+                "timeline markers must be ordered by tick and identifier",
+            );
+        }
+        previous = Some((marker.tick, marker.id.as_str()));
+    }
+    Ok(())
 }
 
 fn validate_meter_events(events: &[MeterEventDocument]) -> Result<(), LoadError> {
@@ -10341,6 +10704,9 @@ fn validate_track_hierarchy(tracks: &[LoadedTrack]) -> Result<(), LoadError> {
 fn validate_loaded_identities(project: &LoadedPlaybackProject) -> Result<(), LoadError> {
     let mut identities = BTreeSet::new();
     insert_identity(&mut identities, &project.timeline_id)?;
+    for marker in &project.timeline_markers {
+        insert_identity(&mut identities, &marker.id)?;
+    }
     for track in &project.tracks {
         insert_identity(&mut identities, &track.id)?;
     }
@@ -10386,6 +10752,12 @@ fn validate_asset_identities(
 ) -> Result<(), AdapterCompileError> {
     let mut identities = BTreeSet::new();
     identities.insert(project.timeline_id.as_str());
+    identities.extend(
+        project
+            .timeline_markers
+            .iter()
+            .map(|marker| marker.id.as_str()),
+    );
     identities.extend(project.tracks.iter().map(|track| track.id.as_str()));
     identities.extend(project.clips.iter().map(|clip| clip.id.as_str()));
     identities.extend(project.scenes.iter().map(|scene| scene.id.as_str()));
@@ -10968,6 +11340,8 @@ struct TimelineDocument {
     ticks_per_quarter: u64,
     tempo_events: Vec<TempoEventDocument>,
     meter_events: Vec<MeterEventDocument>,
+    #[serde(default)]
+    markers: Vec<TimelineMarkerDocument>,
     extensions: ExtensionsDocument,
 }
 
@@ -10984,6 +11358,14 @@ struct MeterEventDocument {
     tick: u64,
     numerator: u16,
     denominator: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimelineMarkerDocument {
+    id: String,
+    tick: u64,
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -19444,6 +19826,282 @@ mod tests {
                 "the map contract rejects invalid marker lifecycle requests: {rejected:?}"
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one lifecycle keeps legacy absence, canonical ordering, reversibility, and refusal boundaries together"
+    )]
+    fn timeline_marker_edits_are_ordered_reversible_and_legacy_safe() {
+        let tracks: [&[u8]; 0] = [];
+        let clips: [&[u8]; 0] = [];
+        let assets: [MediaAssetFact<'_>; 0] = [];
+        let source = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<serde_json::Value>(TIMELINE).unwrap(),
+        )
+        .unwrap();
+        let project = load(
+            input(&source, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(project.timeline_markers().is_empty());
+
+        let first_id = "018f47a2-6b2d-7c11-8a44-001122334470";
+        let added = serialize_timeline_marker_edit(
+            &project,
+            &assets,
+            &source,
+            LoaderLimits::VERSION_1,
+            &TimelineMarkerEdit::Add {
+                id: first_id.to_owned(),
+                tick: 1_920,
+                name: "Verse".to_owned(),
+            },
+        )
+        .unwrap();
+        let project = load(
+            input(&added, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(
+            project.timeline_markers(),
+            [LoadedTimelineMarker {
+                id: first_id.to_owned(),
+                tick: 1_920,
+                name: "Verse".to_owned(),
+            }]
+        );
+
+        let second_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let second_added = serialize_timeline_marker_edit(
+            &project,
+            &assets,
+            &added,
+            LoaderLimits::VERSION_1,
+            &TimelineMarkerEdit::Add {
+                id: second_id.to_owned(),
+                tick: 1_920,
+                name: "Verse".to_owned(),
+            },
+        )
+        .unwrap();
+        let project = load(
+            input(&second_added, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(
+            project
+                .timeline_markers()
+                .iter()
+                .map(LoadedTimelineMarker::id)
+                .collect::<Vec<_>>(),
+            [second_id, first_id]
+        );
+
+        let renamed = serialize_timeline_marker_edit(
+            &project,
+            &assets,
+            &second_added,
+            LoaderLimits::VERSION_1,
+            &TimelineMarkerEdit::Rename {
+                id: first_id.to_owned(),
+                name: "Chorus".to_owned(),
+            },
+        )
+        .unwrap();
+        let project = load(
+            input(&renamed, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(project.timeline_markers()[1].name(), "Chorus");
+
+        let moved = serialize_timeline_marker_edit(
+            &project,
+            &assets,
+            &renamed,
+            LoaderLimits::VERSION_1,
+            &TimelineMarkerEdit::Move {
+                id: first_id.to_owned(),
+                tick: 960,
+            },
+        )
+        .unwrap();
+        let project = load(
+            input(&moved, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(project.timeline_markers()[0].id(), first_id);
+        assert_eq!(project.timeline_markers()[0].tick(), 960);
+
+        assert!(matches!(
+            serialize_timeline_marker_edit(
+                &project,
+                &assets,
+                &moved,
+                LoaderLimits::VERSION_1,
+                &TimelineMarkerEdit::Move {
+                    id: first_id.to_owned(),
+                    tick: MAX_SAFE_INTEGER + 1,
+                },
+            ),
+            Err(TimelineMarkerSerializationError::InvalidMarkerTick)
+        ));
+
+        let one_removed = serialize_timeline_marker_edit(
+            &project,
+            &assets,
+            &moved,
+            LoaderLimits::VERSION_1,
+            &TimelineMarkerEdit::Remove {
+                id: first_id.to_owned(),
+            },
+        )
+        .unwrap();
+        let project = load(
+            input(&one_removed, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(project.timeline_markers()[0].id(), second_id);
+
+        let all_removed = serialize_timeline_marker_edit(
+            &project,
+            &assets,
+            &one_removed,
+            LoaderLimits::VERSION_1,
+            &TimelineMarkerEdit::Remove {
+                id: second_id.to_owned(),
+            },
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&all_removed).unwrap();
+        assert!(value.get("markers").is_none());
+        let project = load(
+            input(&all_removed, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(project.timeline_markers().is_empty());
+
+        assert!(matches!(
+            serialize_timeline_marker_edit(
+                &project,
+                &assets,
+                &all_removed,
+                LoaderLimits::VERSION_1,
+                &TimelineMarkerEdit::Add {
+                    id: "018f47a2-6b2d-7c11-8a44-001122334471".to_owned(),
+                    tick: 0,
+                    name: " Marker ".to_owned(),
+                },
+            ),
+            Err(TimelineMarkerSerializationError::InvalidMarkerName)
+        ));
+        assert!(matches!(
+            serialize_timeline_marker_edit(
+                &project,
+                &assets,
+                &all_removed,
+                LoaderLimits::VERSION_1,
+                &TimelineMarkerEdit::Add {
+                    id: "018f47a2-6b2d-7c11-8a44-001122334471".to_owned(),
+                    tick: MAX_SAFE_INTEGER + 1,
+                    name: "Marker".to_owned(),
+                },
+            ),
+            Err(TimelineMarkerSerializationError::InvalidMarkerTick)
+        ));
+        assert!(matches!(
+            serialize_timeline_marker_edit(
+                &project,
+                &assets,
+                &all_removed,
+                LoaderLimits::VERSION_1,
+                &TimelineMarkerEdit::Rename {
+                    id: first_id.to_owned(),
+                    name: "Marker".to_owned(),
+                },
+            ),
+            Err(TimelineMarkerSerializationError::MarkerMissing)
+        ));
+    }
+
+    #[test]
+    fn timeline_marker_loader_rejects_invalid_order_identity_and_safe_integer() {
+        let tracks: [&[u8]; 0] = [];
+        let clips: [&[u8]; 0] = [];
+        let mut value: serde_json::Value = serde_json::from_slice(TIMELINE).unwrap();
+        value["markers"] = serde_json::json!([
+            {
+                "id": "018f47a2-6b2d-7c11-8a44-001122334471",
+                "tick": 1920,
+                "name": "Later"
+            },
+            {
+                "id": "018f47a2-6b2d-7c11-8a44-001122334470",
+                "tick": 960,
+                "name": "Earlier"
+            }
+        ]);
+        let unsorted = serde_json_canonicalizer::to_vec(&value).unwrap();
+        assert!(
+            load(
+                input(&unsorted, &tracks, &clips, None),
+                LoaderLimits::VERSION_1,
+            )
+            .is_err()
+        );
+
+        value["markers"] = serde_json::json!([
+            {
+                "id": "018f47a2-6b2d-7c11-8a44-001122334470",
+                "tick": 960,
+                "name": "Earlier"
+            },
+            {
+                "id": "018f47a2-6b2d-7c11-8a44-001122334470",
+                "tick": 1920,
+                "name": "Later"
+            }
+        ]);
+        let duplicated = serde_json_canonicalizer::to_vec(&value).unwrap();
+        assert!(matches!(
+            load(
+                input(&duplicated, &tracks, &clips, None),
+                LoaderLimits::VERSION_1,
+            ),
+            Err(LoadError {
+                kind: LoadErrorKind::DuplicateEntityId,
+                ..
+            })
+        ));
+
+        value["markers"] = serde_json::json!([
+            {
+                "id": "018f47a2-6b2d-7c11-8a44-001122334470",
+                "tick": MAX_SAFE_INTEGER + 1,
+                "name": "Beyond JavaScript precision"
+            }
+        ]);
+        let unsafe_tick = serde_json_canonicalizer::to_vec(&value).unwrap();
+        let error = load(
+            input(&unsafe_tick, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            LoadErrorKind::Json {
+                rejection: JsonRejection::NonInteroperableInteger,
+                ..
+            }
+        ));
     }
 
     #[test]

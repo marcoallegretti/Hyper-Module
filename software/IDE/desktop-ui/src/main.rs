@@ -3,6 +3,7 @@
 use core::error::Error;
 use core::fmt;
 use std::cell::{Cell, RefCell};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,13 +27,14 @@ use hyper_desktop_ide::{
     IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeResourceRestoreError,
     IdeRoutingBusKind, IdeRunningObservation, IdeScaledLoudnessValue, IdeScene,
     IdeSceneAvailability, IdeSceneLaunchQuantization, IdeSceneLaunchState, IdeSceneSlotEdit,
-    IdeSceneTrackAction, IdeUnusedSampleCleanupSummary, IdeWorkerCommand, IdeWorkerCommandKind,
-    IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
-    IdeWorkerShutdownReport, LocateState, MAX_COMPRESSOR_ATTACK_MICROSECONDS,
-    MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS, MAX_COMPRESSOR_RATIO_MILLIONTHS,
-    MAX_COMPRESSOR_RELEASE_MICROSECONDS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
-    MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL,
-    MAX_IDE_SCENES, MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    IdeSceneTrackAction, IdeTimelineMarker, IdeTimelineMarkerEdit, IdeUnusedSampleCleanupSummary,
+    IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait,
+    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState,
+    MAX_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    MAX_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RELEASE_MICROSECONDS,
+    MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MAX_FILTER_CUTOFF_MILLIHERTZ,
+    MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL, MAX_IDE_SCENES,
+    MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
     MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
     MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MIN_FILTER_CUTOFF_MILLIHERTZ,
     MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, NativeFilterMode, OfflineExportRange,
@@ -50,7 +52,7 @@ use hyper_desktop_ide::{
     IdeAudioClipSourceTrimEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
     IdeAudioImportError, IdeAutomationTakeEditError, IdeSceneCreationError,
     IdeSceneDuplicationError, IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEditError,
-    IdeWorkerCommandFailure,
+    IdeTempoEditError, IdeWorkerCommandFailure,
 };
 #[cfg(test)]
 use hyper_mixer_runtime::PlaybackRecoverySnapshot;
@@ -1008,6 +1010,10 @@ fn bind_recording_callbacks(
     });
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the preview callbacks share one take-route authority and must be registered together"
+)]
 fn bind_audio_preview_callbacks(ui: &MainWindow, worker: &WorkerCell, take_routes: &TakeRoutes) {
     let actions = ui.global::<IdeActions>();
 
@@ -3229,6 +3235,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_tempo_callback(ui, worker);
     bind_meter_callback(ui, worker);
     bind_timeline_map_callbacks(ui, worker);
+    bind_timeline_marker_callbacks(ui, worker, project_state);
     bind_arrangement_scene_launch_locate_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_scene_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_removal_callback(ui, worker, project_state);
@@ -4878,7 +4885,8 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         | IdeWorkerCommandKind::SetArrangementLoopRange
         | IdeWorkerCommandKind::SetTempo
         | IdeWorkerCommandKind::SetMeter
-        | IdeWorkerCommandKind::EditTimelineMap => AppMode::Saving,
+        | IdeWorkerCommandKind::EditTimelineMap
+        | IdeWorkerCommandKind::EditTimelineMarker => AppMode::Saving,
         IdeWorkerCommandKind::AddAudioTrack => AppMode::AddingTrack,
         IdeWorkerCommandKind::AddRoutingBus => AppMode::AddingRoutingBus,
         IdeWorkerCommandKind::DuplicateAudioTrack => AppMode::DuplicatingTrack,
@@ -4940,14 +4948,15 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::RemoveScene => AppMode::RemovingScene,
         IdeWorkerCommandKind::DuplicateScene => AppMode::DuplicatingScene,
         IdeWorkerCommandKind::SetSceneActive => AppMode::ChangingSceneActivation,
-        IdeWorkerCommandKind::CreateAudioClipFromTake => AppMode::CreatingClip,
-        IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake => AppMode::CreatingClip,
+        IdeWorkerCommandKind::CreateAudioClipFromTake
+        | IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake => AppMode::CreatingClip,
         IdeWorkerCommandKind::StartRecording => AppMode::PreparingRecording,
         IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
             AppMode::FinalizingRecording
         }
-        IdeWorkerCommandKind::StartAudioPreview => AppMode::PreparingPreview,
-        IdeWorkerCommandKind::StartAudioClipPreview => AppMode::PreparingPreview,
+        IdeWorkerCommandKind::StartAudioPreview | IdeWorkerCommandKind::StartAudioClipPreview => {
+            AppMode::PreparingPreview
+        }
         _ => current,
     }
 }
@@ -4976,6 +4985,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::Seek => "Bounded transport locate queued…",
         IdeWorkerCommandKind::LocatePlacement => "Arrangement placement locate queued…",
         IdeWorkerCommandKind::LocateSceneLaunch => "Scene-marker locate queued…",
+        IdeWorkerCommandKind::LocateTimelineMarker => "Navigation-marker locate queued…",
         IdeWorkerCommandKind::Loudness => "Loudness measurement command queued…",
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
         IdeWorkerCommandKind::Monitoring => "Applying input cue control…",
@@ -5004,6 +5014,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::EditTimelineMap => {
             "Preserving mixer state, saving the timeline map, and reopening project..."
+        }
+        IdeWorkerCommandKind::EditTimelineMarker => {
+            "Preserving mixer state, saving the navigation marker, and reopening project..."
         }
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => {
             "Preserving mixer state, changing the marker scene, and reopening project..."
@@ -5673,6 +5686,7 @@ fn apply_event(
             ui.set_timeline_meter_add_visible(false);
             ui.set_timeline_meter_edit_visible(false);
             ui.set_timeline_meter_move_visible(false);
+            reset_timeline_marker_forms(ui);
             ui.set_status_text(format!("Timeline map saved in project revision {revision}").into());
             ui.set_error_text(SharedString::default());
         }
@@ -5682,6 +5696,28 @@ fn apply_event(
             ui.set_error_text(
                 format!("The timeline map was saved but the project may need attention: {warning}")
                     .into(),
+            );
+        }
+        IdeWorkerEvent::TimelineMarkerChanging => {
+            ui.set_status_text("Saving the navigation marker...".into());
+        }
+        IdeWorkerEvent::TimelineMarkerChanged { revision } => {
+            ui.set_app_mode(AppMode::Running);
+            reset_timeline_marker_forms(ui);
+            ui.set_status_text(
+                format!("Navigation marker saved in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::TimelineMarkerCommittedWithWarning { warning } => {
+            ui.set_app_mode(AppMode::Running);
+            reset_timeline_marker_forms(ui);
+            ui.set_status_text(SharedString::default());
+            ui.set_error_text(
+                format!(
+                    "The navigation marker was saved but the project may need attention: {warning}"
+                )
+                .into(),
             );
         }
         IdeWorkerEvent::ArrangementLoopRangeChanging => {
@@ -7386,16 +7422,24 @@ fn waveform_path_commands(waveform: &IdeAudioClipWaveform) -> String {
     if bins.is_empty() {
         return String::new();
     }
-    let bin_width = 128.0_f32 / bins.len() as f32;
+    let bin_count = u16::try_from(bins.len())
+        .expect("the application bounds one waveform observation to 128 bins");
+    let bin_width = 128.0_f32 / f32::from(bin_count);
     let mut commands = String::new();
     for (index, bin) in bins.iter().enumerate() {
-        let left = index as f32 * bin_width;
-        let right = (index as f32 + 0.78) * bin_width;
+        let index = f32::from(
+            u16::try_from(index)
+                .expect("the application bounds one waveform observation to 128 bins"),
+        );
+        let left = index * bin_width;
+        let right = (index + 0.78) * bin_width;
         let top = 1.0 - bin.maximum().clamp(-1.0, 1.0);
         let bottom = 1.0 - bin.minimum().clamp(-1.0, 1.0);
-        commands.push_str(&format!(
+        write!(
+            commands,
             "M {left} {top} L {right} {top} L {right} {bottom} L {left} {bottom} Z "
-        ));
+        )
+        .expect("writing SVG path commands to a String cannot fail");
     }
     commands
 }
@@ -8536,6 +8580,10 @@ fn set_native_devices(ui: &MainWindow, devices: &[IdeNativeDevice], channels: &[
     )))));
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the filter and compressor cases deliberately populate one complete device-row shape"
+)]
 fn native_device_rows(
     devices: &[IdeNativeDevice],
     channels: &[IdeMixerChannel],
@@ -9021,6 +9069,7 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_meter_available(false);
     ui.set_timeline_tempo_markers(ModelRc::default());
     ui.set_timeline_meter_markers(ModelRc::default());
+    ui.set_timeline_navigation_markers(ModelRc::default());
     ui.set_timeline_map_visible(false);
     ui.set_timeline_tempo_add_visible(false);
     ui.set_timeline_tempo_edit_visible(false);
@@ -9028,6 +9077,7 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_timeline_meter_add_visible(false);
     ui.set_timeline_meter_edit_visible(false);
     ui.set_timeline_meter_move_visible(false);
+    reset_timeline_marker_forms(ui);
     ui.set_timeline_map_tick(SharedString::default());
     ui.set_timeline_map_value(SharedString::default());
     ui.set_timeline_map_source_tick(SharedString::default());
@@ -9081,6 +9131,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         | IdeWorkerCommandKind::SetTempo
         | IdeWorkerCommandKind::SetMeter
         | IdeWorkerCommandKind::EditTimelineMap
+        | IdeWorkerCommandKind::EditTimelineMarker
             if current == AppMode::Saving =>
         {
             AppMode::Running
@@ -9246,10 +9297,8 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::SetSceneActive if current == AppMode::ChangingSceneActivation => {
             AppMode::Running
         }
-        IdeWorkerCommandKind::CreateAudioClipFromTake if current == AppMode::CreatingClip => {
-            AppMode::Running
-        }
-        IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake
+        IdeWorkerCommandKind::CreateAudioClipFromTake
+        | IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake
             if current == AppMode::CreatingClip =>
         {
             AppMode::Running
@@ -11505,9 +11554,11 @@ fn format_musical_position(timeline: &ProjectTimeline, frame: usize) -> String {
 /// the project does while the playhead moves every callback.
 #[derive(Clone, Debug, Default)]
 struct ProjectTimeline {
+    project_id: String,
     sample_rate_hz: u32,
     tempo_events: Vec<TempoEvent>,
     meter_events: Vec<MeterEvent>,
+    navigation_markers: Vec<IdeTimelineMarker>,
 }
 
 /// A typed time signature becomes a command only when the contract accepts it.
@@ -11598,6 +11649,10 @@ fn submit_timeline_map_edit(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the tempo and meter edit callbacks form one explicit timeline-map registration table"
+)]
 fn bind_timeline_map_callbacks(ui: &MainWindow, worker: &WorkerCell) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -11735,6 +11790,325 @@ fn bind_timeline_map_callbacks(ui: &MainWindow, worker: &WorkerCell) {
     });
 }
 
+fn normalize_timeline_marker_name(value: &str) -> Result<&str, &'static str> {
+    let name = value.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err("Navigation marker name must contain 1 to 120 characters");
+    }
+    Ok(name)
+}
+
+fn timeline_marker_form_is_current(
+    app_mode: AppMode,
+    visible: bool,
+    selected_marker_id: &str,
+    requested_marker_id: &str,
+) -> bool {
+    app_mode == AppMode::Running
+        && visible
+        && !selected_marker_id.is_empty()
+        && selected_marker_id == requested_marker_id
+}
+
+fn timeline_marker_locate_command(
+    app_mode: AppMode,
+    project_id: &str,
+    index: i32,
+    requested_marker_id: &str,
+    current_marker_id: Option<&str>,
+    play: bool,
+) -> Result<IdeWorkerCommand, &'static str> {
+    if app_mode != AppMode::Running || project_id.is_empty() {
+        return Err("Navigation-marker locate is unavailable in the current state");
+    }
+    let index = usize::try_from(index)
+        .map_err(|_| "The selected navigation marker is no longer available")?;
+    if current_marker_id != Some(requested_marker_id) {
+        return Err("The selected navigation marker is no longer available");
+    }
+    Ok(IdeWorkerCommand::LocateTimelineMarker {
+        project_id: project_id.to_owned(),
+        index,
+        marker_id: requested_marker_id.to_owned(),
+        state: if play {
+            LocateState::Rolling
+        } else {
+            LocateState::Preserve
+        },
+    })
+}
+
+fn bind_timeline_marker_callbacks(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    bind_timeline_marker_addition_callback(ui, worker);
+    bind_timeline_marker_rename_callback(ui, worker, project_state);
+    bind_timeline_marker_move_callback(ui, worker, project_state);
+    bind_timeline_marker_removal_callback(ui, worker, project_state);
+    bind_timeline_marker_locate_callback(ui, worker, project_state);
+}
+
+fn bind_timeline_marker_addition_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_addition = Rc::clone(worker);
+    actions.on_add_timeline_marker(move |tick, name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_timeline_marker_add_visible() {
+            ui.set_error_text("Navigation-marker request is no longer current".into());
+            return;
+        }
+        let tick = match timeline_tick(tick.as_str()) {
+            Ok(tick) => tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let name = match normalize_timeline_marker_name(name.as_str()) {
+            Ok(name) => name.to_owned(),
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_addition,
+            IdeWorkerCommand::EditTimelineMarker {
+                edit: IdeTimelineMarkerEdit::Add { tick, name },
+            },
+        );
+    });
+}
+
+fn bind_timeline_marker_rename_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_rename = Rc::clone(worker);
+    let timeline_for_rename = Rc::clone(project_state);
+    actions.on_rename_timeline_marker(move |marker_id, name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if !timeline_marker_form_is_current(
+            ui.get_app_mode(),
+            ui.get_timeline_marker_rename_visible(),
+            ui.get_timeline_marker_id().as_str(),
+            marker_id.as_str(),
+        ) {
+            ui.set_error_text("Navigation-marker rename request is no longer current".into());
+            return;
+        }
+        let Ok(source_tick) = timeline_tick(ui.get_timeline_marker_source_tick().as_str()) else {
+            ui.set_error_text("Navigation-marker rename request is no longer current".into());
+            return;
+        };
+        let name = match normalize_timeline_marker_name(name.as_str()) {
+            Ok(name) => name.to_owned(),
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let timeline = timeline_for_rename.timeline.borrow();
+        let Some(marker) = timeline
+            .navigation_markers
+            .iter()
+            .find(|marker| marker.id() == marker_id.as_str())
+        else {
+            ui.set_error_text("The selected navigation marker is no longer available".into());
+            return;
+        };
+        if marker.tick() != source_tick {
+            ui.set_error_text(
+                "The selected navigation marker has changed since it was opened".into(),
+            );
+            return;
+        }
+        if marker.name() == name {
+            ui.set_status_text("Navigation marker already uses that name".into());
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        drop(timeline);
+        submit_to_ui(
+            &ui,
+            &worker_for_rename,
+            IdeWorkerCommand::EditTimelineMarker {
+                edit: IdeTimelineMarkerEdit::Rename {
+                    marker_id: marker_id.to_string(),
+                    name,
+                },
+            },
+        );
+    });
+}
+
+fn bind_timeline_marker_move_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_move = Rc::clone(worker);
+    let timeline_for_move = Rc::clone(project_state);
+    actions.on_move_timeline_marker(move |marker_id, tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if !timeline_marker_form_is_current(
+            ui.get_app_mode(),
+            ui.get_timeline_marker_move_visible(),
+            ui.get_timeline_marker_id().as_str(),
+            marker_id.as_str(),
+        ) {
+            ui.set_error_text("Navigation-marker move request is no longer current".into());
+            return;
+        }
+        let Ok(source_tick) = timeline_tick(ui.get_timeline_marker_source_tick().as_str()) else {
+            ui.set_error_text("Navigation-marker move request is no longer current".into());
+            return;
+        };
+        let tick = match timeline_tick(tick.as_str()) {
+            Ok(tick) => tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let timeline = timeline_for_move.timeline.borrow();
+        let Some(marker) = timeline
+            .navigation_markers
+            .iter()
+            .find(|marker| marker.id() == marker_id.as_str())
+        else {
+            ui.set_error_text("The selected navigation marker is no longer available".into());
+            return;
+        };
+        if marker.tick() != source_tick {
+            ui.set_error_text(
+                "The selected navigation marker has changed since it was opened".into(),
+            );
+            return;
+        }
+        if marker.tick() == tick {
+            ui.set_status_text("Navigation marker already uses that project tick".into());
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        drop(timeline);
+        submit_to_ui(
+            &ui,
+            &worker_for_move,
+            IdeWorkerCommand::EditTimelineMarker {
+                edit: IdeTimelineMarkerEdit::Move {
+                    marker_id: marker_id.to_string(),
+                    tick,
+                },
+            },
+        );
+    });
+}
+
+fn bind_timeline_marker_removal_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_removal = Rc::clone(worker);
+    let timeline_for_removal = Rc::clone(project_state);
+    actions.on_remove_timeline_marker(move |marker_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || ui.get_timeline_marker_remove_confirming_id().as_str() != marker_id.as_str()
+        {
+            ui.set_error_text("Navigation-marker removal confirmation is no longer current".into());
+            return;
+        }
+        let timeline = timeline_for_removal.timeline.borrow();
+        if !timeline
+            .navigation_markers
+            .iter()
+            .any(|marker| marker.id() == marker_id.as_str())
+        {
+            ui.set_error_text("The selected navigation marker is no longer available".into());
+            return;
+        }
+        drop(timeline);
+        submit_to_ui(
+            &ui,
+            &worker_for_removal,
+            IdeWorkerCommand::EditTimelineMarker {
+                edit: IdeTimelineMarkerEdit::Remove {
+                    marker_id: marker_id.to_string(),
+                },
+            },
+        );
+    });
+}
+
+fn bind_timeline_marker_locate_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_locate = Rc::clone(worker);
+    let timeline_for_locate = Rc::clone(project_state);
+    actions.on_locate_timeline_marker(move |index, marker_id, play| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let timeline = timeline_for_locate.timeline.borrow();
+        let current_marker_id = usize::try_from(index)
+            .ok()
+            .and_then(|index| timeline.navigation_markers.get(index))
+            .map(IdeTimelineMarker::id);
+        let command = match timeline_marker_locate_command(
+            ui.get_app_mode(),
+            timeline.project_id.as_str(),
+            index,
+            marker_id.as_str(),
+            current_marker_id,
+            play,
+        ) {
+            Ok(command) => command,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        drop(timeline);
+        submit_to_ui(&ui, &worker_for_locate, command);
+    });
+}
+
+fn reset_timeline_marker_forms(ui: &MainWindow) {
+    ui.set_timeline_marker_add_visible(false);
+    ui.set_timeline_marker_rename_visible(false);
+    ui.set_timeline_marker_move_visible(false);
+    ui.set_timeline_marker_id(SharedString::default());
+    ui.set_timeline_marker_source_tick(SharedString::default());
+    ui.set_timeline_marker_tick(SharedString::default());
+    ui.set_timeline_marker_name(SharedString::default());
+    ui.set_timeline_marker_remove_confirming_id(SharedString::default());
+}
+
 /// Saving the project writes the loop range alongside the mixer, because the
 /// loop plan publishes both in one transaction. Marking a loop point is session
 /// state and must never close the audio device on its own.
@@ -11779,9 +12153,11 @@ fn set_tempo_and_loop(
     observation: &IdeRunningObservation,
 ) {
     *project_state.timeline.borrow_mut() = ProjectTimeline {
+        project_id: observation.project_id().to_owned(),
         sample_rate_hz: observation.sample_rate_hz(),
         tempo_events: observation.tempo_events().to_vec(),
         meter_events: observation.meter_events().to_vec(),
+        navigation_markers: observation.timeline_markers().to_vec(),
     };
     let timeline = project_state.timeline.borrow();
     ui.set_timeline_tempo_markers(ModelRc::from(Rc::new(VecModel::from(
@@ -11789,6 +12165,9 @@ fn set_tempo_and_loop(
     ))));
     ui.set_timeline_meter_markers(ModelRc::from(Rc::new(VecModel::from(
         timeline_meter_marker_rows(&timeline),
+    ))));
+    ui.set_timeline_navigation_markers(ModelRc::from(Rc::new(VecModel::from(
+        timeline_navigation_marker_rows(&timeline),
     ))));
     drop(timeline);
     let editable = tempo_editable(
@@ -11853,6 +12232,21 @@ fn timeline_meter_marker_rows(timeline: &ProjectTimeline) -> Vec<TimelineMeterMa
             position: timeline_marker_position(&timeline.meter_events, event.tick),
             signature: format_meter(event.numerator, event.denominator).into(),
             origin: event.tick == 0,
+        })
+        .collect()
+}
+
+fn timeline_navigation_marker_rows(timeline: &ProjectTimeline) -> Vec<TimelineNavigationMarkerRow> {
+    timeline
+        .navigation_markers
+        .iter()
+        .enumerate()
+        .map(|(index, marker)| TimelineNavigationMarkerRow {
+            index: i32::try_from(index).unwrap_or(-1),
+            id: marker.id().into(),
+            tick: marker.tick().to_string().into(),
+            position: timeline_marker_position(&timeline.meter_events, marker.tick()),
+            name: marker.name().into(),
         })
         .collect()
 }
@@ -15250,6 +15644,7 @@ mod tests {
                 numerator: 4,
                 denominator: 4,
             }],
+            ..ProjectTimeline::default()
         };
         assert_eq!(format_musical_position(&timeline, 0), "1|1|000");
         assert_eq!(
@@ -15319,6 +15714,174 @@ mod tests {
     }
 
     #[test]
+    fn navigation_marker_controls_preserve_current_identity_and_transport_intent() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::EditTimelineMarker,
+            ),
+            AppMode::Saving
+        );
+        assert_eq!(
+            mode_after_failure(AppMode::Saving, IdeWorkerCommandKind::EditTimelineMarker),
+            AppMode::Running
+        );
+        assert_eq!(
+            command_status(IdeWorkerCommandKind::EditTimelineMarker),
+            "Preserving mixer state, saving the navigation marker, and reopening project..."
+        );
+        assert_eq!(
+            command_status(IdeWorkerCommandKind::LocateTimelineMarker),
+            "Navigation-marker locate queued…"
+        );
+        assert_eq!(normalize_timeline_marker_name("  Opening  "), Ok("Opening"));
+        assert!(normalize_timeline_marker_name(" ").is_err());
+        assert!(normalize_timeline_marker_name(&"x".repeat(121)).is_err());
+        assert!(timeline_marker_form_is_current(
+            AppMode::Running,
+            true,
+            "marker-a",
+            "marker-a"
+        ));
+        assert!(!timeline_marker_form_is_current(
+            AppMode::Saving,
+            true,
+            "marker-a",
+            "marker-a"
+        ));
+
+        let locate = timeline_marker_locate_command(
+            AppMode::Running,
+            "project-a",
+            2,
+            "marker-a",
+            Some("marker-a"),
+            false,
+        )
+        .expect("the current marker must locate without starting playback");
+        assert!(matches!(
+            locate,
+            IdeWorkerCommand::LocateTimelineMarker {
+                project_id,
+                index: 2,
+                marker_id,
+                state: LocateState::Preserve,
+            } if project_id == "project-a" && marker_id == "marker-a"
+        ));
+        assert!(matches!(
+            timeline_marker_locate_command(
+                AppMode::Running,
+                "project-a",
+                2,
+                "marker-a",
+                Some("marker-a"),
+                true,
+            ),
+            Ok(IdeWorkerCommand::LocateTimelineMarker {
+                state: LocateState::Rolling,
+                ..
+            })
+        ));
+        assert!(
+            timeline_marker_locate_command(
+                AppMode::Running,
+                "project-a",
+                2,
+                "marker-a",
+                Some("other-marker"),
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            timeline_marker_locate_command(
+                AppMode::Running,
+                "project-a",
+                -1,
+                "marker-a",
+                Some("marker-a"),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn committed_navigation_marker_warning_revokes_all_marker_form_state() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Saving);
+        ui.set_timeline_marker_add_visible(true);
+        ui.set_timeline_marker_rename_visible(true);
+        ui.set_timeline_marker_move_visible(true);
+        ui.set_timeline_marker_id("marker-a".into());
+        ui.set_timeline_marker_source_tick("1920".into());
+        ui.set_timeline_marker_tick("3840".into());
+        ui.set_timeline_marker_name("Verse".into());
+        ui.set_timeline_marker_remove_confirming_id("marker-a".into());
+
+        apply_event(
+            &ui,
+            &UiRoutes::default(),
+            &Rc::new(ProjectUiState::default()),
+            IdeWorkerEvent::TimelineMarkerCommittedWithWarning {
+                warning: Box::new(IdeTempoEditError::TimelineResourceMissing),
+            },
+        );
+
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(!ui.get_timeline_marker_add_visible());
+        assert!(!ui.get_timeline_marker_rename_visible());
+        assert!(!ui.get_timeline_marker_move_visible());
+        assert!(ui.get_timeline_marker_id().is_empty());
+        assert!(ui.get_timeline_marker_source_tick().is_empty());
+        assert!(ui.get_timeline_marker_tick().is_empty());
+        assert!(ui.get_timeline_marker_name().is_empty());
+        assert!(ui.get_timeline_marker_remove_confirming_id().is_empty());
+        assert!(ui.get_status_text().is_empty());
+        assert!(ui.get_error_text().contains("navigation marker was saved"));
+    }
+
+    #[test]
+    fn navigation_marker_removal_confirmation_closes_timeline_map_forms() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_timeline_map_visible(true);
+        ui.set_timeline_navigation_markers(ModelRc::from(Rc::new(VecModel::from(vec![
+            TimelineNavigationMarkerRow {
+                index: 0,
+                id: "marker-a".into(),
+                tick: "1920".into(),
+                position: "1|2|000".into(),
+                name: "Verse".into(),
+            },
+        ]))));
+        ui.set_timeline_tempo_add_visible(true);
+        ui.set_timeline_tempo_edit_visible(true);
+        ui.set_timeline_tempo_move_visible(true);
+        ui.set_timeline_meter_add_visible(true);
+        ui.set_timeline_meter_edit_visible(true);
+        ui.set_timeline_meter_move_visible(true);
+        ui.show().unwrap();
+
+        let remove = ElementHandle::find_by_accessible_label(&ui, "Remove navigation marker Verse")
+            .next()
+            .expect("the rendered navigation marker exposes removal");
+        assert_eq!(remove.accessible_enabled(), Some(true));
+        remove.mock_single_click(PointerEventButton::Left);
+
+        assert!(!ui.get_timeline_tempo_add_visible());
+        assert!(!ui.get_timeline_tempo_edit_visible());
+        assert!(!ui.get_timeline_tempo_move_visible());
+        assert!(!ui.get_timeline_meter_add_visible());
+        assert!(!ui.get_timeline_meter_edit_visible());
+        assert!(!ui.get_timeline_meter_move_visible());
+        assert_eq!(ui.get_timeline_marker_remove_confirming_id(), "marker-a");
+        ui.hide().unwrap();
+    }
+
+    #[test]
     fn timeline_marker_rows_show_the_stored_maps_in_musical_order() {
         let timeline = ProjectTimeline {
             sample_rate_hz: 48_000,
@@ -15344,6 +15907,7 @@ mod tests {
                     denominator: 4,
                 },
             ],
+            ..ProjectTimeline::default()
         };
         let tempos = timeline_tempo_marker_rows(&timeline);
         assert_eq!(tempos.len(), 2);
@@ -15935,6 +16499,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one authoritative mixer model exercises related removal, rename, and mode transitions"
+    )]
     fn audio_track_removal_requires_authoritative_rows() {
         let track_a = "018f47a2-6b2d-7c11-8a44-001122334456";
         let track_b = "018f47a2-6b2d-7c11-8a44-001122334457";
