@@ -104,9 +104,10 @@ use hyper_playback_json::{
     AudioTrackContentRemovalDocuments, AudioTrackContentRemovalSerializationError,
     AudioTrackContentRemovalSource, AudioTrackDocumentSerializationError,
     AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
-    AudioTrackFreezeDocuments, AudioTrackFreezeSerializationError, AudioTrackRemovalBlockers,
-    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
-    AudioTrackUnfreezeDocuments, AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
+    AudioTrackFreezeDeviceChain, AudioTrackFreezeDocuments, AudioTrackFreezeSerializationError,
+    AudioTrackRemovalBlockers, AudioTrackRemovalSerializationError,
+    AudioTrackRenameSerializationError, AudioTrackUnfreezeDocuments,
+    AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
     AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
     AutomationTargetSelection, CompiledMixerDestination, CompiledMixerGraph, CompiledMixerTap,
     CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact,
@@ -3089,6 +3090,7 @@ pub enum IdeAudioTrackFreezeError {
     ClipResourceRoleMismatch,
     ArrangementResourceMissing,
     ArrangementResourceAmbiguous,
+    DeviceChainResourceMissing,
     DeviceChainAmbiguous,
     CapacityUnavailable,
     Render(Box<OfflineExportError>),
@@ -3154,6 +3156,9 @@ impl fmt::Display for IdeAudioTrackFreezeError {
             Self::ArrangementResourceAmbiguous => {
                 formatter.write_str("the project has multiple arrangement resources")
             }
+            Self::DeviceChainResourceMissing => {
+                formatter.write_str("the selected track device chain is unavailable")
+            }
             Self::DeviceChainAmbiguous => formatter.write_str(
                 "the selected track has multiple native device chains and cannot be frozen safely",
             ),
@@ -3216,6 +3221,7 @@ impl Error for IdeAudioTrackFreezeError {
             | Self::ClipResourceRoleMismatch
             | Self::ArrangementResourceMissing
             | Self::ArrangementResourceAmbiguous
+            | Self::DeviceChainResourceMissing
             | Self::DeviceChainAmbiguous
             | Self::CapacityUnavailable
             | Self::NativeClose(_) => None,
@@ -9421,6 +9427,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub mixer_channel_ids: [&'a str; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_names: [&'a str; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_kinds: [IdeMixerChannelKind; MAX_IDE_MIXER_CHANNELS],
+    pub mixer_channel_frozen: [bool; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_active: [bool; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_destinations: [IdeMixerPrimaryDestination<'a>; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_states: [Option<IdeMixerChannelState>; MAX_IDE_MIXER_CHANNELS],
@@ -10232,7 +10239,23 @@ impl RunningDesktopIdeApplication {
             .device_chains()
             .iter()
             .filter(|chain| chain.track_id() == track_id);
-        let device_chain_id = chains.next().map(|chain| chain.id().to_owned());
+        let device_chain = if let Some(chain) = chains.next() {
+            let descriptor = package
+                .manifest()
+                .resources()
+                .iter()
+                .find(|descriptor| descriptor.id() == chain.id())
+                .ok_or(IdeAudioTrackFreezeError::DeviceChainResourceMissing)?;
+            if descriptor.role() != ResourceRole::DeviceChain {
+                return Err(IdeAudioTrackFreezeError::DeviceChainResourceMissing);
+            }
+            Some(AudioTrackFreezeDeviceChain::new(
+                chain.id(),
+                descriptor.sha256(),
+            ))
+        } else {
+            None
+        };
         if chains.next().is_some() {
             return Err(IdeAudioTrackFreezeError::DeviceChainAmbiguous);
         }
@@ -10274,7 +10297,7 @@ impl RunningDesktopIdeApplication {
             &frozen_placement_id,
             &freeze_state_id,
             frozen_clip_name,
-            device_chain_id,
+            device_chain,
             application.config.project_limits.session.documents,
         )
         .map_err(IdeAudioTrackFreezeError::Serialization)?;
@@ -14247,6 +14270,7 @@ impl RunningDesktopIdeApplication {
         let mut mixer_channel_ids = [""; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_names = [""; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_kinds = [IdeMixerChannelKind::Audio; MAX_IDE_MIXER_CHANNELS];
+        let mut mixer_channel_frozen = [false; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_active = [false; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_destinations =
             [IdeMixerPrimaryDestination::Main; MAX_IDE_MIXER_CHANNELS];
@@ -14272,6 +14296,10 @@ impl RunningDesktopIdeApplication {
                 CompiledMixerTrackKind::Group => IdeMixerChannelKind::Group,
                 CompiledMixerTrackKind::Return => IdeMixerChannelKind::Return,
             };
+            mixer_channel_frozen[channel_index] = project
+                .freeze_states()
+                .iter()
+                .any(|state| state.track_id() == slot.track_id());
             mixer_channel_destinations[channel_index] = match slot.destination() {
                 CompiledMixerDestination::Main => IdeMixerPrimaryDestination::Main,
                 CompiledMixerDestination::Slot(target) => {
@@ -14339,6 +14367,7 @@ impl RunningDesktopIdeApplication {
             mixer_channel_ids,
             mixer_channel_names,
             mixer_channel_kinds,
+            mixer_channel_frozen,
             mixer_channel_active,
             mixer_channel_destinations,
             mixer_channel_states,

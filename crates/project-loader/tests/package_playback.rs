@@ -719,12 +719,21 @@ fn binds_one_native_device_chain_to_its_compiled_mixer_route() {
 fn freeze_state_bypasses_the_rendered_tracks_native_device_chain() {
     let fixture = Fixture::new();
     fixture.add_sample_asset();
+    let device_chain_document = device_chain(DEVICE_CHAIN_ID, TRACK_ID, NATIVE_DEVICE_ID);
     fixture.add_resource(
         DEVICE_CHAIN_ID,
         "device-chain",
         "devices/audio.json",
-        &device_chain(DEVICE_CHAIN_ID, TRACK_ID, NATIVE_DEVICE_ID),
+        &device_chain_document,
     );
+    let device_chain_sha256 = fixture.manifest()["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["id"] == DEVICE_CHAIN_ID)
+        .and_then(|resource| resource["sha256"].as_str())
+        .unwrap()
+        .to_owned();
     let original_clip: Value =
         serde_json::from_slice(&fs::read(fixture.root.join("clips/clip.json")).unwrap()).unwrap();
     fixture.replace_resource(
@@ -748,7 +757,7 @@ fn freeze_state_bypasses_the_rendered_tracks_native_device_chain() {
         FREEZE_STATE_ID,
         "freeze-state",
         "freezes/audio.json",
-        &json!({"format":"hyper-track-freeze-state","format_version":3,"id":FREEZE_STATE_ID,"project_id":PROJECT_ID,"track_id":TRACK_ID,"frozen_clip_id":FROZEN_CLIP_ID,"frozen_asset_id":SECOND_ASSET_ID,"frozen_clip":{"document":frozen_clip.clone()},"arrangement_id":ARRANGEMENT_ID,"frozen_placement_id":FROZEN_PLACEMENT_ID,"original_clips":[{"document":original_clip}],"original_placements":[{"document":{"id":PLACEMENT_ID,"track_id":TRACK_ID,"clip_id":CLIP_ID,"start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":DEVICE_CHAIN_ID,"extensions":{}}),
+        &json!({"format":"hyper-track-freeze-state","format_version":4,"id":FREEZE_STATE_ID,"project_id":PROJECT_ID,"track_id":TRACK_ID,"frozen_clip_id":FROZEN_CLIP_ID,"frozen_asset_id":SECOND_ASSET_ID,"frozen_clip":{"document":frozen_clip.clone()},"arrangement_id":ARRANGEMENT_ID,"frozen_placement_id":FROZEN_PLACEMENT_ID,"frozen_placement":{"document":{"id":FROZEN_PLACEMENT_ID,"track_id":TRACK_ID,"clip_id":FROZEN_CLIP_ID,"start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}},"original_clips":[{"document":original_clip}],"original_placements":[{"document":{"id":PLACEMENT_ID,"track_id":TRACK_ID,"clip_id":CLIP_ID,"start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":DEVICE_CHAIN_ID,"device_chain_sha256":device_chain_sha256,"extensions":{}}),
     );
 
     let mut project_limits = limits();
@@ -757,6 +766,7 @@ fn freeze_state_bypasses_the_rendered_tracks_native_device_chain() {
     let prepared = prepare_project_playback(&fixture.root, project_limits).unwrap();
     assert!(prepared.device_chains().is_empty());
     assert_eq!(prepared.freeze_states().len(), 1);
+    assert!(prepared.unused_sample_assets().next().is_none());
     let mut altered_state: Value =
         serde_json::from_slice(&fs::read(fixture.root.join("freezes/audio.json")).unwrap())
             .unwrap();

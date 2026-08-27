@@ -9,8 +9,80 @@ use std::error::Error;
 use std::fmt;
 
 const FORMAT: &str = "hyper-track-freeze-state";
-const FORMAT_VERSION: u8 = 3;
+const FORMAT_VERSION: u8 = 4;
+const LEGACY_FORMAT_VERSION: u8 = 3;
 const MAX_DOCUMENT_BYTES: usize = 1_048_576;
+
+/// The current manifest-declared documents that make one freeze reversible.
+///
+/// Callers must provide canonical JSON document bytes and sample-asset
+/// identities from the same verified package.  The optional device-chain
+/// digest is the manifest digest for the chain retained by the freeze.
+#[derive(Clone, Copy, Debug)]
+pub struct ActiveTrackFreezeAuthority<'a> {
+    project_id: &'a str,
+    track_document: &'a [u8],
+    frozen_clip_document: &'a [u8],
+    arrangement_document: &'a [u8],
+    sample_asset_ids: &'a [&'a str],
+    device_chain_sha256: Option<&'a str>,
+}
+
+impl<'a> ActiveTrackFreezeAuthority<'a> {
+    #[must_use]
+    pub const fn new(
+        project_id: &'a str,
+        track_document: &'a [u8],
+        frozen_clip_document: &'a [u8],
+        arrangement_document: &'a [u8],
+        sample_asset_ids: &'a [&'a str],
+        device_chain_sha256: Option<&'a str>,
+    ) -> Self {
+        Self {
+            project_id,
+            track_document,
+            frozen_clip_document,
+            arrangement_document,
+            sample_asset_ids,
+            device_chain_sha256,
+        }
+    }
+}
+
+/// The exact manifest identity retained for one bypassed native-device chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenDeviceChainAuthority {
+    id: String,
+    sha256: String,
+}
+
+impl FrozenDeviceChainAuthority {
+    /// Creates one validated device-chain identity and canonical SHA-256
+    /// digest pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain rejection if either value cannot identify one
+    /// manifest-declared device-chain resource.
+    pub fn try_new(id: String, sha256: String) -> Result<Self, TrackFreezeStateError> {
+        if !is_valid_entity_id(&id) || !is_canonical_sha256(&sha256) {
+            return Err(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an invalid device-chain authority",
+            ));
+        }
+        Ok(Self { id, sha256 })
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
 
 /// One complete arrangement placement displaced by a rendered freeze clip.
 ///
@@ -288,6 +360,7 @@ impl FrozenClipState {
 /// Complete durable authority needed to unfreeze one rendered audio track.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrackFreezeState {
+    format_version: u8,
     id: String,
     project_id: String,
     track_id: String,
@@ -296,14 +369,16 @@ pub struct TrackFreezeState {
     frozen_clip: FrozenClipState,
     arrangement_id: String,
     frozen_placement_id: String,
+    frozen_placement: Option<FrozenPlacementState>,
     original_clips: Vec<FrozenClipState>,
     original_placements: Vec<FrozenPlacementState>,
     device_chain_id: Option<String>,
+    device_chain_sha256: Option<String>,
     extensions: BTreeMap<String, serde_json::Value>,
 }
 
 impl TrackFreezeState {
-    /// Creates one validated version-3 freeze authority.
+    /// Creates one validated version-4 freeze authority.
     ///
     /// # Errors
     ///
@@ -322,9 +397,10 @@ impl TrackFreezeState {
         frozen_clip: FrozenClipState,
         arrangement_id: String,
         frozen_placement_id: String,
+        frozen_placement: FrozenPlacementState,
         original_clips: Vec<FrozenClipState>,
         original_placements: Vec<FrozenPlacementState>,
-        device_chain_id: Option<String>,
+        device_chain: Option<FrozenDeviceChainAuthority>,
     ) -> Result<Self, TrackFreezeStateError> {
         validate(RawTrackFreezeState {
             format: FORMAT.to_owned(),
@@ -339,6 +415,9 @@ impl TrackFreezeState {
             },
             arrangement_id,
             frozen_placement_id,
+            frozen_placement: Some(RawFrozenPlacementState {
+                document: frozen_placement.document,
+            }),
             original_clips: original_clips
                 .into_iter()
                 .map(|clip| RawFrozenClipState {
@@ -351,7 +430,8 @@ impl TrackFreezeState {
                     document: placement.document,
                 })
                 .collect(),
-            device_chain_id,
+            device_chain_id: device_chain.as_ref().map(|authority| authority.id.clone()),
+            device_chain_sha256: device_chain.map(|authority| authority.sha256),
             extensions: BTreeMap::new(),
         })
     }
@@ -369,6 +449,10 @@ impl TrackFreezeState {
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
+    }
+    #[must_use]
+    pub const fn format_version(&self) -> u8 {
+        self.format_version
     }
     #[must_use]
     pub fn project_id(&self) -> &str {
@@ -399,6 +483,10 @@ impl TrackFreezeState {
         &self.frozen_placement_id
     }
     #[must_use]
+    pub fn frozen_placement(&self) -> Option<&FrozenPlacementState> {
+        self.frozen_placement.as_ref()
+    }
+    #[must_use]
     pub fn original_clips(&self) -> &[FrozenClipState] {
         &self.original_clips
     }
@@ -409,6 +497,16 @@ impl TrackFreezeState {
     #[must_use]
     pub fn device_chain_id(&self) -> Option<&str> {
         self.device_chain_id.as_deref()
+    }
+    #[must_use]
+    pub fn device_chain_sha256(&self) -> Option<&str> {
+        self.device_chain_sha256.as_deref()
+    }
+    /// Returns whether this state records every current rendered authority
+    /// needed to keep a frozen track immutable before unfreeze.
+    #[must_use]
+    pub const fn has_complete_rendered_authority(&self) -> bool {
+        self.format_version == FORMAT_VERSION
     }
     #[must_use]
     pub const fn extensions(&self) -> &BTreeMap<String, serde_json::Value> {
@@ -423,7 +521,7 @@ impl TrackFreezeState {
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json_canonicalizer::to_vec(&CanonicalTrackFreezeState {
             format: FORMAT,
-            format_version: FORMAT_VERSION,
+            format_version: self.format_version,
             id: &self.id,
             project_id: &self.project_id,
             track_id: &self.track_id,
@@ -432,9 +530,11 @@ impl TrackFreezeState {
             frozen_clip: &self.frozen_clip,
             arrangement_id: &self.arrangement_id,
             frozen_placement_id: &self.frozen_placement_id,
+            frozen_placement: self.frozen_placement.as_ref(),
             original_clips: &self.original_clips,
             original_placements: &self.original_placements,
             device_chain_id: self.device_chain_id.as_deref(),
+            device_chain_sha256: self.device_chain_sha256.as_deref(),
             extensions: &self.extensions,
         })
     }
@@ -483,10 +583,14 @@ struct RawTrackFreezeState {
     frozen_clip: RawFrozenClipState,
     arrangement_id: String,
     frozen_placement_id: String,
+    #[serde(default)]
+    frozen_placement: Option<RawFrozenPlacementState>,
     original_clips: Vec<RawFrozenClipState>,
     original_placements: Vec<RawFrozenPlacementState>,
     #[serde(default)]
     device_chain_id: Option<String>,
+    #[serde(default)]
+    device_chain_sha256: Option<String>,
     extensions: BTreeMap<String, serde_json::Value>,
 }
 
@@ -514,10 +618,14 @@ struct CanonicalTrackFreezeState<'a> {
     frozen_clip: &'a FrozenClipState,
     arrangement_id: &'a str,
     frozen_placement_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frozen_placement: Option<&'a FrozenPlacementState>,
     original_clips: &'a [FrozenClipState],
     original_placements: &'a [FrozenPlacementState],
     #[serde(skip_serializing_if = "Option::is_none")]
     device_chain_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_chain_sha256: Option<&'a str>,
     extensions: &'a BTreeMap<String, serde_json::Value>,
 }
 
@@ -526,7 +634,8 @@ struct CanonicalTrackFreezeState<'a> {
     reason = "the one persistence boundary validates every cross-resource identity before exposing reversible authority"
 )]
 fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeStateError> {
-    if raw.format != FORMAT || raw.format_version != FORMAT_VERSION {
+    if raw.format != FORMAT || !matches!(raw.format_version, LEGACY_FORMAT_VERSION | FORMAT_VERSION)
+    {
         return Err(TrackFreezeStateError::InvalidDomain(
             "track freeze state format is unsupported",
         ));
@@ -554,11 +663,22 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
             "track freeze state identities must be distinct",
         ));
     }
-    if let Some(device_chain_id) = &raw.device_chain_id
-        && (!is_valid_entity_id(device_chain_id) || !unique.insert(device_chain_id.clone()))
-    {
+    let device_chain_is_valid = match (
+        raw.device_chain_id.as_deref(),
+        raw.device_chain_sha256.as_deref(),
+    ) {
+        (None, None) => true,
+        (Some(id), Some(sha256)) => {
+            is_valid_entity_id(id) && is_canonical_sha256(sha256) && unique.insert(id.to_owned())
+        }
+        (Some(id), None) if raw.format_version == LEGACY_FORMAT_VERSION => {
+            is_valid_entity_id(id) && unique.insert(id.to_owned())
+        }
+        _ => false,
+    };
+    if !device_chain_is_valid {
         return Err(TrackFreezeStateError::InvalidDomain(
-            "track freeze state has an invalid device-chain identity",
+            "track freeze state has an invalid device-chain authority",
         ));
     }
     let frozen_clip = FrozenClipState::try_new(raw.frozen_clip.document)?;
@@ -571,6 +691,58 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
             "track freeze state has an invalid rendered clip",
         ));
     }
+    let frozen_placement = match (raw.format_version, raw.frozen_placement) {
+        (FORMAT_VERSION, Some(raw_placement)) => {
+            let placement = FrozenPlacementState::try_new(raw_placement.document)?;
+            let frozen_duration = frozen_clip
+                .document()
+                .get("duration_ticks")
+                .and_then(serde_json::Value::as_u64);
+            if placement.id() != raw.frozen_placement_id
+                || placement
+                    .document()
+                    .get("track_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(raw.track_id.as_str())
+                || placement
+                    .document()
+                    .get("clip_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(raw.frozen_clip_id.as_str())
+                || placement
+                    .document()
+                    .get("start_tick")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(0)
+                || placement
+                    .document()
+                    .get("clip_start_tick")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(0)
+                || placement
+                    .document()
+                    .get("duration_ticks")
+                    .and_then(serde_json::Value::as_u64)
+                    != frozen_duration
+                || placement
+                    .document()
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            {
+                return Err(TrackFreezeStateError::InvalidDomain(
+                    "track freeze state has an invalid rendered placement",
+                ));
+            }
+            Some(placement)
+        }
+        (LEGACY_FORMAT_VERSION, None) => None,
+        _ => {
+            return Err(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an invalid rendered placement authority",
+            ));
+        }
+    };
     if raw.original_clips.is_empty() {
         return Err(TrackFreezeStateError::InvalidDomain(
             "track freeze state has no displaced clips",
@@ -630,6 +802,7 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
         original_placements.push(placement);
     }
     Ok(TrackFreezeState {
+        format_version: raw.format_version,
         id: raw.id,
         project_id: raw.project_id,
         track_id: raw.track_id,
@@ -638,11 +811,180 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
         frozen_clip,
         arrangement_id: raw.arrangement_id,
         frozen_placement_id: raw.frozen_placement_id,
+        frozen_placement,
         original_clips,
         original_placements,
         device_chain_id: raw.device_chain_id,
+        device_chain_sha256: raw.device_chain_sha256,
         extensions: raw.extensions,
     })
+}
+
+/// Verifies that the active project graph still represents exactly one
+/// reversible rendered freeze.
+///
+/// The caller owns package-level role, descriptor-identity, and duplicate-state
+/// checks.  This function owns the freeze record's current track, rendered
+/// clip, rendered placement, retained sample, and bypassed device-chain
+/// authority.
+///
+/// # Errors
+///
+/// Returns a domain rejection if an active document is noncanonical or if any
+/// retained freeze authority differs from the current project graph.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the reversible freeze contract compares the complete current track, rendered clip, placement, assets, and device-chain authority together"
+)]
+pub fn validate_active_track_freeze_authority(
+    state: &TrackFreezeState,
+    authority: ActiveTrackFreezeAuthority<'_>,
+) -> Result<(), TrackFreezeStateError> {
+    if state.project_id() != authority.project_id {
+        return Err(TrackFreezeStateError::InvalidDomain(
+            "track freeze state project authority is inconsistent",
+        ));
+    }
+    let track = parse_canonical_active_document(
+        authority.track_document,
+        "active frozen track is not canonical JSON",
+    )?;
+    let arrangement = parse_canonical_active_document(
+        authority.arrangement_document,
+        "active frozen arrangement is not canonical JSON",
+    )?;
+    let retained_frozen_clip = serde_json_canonicalizer::to_vec(state.frozen_clip().document())
+        .map_err(|_| {
+            TrackFreezeStateError::InvalidDomain(
+                "track freeze state rendered clip cannot be canonicalized",
+            )
+        })?;
+    if retained_frozen_clip != authority.frozen_clip_document {
+        return Err(TrackFreezeStateError::InvalidDomain(
+            "track freeze state rendered clip authority differs from the active clip",
+        ));
+    }
+    if track.get("id").and_then(serde_json::Value::as_str) != Some(state.track_id())
+        || track.get("project_id").and_then(serde_json::Value::as_str) != Some(state.project_id())
+        || track.get("kind").and_then(serde_json::Value::as_str) != Some("audio")
+        || track
+            .get("clip_ids")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|ids| ids.len() != 1 || ids[0].as_str() != Some(state.frozen_clip_id()))
+    {
+        return Err(TrackFreezeStateError::InvalidDomain(
+            "active frozen track no longer contains exactly its rendered clip",
+        ));
+    }
+    if arrangement.get("id").and_then(serde_json::Value::as_str) != Some(state.arrangement_id())
+        || arrangement
+            .get("project_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(state.project_id())
+    {
+        return Err(TrackFreezeStateError::InvalidDomain(
+            "active frozen arrangement identity is inconsistent",
+        ));
+    }
+    let target = arrangement
+        .get("placements")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(TrackFreezeStateError::InvalidDomain(
+            "active frozen arrangement has no placement collection",
+        ))?
+        .iter()
+        .filter(|placement| {
+            placement
+                .get("track_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(state.track_id())
+        })
+        .collect::<Vec<_>>();
+    let frozen_duration = state
+        .frozen_clip()
+        .document()
+        .get("duration_ticks")
+        .and_then(serde_json::Value::as_u64);
+    if target.len() != 1
+        || target[0].get("id").and_then(serde_json::Value::as_str)
+            != Some(state.frozen_placement_id())
+        || target[0].get("clip_id").and_then(serde_json::Value::as_str)
+            != Some(state.frozen_clip_id())
+        || target[0]
+            .get("start_tick")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+        || target[0]
+            .get("clip_start_tick")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+        || target[0]
+            .get("duration_ticks")
+            .and_then(serde_json::Value::as_u64)
+            != frozen_duration
+        || target[0]
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || state
+            .frozen_placement()
+            .is_some_and(|retained| target[0] != retained.document())
+    {
+        return Err(TrackFreezeStateError::InvalidDomain(
+            "active frozen arrangement no longer contains its rendered placement",
+        ));
+    }
+    if !authority
+        .sample_asset_ids
+        .iter()
+        .any(|id| *id == state.frozen_asset_id())
+        || state.original_clips().iter().any(|clip| {
+            !authority
+                .sample_asset_ids
+                .iter()
+                .any(|id| *id == clip.asset_id())
+        })
+    {
+        return Err(TrackFreezeStateError::InvalidDomain(
+            "track freeze state retains a missing sample asset",
+        ));
+    }
+    match (
+        state.device_chain_id(),
+        state.device_chain_sha256(),
+        authority.device_chain_sha256,
+    ) {
+        (None, None, None) => {}
+        (Some(_), Some(expected), Some(active)) if expected == active => {}
+        (Some(_), None, Some(_)) if state.format_version() == LEGACY_FORMAT_VERSION => {}
+        _ => {
+            return Err(TrackFreezeStateError::InvalidDomain(
+                "track freeze state device-chain authority differs from the active project",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_canonical_active_document(
+    bytes: &[u8],
+    message: &'static str,
+) -> Result<serde_json::Value, TrackFreezeStateError> {
+    let document: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| TrackFreezeStateError::InvalidDomain(message))?;
+    let canonical = serde_json_canonicalizer::to_vec(&document)
+        .map_err(|_| TrackFreezeStateError::InvalidDomain(message))?;
+    if canonical != bytes {
+        return Err(TrackFreezeStateError::InvalidDomain(message));
+    }
+    Ok(document)
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 #[cfg(test)]
@@ -654,11 +996,31 @@ mod tests {
 
     fn state_bytes() -> Vec<u8> {
         let mut state: Value = serde_json::from_slice(STATE).unwrap();
-        state["format_version"] = 3.into();
+        state["format_version"] = 4.into();
         let mut frozen = state["original_clips"][0]["document"].clone();
         frozen["id"] = "018f47a2-6b2d-7c11-8a44-001122337603".into();
         frozen["source"]["asset_id"] = "018f47a2-6b2d-7c11-8a44-001122337604".into();
         state["frozen_clip"] = serde_json::json!({"document": frozen});
+        state["frozen_placement"] = serde_json::json!({"document": {
+            "id":"018f47a2-6b2d-7c11-8a44-001122337606",
+            "track_id":"018f47a2-6b2d-7c11-8a44-001122337602",
+            "clip_id":"018f47a2-6b2d-7c11-8a44-001122337603",
+            "start_tick":0,
+            "clip_start_tick":0,
+            "duration_ticks":4,
+            "enabled":true
+        }});
+        state["device_chain_sha256"] = Value::String(
+            "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        );
+        serde_json_canonicalizer::to_vec(&state).unwrap()
+    }
+
+    fn legacy_state_bytes() -> Vec<u8> {
+        let mut state: Value = serde_json::from_slice(&state_bytes()).unwrap();
+        state["format_version"] = 3.into();
+        state.as_object_mut().unwrap().remove("frozen_placement");
+        state.as_object_mut().unwrap().remove("device_chain_sha256");
         serde_json_canonicalizer::to_vec(&state).unwrap()
     }
 
@@ -672,6 +1034,18 @@ mod tests {
             4
         );
         assert!(state.device_chain_id().is_some());
+        assert!(state.frozen_placement().is_some());
+        assert!(state.has_complete_rendered_authority());
+        let round_trip = TrackFreezeState::parse(&state.to_canonical_bytes().unwrap()).unwrap();
+        assert_eq!(state, round_trip);
+    }
+
+    #[test]
+    fn retains_legacy_freeze_states_only_for_safe_reading_and_unfreeze() {
+        let state = TrackFreezeState::parse(&legacy_state_bytes()).unwrap();
+        assert_eq!(state.format_version(), 3);
+        assert!(state.frozen_placement().is_none());
+        assert!(!state.has_complete_rendered_authority());
         let round_trip = TrackFreezeState::parse(&state.to_canonical_bytes().unwrap()).unwrap();
         assert_eq!(state, round_trip);
     }
@@ -691,7 +1065,7 @@ mod tests {
     #[test]
     fn refuses_the_nonreversible_version_one_schema() {
         let state = String::from_utf8(state_bytes()).unwrap();
-        let legacy = state.replace("\"format_version\":3", "\"format_version\":1");
+        let legacy = state.replace("\"format_version\":4", "\"format_version\":1");
         assert!(matches!(
             TrackFreezeState::parse(legacy.as_bytes()),
             Err(TrackFreezeStateError::InvalidDomain(_))

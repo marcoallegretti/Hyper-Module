@@ -5,6 +5,7 @@ use std::path::Path;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 use hyper_project_model::{AssetRole, ProjectManifest, ResourceRole, is_valid_entity_id};
+use hyper_track_freeze::TrackFreezeState;
 use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -480,6 +481,31 @@ fn validate_request(
                 )
             })?;
         referenced.insert(asset_id.to_owned());
+    }
+    for descriptor in verified
+        .manifest()
+        .resources()
+        .iter()
+        .filter(|resource| resource.role() == ResourceRole::FreezeState)
+    {
+        let bytes = verified.read_resource(descriptor.id()).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "read track-freeze state while classifying sample cleanup",
+                error,
+            )
+        })?;
+        require_canonical(&bytes, "track-freeze state used for sample cleanup")?;
+        let state = TrackFreezeState::parse(&bytes).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "parse track-freeze state while classifying sample cleanup",
+                error,
+            )
+        })?;
+        for original in state.original_clips() {
+            referenced.insert(original.asset_id().to_owned());
+        }
     }
     let mut selected = verified
         .manifest()

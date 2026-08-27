@@ -46,7 +46,8 @@ use hyper_playback_compiler::{
 };
 use hyper_project_model::{is_valid_entity_id, is_valid_extension_key};
 use hyper_track_freeze::{
-    FrozenClipState, FrozenPlacementState, TrackFreezeState, TrackFreezeStateError,
+    FrozenClipState, FrozenDeviceChainAuthority, FrozenPlacementState, TrackFreezeState,
+    TrackFreezeStateError,
 };
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -694,6 +695,24 @@ pub struct AudioTrackFreezeDocuments {
     frozen_clip_id: String,
     frozen_asset_id: String,
     freeze_state_id: String,
+}
+
+/// The manifest identity retained for a source track's bypassed device chain.
+///
+/// A freeze never edits this chain. Its digest lets the durable package
+/// boundary prove that the chain remains exactly the state rendered by the
+/// freeze until unfreeze reactivates it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioTrackFreezeDeviceChain<'a> {
+    id: &'a str,
+    sha256: &'a str,
+}
+
+impl<'a> AudioTrackFreezeDeviceChain<'a> {
+    #[must_use]
+    pub const fn new(id: &'a str, sha256: &'a str) -> Self {
+        Self { id, sha256 }
+    }
 }
 
 /// One retained source clip restored by a reversible audio-track unfreeze.
@@ -3947,7 +3966,7 @@ pub fn serialize_audio_track_freeze(
     frozen_placement_id: &str,
     freeze_state_id: &str,
     frozen_clip_name: &str,
-    device_chain_id: Option<String>,
+    device_chain: Option<AudioTrackFreezeDeviceChain<'_>>,
     limits: LoaderLimits,
 ) -> Result<AudioTrackFreezeDocuments, AudioTrackFreezeSerializationError> {
     if !project.is_audio_track(track_id) {
@@ -4119,7 +4138,8 @@ pub fn serialize_audio_track_freeze(
             true
         }
     });
-    placements.push(json!({"id": frozen_placement_id, "track_id": track_id, "clip_id": frozen_clip_id, "start_tick": 0, "clip_start_tick": 0, "duration_ticks": added.duration_ticks, "enabled": true}));
+    let frozen_placement_document = json!({"id": frozen_placement_id, "track_id": track_id, "clip_id": frozen_clip_id, "start_tick": 0, "clip_start_tick": 0, "duration_ticks": added.duration_ticks, "enabled": true});
+    placements.push(frozen_placement_document.clone());
     placements
         .sort_unstable_by(|left, right| placement_sort_key(left).cmp(&placement_sort_key(right)));
     let arrangement_bytes = serde_json_canonicalizer::to_vec(&arrangement_value)
@@ -4147,6 +4167,14 @@ pub fn serialize_audio_track_freeze(
             .map_err(AudioTrackFreezeSerializationError::Serialization)?,
     )
     .map_err(AudioTrackFreezeSerializationError::State)?;
+    let frozen_placement_state = FrozenPlacementState::try_new(frozen_placement_document)
+        .map_err(AudioTrackFreezeSerializationError::State)?;
+    let device_chain = device_chain
+        .map(|chain| {
+            FrozenDeviceChainAuthority::try_new(chain.id.to_owned(), chain.sha256.to_owned())
+        })
+        .transpose()
+        .map_err(AudioTrackFreezeSerializationError::State)?;
     let state = TrackFreezeState::try_new(
         freeze_state_id.to_owned(),
         project.project_id().to_owned(),
@@ -4156,9 +4184,10 @@ pub fn serialize_audio_track_freeze(
         frozen_clip_state,
         arrangement.id.clone(),
         frozen_placement_id.to_owned(),
+        frozen_placement_state,
         original_clips,
         states,
-        device_chain_id,
+        device_chain,
     )
     .map_err(AudioTrackFreezeSerializationError::State)?;
     let freeze_state = state
@@ -4302,6 +4331,21 @@ pub fn serialize_audio_track_unfreeze(
         || !frozen_placement.enabled
     {
         return Err(AudioTrackUnfreezeSerializationError::FrozenStateMismatch);
+    }
+    if let Some(retained_placement) = state.frozen_placement() {
+        let active_arrangement: Value = serde_json::from_slice(source_arrangement)
+            .map_err(AudioTrackUnfreezeSerializationError::Serialization)?;
+        let active_placement = active_arrangement
+            .get("placements")
+            .and_then(Value::as_array)
+            .and_then(|placements| {
+                placements.iter().find(|placement| {
+                    placement.get("id").and_then(Value::as_str) == Some(state.frozen_placement_id())
+                })
+            });
+        if active_placement != Some(retained_placement.document()) {
+            return Err(AudioTrackUnfreezeSerializationError::FrozenStateMismatch);
+        }
     }
     if state
         .original_clips()
@@ -19622,6 +19666,7 @@ mod tests {
             documents.frozen_clip_id()
         );
         let state = TrackFreezeState::parse(documents.freeze_state()).unwrap();
+        assert!(state.has_complete_rendered_authority());
         assert_eq!(
             state.original_clips()[0].id(),
             "018f47a2-6b2d-7c11-8a44-001122334460"
@@ -19629,6 +19674,10 @@ mod tests {
         assert_eq!(
             state.original_placements()[0].document()["clip_id"],
             "018f47a2-6b2d-7c11-8a44-001122334460"
+        );
+        assert_eq!(
+            state.frozen_placement().unwrap().document()["clip_id"],
+            documents.frozen_clip_id()
         );
     }
 

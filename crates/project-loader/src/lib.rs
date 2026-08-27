@@ -30,7 +30,10 @@ use hyper_storage_engine::{
     StructurallyVerifiedProject, verify_project_package_with_limits,
 };
 use hyper_strict_json::StrictJsonError;
-use hyper_track_freeze::{TrackFreezeState, TrackFreezeStateError};
+use hyper_track_freeze::{
+    ActiveTrackFreezeAuthority, FrozenClipState, TrackFreezeState, TrackFreezeStateError,
+    validate_active_track_freeze_authority,
+};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,17 +129,25 @@ impl PreparedProjectPlayback {
         &self.freeze_states
     }
 
-    /// Returns verified project-owned sample assets that no reusable audio
-    /// clip references. Recording assets are deliberately outside this
-    /// cleanup domain because they carry independent provenance metadata.
+    /// Returns verified project-owned sample assets that neither reusable
+    /// audio clips nor retained track-freeze sources reference. Recording
+    /// assets are deliberately outside this cleanup domain because they carry
+    /// independent provenance metadata.
     pub fn unused_sample_assets(&self) -> impl Iterator<Item = &AssetDescriptor> {
         let loaded = self.session.parts().0;
+        let retained_freeze_source_assets = self
+            .freeze_states
+            .iter()
+            .flat_map(TrackFreezeState::original_clips)
+            .map(FrozenClipState::asset_id)
+            .collect::<BTreeSet<_>>();
         self.package
             .manifest()
             .assets()
             .iter()
             .filter(move |asset| {
                 asset.role() == AssetRole::Sample
+                    && !retained_freeze_source_assets.contains(asset.id())
                     && !(0..loaded.clip_count())
                         .any(|clip_index| loaded.clip_asset_id_at(clip_index) == Some(asset.id()))
             })
@@ -1243,6 +1254,10 @@ fn read_freeze_states(
     Ok(documents)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one explicit boundary validates each retained freeze authority against its parsed playback and package resources"
+)]
 fn validate_freeze_state_inventory(
     package: &StructurallyVerifiedProject,
     states: &[CapturedFreezeState],
@@ -1250,6 +1265,26 @@ fn validate_freeze_state_inventory(
 ) -> Result<(), ProjectPlaybackError> {
     let mut tracks = BTreeSet::new();
     let descriptors = package.manifest().resources();
+    if !states.is_empty()
+        && descriptors
+            .iter()
+            .any(|descriptor| descriptor.role() == ResourceRole::Scene)
+    {
+        let resource_id = states[0].descriptor_id.clone();
+        return Err(ProjectPlaybackError::FreezeState {
+            resource_id,
+            source: TrackFreezeStateError::InvalidDomain(
+                "a project with a rendered track freeze cannot declare interactive scenes",
+            ),
+        });
+    }
+    let sample_asset_ids = package
+        .manifest()
+        .assets()
+        .iter()
+        .filter(|asset| asset.role() == AssetRole::Sample)
+        .map(AssetDescriptor::id)
+        .collect::<Vec<_>>();
     for state in states {
         let document = &state.document;
         let fail = |message| ProjectPlaybackError::FreezeState {
@@ -1276,6 +1311,7 @@ fn validate_freeze_state_inventory(
             return Err(fail("freeze-state clip does not belong to its track"));
         }
         for (id, role) in [
+            (document.track_id(), ResourceRole::Track),
             (document.frozen_clip_id(), ResourceRole::Clip),
             (document.arrangement_id(), ResourceRole::Arrangement),
         ] {
@@ -1286,48 +1322,48 @@ fn validate_freeze_state_inventory(
                 return Err(fail("freeze-state references a missing resource"));
             }
         }
-        let frozen_clip = package.read_resource(document.frozen_clip_id())?;
-        let retained_frozen_clip =
-            serde_json_canonicalizer::to_vec(document.frozen_clip().document()).map_err(|_| {
-                ProjectPlaybackError::FreezeState {
-                    resource_id: state.descriptor_id.clone(),
-                    source: TrackFreezeStateError::InvalidDomain(
-                        "freeze-state rendered clip cannot be canonicalized",
-                    ),
-                }
-            })?;
-        if frozen_clip != retained_frozen_clip {
-            return Err(fail(
-                "freeze-state rendered clip authority differs from the active clip",
-            ));
-        }
-        if !package.manifest().assets().iter().any(|asset| {
-            asset.id() == document.frozen_asset_id() && asset.role() == AssetRole::Sample
-        }) {
-            return Err(fail("freeze-state references a missing rendered sample"));
-        }
         if document.original_clips().iter().any(|clip| {
             clip.track_id() != document.track_id()
-                || descriptors.iter().any(|descriptor| {
-                    descriptor.id() == clip.id() && descriptor.role() == ResourceRole::Clip
-                })
-                || !package
-                    .manifest()
-                    .assets()
+                || descriptors
                     .iter()
-                    .any(|asset| asset.id() == clip.asset_id() && asset.role() == AssetRole::Sample)
+                    .any(|descriptor| descriptor.id() == clip.id())
         }) {
             return Err(fail(
                 "freeze-state has inconsistent original clip authority",
             ));
         }
-        if let Some(chain_id) = document.device_chain_id()
-            && !descriptors.iter().any(|descriptor| {
-                descriptor.id() == chain_id && descriptor.role() == ResourceRole::DeviceChain
-            })
-        {
-            return Err(fail("freeze-state references a missing device chain"));
-        }
+        let device_chain_sha256 = if let Some(chain_id) = document.device_chain_id() {
+            Some(
+                descriptors
+                    .iter()
+                    .find(|descriptor| {
+                        descriptor.id() == chain_id
+                            && descriptor.role() == ResourceRole::DeviceChain
+                    })
+                    .map(ResourceDescriptor::sha256)
+                    .ok_or_else(|| fail("freeze-state references a missing device chain"))?,
+            )
+        } else {
+            None
+        };
+        let track = package.read_resource(document.track_id())?;
+        let frozen_clip = package.read_resource(document.frozen_clip_id())?;
+        let arrangement = package.read_resource(document.arrangement_id())?;
+        validate_active_track_freeze_authority(
+            document,
+            ActiveTrackFreezeAuthority::new(
+                package.manifest().project_id(),
+                &track,
+                &frozen_clip,
+                &arrangement,
+                &sample_asset_ids,
+                device_chain_sha256,
+            ),
+        )
+        .map_err(|source| ProjectPlaybackError::FreezeState {
+            resource_id: state.descriptor_id.clone(),
+            source,
+        })?;
     }
     Ok(())
 }

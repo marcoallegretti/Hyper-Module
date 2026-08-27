@@ -96,7 +96,12 @@ use std::sync::Arc;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
-use hyper_project_model::{AssetDescriptor, ProjectManifest, ResourceDescriptor};
+use hyper_project_model::{
+    AssetDescriptor, AssetRole, ProjectManifest, ResourceDescriptor, ResourceRole,
+};
+use hyper_track_freeze::{
+    ActiveTrackFreezeAuthority, TrackFreezeState, validate_active_track_freeze_authority,
+};
 use same_file::Handle;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -632,6 +637,7 @@ pub(crate) fn verify_project_candidate(
     let initial_files = collect_owned_tree(root, &policy)?;
     require_managed_tree(&initial_files, &policy)?;
     verify_records(root_dir, &manifest)?;
+    validate_freeze_state_inventory(root_dir, &manifest, true)?;
     let final_files = collect_owned_tree(root, &policy)?;
     if initial_files != final_files {
         return Err(rejection(
@@ -660,6 +666,7 @@ pub(crate) fn verify_retained_project_candidate(
     let initial_files = collect_owned_tree_retained(root_dir, &policy)?;
     require_managed_tree(&initial_files, &policy)?;
     verify_records(root_dir, &manifest)?;
+    validate_freeze_state_inventory(root_dir, &manifest, false)?;
     let final_files = collect_owned_tree_retained(root_dir, &policy)?;
     if initial_files != final_files {
         return Err(rejection(
@@ -750,21 +757,7 @@ fn preflight_manifest(
 
 fn verify_records(root: &Dir, manifest: &ProjectManifest) -> Result<(), StorageError> {
     for descriptor in manifest.resources() {
-        let verified = verify_open_stable(
-            open_declared_file(root, descriptor.path())?,
-            descriptor.path(),
-            descriptor.byte_length(),
-            decode_sha256(descriptor.sha256(), descriptor.path())?,
-            true,
-        )?;
-        let bytes = verified.bytes.ok_or_else(|| {
-            rejection(
-                StorageErrorKind::Io,
-                descriptor.path(),
-                "verified resource bytes are unavailable",
-            )
-        })?;
-        assert_canonical_json(&bytes, descriptor.path())?;
+        read_verified_resource(root, descriptor)?;
     }
     for descriptor in manifest.assets() {
         verify_open_stable(
@@ -776,6 +769,174 @@ fn verify_records(root: &Dir, manifest: &ProjectManifest) -> Result<(), StorageE
         )?;
     }
     Ok(())
+}
+
+fn read_verified_resource(
+    root: &Dir,
+    descriptor: &ResourceDescriptor,
+) -> Result<Vec<u8>, StorageError> {
+    let verified = verify_open_stable(
+        open_declared_file(root, descriptor.path())?,
+        descriptor.path(),
+        descriptor.byte_length(),
+        decode_sha256(descriptor.sha256(), descriptor.path())?,
+        true,
+    )?;
+    let bytes = verified.bytes.ok_or_else(|| {
+        rejection(
+            StorageErrorKind::Io,
+            descriptor.path(),
+            "verified resource bytes are unavailable",
+        )
+    })?;
+    assert_canonical_json(&bytes, descriptor.path())?;
+    Ok(bytes)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "each freeze state must be checked against its current track, clip, arrangement, retained assets, and optional device chain before a manifest can become active"
+)]
+fn validate_freeze_state_inventory(
+    root: &Dir,
+    manifest: &ProjectManifest,
+    require_complete_authority: bool,
+) -> Result<(), StorageError> {
+    let freeze_states = manifest
+        .resources()
+        .iter()
+        .filter(|descriptor| descriptor.role() == ResourceRole::FreezeState)
+        .collect::<Vec<_>>();
+    if freeze_states.is_empty() {
+        return Ok(());
+    }
+    if manifest
+        .resources()
+        .iter()
+        .any(|descriptor| descriptor.role() == ResourceRole::Scene)
+    {
+        return Err(freeze_authority_rejection(
+            MANIFEST_NAME,
+            "a project with a rendered track freeze cannot declare interactive scenes",
+        ));
+    }
+    let sample_asset_ids = manifest
+        .assets()
+        .iter()
+        .filter(|asset| asset.role() == AssetRole::Sample)
+        .map(AssetDescriptor::id)
+        .collect::<Vec<_>>();
+    let mut frozen_tracks = BTreeSet::new();
+    for descriptor in freeze_states {
+        let state_bytes = read_verified_resource(root, descriptor)?;
+        let state = TrackFreezeState::parse(&state_bytes).map_err(|source| StorageError {
+            kind: StorageErrorKind::ManifestInvalid,
+            path: descriptor.path().to_owned(),
+            message: "track-freeze state resource is invalid".to_owned(),
+            limit: None,
+            source: Some(Box::new(source)),
+        })?;
+        if require_complete_authority && !state.has_complete_rendered_authority() {
+            return Err(freeze_authority_rejection(
+                descriptor.path(),
+                "legacy track-freeze authority must be unfrozen and rendered again before another project mutation",
+            ));
+        }
+        if state.id() != descriptor.id()
+            || state.project_id() != manifest.project_id()
+            || !frozen_tracks.insert(state.track_id().to_owned())
+        {
+            return Err(freeze_authority_rejection(
+                descriptor.path(),
+                "track-freeze state identity is inconsistent",
+            ));
+        }
+        if manifest.resources().iter().any(|candidate| {
+            state
+                .original_clips()
+                .iter()
+                .any(|clip| candidate.id() == clip.id())
+        }) {
+            return Err(freeze_authority_rejection(
+                descriptor.path(),
+                "track-freeze state original clip identity remains active",
+            ));
+        }
+        let track = required_freeze_resource(
+            manifest,
+            state.track_id(),
+            ResourceRole::Track,
+            descriptor.path(),
+        )?;
+        let frozen_clip = required_freeze_resource(
+            manifest,
+            state.frozen_clip_id(),
+            ResourceRole::Clip,
+            descriptor.path(),
+        )?;
+        let arrangement = required_freeze_resource(
+            manifest,
+            state.arrangement_id(),
+            ResourceRole::Arrangement,
+            descriptor.path(),
+        )?;
+        let device_chain_sha256 = match state.device_chain_id() {
+            Some(id) => Some(
+                required_freeze_resource(
+                    manifest,
+                    id,
+                    ResourceRole::DeviceChain,
+                    descriptor.path(),
+                )?
+                .sha256(),
+            ),
+            None => None,
+        };
+        let track_bytes = read_verified_resource(root, track)?;
+        let frozen_clip_bytes = read_verified_resource(root, frozen_clip)?;
+        let arrangement_bytes = read_verified_resource(root, arrangement)?;
+        validate_active_track_freeze_authority(
+            &state,
+            ActiveTrackFreezeAuthority::new(
+                manifest.project_id(),
+                &track_bytes,
+                &frozen_clip_bytes,
+                &arrangement_bytes,
+                &sample_asset_ids,
+                device_chain_sha256,
+            ),
+        )
+        .map_err(|source| StorageError {
+            kind: StorageErrorKind::ManifestInvalid,
+            path: descriptor.path().to_owned(),
+            message: "track-freeze authority differs from the candidate project".to_owned(),
+            limit: None,
+            source: Some(Box::new(source)),
+        })?;
+    }
+    Ok(())
+}
+
+fn required_freeze_resource<'a>(
+    manifest: &'a ProjectManifest,
+    id: &str,
+    role: ResourceRole,
+    state_path: &str,
+) -> Result<&'a ResourceDescriptor, StorageError> {
+    manifest
+        .resources()
+        .iter()
+        .find(|descriptor| descriptor.id() == id && descriptor.role() == role)
+        .ok_or_else(|| {
+            freeze_authority_rejection(
+                state_path,
+                "track-freeze state references a missing or mismatched resource",
+            )
+        })
+}
+
+fn freeze_authority_rejection(path: &str, message: &str) -> StorageError {
+    rejection(StorageErrorKind::ManifestInvalid, path, message)
 }
 
 fn assert_canonical_json(bytes: &[u8], path: &str) -> Result<(), StorageError> {

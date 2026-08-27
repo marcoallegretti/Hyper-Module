@@ -589,6 +589,33 @@ fn resolve_entries<'a>(
             "track-freeze state does not match its publication documents",
         ));
     }
+    if !state.has_complete_rendered_authority() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "new track freezes must retain complete rendered authority",
+        ));
+    }
+    if let Some(chain_id) = state.device_chain_id() {
+        let descriptor = verified
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| {
+                descriptor.id() == chain_id && descriptor.role() == ResourceRole::DeviceChain
+            })
+            .ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::InvalidResource,
+                    "track-freeze state references a missing device chain",
+                )
+            })?;
+        if state.device_chain_sha256() != Some(descriptor.sha256()) {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-freeze device-chain authority differs from the active project",
+            ));
+        }
+    }
     let frozen_state_clip = serde_json_canonicalizer::to_vec(state.frozen_clip().document())
         .map_err(|error| {
             caused(
@@ -1338,6 +1365,9 @@ fn validate_freeze_document_delta(
         || candidate_target[0]["start_tick"].as_u64() != Some(0)
         || candidate_target[0]["clip_start_tick"].as_u64() != Some(0)
         || candidate_target[0]["enabled"].as_bool() != Some(true)
+        || state
+            .frozen_placement()
+            .is_none_or(|retained| &candidate_target[0] != retained.document())
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
@@ -1464,9 +1494,21 @@ fn validate_unfreeze_document_delta(
         .iter()
         .filter(|placement| placement["track_id"].as_str() == Some(state.track_id()))
         .collect::<Vec<_>>();
+    let frozen_duration = state
+        .frozen_clip()
+        .document()
+        .get("duration_ticks")
+        .and_then(Value::as_u64);
     if active_track_placements.len() != 1
         || active_track_placements[0]["id"].as_str() != Some(state.frozen_placement_id())
         || active_track_placements[0]["clip_id"].as_str() != Some(state.frozen_clip_id())
+        || active_track_placements[0]["start_tick"].as_u64() != Some(0)
+        || active_track_placements[0]["clip_start_tick"].as_u64() != Some(0)
+        || active_track_placements[0]["duration_ticks"].as_u64() != frozen_duration
+        || active_track_placements[0]["enabled"].as_bool() != Some(true)
+        || state
+            .frozen_placement()
+            .is_some_and(|retained| active_track_placements[0] != retained.document())
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::ProjectChanged,
@@ -4043,13 +4085,16 @@ fn clear_transaction(transaction: &Dir) -> Result<(), ProjectResourcePublication
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{recover_project_transactions, verify_project_package};
+    use crate::{
+        ProjectResourcePublicationRequest, SampleCleanupRequest, clean_unused_samples,
+        publish_project_resource, recover_project_transactions, verify_project_package,
+    };
     use hyper_audio_source::{DecodedAudio, encode_float_wav};
     use hyper_playback_json::{
-        LoaderLimits, MediaAssetFact, PlaybackJsonInput, load, serialize_audio_track_freeze,
-        serialize_audio_track_unfreeze,
+        AudioTrackFreezeDeviceChain, LoaderLimits, MediaAssetFact, PlaybackJsonInput, load,
+        serialize_audio_track_freeze, serialize_audio_track_unfreeze,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4065,6 +4110,8 @@ mod tests {
     const FROZEN_CLIP_ID: &str = "018f47a2-6b2d-7c11-8a44-001122339009";
     const FROZEN_PLACEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122339010";
     const FREEZE_STATE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122339011";
+    const DEVICE_CHAIN_ID: &str = "018f47a2-6b2d-7c11-8a44-001122339012";
+    const DEVICE_INSTANCE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122339013";
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
     struct Fixture {
@@ -4073,6 +4120,7 @@ mod tests {
         track: Vec<u8>,
         clip: Vec<u8>,
         arrangement: Vec<u8>,
+        chain: Vec<u8>,
         sample: Vec<u8>,
     }
 
@@ -4088,6 +4136,7 @@ mod tests {
                 "tracks",
                 "clips",
                 "arrangement",
+                "devices",
                 "assets/samples",
             ] {
                 fs::create_dir_all(root.join(directory)).unwrap();
@@ -4121,10 +4170,20 @@ mod tests {
                     "clip_id":SOURCE_CLIP_ID,"start_tick":0,"clip_start_tick":0,"duration_ticks":2,"enabled":true}],
                 "scene_launches":[],"extensions":{}
             }));
+            let chain = canonical(json!({
+                "format":"hyper-device-chain","format_version":1,"id":DEVICE_CHAIN_ID,
+                "project_id":PROJECT_ID,"track_id":TRACK_ID,"devices":[{
+                    "id":DEVICE_INSTANCE_ID,"device_id":"org.hyper-module.native-filter",
+                    "state_version":1,"dsp_version":1,"enabled":true,
+                    "state":{"mode":"low-pass","cutoff_millihertz":1_000_000,"resonance_millionths":707_107},
+                    "extensions":{}
+                }],"extensions":{}
+            }));
             fs::write(root.join("timeline/timeline.json"), &timeline).unwrap();
             fs::write(root.join("tracks/lead.json"), &track).unwrap();
             fs::write(root.join("clips/lead.json"), &clip).unwrap();
             fs::write(root.join("arrangement/main.json"), &arrangement).unwrap();
+            fs::write(root.join("devices/lead.json"), &chain).unwrap();
             fs::write(root.join("assets/samples/source.wav"), &sample).unwrap();
             let manifest = canonical(json!({
                 "format":"hyper-project","format_version":1,"project_id":PROJECT_ID,"revision":1,
@@ -4137,7 +4196,8 @@ mod tests {
                     descriptor(TIMELINE_ID,"timeline","timeline/timeline.json",&timeline),
                     descriptor(TRACK_ID,"track","tracks/lead.json",&track),
                     descriptor(SOURCE_CLIP_ID,"clip","clips/lead.json",&clip),
-                    descriptor(ARRANGEMENT_ID,"arrangement","arrangement/main.json",&arrangement)
+                    descriptor(ARRANGEMENT_ID,"arrangement","arrangement/main.json",&arrangement),
+                    descriptor(DEVICE_CHAIN_ID,"device-chain","devices/lead.json",&chain)
                 ],"assets":[{"id":SOURCE_ASSET_ID,"role":"sample","path":"assets/samples/source.wav",
                     "media_type":"audio/wav","byte_length":sample.len(),"sha256":hex_digest(digest(&sample)),"extensions":{}}],
                 "extensions":{}
@@ -4150,6 +4210,7 @@ mod tests {
                 track,
                 clip,
                 arrangement,
+                chain,
                 sample,
             }
         }
@@ -4176,6 +4237,7 @@ mod tests {
                 sample_rate_hz: 48_000,
                 frame_count: 50,
             }];
+            let device_chain_sha256 = hex_digest(digest(&self.chain));
             let documents = serialize_audio_track_freeze(
                 &project,
                 &assets,
@@ -4189,7 +4251,10 @@ mod tests {
                 FROZEN_PLACEMENT_ID,
                 FREEZE_STATE_ID,
                 "Frozen Lead",
-                None,
+                Some(AudioTrackFreezeDeviceChain::new(
+                    DEVICE_CHAIN_ID,
+                    &device_chain_sha256,
+                )),
                 LoaderLimits::VERSION_1,
             )
             .unwrap();
@@ -4303,6 +4368,143 @@ mod tests {
             )
             .unwrap(),
             fixture.sample
+        );
+    }
+
+    #[test]
+    fn rejects_generic_mutation_of_the_rendered_freeze_authority() {
+        let fixture = Fixture::new();
+        let (identity, freeze) = fixture.request();
+        publish_audio_track_freeze(
+            &fixture.root,
+            AudioTrackFreezePublicationRequest {
+                expected_project_sha256: identity,
+                documents: &freeze,
+                rendered_sample: &fixture.sample,
+            },
+        )
+        .unwrap();
+        let package = verify_project_package(&fixture.root).unwrap();
+        let frozen_identity = *package.manifest_sha256();
+        let mut changed_arrangement: Value =
+            serde_json::from_slice(&package.read_resource(ARRANGEMENT_ID).unwrap()).unwrap();
+        changed_arrangement["placements"][0]["duration_ticks"] = json!(1);
+        let changed_arrangement = canonical(changed_arrangement);
+
+        let error = publish_project_resource(
+            &fixture.root,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: frozen_identity,
+                resource_id: ARRANGEMENT_ID,
+                expected_role: ResourceRole::Arrangement,
+                resource_bytes: &changed_arrangement,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Integrity);
+        let still_frozen = verify_project_package(&fixture.root).unwrap();
+        assert_eq!(*still_frozen.manifest_sha256(), frozen_identity);
+        assert_eq!(
+            still_frozen.read_resource(ARRANGEMENT_ID).unwrap(),
+            freeze.arrangement()
+        );
+        let (unfreeze_identity, unfreeze) = fixture.unfreeze_request();
+        publish_audio_track_unfreeze(
+            &fixture.root,
+            AudioTrackUnfreezePublicationRequest {
+                expected_project_sha256: unfreeze_identity,
+                documents: &unfreeze,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_generic_mutation_of_a_frozen_tracks_device_chain() {
+        let fixture = Fixture::new();
+        let (identity, freeze) = fixture.request();
+        publish_audio_track_freeze(
+            &fixture.root,
+            AudioTrackFreezePublicationRequest {
+                expected_project_sha256: identity,
+                documents: &freeze,
+                rendered_sample: &fixture.sample,
+            },
+        )
+        .unwrap();
+        let package = verify_project_package(&fixture.root).unwrap();
+        let frozen_identity = *package.manifest_sha256();
+        let mut changed_chain: Value =
+            serde_json::from_slice(&package.read_resource(DEVICE_CHAIN_ID).unwrap()).unwrap();
+        changed_chain["devices"][0]["enabled"] = json!(false);
+        let changed_chain = canonical(changed_chain);
+
+        let error = publish_project_resource(
+            &fixture.root,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: frozen_identity,
+                resource_id: DEVICE_CHAIN_ID,
+                expected_role: ResourceRole::DeviceChain,
+                resource_bytes: &changed_chain,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Integrity);
+        let still_frozen = verify_project_package(&fixture.root).unwrap();
+        assert_eq!(*still_frozen.manifest_sha256(), frozen_identity);
+        assert_eq!(
+            still_frozen.read_resource(DEVICE_CHAIN_ID).unwrap(),
+            fixture.chain
+        );
+        let (unfreeze_identity, unfreeze) = fixture.unfreeze_request();
+        publish_audio_track_unfreeze(
+            &fixture.root,
+            AudioTrackUnfreezePublicationRequest {
+                expected_project_sha256: unfreeze_identity,
+                documents: &unfreeze,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cleanup_refuses_a_source_asset_retained_by_a_frozen_track() {
+        let fixture = Fixture::new();
+        let (identity, freeze) = fixture.request();
+        publish_audio_track_freeze(
+            &fixture.root,
+            AudioTrackFreezePublicationRequest {
+                expected_project_sha256: identity,
+                documents: &freeze,
+                rendered_sample: &fixture.sample,
+            },
+        )
+        .unwrap();
+        let package = verify_project_package(&fixture.root).unwrap();
+        let retained_identity = *package.manifest_sha256();
+        let requested = [SOURCE_ASSET_ID.to_owned()];
+
+        let error = clean_unused_samples(
+            &fixture.root,
+            SampleCleanupRequest {
+                expected_project_sha256: retained_identity,
+                asset_ids: &requested,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+        assert!(fixture.root.join("assets/samples/source.wav").is_file());
+        assert_eq!(
+            *verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest_sha256(),
+            retained_identity
         );
     }
 
