@@ -222,10 +222,10 @@ impl Error for ProjectTransactionRecoveryErrorSource {
             | Self::AudioTrackDuplication(source)
             | Self::AudioTrackContentRemoval(source)
             | Self::TrackOrder(source)
-            | Self::AudioClip(source) => Some(source),
+            | Self::AudioClip(source)
+            | Self::RecordingDiscard(source) => Some(source),
             Self::ControlMapping(source) => Some(source),
             Self::Recording(source) => Some(source),
-            Self::RecordingDiscard(source) => Some(source),
             Self::Rename(source) => Some(source),
         }
     }

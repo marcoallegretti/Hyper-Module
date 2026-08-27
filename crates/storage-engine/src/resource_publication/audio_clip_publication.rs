@@ -385,6 +385,10 @@ fn publish_audio_clip_observed(
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the coordinator keeps lock, recovery, staging, and disposition ordering visible as one fail-closed operation"
+)]
 fn publish_audio_clip_with_arrangement_observed(
     project_path: &Path,
     request: AudioClipPublicationRequest<'_>,
@@ -468,16 +472,15 @@ fn publish_audio_clip_with_arrangement_observed(
         )
     })?;
     let created_clip_directory = inspect_clip_destination(&verified.root_dir, &clip_path)?;
-    if let Some(arrangement) = &arrangement {
-        if arrangement.previous_bytes.is_none()
-            && inspect_arrangement_destination(&verified.root_dir, &arrangement.path)?
-                != arrangement.created_arrangement_directory
-        {
-            return Err(failure(
-                ProjectResourcePublicationErrorKind::ProjectChanged,
-                "arrangement destination changed before recorded-take placement staging",
-            ));
-        }
+    if let Some(arrangement) = &arrangement
+        && arrangement.previous_bytes.is_none()
+        && inspect_arrangement_destination(&verified.root_dir, &arrangement.path)?
+            != arrangement.created_arrangement_directory
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "arrangement destination changed before recorded-take placement staging",
+        ));
     }
     let sample_destination = if let Some(path) = sample_path.as_deref() {
         inspect_sample_destination(&verified.root_dir, path)?
@@ -505,16 +508,16 @@ fn publish_audio_clip_with_arrangement_observed(
             "owning track changed before audio-clip staging",
         ));
     }
-    if let Some(arrangement) = &arrangement {
-        if let Some(previous) = &arrangement.previous_bytes {
-            let parent = open_relative_parent(&verified.root_dir, &arrangement.path)?;
-            let active = read_bounded(&parent, file_name(&arrangement.path)?, MAX_JSON_BYTES)?;
-            if active != *previous {
-                return Err(failure(
-                    ProjectResourcePublicationErrorKind::ProjectChanged,
-                    "arrangement changed before recorded-take placement staging",
-                ));
-            }
+    if let Some(arrangement) = &arrangement
+        && let Some(previous) = &arrangement.previous_bytes
+    {
+        let parent = open_relative_parent(&verified.root_dir, &arrangement.path)?;
+        let active = read_bounded(&parent, file_name(&arrangement.path)?, MAX_JSON_BYTES)?;
+        if active != *previous {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::ProjectChanged,
+                "arrangement changed before recorded-take placement staging",
+            ));
         }
     }
     let next_revision = verified
@@ -2143,49 +2146,45 @@ fn rollback_recorded_take_arrangement(
     let name = file_name(&arrangement.arrangement.path)?;
     let current = read_optional_file(&parent, name)?;
     let after = decode_digest(&arrangement.arrangement.sha256)?;
-    match &arrangement.previous_arrangement {
-        Some(previous) => {
-            let before = decode_digest(&previous.sha256)?;
-            match current.as_deref().map(digest) {
-                Some(found) if found == before => return Ok(()),
-                Some(found) if found != after => {
-                    return Err(failure(
-                        ProjectResourcePublicationErrorKind::Recovery,
-                        "recorded-take placement rollback refuses unrelated arrangement content",
-                    ));
-                }
-                Some(_) | None => {}
-            }
-            publish_staged_file(
-                transaction,
-                PREVIOUS_ARRANGEMENT_NAME,
-                &parent,
-                &parent,
-                name,
-                &format!(".audio-clip-arrangement-rollback-{}.json", tx.id),
-                "previous recorded-take placement arrangement",
-            )
-        }
-        None => {
-            let Some(current) = current else {
-                return Ok(());
-            };
-            if digest(&current) != after {
+    if let Some(previous) = &arrangement.previous_arrangement {
+        let before = decode_digest(&previous.sha256)?;
+        match current.as_deref().map(digest) {
+            Some(found) if found == before => return Ok(()),
+            Some(found) if found != after => {
                 return Err(failure(
                     ProjectResourcePublicationErrorKind::Recovery,
                     "recorded-take placement rollback refuses unrelated arrangement content",
                 ));
             }
-            parent.remove_file(name).map_err(|error| {
-                caused(
-                    ProjectResourcePublicationErrorKind::Recovery,
-                    "remove rolled-back recorded-take placement arrangement",
-                    error,
-                )
-            })?;
-            sync_dir(&parent)
+            Some(_) | None => {}
         }
+        return publish_staged_file(
+            transaction,
+            PREVIOUS_ARRANGEMENT_NAME,
+            &parent,
+            &parent,
+            name,
+            &format!(".audio-clip-arrangement-rollback-{}.json", tx.id),
+            "previous recorded-take placement arrangement",
+        );
     }
+    let Some(current) = current else {
+        return Ok(());
+    };
+    if digest(&current) != after {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "recorded-take placement rollback refuses unrelated arrangement content",
+        ));
+    }
+    parent.remove_file(name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "remove rolled-back recorded-take placement arrangement",
+            error,
+        )
+    })?;
+    sync_dir(&parent)
 }
 
 fn rollback_audio_clip_track(
@@ -3035,20 +3034,20 @@ fn cleanup_audio_clip_temporaries(
             decode_digest(&tx.previous_track.sha256)?,
         )?;
     }
-    if let Some(arrangement) = &tx.arrangement {
-        if let Ok(parent) = open_relative_parent(root, &arrangement.arrangement.path) {
+    if let Some(arrangement) = &tx.arrangement
+        && let Ok(parent) = open_relative_parent(root, &arrangement.arrangement.path)
+    {
+        remove_optional_matching_file(
+            &parent,
+            &format!(".audio-clip-arrangement-{}.json", tx.id),
+            decode_digest(&arrangement.arrangement.sha256)?,
+        )?;
+        if let Some(previous) = &arrangement.previous_arrangement {
             remove_optional_matching_file(
                 &parent,
-                &format!(".audio-clip-arrangement-{}.json", tx.id),
-                decode_digest(&arrangement.arrangement.sha256)?,
+                &format!(".audio-clip-arrangement-rollback-{}.json", tx.id),
+                decode_digest(&previous.sha256)?,
             )?;
-            if let Some(previous) = &arrangement.previous_arrangement {
-                remove_optional_matching_file(
-                    &parent,
-                    &format!(".audio-clip-arrangement-rollback-{}.json", tx.id),
-                    decode_digest(&previous.sha256)?,
-                )?;
-            }
         }
     }
     remove_optional_matching_file(
@@ -3352,7 +3351,7 @@ mod tests {
             publish_audio_clip(&self.root, self.request()).unwrap();
         }
 
-        fn take_arrangement(&self) -> Vec<u8> {
+        fn take_arrangement() -> Vec<u8> {
             serde_json_canonicalizer::to_vec(&json!({
                 "format":"hyper-arrangement", "format_version":1,
                 "id":ARRANGEMENT_ID, "project_id":PROJECT_ID, "name":"Main",
@@ -3461,7 +3460,7 @@ mod tests {
     #[test]
     fn publishes_recorded_take_clip_and_first_arrangement_atomically() {
         let fixture = Fixture::new();
-        let arrangement = fixture.take_arrangement();
+        let arrangement = Fixture::take_arrangement();
 
         let outcome = publish_recorded_take_placement(
             &fixture.root,
@@ -3500,7 +3499,7 @@ mod tests {
             AudioClipPublicationPhase::Arrangement,
         ] {
             let fixture = Fixture::new();
-            let arrangement = fixture.take_arrangement();
+            let arrangement = Fixture::take_arrangement();
             let result = catch_unwind(AssertUnwindSafe(|| {
                 let _ = publish_audio_clip_with_arrangement_observed(
                     &fixture.root,
@@ -3544,7 +3543,7 @@ mod tests {
     #[test]
     fn recorded_take_placement_crash_after_manifest_recovers_as_one_complete_revision() {
         let fixture = Fixture::new();
-        let arrangement = fixture.take_arrangement();
+        let arrangement = Fixture::take_arrangement();
         let result = catch_unwind(AssertUnwindSafe(|| {
             let _ = publish_audio_clip_with_arrangement_observed(
                 &fixture.root,
@@ -3595,7 +3594,7 @@ mod tests {
     fn recorded_take_placement_rolls_back_an_existing_arrangement_exactly() {
         let fixture = Fixture::new();
         let before = fixture.install_empty_arrangement();
-        let arrangement = fixture.take_arrangement();
+        let arrangement = Fixture::take_arrangement();
         let result = catch_unwind(AssertUnwindSafe(|| {
             let _ = publish_audio_clip_with_arrangement_observed(
                 &fixture.root,

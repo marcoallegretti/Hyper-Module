@@ -1297,6 +1297,10 @@ fn preflight_rollback(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the staged journal must be completely verified before recovery mutates any project path"
+)]
 fn validate_staged_transaction(
     transaction: &Dir,
     tx: &Transaction,

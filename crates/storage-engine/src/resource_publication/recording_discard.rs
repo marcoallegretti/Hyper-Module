@@ -187,6 +187,10 @@ pub fn recover_recording_discards(
     recover_locked(&root_path, &root, &backups)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the coordinator keeps lock, recovery, staging, and disposition ordering visible as one fail-closed operation"
+)]
 fn discard_observed(
     project_path: &Path,
     request: RecordingDiscardRequest<'_>,
@@ -322,6 +326,10 @@ fn discard_observed(
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "recording and asset authority must be validated completely before a discard transaction is created"
+)]
 fn validate_request(
     verified: &StructurallyVerifiedProject,
     recording_id: &str,
@@ -555,7 +563,11 @@ fn candidate_manifest(
     Ok(bytes)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the transaction keeps each irreversible discard phase and its retained authority visible in one fail-closed sequence"
+)]
 fn run_discard(
     verified: &StructurallyVerifiedProject,
     backups: &Dir,
@@ -834,8 +846,7 @@ fn finish_result(
 ) -> Result<RecordingDiscardOutcome, ProjectResourcePublicationError> {
     match result {
         Ok(outcome) => {
-            clear_and_remove(backups, transaction, name)
-                .map_err(|error| published_cleanup_error(error))?;
+            clear_and_remove(backups, transaction, name).map_err(published_cleanup_error)?;
             Ok(outcome)
         }
         Err(operation) => {
@@ -852,7 +863,7 @@ fn finish_result(
                 RecordingDiscardRecoveryDisposition::Committed => {
                     let outcome = outcome(&tx)?;
                     clear_and_remove(backups, transaction, name)
-                        .map_err(|error| published_cleanup_error(error))?;
+                        .map_err(published_cleanup_error)?;
                     Ok(outcome)
                 }
             }
@@ -1297,6 +1308,7 @@ mod tests {
     use crate::{RecordingImportRequest, import_recording};
     use serde_json::json;
     use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1379,7 +1391,11 @@ mod tests {
     }
 
     fn hex(value: [u8; 32]) -> String {
-        value.iter().map(|byte| format!("{byte:02x}")).collect()
+        let mut encoded = String::with_capacity(value.len() * 2);
+        for byte in value {
+            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        encoded
     }
     fn wav() -> Vec<u8> {
         let mut bytes = Vec::new();
