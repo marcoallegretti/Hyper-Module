@@ -20239,7 +20239,11 @@ mod tests {
     }
 
     #[test]
-    fn audio_track_freeze_reactivation_reuses_exact_artifact_and_preserves_live_metadata() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one reactivation contract keeps exact artifact reuse, live metadata preservation, and source-divergence refusal together"
+    )]
+    fn audio_track_freeze_reactivation_preserves_live_metadata_and_refuses_diverged_source() {
         let frozen = frozen_track_reactivation_documents();
         let frozen_tracks = [frozen.track()];
         let frozen_clips = [frozen.clip()];
@@ -20336,6 +20340,61 @@ mod tests {
             reactivated_arrangement["placements"][0]["id"],
             "018f47a2-6b2d-7c11-8a44-001122334472"
         );
+
+        let mut changed_clip: Value = serde_json::from_slice(restored_clips[0]).unwrap();
+        changed_clip["name"] = json!("Edited after unfreeze");
+        let changed_clip = serde_json_canonicalizer::to_vec(&changed_clip).unwrap();
+        let changed_clips = [changed_clip.as_slice()];
+        let changed_clip_project = load(
+            input(
+                TIMELINE,
+                &reactivation_tracks,
+                &changed_clips,
+                Some(&live_arrangement),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_audio_track_freeze_reactivation(
+                &changed_clip_project,
+                &assets,
+                &live_track,
+                &changed_clips,
+                &live_arrangement,
+                frozen.freeze_state(),
+                "018f47a2-6b2d-7c11-8a44-001122334456",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackFreezeReactivationSerializationError::FrozenStateMismatch)
+        ));
+
+        let mut changed_arrangement: Value = serde_json::from_slice(&live_arrangement).unwrap();
+        changed_arrangement["placements"][0]["start_tick"] = json!(1);
+        let changed_arrangement = serde_json_canonicalizer::to_vec(&changed_arrangement).unwrap();
+        let changed_arrangement_project = load(
+            input(
+                TIMELINE,
+                &reactivation_tracks,
+                &restored_clips,
+                Some(&changed_arrangement),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_audio_track_freeze_reactivation(
+                &changed_arrangement_project,
+                &assets,
+                &live_track,
+                &restored_clips,
+                &changed_arrangement,
+                frozen.freeze_state(),
+                "018f47a2-6b2d-7c11-8a44-001122334456",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackFreezeReactivationSerializationError::FrozenStateMismatch)
+        ));
     }
 
     #[test]

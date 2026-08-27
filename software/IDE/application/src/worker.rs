@@ -7870,13 +7870,19 @@ fn observe_history(
                 true
             }
             ProjectMutationAttempt::UnfreezeAudioTrack(Ok(outcome)) => {
-                history.record_edit(UndoEntry::from_operation(
-                    IdeHistoryOperation::AudioTrackFreezeReactivation {
-                        authority: Box::new(outcome.authority().clone()),
-                    },
-                    undo_label(command),
-                ));
-                true
+                if let Some(authority) = outcome.authority() {
+                    history.record_edit(UndoEntry::from_operation(
+                        IdeHistoryOperation::AudioTrackFreezeReactivation {
+                            authority: Box::new(authority.clone()),
+                        },
+                        undo_label(command),
+                    ));
+                    true
+                } else {
+                    // A legacy unfreeze is durable but cannot safely support
+                    // an exact redo, so it is a structural history boundary.
+                    history.clear()
+                }
             }
             other => match history_effect(other) {
                 HistoryEffect::Replacement(outcome) => match outcome.previous_resource() {
@@ -9475,7 +9481,7 @@ impl AudioTrackFreezePublicationWithHistory {
 #[derive(Debug)]
 struct AudioTrackUnfreezePublicationWithHistory {
     outcome: hyper_storage_engine::AudioTrackUnfreezePublicationOutcome,
-    authority: IdeTrackFreezeHistoryAuthority,
+    authority: Option<IdeTrackFreezeHistoryAuthority>,
 }
 
 impl AudioTrackUnfreezePublicationWithHistory {
@@ -9487,8 +9493,8 @@ impl AudioTrackUnfreezePublicationWithHistory {
         self.outcome.track_id()
     }
 
-    fn authority(&self) -> &IdeTrackFreezeHistoryAuthority {
-        &self.authority
+    fn authority(&self) -> Option<&IdeTrackFreezeHistoryAuthority> {
+        self.authority.as_ref()
     }
 
     fn into_outcome(self) -> hyper_storage_engine::AudioTrackUnfreezePublicationOutcome {
@@ -11765,7 +11771,7 @@ fn attempt_project_mutation(
                     &track_id,
                 )
                 .and_then(|plan| {
-                    let authority = plan.history_authority().clone();
+                    let authority = plan.history_authority().cloned();
                     plan.publish()
                         .map(|outcome| AudioTrackUnfreezePublicationWithHistory {
                             outcome,
@@ -15536,6 +15542,7 @@ mod tests {
         MixerRecoverySnapshotRequest, ProjectCreationErrorKind, store_mixer_recovery_snapshot,
         verify_project_package,
     };
+    use sha2::{Digest, Sha256};
 
     const WAIT: Duration = Duration::from_secs(2);
     const EVENT_WAIT: Duration = Duration::from_secs(10);
@@ -17764,9 +17771,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one real-worker scenario proves the render, reversible publication, loader, and reopen boundaries of an audio track"
+        reason = "one real-worker scenario proves render, reversible history, legacy compatibility, loader, and reopen boundaries"
     )]
-    fn audio_track_freeze_and_unfreeze_are_durable_through_the_real_worker() {
+    fn audio_track_freeze_history_is_durable_and_legacy_freeze_can_unfreeze() {
         let fixture = std::env::temp_dir().join(format!(
             "hyper-desktop-ide-track-freeze-{}",
             uuid::Uuid::new_v4()
@@ -18062,14 +18069,186 @@ mod tests {
             recv_native_mutation(&worker),
             IdeWorkerEvent::AudioTrackUnfreezing
         ));
-        let mut unfreeze_revision = None;
-        let mut unfrozen_reopened = false;
-        while unfreeze_revision.is_none() || !unfrozen_reopened {
+        let mut normal_unfreeze_revision = None;
+        let mut normal_unfrozen_reopened = false;
+        let mut normal_unfreeze_history = false;
+        while normal_unfreeze_revision.is_none()
+            || !normal_unfrozen_reopened
+            || !normal_unfreeze_history
+        {
             match recv_native_mutation(&worker) {
                 IdeWorkerEvent::UndoStateChanged {
                     undo_label: Some("track unfreeze"),
                     redo_label: None,
-                } => {}
+                } => normal_unfreeze_history = true,
+                IdeWorkerEvent::Running(snapshot) => {
+                    normal_unfrozen_reopened = snapshot.audio_clips().len() == 1
+                        && snapshot.audio_clips()[0].id() == imported_clip_id
+                        && snapshot
+                            .mixer_channels()
+                            .iter()
+                            .any(|channel| channel.id() == track_id && !channel.frozen());
+                }
+                IdeWorkerEvent::AudioTrackUnfrozen {
+                    revision,
+                    track_id: event_track,
+                } => {
+                    assert_eq!(event_track, track_id);
+                    normal_unfreeze_revision = Some(revision);
+                }
+                event => {
+                    panic!("track unfreeze emitted an unexpected lifecycle event: {event:?}")
+                }
+            }
+        }
+        assert_eq!(normal_unfreeze_revision, Some(8));
+        let normal_unfrozen = verify_project_package(&project).unwrap();
+        assert_eq!(normal_unfrozen.manifest().revision(), 8);
+        assert!(
+            normal_unfrozen
+                .manifest()
+                .resources()
+                .iter()
+                .any(|resource| resource.id() == imported_clip_id),
+            "the original clip must be restored by the unfreeze transaction"
+        );
+        assert_eq!(
+            normal_unfrozen
+                .manifest()
+                .resources()
+                .iter()
+                .filter(|resource| resource.role() == hyper_project_model::ResourceRole::FreezeState)
+                .count(),
+            0,
+            "the consumed freeze state must not remain active after unfreeze"
+        );
+        drop(normal_unfrozen);
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "track unfreeze",
+            }
+        ));
+        let mut normal_reactivation_revision = None;
+        let mut normal_reactivation_reopened = false;
+        let mut normal_reactivation_history = false;
+        while normal_reactivation_revision.is_none()
+            || !normal_reactivation_reopened
+            || !normal_reactivation_history
+        {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: Some("track freeze"),
+                    redo_label: Some("track unfreeze"),
+                } => normal_reactivation_history = true,
+                IdeWorkerEvent::Running(snapshot) => {
+                    normal_reactivation_reopened = snapshot.audio_clips().len() == 1
+                        && snapshot.audio_clips()[0].id() == frozen_clip_id
+                        && snapshot
+                            .mixer_channels()
+                            .iter()
+                            .any(|channel| channel.id() == track_id && channel.frozen());
+                }
+                IdeWorkerEvent::EditRestored {
+                    revision,
+                    redo: false,
+                    label: "track unfreeze",
+                } => normal_reactivation_revision = Some(revision),
+                event => {
+                    panic!("track-unfreeze undo emitted an unexpected lifecycle event: {event:?}")
+                }
+            }
+        }
+        assert_eq!(normal_reactivation_revision, Some(9));
+        let normal_reactivated = verify_project_package(&project).unwrap();
+        assert_eq!(normal_reactivated.manifest().revision(), 9);
+        assert_eq!(
+            normal_reactivated.read_resource(&freeze_state_id).unwrap(),
+            freeze_state
+        );
+        drop(normal_reactivated);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+
+        let mut legacy_freeze_state: serde_json::Value =
+            serde_json::from_slice(&freeze_state).unwrap();
+        legacy_freeze_state["format_version"] = serde_json::json!(3);
+        legacy_freeze_state
+            .as_object_mut()
+            .unwrap()
+            .remove("frozen_placement");
+        legacy_freeze_state
+            .as_object_mut()
+            .unwrap()
+            .remove("device_chain_sha256");
+        let legacy_freeze_state = serde_json_canonicalizer::to_vec(&legacy_freeze_state).unwrap();
+        let legacy_source = verify_project_package(&project).unwrap();
+        let legacy_state_path = legacy_source
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.id() == freeze_state_id)
+            .expect("the reactivated package retains its freeze-state descriptor")
+            .path()
+            .to_owned();
+        let mut legacy_manifest: serde_json::Value =
+            serde_json::from_slice(&legacy_source.read_manifest().unwrap()).unwrap();
+        let legacy_descriptor = legacy_manifest["resources"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|resource| resource["id"].as_str() == Some(freeze_state_id.as_str()))
+            .expect("the historical manifest declares its freeze state");
+        legacy_descriptor["byte_length"] = serde_json::json!(legacy_freeze_state.len());
+        legacy_descriptor["sha256"] =
+            serde_json::json!(format!("{:x}", Sha256::digest(&legacy_freeze_state)));
+        let legacy_manifest = serde_json_canonicalizer::to_vec(&legacy_manifest).unwrap();
+        drop(legacy_source);
+        // Model a package produced by the v3 writer. General publication is
+        // intentionally unavailable while its incomplete redo authority is
+        // active; opening and consuming it through unfreeze remains safe.
+        std::fs::write(project.join(&legacy_state_path), &legacy_freeze_state).unwrap();
+        std::fs::write(project.join("project.json"), legacy_manifest).unwrap();
+
+        let legacy_worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 8)
+                .unwrap();
+        assert!(matches!(
+            recv(&legacy_worker),
+            IdeWorkerEvent::Closed { .. }
+        ));
+        legacy_worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(legacy_opened) = recv(&legacy_worker) else {
+            panic!("the legacy frozen project must open before unfreeze");
+        };
+        assert!(
+            legacy_opened
+                .mixer_channels()
+                .iter()
+                .any(|channel| channel.id() == track_id && channel.frozen()),
+            "the converted legacy freeze state must remain visible before unfreeze"
+        );
+
+        legacy_worker
+            .try_send(IdeWorkerCommand::UnfreezeAudioTrack {
+                track_id: track_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&legacy_worker),
+            IdeWorkerEvent::AudioTrackUnfreezing
+        ));
+        let mut unfreeze_revision = None;
+        let mut unfrozen_reopened = false;
+        while unfreeze_revision.is_none() || !unfrozen_reopened {
+            match recv_native_mutation(&legacy_worker) {
+                IdeWorkerEvent::UndoStateChanged { .. } => {
+                    panic!("legacy unfreeze must not record an unsafe reactivation history entry")
+                }
                 IdeWorkerEvent::Running(snapshot) => {
                     unfrozen_reopened = snapshot.audio_clips().len() == 1
                         && snapshot.audio_clips()[0].id() == imported_clip_id
@@ -18088,10 +18267,10 @@ mod tests {
                 event => panic!("track unfreeze emitted an unexpected lifecycle event: {event:?}"),
             }
         }
-        assert_eq!(unfreeze_revision, Some(8));
+        assert_eq!(unfreeze_revision, Some(10));
 
         let package = verify_project_package(&project).unwrap();
-        assert_eq!(package.manifest().revision(), 8);
+        assert_eq!(package.manifest().revision(), 10);
         assert!(
             package
                 .manifest()
@@ -18110,8 +18289,17 @@ mod tests {
             0,
             "the consumed freeze state must not remain active after unfreeze"
         );
+        assert!(matches!(
+            package
+                .manifest()
+                .assets()
+                .iter()
+                .find(|asset| asset.id() == frozen_asset_id.as_str()),
+            Some(asset) if asset.sha256() == frozen_asset_sha256
+                && asset.byte_length() == frozen_asset_byte_length
+        ));
         drop(package);
-        assert_eq!(shutdown_report(worker).native_failure(), None);
+        assert_eq!(shutdown_report(legacy_worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
 

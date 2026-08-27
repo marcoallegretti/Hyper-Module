@@ -7999,7 +7999,9 @@ struct IdeAudioTrackFreezePlan {
 struct IdeAudioTrackUnfreezePlan {
     mixer: IdeMixerSavePlan,
     documents: AudioTrackUnfreezeDocuments,
-    history_authority: IdeTrackFreezeHistoryAuthority,
+    // Legacy freeze states remain safely unfreezable, but cannot prove the
+    // exact rendered placement and device-chain authority required for redo.
+    history_authority: Option<IdeTrackFreezeHistoryAuthority>,
 }
 
 #[derive(Debug)]
@@ -8175,8 +8177,8 @@ impl IdeAudioTrackFreezePlan {
 }
 
 impl IdeAudioTrackUnfreezePlan {
-    fn history_authority(&self) -> &IdeTrackFreezeHistoryAuthority {
-        &self.history_authority
+    fn history_authority(&self) -> Option<&IdeTrackFreezeHistoryAuthority> {
+        self.history_authority.as_ref()
     }
 
     fn publish(&self) -> Result<AudioTrackUnfreezePublicationOutcome, IdeAudioTrackUnfreezeError> {
@@ -10656,18 +10658,38 @@ impl RunningDesktopIdeApplication {
             .iter()
             .find(|asset| asset.id() == documents.frozen_asset_id())
             .ok_or(IdeAudioTrackUnfreezeError::FreezeStateInvalid)?;
-        let history_authority = IdeTrackFreezeHistoryAuthority::try_new(
+        let history_authority = Self::prepare_audio_track_unfreeze_history_authority(
             track_id,
             &freeze_states[0],
             frozen_asset.sha256(),
             frozen_asset.byte_length(),
-        )
-        .map_err(|source| IdeAudioTrackUnfreezeError::HistoryAuthority(Box::new(source)))?;
+        )?;
         Ok(IdeAudioTrackUnfreezePlan {
             mixer,
             documents,
             history_authority,
         })
+    }
+
+    fn prepare_audio_track_unfreeze_history_authority(
+        track_id: &str,
+        freeze_state: &[u8],
+        frozen_asset_sha256: &str,
+        frozen_asset_byte_length: u64,
+    ) -> Result<Option<IdeTrackFreezeHistoryAuthority>, IdeAudioTrackUnfreezeError> {
+        let state = TrackFreezeState::parse(freeze_state)
+            .map_err(|_| IdeAudioTrackUnfreezeError::FreezeStateInvalid)?;
+        if !state.has_complete_rendered_authority() {
+            return Ok(None);
+        }
+        IdeTrackFreezeHistoryAuthority::try_new(
+            track_id,
+            freeze_state,
+            frozen_asset_sha256,
+            frozen_asset_byte_length,
+        )
+        .map(Some)
+        .map_err(|source| IdeAudioTrackUnfreezeError::HistoryAuthority(Box::new(source)))
     }
 
     fn prepare_audio_track_unfreeze_history(
@@ -10677,7 +10699,10 @@ impl RunningDesktopIdeApplication {
     ) -> Result<IdeAudioTrackUnfreezePlan, IdeResourceRestoreError> {
         let plan = Self::prepare_audio_track_unfreeze(application, recovery, authority.track_id())
             .map_err(|source| IdeResourceRestoreError::AudioTrackUnfreeze(Box::new(source)))?;
-        if plan.history_authority() != authority {
+        if plan
+            .history_authority()
+            .is_none_or(|candidate| candidate != authority)
+        {
             return Err(IdeResourceRestoreError::CandidateInvalid(Box::new(
                 IdeTrackFreezeHistoryAuthorityError::StateMismatch,
             )));
