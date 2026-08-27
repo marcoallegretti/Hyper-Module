@@ -8823,12 +8823,8 @@ fn project_mutation_save_failure(
                 source: Box::new(IdeAudioImportError::MixerSave(Box::new(reason))),
             }))
         }
-        ProjectMutation::CreateAudioClipFromTake { .. } => {
-            IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
-                IdeRecordingClipCreationError::MixerSave(Box::new(reason)),
-            ))
-        }
-        ProjectMutation::CreateAndPlaceAudioClipFromTake { .. } => {
+        ProjectMutation::CreateAudioClipFromTake { .. }
+        | ProjectMutation::CreateAndPlaceAudioClipFromTake { .. } => {
             IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
                 IdeRecordingClipCreationError::MixerSave(Box::new(reason)),
             ))
@@ -8847,9 +8843,11 @@ fn project_mutation_save_failure(
         ProjectMutation::DiscardRecordingTake { .. } => IdeWorkerCommandFailure::RecordingDiscard(
             Box::new(IdeRecordingDiscardError::MixerSave(Box::new(reason))),
         ),
-        ProjectMutation::RenameRecordingTake { .. } => IdeWorkerCommandFailure::EditRestore(
-            Box::new(IdeResourceRestoreError::MixerSave(Box::new(reason))),
-        ),
+        ProjectMutation::RenameRecordingTake { .. } | ProjectMutation::RestoreResource { .. } => {
+            IdeWorkerCommandFailure::EditRestore(Box::new(IdeResourceRestoreError::MixerSave(
+                Box::new(reason),
+            )))
+        }
         ProjectMutation::AddArrangementPlacement { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementAddition(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -8975,9 +8973,6 @@ fn project_mutation_save_failure(
         ProjectMutation::EditControlMapping { .. } => IdeWorkerCommandFailure::ControlMappingEdit(
             Box::new(IdeControlMappingEditError::MixerSave(Box::new(reason))),
         ),
-        ProjectMutation::RestoreResource { .. } => IdeWorkerCommandFailure::EditRestore(Box::new(
-            IdeResourceRestoreError::MixerSave(Box::new(reason)),
-        )),
         ProjectMutation::DuplicateScene { .. } => IdeWorkerCommandFailure::SceneDuplication(
             Box::new(IdeSceneDuplicationError::MixerSave(Box::new(reason))),
         ),
@@ -9135,12 +9130,8 @@ fn project_mutation_native_close_failure(
                 source: Box::new(IdeAudioImportError::NativeClose(failure)),
             }))
         }
-        ProjectMutation::CreateAudioClipFromTake { .. } => {
-            IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
-                IdeRecordingClipCreationError::NativeClose(failure),
-            ))
-        }
-        ProjectMutation::CreateAndPlaceAudioClipFromTake { .. } => {
+        ProjectMutation::CreateAudioClipFromTake { .. }
+        | ProjectMutation::CreateAndPlaceAudioClipFromTake { .. } => {
             IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
                 IdeRecordingClipCreationError::NativeClose(failure),
             ))
@@ -9159,9 +9150,11 @@ fn project_mutation_native_close_failure(
         ProjectMutation::DiscardRecordingTake { .. } => IdeWorkerCommandFailure::RecordingDiscard(
             Box::new(IdeRecordingDiscardError::NativeClose(failure)),
         ),
-        ProjectMutation::RenameRecordingTake { .. } => IdeWorkerCommandFailure::EditRestore(
-            Box::new(IdeResourceRestoreError::NativeClose(failure)),
-        ),
+        ProjectMutation::RenameRecordingTake { .. } | ProjectMutation::RestoreResource { .. } => {
+            IdeWorkerCommandFailure::EditRestore(Box::new(IdeResourceRestoreError::NativeClose(
+                failure,
+            )))
+        }
         ProjectMutation::AddArrangementPlacement { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementAddition(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
@@ -9287,9 +9280,6 @@ fn project_mutation_native_close_failure(
         ProjectMutation::EditControlMapping { .. } => IdeWorkerCommandFailure::ControlMappingEdit(
             Box::new(IdeControlMappingEditError::NativeClose(failure)),
         ),
-        ProjectMutation::RestoreResource { .. } => IdeWorkerCommandFailure::EditRestore(Box::new(
-            IdeResourceRestoreError::NativeClose(failure),
-        )),
         ProjectMutation::DuplicateScene { .. } => IdeWorkerCommandFailure::SceneDuplication(
             Box::new(IdeSceneDuplicationError::NativeClose(failure)),
         ),
@@ -13121,10 +13111,8 @@ fn project_mutation_reopen_failure(
                 reopen: Box::new(reopen),
             }
         }
-        ProjectMutationAttempt::CreateAudioClipFromTake(result) => {
-            recording_clip_creation_reopen_failure(result, reopen)
-        }
-        ProjectMutationAttempt::CreateAndPlaceAudioClipFromTake(result) => {
+        ProjectMutationAttempt::CreateAudioClipFromTake(result)
+        | ProjectMutationAttempt::CreateAndPlaceAudioClipFromTake(result) => {
             recording_clip_creation_reopen_failure(result, reopen)
         }
         ProjectMutationAttempt::DuplicateAudioClip { result, .. } => {
