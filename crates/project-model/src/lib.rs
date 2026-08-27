@@ -99,6 +99,7 @@ pub enum ResourceRole {
     AutomationTake,
     RecordingMetadata,
     DeviceChain,
+    FreezeState,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -624,6 +625,7 @@ fn resource_root(role: ResourceRole) -> &'static str {
         ResourceRole::AutomationTake => "takes/",
         ResourceRole::RecordingMetadata => "assets/recordings/",
         ResourceRole::DeviceChain => "devices/",
+        ResourceRole::FreezeState => "freezes/",
     }
 }
 

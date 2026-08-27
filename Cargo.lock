@@ -2389,6 +2389,7 @@ dependencies = [
  "hyper-recording-metadata",
  "hyper-storage-engine",
  "hyper-strict-json",
+ "hyper-track-freeze",
  "serde_json",
  "serde_json_canonicalizer",
  "sha2",
@@ -2595,6 +2596,16 @@ dependencies = [
 [[package]]
 name = "hyper-thread-supervisor"
 version = "0.1.0"
+
+[[package]]
+name = "hyper-track-freeze"
+version = "0.1.0"
+dependencies = [
+ "hyper-project-model",
+ "hyper-strict-json",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "i-slint-backend-linuxkms"

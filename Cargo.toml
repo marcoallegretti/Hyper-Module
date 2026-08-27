@@ -24,6 +24,7 @@ members = [
     "crates/storage-engine",
     "crates/strict-json",
     "crates/thread-supervisor",
+    "crates/track-freeze",
     "software/IDE/audio-backend",
     "software/IDE/application",
     "software/IDE/desktop-ui",

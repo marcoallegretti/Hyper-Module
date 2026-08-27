@@ -30,6 +30,7 @@ use hyper_storage_engine::{
     StructurallyVerifiedProject, verify_project_package_with_limits,
 };
 use hyper_strict_json::StrictJsonError;
+use hyper_track_freeze::{TrackFreezeState, TrackFreezeStateError};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +75,7 @@ pub struct PreparedProjectPlayback {
     compiled_control_mapping: Option<CompiledControlMappingTable>,
     recording_metadata: Vec<RecordingMetadataDocument>,
     device_chains: Vec<DeviceChain>,
+    freeze_states: Vec<TrackFreezeState>,
     nested_playback_ids: BTreeSet<String>,
 }
 
@@ -117,6 +119,11 @@ impl PreparedProjectPlayback {
     #[must_use]
     pub fn device_chains(&self) -> &[DeviceChain] {
         &self.device_chains
+    }
+
+    #[must_use]
+    pub fn freeze_states(&self) -> &[TrackFreezeState] {
+        &self.freeze_states
     }
 
     /// Returns verified project-owned sample assets that no reusable audio
@@ -331,6 +338,10 @@ pub enum ProjectPlaybackError {
         source: DeviceChainError,
     },
     DeviceChainBinding(DeviceChainBindingError),
+    FreezeState {
+        resource_id: String,
+        source: TrackFreezeStateError,
+    },
     ResourceJson {
         resource_id: String,
         source: StrictJsonError,
@@ -413,6 +424,13 @@ impl fmt::Display for ProjectPlaybackError {
                 "device-chain resource {resource_id} is invalid: {source}"
             ),
             Self::DeviceChainBinding(source) => source.fmt(formatter),
+            Self::FreezeState {
+                resource_id,
+                source,
+            } => write!(
+                formatter,
+                "freeze-state resource {resource_id} is invalid: {source}"
+            ),
             Self::ResourceJson {
                 resource_id,
                 source,
@@ -452,6 +470,7 @@ impl Error for ProjectPlaybackError {
             Self::RecordingMetadata { source, .. } => Some(source),
             Self::DeviceChain { source, .. } => Some(source),
             Self::DeviceChainBinding(source) => Some(source),
+            Self::FreezeState { source, .. } => Some(source),
             Self::ResourceJson { source, .. } => Some(source),
             Self::RecordingBinding(source) => Some(source),
             Self::Audio { source, .. } => Some(source),
@@ -544,6 +563,7 @@ fn prepare_verified_project_playback_inner(
         &session,
         &captured.nested_playback_ids,
     )?;
+    validate_freeze_state_inventory(&package, &captured.freeze_states, &session)?;
     for captured_chain in &captured.device_chains {
         for device in captured_chain.document.devices() {
             captured.nested_playback_ids.insert(device.id().to_owned());
@@ -571,6 +591,11 @@ fn prepare_verified_project_playback_inner(
             })
         })
         .transpose()?;
+    let bypassed_device_chain_ids: BTreeSet<&str> = captured
+        .freeze_states
+        .iter()
+        .filter_map(|state| state.document.device_chain_id())
+        .collect();
     package.confirm_unchanged()?;
     Ok(PreparedProjectPlayback {
         package,
@@ -585,7 +610,13 @@ fn prepare_verified_project_playback_inner(
         device_chains: captured
             .device_chains
             .into_iter()
+            .filter(|chain| !bypassed_device_chain_ids.contains(chain.descriptor_id.as_str()))
             .map(|chain| chain.document)
+            .collect(),
+        freeze_states: captured
+            .freeze_states
+            .into_iter()
+            .map(|state| state.document)
             .collect(),
         nested_playback_ids: captured.nested_playback_ids,
     })
@@ -761,6 +792,7 @@ struct ResourceInventory<'manifest> {
     automation_takes: Vec<&'manifest ResourceDescriptor>,
     recording_metadata: Vec<&'manifest ResourceDescriptor>,
     device_chains: Vec<&'manifest ResourceDescriptor>,
+    freeze_states: Vec<&'manifest ResourceDescriptor>,
 }
 
 impl<'manifest> ResourceInventory<'manifest> {
@@ -796,6 +828,7 @@ impl<'manifest> ResourceInventory<'manifest> {
         let mut automation_takes = Vec::new();
         let mut recording_metadata = Vec::new();
         let mut device_chains = Vec::new();
+        let mut freeze_states = Vec::new();
         for descriptor in resources {
             match descriptor.role() {
                 ResourceRole::Timeline => {}
@@ -824,6 +857,7 @@ impl<'manifest> ResourceInventory<'manifest> {
                     push_descriptor(&mut recording_metadata, descriptor)?;
                 }
                 ResourceRole::DeviceChain => push_descriptor(&mut device_chains, descriptor)?,
+                ResourceRole::FreezeState => push_descriptor(&mut freeze_states, descriptor)?,
             }
         }
         let mixer = mixer.ok_or(ProjectPlaybackError::MissingMixer)?;
@@ -838,6 +872,7 @@ impl<'manifest> ResourceInventory<'manifest> {
             automation_takes,
             recording_metadata,
             device_chains,
+            freeze_states,
         })
     }
 
@@ -873,6 +908,7 @@ impl<'manifest> ResourceInventory<'manifest> {
                 .transpose()?,
             recording_metadata: read_recording_metadata(package, &self.recording_metadata)?,
             device_chains: read_device_chains(package, &self.device_chains)?,
+            freeze_states: read_freeze_states(package, &self.freeze_states)?,
             nested_playback_ids,
         })
     }
@@ -883,6 +919,7 @@ struct CapturedPackage {
     control_mapping: Option<CapturedControlMapping>,
     recording_metadata: Vec<CapturedRecordingMetadata>,
     device_chains: Vec<CapturedDeviceChain>,
+    freeze_states: Vec<CapturedFreezeState>,
     nested_playback_ids: BTreeSet<String>,
 }
 
@@ -899,6 +936,11 @@ struct CapturedRecordingMetadata {
 struct CapturedDeviceChain {
     descriptor_id: String,
     document: DeviceChain,
+}
+
+struct CapturedFreezeState {
+    descriptor_id: String,
+    document: TrackFreezeState,
 }
 
 /// Resolves control-mapping identities against one verified prepared project.
@@ -1175,6 +1217,101 @@ fn read_device_chains(
         });
     }
     Ok(documents)
+}
+
+fn read_freeze_states(
+    package: &StructurallyVerifiedProject,
+    descriptors: &[&ResourceDescriptor],
+) -> Result<Vec<CapturedFreezeState>, ProjectPlaybackError> {
+    let mut documents = Vec::new();
+    documents
+        .try_reserve_exact(descriptors.len())
+        .map_err(|_| ProjectPlaybackError::ResourceCapacityUnavailable)?;
+    for descriptor in descriptors {
+        let bytes = package.read_resource(descriptor.id())?;
+        let document = TrackFreezeState::parse(&bytes).map_err(|source| {
+            ProjectPlaybackError::FreezeState {
+                resource_id: descriptor.id().to_owned(),
+                source,
+            }
+        })?;
+        documents.push(CapturedFreezeState {
+            descriptor_id: descriptor.id().to_owned(),
+            document,
+        });
+    }
+    Ok(documents)
+}
+
+fn validate_freeze_state_inventory(
+    package: &StructurallyVerifiedProject,
+    states: &[CapturedFreezeState],
+    session: &PreparedPlaybackSession,
+) -> Result<(), ProjectPlaybackError> {
+    let mut tracks = BTreeSet::new();
+    let descriptors = package.manifest().resources();
+    for state in states {
+        let document = &state.document;
+        let fail = |message| ProjectPlaybackError::FreezeState {
+            resource_id: state.descriptor_id.clone(),
+            source: TrackFreezeStateError::InvalidDomain(message),
+        };
+        if state.descriptor_id != document.id()
+            || document.project_id() != package.manifest().project_id()
+            || !tracks.insert(document.track_id())
+        {
+            return Err(fail("freeze-state resource identity is inconsistent"));
+        }
+        if !session.parts().0.is_audio_track(document.track_id()) {
+            return Err(fail("freeze-state track is not an audio track"));
+        }
+        let loaded = session.parts().0;
+        let clip_belongs_to_track = |clip_id: &str| {
+            (0..loaded.clip_count()).any(|index| {
+                loaded.clip_id_at(index) == Some(clip_id)
+                    && loaded.clip_track_id_at(index) == Some(document.track_id())
+            })
+        };
+        if !clip_belongs_to_track(document.frozen_clip_id())
+            || document
+                .original_clip_ids()
+                .iter()
+                .any(|clip_id| !clip_belongs_to_track(clip_id))
+        {
+            return Err(fail("freeze-state clip does not belong to its track"));
+        }
+        for (id, role) in [
+            (document.frozen_clip_id(), ResourceRole::Clip),
+            (document.arrangement_id(), ResourceRole::Arrangement),
+        ] {
+            if !descriptors
+                .iter()
+                .any(|descriptor| descriptor.id() == id && descriptor.role() == role)
+            {
+                return Err(fail("freeze-state references a missing resource"));
+            }
+        }
+        if !package.manifest().assets().iter().any(|asset| {
+            asset.id() == document.frozen_asset_id() && asset.role() == AssetRole::Sample
+        }) {
+            return Err(fail("freeze-state references a missing rendered sample"));
+        }
+        if document.original_clip_ids().iter().any(|id| {
+            !descriptors
+                .iter()
+                .any(|descriptor| descriptor.id() == id && descriptor.role() == ResourceRole::Clip)
+        }) {
+            return Err(fail("freeze-state references a missing original clip"));
+        }
+        if let Some(chain_id) = document.device_chain_id()
+            && !descriptors.iter().any(|descriptor| {
+                descriptor.id() == chain_id && descriptor.role() == ResourceRole::DeviceChain
+            })
+        {
+            return Err(fail("freeze-state references a missing device chain"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_device_inventory(

@@ -516,6 +516,7 @@ const fn resource_format(role: ResourceRole) -> &'static str {
         ResourceRole::Scene => "hyper-scene",
         ResourceRole::AutomationTake => "hyper-automation-take",
         ResourceRole::DeviceChain => "hyper-device-chain",
+        ResourceRole::FreezeState => "hyper-track-freeze-state",
         _ => "",
     }
 }
@@ -528,6 +529,7 @@ const fn role_name(role: ResourceRole) -> &'static str {
         ResourceRole::Scene => "scene",
         ResourceRole::AutomationTake => "automation-take",
         ResourceRole::DeviceChain => "device-chain",
+        ResourceRole::FreezeState => "freeze-state",
         _ => "",
     }
 }

@@ -758,7 +758,10 @@ const fn resource_format(role: ResourceRole) -> &'static str {
         ResourceRole::Scene => "hyper-scene",
         ResourceRole::AutomationTake => "hyper-automation-take",
         ResourceRole::DeviceChain => "hyper-device-chain",
-        ResourceRole::Timeline | ResourceRole::Mapping | ResourceRole::RecordingMetadata => "",
+        ResourceRole::Timeline
+        | ResourceRole::Mapping
+        | ResourceRole::RecordingMetadata
+        | ResourceRole::FreezeState => "",
     }
 }
 
@@ -774,6 +777,7 @@ fn role_name(role: ResourceRole) -> &'static str {
         ResourceRole::AutomationTake => "automation-take",
         ResourceRole::RecordingMetadata => "recording-metadata",
         ResourceRole::DeviceChain => "device-chain",
+        ResourceRole::FreezeState => "freeze-state",
     }
 }
 
@@ -786,6 +790,7 @@ fn role_from_name(value: &str) -> Option<ResourceRole> {
         "scene" => ResourceRole::Scene,
         "automation-take" => ResourceRole::AutomationTake,
         "device-chain" => ResourceRole::DeviceChain,
+        "freeze-state" => ResourceRole::FreezeState,
         _ => return None,
     })
 }
