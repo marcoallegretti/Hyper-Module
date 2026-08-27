@@ -10,7 +10,8 @@ use hyper_playback_compiler::scene::{
     compile_scene_performance,
 };
 use hyper_playback_compiler::{
-    ClipCompileSpec, TempoEvent, TickRange, Timeline, WarpMarker, compile_scene_audio_clip,
+    ClipCompileSpec, ClipTimebase, TempoEvent, TickRange, Timeline, WarpMarker,
+    compile_scene_audio_clip,
 };
 
 const EPSILON: f32 = 1.0e-6;
@@ -99,6 +100,7 @@ fn prepared_scene_audio_launches_loops_stops_and_reaches_the_mixer() {
         timeline,
         ClipCompileSpec {
             enabled: true,
+            timebase: ClipTimebase::Musical,
             duration_ticks: 2,
             source_start_frame: 0,
             source_frame_count: 25,

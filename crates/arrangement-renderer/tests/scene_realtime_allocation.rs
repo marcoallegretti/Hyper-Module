@@ -13,7 +13,8 @@ use hyper_playback_compiler::scene::{
     compile_scene_performance,
 };
 use hyper_playback_compiler::{
-    ClipCompileSpec, TempoEvent, TickRange, Timeline, WarpMarker, compile_scene_audio_clip,
+    ClipCompileSpec, ClipTimebase, TempoEvent, TickRange, Timeline, WarpMarker,
+    compile_scene_audio_clip,
 };
 
 struct CountingAllocator;
@@ -101,6 +102,7 @@ fn prepared_scene_rendering_performs_zero_heap_allocations() {
         timeline,
         ClipCompileSpec {
             enabled: true,
+            timebase: ClipTimebase::Musical,
             duration_ticks: 2,
             source_start_frame: 0,
             source_frame_count: 25,

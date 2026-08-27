@@ -1247,6 +1247,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one concurrent publication loop verifies every field remains generation-coherent"
+    )]
     fn concurrent_snapshots_do_not_mix_publications() {
         const PUBLICATIONS: usize = 20_000;
         let (mut publisher, checkpoint) = playback_recovery_channel(None, None);
