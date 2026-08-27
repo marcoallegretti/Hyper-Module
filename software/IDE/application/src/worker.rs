@@ -25173,6 +25173,71 @@ mod tests {
     }
 
     #[test]
+    fn frozen_track_publication_warnings_remain_truthful_after_reopen_failure() {
+        fn committed_publication_error() -> hyper_storage_engine::ProjectResourcePublicationError {
+            hyper_storage_engine::ProjectResourcePublicationError::for_test(
+                hyper_storage_engine::ProjectResourcePublicationErrorKind::Recovery,
+                "simulated transaction cleanup warning",
+                true,
+            )
+        }
+
+        let freeze = project_mutation_reopen_failure(
+            ProjectMutationAttempt::FreezeAudioTrack(Err(IdeAudioTrackFreezeError::Publication(
+                Box::new(committed_publication_error()),
+            ))),
+            IdeProjectOpenError::SelectedOutputUnavailable,
+        );
+        let IdeWorkerCommandFailure::AudioTrackFreeze(freeze) = freeze else {
+            panic!("freeze publication warning must retain its command failure type");
+        };
+        assert!(matches!(
+            audio_track_freeze_failure_event(*freeze),
+            IdeWorkerEvent::AudioTrackFreezeCommittedWithWarning { warning }
+                if warning.publication_committed()
+                    && warning.to_string().contains("was frozen")
+                    && warning.to_string().contains("could not be reopened")
+                    && !warning.to_string().contains("freeze failed")
+        ));
+
+        let unfreeze = project_mutation_reopen_failure(
+            ProjectMutationAttempt::UnfreezeAudioTrack(Err(
+                IdeAudioTrackUnfreezeError::Publication(Box::new(committed_publication_error())),
+            )),
+            IdeProjectOpenError::SelectedOutputUnavailable,
+        );
+        let IdeWorkerCommandFailure::AudioTrackUnfreeze(unfreeze) = unfreeze else {
+            panic!("unfreeze publication warning must retain its command failure type");
+        };
+        assert!(matches!(
+            audio_track_unfreeze_failure_event(*unfreeze),
+            IdeWorkerEvent::AudioTrackUnfreezeCommittedWithWarning { warning }
+                if warning.publication_committed()
+                    && warning.to_string().contains("was unfrozen")
+                    && warning.to_string().contains("could not be reopened")
+                    && !warning.to_string().contains("unfreeze failed")
+        ));
+
+        let flatten = project_mutation_reopen_failure(
+            ProjectMutationAttempt::FlattenAudioTrack(Err(IdeAudioTrackFlattenError::Publication(
+                Box::new(committed_publication_error()),
+            ))),
+            IdeProjectOpenError::SelectedOutputUnavailable,
+        );
+        let IdeWorkerCommandFailure::AudioTrackFlatten(flatten) = flatten else {
+            panic!("flatten publication warning must retain its command failure type");
+        };
+        assert!(matches!(
+            audio_track_flatten_failure_event(*flatten),
+            IdeWorkerEvent::AudioTrackFlattenCommittedWithWarning { warning }
+                if warning.publication_committed()
+                    && warning.to_string().contains("was flattened")
+                    && warning.to_string().contains("could not be reopened")
+                    && !warning.to_string().contains("flatten failed")
+        ));
+    }
+
+    #[test]
     fn committed_unused_sample_cleanup_warning_invalidates_history_and_stays_truthful() {
         let committed_warning = || {
             IdeUnusedSampleCleanupError::PublicationCommittedWithWarning(

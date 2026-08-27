@@ -169,6 +169,25 @@ impl ProjectResourcePublicationError {
     pub const fn published(&self) -> bool {
         self.published
     }
+
+    /// Constructs a controlled publication error for higher-layer tests.
+    ///
+    /// This is unavailable from the default production build so callers cannot
+    /// fabricate a durable-publication outcome accidentally.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn for_test(
+        kind: ProjectResourcePublicationErrorKind,
+        message: impl Into<String>,
+        published: bool,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            published,
+            source: None,
+        }
+    }
 }
 
 impl fmt::Display for ProjectResourcePublicationError {

@@ -43,6 +43,7 @@ ui-test-support = []
 [dev-dependencies]
 hyper-clip-engine = { path = "../../../crates/clip-engine" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime", features = ["test-support"] }
+hyper-storage-engine = { path = "../../../crates/storage-engine", features = ["test-support"] }
 serde_json_canonicalizer = "=0.3.2"
 
 [target.'cfg(windows)'.dev-dependencies]

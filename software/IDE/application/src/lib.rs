@@ -3127,10 +3127,16 @@ impl IdeAudioTrackFreezeError {
     /// Whether the manifest commit completed despite a later warning.
     #[must_use]
     pub fn publication_committed(&self) -> bool {
-        matches!(self, Self::Publication(source) if source.published())
-            || matches!(self, Self::ReopenAfterPublication { .. })
-            || matches!(self, Self::ReopenAfterPreparation { preparation, .. }
-                if preparation.publication_committed())
+        match self {
+            Self::Publication(source)
+            | Self::PublicationAndReopen {
+                publication: source,
+                ..
+            } => source.published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::ReopenAfterPreparation { preparation, .. } => preparation.publication_committed(),
+            _ => false,
+        }
     }
 }
 
@@ -3179,6 +3185,10 @@ impl fmt::Display for IdeAudioTrackFreezeError {
                 formatter,
                 "the exact rendered-freeze history authority could not be retained: {source}"
             ),
+            Self::Publication(source) if source.published() => write!(
+                formatter,
+                "the audio track was frozen, but project verification or transaction recovery is incomplete: {source}"
+            ),
             Self::Publication(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
@@ -3200,6 +3210,13 @@ impl fmt::Display for IdeAudioTrackFreezeError {
                 "audio track {} was frozen in project revision {} but the project could not be reopened: {source}",
                 outcome.track_id(),
                 outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.published() => write!(
+                formatter,
+                "the audio track was frozen, but project verification or transaction recovery is incomplete ({publication}) and the project could not be reopened ({reopen})"
             ),
             Self::PublicationAndReopen {
                 publication,
@@ -3279,9 +3296,16 @@ pub enum IdeAudioTrackUnfreezeError {
 impl IdeAudioTrackUnfreezeError {
     #[must_use]
     pub fn publication_committed(&self) -> bool {
-        matches!(self, Self::Publication(source) if source.published())
-            || matches!(self, Self::ReopenAfterPublication { .. })
-            || matches!(self, Self::ReopenAfterPreparation { preparation, .. } if preparation.publication_committed())
+        match self {
+            Self::Publication(source)
+            | Self::PublicationAndReopen {
+                publication: source,
+                ..
+            } => source.published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::ReopenAfterPreparation { preparation, .. } => preparation.publication_committed(),
+            _ => false,
+        }
     }
 
     /// Whether the retained authority cannot become valid without a new
@@ -3341,6 +3365,10 @@ impl fmt::Display for IdeAudioTrackUnfreezeError {
                 formatter,
                 "the exact rendered-freeze history authority could not be retained: {source}"
             ),
+            Self::Publication(source) if source.published() => write!(
+                formatter,
+                "the audio track was unfrozen, but project verification or transaction recovery is incomplete: {source}"
+            ),
             Self::Publication(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
@@ -3362,6 +3390,13 @@ impl fmt::Display for IdeAudioTrackUnfreezeError {
                 "audio track {} was unfrozen in project revision {} but the project could not be reopened: {source}",
                 outcome.track_id(),
                 outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.published() => write!(
+                formatter,
+                "the audio track was unfrozen, but project verification or transaction recovery is incomplete ({publication}) and the project could not be reopened ({reopen})"
             ),
             Self::PublicationAndReopen {
                 publication,
@@ -3436,10 +3471,16 @@ impl IdeAudioTrackFlattenError {
     /// Whether the manifest commit completed despite a later warning.
     #[must_use]
     pub fn publication_committed(&self) -> bool {
-        matches!(self, Self::Publication(source) if source.published())
-            || matches!(self, Self::ReopenAfterPublication { .. })
-            || matches!(self, Self::ReopenAfterPreparation { preparation, .. }
-                if preparation.publication_committed())
+        match self {
+            Self::Publication(source)
+            | Self::PublicationAndReopen {
+                publication: source,
+                ..
+            } => source.published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::ReopenAfterPreparation { preparation, .. } => preparation.publication_committed(),
+            _ => false,
+        }
     }
 }
 
@@ -3472,6 +3513,10 @@ impl fmt::Display for IdeAudioTrackFlattenError {
             Self::CapacityUnavailable => {
                 formatter.write_str("audio-track flatten capacity is unavailable")
             }
+            Self::Publication(source) if source.published() => write!(
+                formatter,
+                "the audio track was flattened, but project verification or transaction recovery is incomplete: {source}"
+            ),
             Self::Publication(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
@@ -3493,6 +3538,13 @@ impl fmt::Display for IdeAudioTrackFlattenError {
                 "audio track {} was flattened in project revision {} but the project could not be reopened: {source}",
                 outcome.track_id(),
                 outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.published() => write!(
+                formatter,
+                "the audio track was flattened, but project verification or transaction recovery is incomplete ({publication}) and the project could not be reopened ({reopen})"
             ),
             Self::PublicationAndReopen {
                 publication,
