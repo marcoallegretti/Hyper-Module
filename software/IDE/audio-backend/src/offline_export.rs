@@ -29,7 +29,7 @@ use hyper_mixer_runtime::{
 use hyper_native_device::DeviceChain;
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
-use hyper_playback_json::{AdapterCompileError, CompiledMixerGraph};
+use hyper_playback_json::{AdapterCompileError, CompiledMixerGraph, CompiledMixerTrackKind};
 use hyper_playback_session::{PlaybackExtent, PreparedPlaybackSession};
 use hyper_project_loader::PreparedProjectPlayback;
 use hyper_recording_journal::{JournalConfig, JournalError, JournalWriter};
@@ -186,6 +186,15 @@ pub enum OfflineExportError {
     TruePeak(StereoTruePeakError),
     Loudness(StereoLoudnessError),
     MixerLayoutMismatch,
+    FreezeTrackMissing {
+        track_id: String,
+    },
+    FreezeTrackNotAudio {
+        track_id: String,
+    },
+    FreezeTrackMixerChannelMissing {
+        track_id: String,
+    },
     StemTrackMetadataUnavailable {
         channel_index: usize,
     },
@@ -233,6 +242,19 @@ impl fmt::Display for OfflineExportError {
             Self::MixerLayoutMismatch => {
                 formatter.write_str("the live mixer does not match the prepared mixer graph")
             }
+            Self::FreezeTrackMissing { track_id } => {
+                write!(
+                    formatter,
+                    "freeze track {track_id} is not present in the project"
+                )
+            }
+            Self::FreezeTrackNotAudio { track_id } => {
+                write!(formatter, "freeze track {track_id} is not an audio track")
+            }
+            Self::FreezeTrackMixerChannelMissing { track_id } => write!(
+                formatter,
+                "freeze track {track_id} has no matching compiled mixer channel"
+            ),
             Self::StemTrackMetadataUnavailable { channel_index } => write!(
                 formatter,
                 "compiled mixer channel {channel_index} has no verified track metadata"
@@ -284,6 +306,9 @@ impl Error for OfflineExportError {
             | Self::InvalidBlockFrames
             | Self::CapacityUnavailable
             | Self::MixerLayoutMismatch
+            | Self::FreezeTrackMissing { .. }
+            | Self::FreezeTrackNotAudio { .. }
+            | Self::FreezeTrackMixerChannelMissing { .. }
             | Self::StemTrackMetadataUnavailable { .. }
             | Self::NoMixerStems
             | Self::FlacEncoding(_)
@@ -572,6 +597,47 @@ pub fn render_prepared_project_track_stems_with_mixer(
         project.device_chains(),
         spec,
         live_mixer,
+    )
+}
+
+/// Renders one audio track at the freeze boundary: after its persisted native
+/// device chain and before its channel mute, fader, pan, sends, routing, and
+/// main processing.
+///
+/// This deliberately uses the prepared mixer and device-chain documents only.
+/// It never accepts a live-mixer override, because a durable freeze must be
+/// derived from the same saved authority that will be replaced atomically.
+///
+/// # Errors
+///
+/// Returns a classified refusal when the selected track is absent or not an
+/// audio track, or the usual offline-render errors for invalid project state,
+/// block bounds, media preparation, runtime construction, or output assembly.
+pub fn render_audio_track_pre_fader_for_freeze(
+    session: &PreparedPlaybackSession,
+    track_id: &str,
+    spec: OfflineExportSpec,
+) -> Result<DecodedAudio, OfflineExportError> {
+    render_audio_track_pre_fader_for_freeze_with_devices(session, &[], track_id, spec)
+}
+
+/// Renders one structurally verified audio track at the freeze boundary,
+/// including its persisted native device chain.
+///
+/// # Errors
+///
+/// Returns the same classified rejections as
+/// [`render_audio_track_pre_fader_for_freeze`].
+pub fn render_prepared_audio_track_pre_fader_for_freeze(
+    project: &PreparedProjectPlayback,
+    track_id: &str,
+    spec: OfflineExportSpec,
+) -> Result<DecodedAudio, OfflineExportError> {
+    render_audio_track_pre_fader_for_freeze_with_devices(
+        project.session(),
+        project.device_chains(),
+        track_id,
+        spec,
     )
 }
 
@@ -1365,6 +1431,113 @@ fn track_stem_export_report(
 
 #[allow(
     clippy::too_many_lines,
+    reason = "the freeze render keeps persisted authority selection, one-track capture, and exact output assembly in one ordered operation"
+)]
+fn render_audio_track_pre_fader_for_freeze_with_devices(
+    session: &PreparedPlaybackSession,
+    device_chains: &[DeviceChain],
+    track_id: &str,
+    spec: OfflineExportSpec,
+) -> Result<DecodedAudio, OfflineExportError> {
+    let PlaybackExtent::Bounded { end_frame } = session.extent() else {
+        return Err(OfflineExportError::UnboundedExtent);
+    };
+    if end_frame == 0 {
+        return Err(OfflineExportError::EmptyExtent);
+    }
+    if spec.block_frames == 0 || spec.block_frames > hyper_audio_engine::MAX_PROCESS_FRAMES {
+        return Err(OfflineExportError::InvalidBlockFrames);
+    }
+    let block_frames = spec.block_frames.min(end_frame);
+
+    let (project, mixer, automation, media) = session.parts();
+    if project.track_index(track_id).is_none() {
+        return Err(OfflineExportError::FreezeTrackMissing {
+            track_id: track_id.to_owned(),
+        });
+    }
+    if !project.is_audio_track(track_id) {
+        return Err(OfflineExportError::FreezeTrackNotAudio {
+            track_id: track_id.to_owned(),
+        });
+    }
+    let channel_index = mixer
+        .slots()
+        .iter()
+        .position(|slot| slot.track_id() == track_id)
+        .ok_or_else(|| OfflineExportError::FreezeTrackMixerChannelMissing {
+            track_id: track_id.to_owned(),
+        })?;
+    if mixer.slots()[channel_index].kind() != CompiledMixerTrackKind::Audio {
+        return Err(OfflineExportError::FreezeTrackNotAudio {
+            track_id: track_id.to_owned(),
+        });
+    }
+
+    let facts: Vec<_> = media.media_asset_facts().collect();
+    let graph = project
+        .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(OfflineExportError::Playback)?;
+    let prepared = media
+        .prepare_playback(&graph)
+        .map_err(OfflineExportError::Media)?;
+    let mut runtime = match automation {
+        Some(automation) => RoutedMainRuntime::try_new_prepared_playback_automated_with_devices(
+            &prepared,
+            mixer,
+            automation.clone(),
+            device_chains,
+            block_frames,
+        ),
+        None => RoutedMainRuntime::try_new_prepared_playback_with_devices(
+            &prepared,
+            mixer,
+            device_chains,
+            block_frames,
+        ),
+    }
+    .map_err(OfflineExportError::Runtime)?;
+    let slot_count = mixer.slots().len();
+    let mut scratch_left = allocate_planes(slot_count, block_frames)?;
+    let mut scratch_right = allocate_planes(slot_count, block_frames)?;
+    let mut scratch = Vec::new();
+    scratch
+        .try_reserve_exact(slot_count)
+        .map_err(|_| OfflineExportError::CapacityUnavailable)?;
+    scratch.extend(
+        scratch_left
+            .iter_mut()
+            .zip(&mut scratch_right)
+            .map(|(left, right)| RenderScratchSlot::new(left, right)),
+    );
+    let mut main_left = allocate_silence(block_frames)?;
+    let mut main_right = allocate_silence(block_frames)?;
+    let mut left = allocate_silence(end_frame)?;
+    let mut right = allocate_silence(end_frame)?;
+
+    render_audio_pre_fader_windows(
+        &mut runtime,
+        &mut scratch,
+        &mut main_left,
+        &mut main_right,
+        channel_index,
+        end_frame,
+        block_frames,
+        |start_frame, captured_left, captured_right| {
+            let end_frame = start_frame
+                .checked_add(captured_left.len())
+                .ok_or(OfflineExportError::CapacityUnavailable)?;
+            left[start_frame..end_frame].copy_from_slice(captured_left);
+            right[start_frame..end_frame].copy_from_slice(captured_right);
+            Ok(())
+        },
+    )?;
+    DecodedAudio::from_stereo(session.sample_rate_hz(), left, right)
+        .map_err(OfflineExportError::Output)
+}
+
+#[allow(
+    clippy::too_many_lines,
     reason = "one pass retains the required shared renderer/device state for every aligned stem"
 )]
 fn render_project_track_stems_with_devices(
@@ -1502,6 +1675,50 @@ fn render_selected_track_stem_windows<R: TrackWindowRenderer>(
                 |channel_index, left, right| {
                     if sink_error.is_none() {
                         sink_error = sink(rendered, channel_index, left, right).err();
+                    }
+                },
+            )
+            .map_err(OfflineExportError::Process)?;
+        if let Some(error) = sink_error {
+            return Err(error);
+        }
+        rendered = rendered
+            .checked_add(frames)
+            .ok_or(OfflineExportError::CapacityUnavailable)?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one bounded renderer owns the shared runtime and scratch state for the selected freeze-track sink"
+)]
+fn render_audio_pre_fader_windows<R: TrackWindowRenderer>(
+    runtime: &mut RoutedMainRuntime<R>,
+    scratch: &mut [RenderScratchSlot<'_>],
+    main_left: &mut [f32],
+    main_right: &mut [f32],
+    channel_index: usize,
+    end_frame: usize,
+    block_frames: usize,
+    mut sink: impl FnMut(usize, &[f32], &[f32]) -> Result<(), OfflineExportError>,
+) -> Result<(), OfflineExportError> {
+    let mut rendered = 0_usize;
+    while rendered < end_frame {
+        let frames = block_frames.min(end_frame - rendered);
+        let mut sink_error = None;
+        runtime
+            .process_window_with_audio_pre_fader_tap_sink(
+                rendered,
+                scratch,
+                StereoOutput {
+                    left: &mut main_left[..frames],
+                    right: &mut main_right[..frames],
+                },
+                &[channel_index],
+                |_, left, right| {
+                    if sink_error.is_none() {
+                        sink_error = sink(rendered, left, right).err();
                     }
                 },
             )

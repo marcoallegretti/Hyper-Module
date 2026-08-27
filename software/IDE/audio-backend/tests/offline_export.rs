@@ -3,8 +3,9 @@ use hyper_audio_engine::StereoOutput;
 use hyper_audio_source::DecodedAudio;
 use hyper_desktop_audio::{
     OfflineExportError, OfflineExportRange, OfflineExportSpec, export_project_wav,
-    render_project_offline, render_project_offline_range_with_mixer,
-    render_project_offline_with_mixer, render_project_track_stems_with_mixer,
+    render_audio_track_pre_fader_for_freeze, render_project_offline,
+    render_project_offline_range_with_mixer, render_project_offline_with_mixer,
+    render_project_track_stems_with_mixer,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{RoutedMainRuntime, RoutedTransportRuntime, TransportCommand};
@@ -214,6 +215,53 @@ fn track_stems_are_aligned_direct_channel_renders() {
     assert_eq!(stem.audio.frame_count(), main.frame_count());
     assert_eq!(stem.audio.plane(0), main.plane(0));
     assert_eq!(stem.audio.plane(1), main.plane(1));
+}
+
+#[test]
+fn freeze_track_render_preserves_clip_audio_without_mixer_automation_or_pan() {
+    let session = session(Some(ARRANGEMENT), vec![AUTOMATION.to_vec()]);
+    let rendered = render_audio_track_pre_fader_for_freeze(
+        &session,
+        "018f47a2-6b2d-7c11-8a44-001122337502",
+        OfflineExportSpec { block_frames: 32 },
+    )
+    .unwrap();
+    let full_mix =
+        render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
+
+    assert_eq!(rendered.sample_rate_hz(), 48_000);
+    assert_eq!(rendered.frame_count(), 100);
+    assert_eq!(rendered.plane(0), rendered.plane(1));
+    for (frame, (sample, expected)) in rendered
+        .plane(0)
+        .unwrap()
+        .iter()
+        .zip((0_i16..100).map(|value| f32::from(value) / 200.0))
+        .enumerate()
+    {
+        assert_eq!(sample.to_bits(), expected.to_bits(), "frame {frame}");
+    }
+    assert!(
+        rendered
+            .plane(0)
+            .unwrap()
+            .iter()
+            .zip(full_mix.plane(0).unwrap())
+            .any(|(frozen, mixed)| frozen.to_bits() != mixed.to_bits())
+    );
+}
+
+#[test]
+fn freeze_track_render_refuses_unknown_track_authority() {
+    let session = session(Some(ARRANGEMENT), Vec::new());
+    assert!(matches!(
+        render_audio_track_pre_fader_for_freeze(
+            &session,
+            "018f47a2-6b2d-7c11-8a44-001122337599",
+            OfflineExportSpec { block_frames: 32 },
+        ),
+        Err(OfflineExportError::FreezeTrackMissing { .. })
+    ));
 }
 
 #[test]
