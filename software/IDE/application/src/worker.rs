@@ -43,20 +43,20 @@ use super::{
     IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
     IdeAudioPreviewError, IdeAudioPrimaryRouteError, IdeAudioTrackAdditionError,
     IdeAudioTrackContentRemovalError, IdeAudioTrackDuplicationError, IdeAudioTrackEditError,
-    IdeAudioTrackRemovalError, IdeAutomationTakeCreationError, IdeAutomationTakeEditError,
-    IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome, IdeControlMappingEdit,
-    IdeControlMappingEditError, IdeHistoryOperation, IdeInputDiscoveryError, IdeInputSelection,
-    IdeInputSelectionError, IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessCommandError,
-    IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
-    IdeMixerMainState, IdeMixerPrimaryDestination, IdeMixerStripReorderError, IdeMonitoringCommand,
-    IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure, IdeNativeFilterEdit,
-    IdeNativeFilterEditError, IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError,
-    IdeOutputTestError, IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
-    IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
-    IdePendingSaveCloseWait, IdeProjectExportError, IdeProjectExportFormat, IdeProjectOpenError,
-    IdeProjectSaveError, IdeRecordingAbortError, IdeRecordingAbortOutcome,
-    IdeRecordingClipCreationError, IdeRecordingDiscardError, IdeRecordingError,
-    IdeRecordingImportOutcome, IdeRecordingObservation, IdeResourceRestoreError,
+    IdeAudioTrackFreezeError, IdeAudioTrackRemovalError, IdeAutomationTakeCreationError,
+    IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
+    IdeControlMappingEdit, IdeControlMappingEditError, IdeHistoryOperation, IdeInputDiscoveryError,
+    IdeInputSelection, IdeInputSelectionError, IdeLoopRangeFrames, IdeLoudnessCommand,
+    IdeLoudnessCommandError, IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand,
+    IdeMixerCommandError, IdeMixerMainState, IdeMixerPrimaryDestination, IdeMixerStripReorderError,
+    IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure,
+    IdeNativeFilterEdit, IdeNativeFilterEditError, IdeOutputDiscoveryError, IdeOutputSelection,
+    IdeOutputSelectionError, IdeOutputTestError, IdeOutputTestSnapshot, IdeOutputTestStartOutcome,
+    IdeOutputTestStopOutcome, IdePendingCloseWait, IdePendingOutputTestShutdown,
+    IdePendingOutputTestShutdownWait, IdePendingSaveCloseWait, IdeProjectExportError,
+    IdeProjectExportFormat, IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError,
+    IdeRecordingAbortOutcome, IdeRecordingClipCreationError, IdeRecordingDiscardError,
+    IdeRecordingError, IdeRecordingImportOutcome, IdeRecordingObservation, IdeResourceRestoreError,
     IdeReturnSendEditError, IdeRoutingBusCreationError, IdeRoutingBusKind,
     IdeRoutingBusRemovalError, IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability,
     IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization,
@@ -166,6 +166,7 @@ pub enum IdeWorkerCommandKind {
     SetAudioPrimaryRoute,
     RemoveAudioTrack,
     RemoveAudioTrackContent,
+    FreezeAudioTrack,
     ReorderMixerStrips,
     DuplicateAudioTrack,
     RenameAudioTrack,
@@ -312,6 +313,9 @@ pub enum IdeWorkerCommand {
         track_id: String,
     },
     RemoveAudioTrackContent {
+        track_id: String,
+    },
+    FreezeAudioTrack {
         track_id: String,
     },
     ReorderMixerStrips {
@@ -573,6 +577,7 @@ impl IdeWorkerCommand {
             Self::SetAudioPrimaryRoute { .. } => IdeWorkerCommandKind::SetAudioPrimaryRoute,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
             Self::RemoveAudioTrackContent { .. } => IdeWorkerCommandKind::RemoveAudioTrackContent,
+            Self::FreezeAudioTrack { .. } => IdeWorkerCommandKind::FreezeAudioTrack,
             Self::ReorderMixerStrips { .. } => IdeWorkerCommandKind::ReorderMixerStrips,
             Self::DuplicateAudioTrack { .. } => IdeWorkerCommandKind::DuplicateAudioTrack,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
@@ -2087,6 +2092,7 @@ pub enum IdeWorkerCommandFailure {
     AudioPrimaryRoute(Box<super::IdeAudioPrimaryRouteError>),
     AudioTrackRemoval(Box<super::IdeAudioTrackRemovalError>),
     AudioTrackContentRemoval(Box<super::IdeAudioTrackContentRemovalError>),
+    AudioTrackFreeze(Box<super::IdeAudioTrackFreezeError>),
     MixerStripReorder(Box<super::IdeMixerStripReorderError>),
     AudioTrackDuplication(Box<super::IdeAudioTrackDuplicationError>),
     AudioTrackRename(Box<super::IdeAudioTrackEditError>),
@@ -2244,6 +2250,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioPrimaryRoute(source) => source.fmt(formatter),
             Self::AudioTrackRemoval(source) => source.fmt(formatter),
             Self::AudioTrackContentRemoval(source) => source.fmt(formatter),
+            Self::AudioTrackFreeze(source) => source.fmt(formatter),
             Self::MixerStripReorder(source) => source.fmt(formatter),
             Self::AudioTrackDuplication(source) => source.fmt(formatter),
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => {
@@ -2348,6 +2355,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioPrimaryRoute(source) => Some(source),
             Self::AudioTrackRemoval(source) => Some(source),
             Self::AudioTrackContentRemoval(source) => Some(source),
+            Self::AudioTrackFreeze(source) => Some(source),
             Self::MixerStripReorder(source) => Some(source),
             Self::AudioTrackDuplication(source) => Some(source),
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => Some(source),
@@ -2534,6 +2542,13 @@ pub enum IdeWorkerEvent {
     },
     AudioTrackContentRemovalCommittedWithWarning {
         warning: Box<IdeAudioTrackContentRemovalError>,
+    },
+    AudioTrackFrozen {
+        revision: u64,
+        track_id: String,
+    },
+    AudioTrackFreezeCommittedWithWarning {
+        warning: Box<IdeAudioTrackFreezeError>,
     },
     MixerStripsReordered {
         revision: u64,
@@ -2850,6 +2865,7 @@ pub enum IdeWorkerEvent {
     AudioTrackAdding,
     AudioTrackRemoving,
     AudioTrackContentRemoving,
+    AudioTrackFreezing,
     MixerStripsReordering,
     AudioTrackDuplicating,
     AudioTrackRenaming,
@@ -3387,6 +3403,9 @@ enum ProjectMutation {
     RemoveAudioTrackContent {
         track_id: String,
     },
+    FreezeAudioTrack {
+        track_id: String,
+    },
     ReorderMixerStrips {
         track_id: String,
         destination_index: usize,
@@ -3593,6 +3612,7 @@ impl ProjectMutation {
             Self::SetAudioPrimaryRoute { .. } => IdeWorkerCommandKind::SetAudioPrimaryRoute,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
             Self::RemoveAudioTrackContent { .. } => IdeWorkerCommandKind::RemoveAudioTrackContent,
+            Self::FreezeAudioTrack { .. } => IdeWorkerCommandKind::FreezeAudioTrack,
             Self::ReorderMixerStrips { .. } => IdeWorkerCommandKind::ReorderMixerStrips,
             Self::DuplicateAudioTrack { .. } => IdeWorkerCommandKind::DuplicateAudioTrack,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
@@ -3681,6 +3701,7 @@ impl ProjectMutation {
             Self::AddRoutingBus { kind, .. } => IdeWorkerEvent::RoutingBusAdding { kind: *kind },
             Self::RemoveAudioTrack { .. } => IdeWorkerEvent::AudioTrackRemoving,
             Self::RemoveAudioTrackContent { .. } => IdeWorkerEvent::AudioTrackContentRemoving,
+            Self::FreezeAudioTrack { .. } => IdeWorkerEvent::AudioTrackFreezing,
             Self::ReorderMixerStrips { .. } => IdeWorkerEvent::MixerStripsReordering,
             Self::DuplicateAudioTrack { .. } => IdeWorkerEvent::AudioTrackDuplicating,
             Self::RenameAudioTrack { .. } => IdeWorkerEvent::AudioTrackRenaming,
@@ -4052,6 +4073,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::AddRoutingBus
         | IdeWorkerCommandKind::RemoveAudioTrack
         | IdeWorkerCommandKind::RemoveAudioTrackContent
+        | IdeWorkerCommandKind::FreezeAudioTrack
         | IdeWorkerCommandKind::ReorderMixerStrips
         | IdeWorkerCommandKind::DuplicateAudioTrack
         | IdeWorkerCommandKind::ImportAudio
@@ -4385,6 +4407,7 @@ fn process_command(
         | IdeWorkerCommand::AddAudioTrack { .. }
         | IdeWorkerCommand::RemoveAudioTrack { .. }
         | IdeWorkerCommand::RemoveAudioTrackContent { .. }
+        | IdeWorkerCommand::FreezeAudioTrack { .. }
         | IdeWorkerCommand::ReorderMixerStrips { .. }
         | IdeWorkerCommand::DuplicateAudioTrack { .. }
         | IdeWorkerCommand::RenameAudioTrack { .. }
@@ -4598,6 +4621,9 @@ fn process_project_mutation_command(
         }
         IdeWorkerCommand::RemoveAudioTrackContent { track_id } => {
             remove_audio_track_content(state, events, &track_id)
+        }
+        IdeWorkerCommand::FreezeAudioTrack { track_id } => {
+            freeze_audio_track(state, events, &track_id)
         }
         IdeWorkerCommand::ReorderMixerStrips {
             track_id,
@@ -6429,6 +6455,40 @@ fn remove_audio_track_content(
     )
 }
 
+fn freeze_audio_track(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    track_id: &str,
+) -> bool {
+    if track_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::FreezeAudioTrack,
+            IdeWorkerCommandFailure::AudioTrackFreeze(Box::new(
+                IdeAudioTrackFreezeError::InvalidTrackIdentity,
+            )),
+        );
+    }
+    let mut owned_track_id = String::new();
+    if owned_track_id.try_reserve_exact(track_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::FreezeAudioTrack,
+            IdeWorkerCommandFailure::AudioTrackFreeze(Box::new(
+                IdeAudioTrackFreezeError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_track_id.push_str(track_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::FreezeAudioTrack {
+            track_id: owned_track_id,
+        },
+    )
+}
+
 fn reorder_mixer_strips(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -7974,6 +8034,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::RemoveRoutingBus(Ok(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Ok(_))
         | ProjectMutationAttempt::RemoveAudioTrackContent(Ok(_))
+        | ProjectMutationAttempt::FreezeAudioTrack(Ok(_))
         | ProjectMutationAttempt::ReorderMixerStrips(Ok(_))
         | ProjectMutationAttempt::DuplicateAudioTrack(Ok(_))
         | ProjectMutationAttempt::ImportAudio(
@@ -8021,6 +8082,9 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         {
             HistoryEffect::Invalidate
         }
+        ProjectMutationAttempt::FreezeAudioTrack(Err(reason)) if reason.publication_committed() => {
+            HistoryEffect::Invalidate
+        }
         ProjectMutationAttempt::EditNativeFilter { .. }
         | ProjectMutationAttempt::SaveProjectAs(_)
         | ProjectMutationAttempt::RenameProject(_)
@@ -8032,6 +8096,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::AddRoutingBus(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrackContent(Err(_))
+        | ProjectMutationAttempt::FreezeAudioTrack(Err(_))
         | ProjectMutationAttempt::ReorderMixerStrips(Err(_))
         | ProjectMutationAttempt::DuplicateAudioTrack(Err(_))
         | ProjectMutationAttempt::ImportAudio(Err(IdeAudioImportBatchFailure {
@@ -8799,6 +8864,9 @@ fn project_mutation_save_failure(
                 IdeAudioTrackContentRemovalError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::FreezeAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackFreeze(
+            Box::new(IdeAudioTrackFreezeError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::ReorderMixerStrips { .. } => IdeWorkerCommandFailure::MixerStripReorder(
             Box::new(IdeMixerStripReorderError::MixerSave(Box::new(reason))),
         ),
@@ -9106,6 +9174,9 @@ fn project_mutation_native_close_failure(
                 IdeAudioTrackContentRemovalError::NativeClose(failure),
             ))
         }
+        ProjectMutation::FreezeAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackFreeze(
+            Box::new(IdeAudioTrackFreezeError::NativeClose(failure)),
+        ),
         ProjectMutation::ReorderMixerStrips { .. } => IdeWorkerCommandFailure::MixerStripReorder(
             Box::new(IdeMixerStripReorderError::NativeClose(failure)),
         ),
@@ -9353,6 +9424,9 @@ enum ProjectMutationAttempt {
             hyper_storage_engine::AudioTrackContentRemovalPublicationOutcome,
             IdeAudioTrackContentRemovalError,
         >,
+    ),
+    FreezeAudioTrack(
+        Result<hyper_storage_engine::AudioTrackFreezePublicationOutcome, IdeAudioTrackFreezeError>,
     ),
     ReorderMixerStrips(
         Result<hyper_storage_engine::TrackOrderPublicationOutcome, IdeMixerStripReorderError>,
@@ -9694,6 +9768,19 @@ fn audio_track_content_removal_failure_event(
         IdeWorkerEvent::CommandFailed {
             command: IdeWorkerCommandKind::RemoveAudioTrackContent,
             reason: IdeWorkerCommandFailure::AudioTrackContentRemoval(Box::new(reason)),
+        }
+    }
+}
+
+fn audio_track_freeze_failure_event(reason: IdeAudioTrackFreezeError) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::AudioTrackFreezeCommittedWithWarning {
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::FreezeAudioTrack,
+            reason: IdeWorkerCommandFailure::AudioTrackFreeze(Box::new(reason)),
         }
     }
 }
@@ -10140,6 +10227,16 @@ fn complete_project_mutation(
                 ),
                 ProjectMutationAttempt::RemoveAudioTrackContent(Err(reason)) => {
                     send_event(events, audio_track_content_removal_failure_event(reason))
+                }
+                ProjectMutationAttempt::FreezeAudioTrack(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::AudioTrackFrozen {
+                        revision: outcome.project_revision(),
+                        track_id: outcome.track_id().to_owned(),
+                    },
+                ),
+                ProjectMutationAttempt::FreezeAudioTrack(Err(reason)) => {
+                    send_event(events, audio_track_freeze_failure_event(reason))
                 }
                 ProjectMutationAttempt::ReorderMixerStrips(Ok(outcome)) => send_event(
                     events,
@@ -11496,6 +11593,18 @@ fn attempt_project_mutation(
                         IdeAudioTrackContentRemovalError::Publication(Box::new(source))
                     })
                 })
+            })
+        }
+        ProjectMutation::FreezeAudioTrack { track_id } => {
+            ProjectMutationAttempt::FreezeAudioTrack(if let Some(failure) = native_failure {
+                Err(IdeAudioTrackFreezeError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_audio_track_freeze(
+                    application,
+                    recovery,
+                    &track_id,
+                )
+                .and_then(|plan| plan.publish())
             })
         }
         ProjectMutation::ReorderMixerStrips {
@@ -13015,6 +13124,38 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::RemoveAudioTrackContent(Err(preparation)) => {
             IdeWorkerCommandFailure::AudioTrackContentRemoval(Box::new(
                 IdeAudioTrackContentRemovalError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
+                    reopen: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::FreezeAudioTrack(Ok(outcome)) => {
+            IdeWorkerCommandFailure::AudioTrackFreeze(Box::new(
+                IdeAudioTrackFreezeError::ReopenAfterPublication {
+                    outcome,
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::FreezeAudioTrack(Err(IdeAudioTrackFreezeError::Publication(
+            publication,
+        ))) => IdeWorkerCommandFailure::AudioTrackFreeze(Box::new(
+            IdeAudioTrackFreezeError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::FreezeAudioTrack(Err(IdeAudioTrackFreezeError::NativeClose(
+            close,
+        ))) => IdeWorkerCommandFailure::AudioTrackFreeze(Box::new(
+            IdeAudioTrackFreezeError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::FreezeAudioTrack(Err(preparation)) => {
+            IdeWorkerCommandFailure::AudioTrackFreeze(Box::new(
+                IdeAudioTrackFreezeError::ReopenAfterPreparation {
                     preparation: Box::new(preparation),
                     reopen: Box::new(reopen),
                 },
@@ -17356,6 +17497,159 @@ mod tests {
                 .resources()
                 .iter()
                 .all(|resource| resource.id() != source_track_id),
+        );
+        drop(package);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker scenario proves the render, publication, loader, and reopen boundaries of a frozen audio track"
+    )]
+    fn audio_track_freeze_is_durable_through_the_real_worker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-track-freeze-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let source = fixture.join("Source.wav");
+        std::fs::write(&source, mono_pcm16_wav(48_000, &[500; 96])).unwrap();
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 8)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the verified project must open before track freeze");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the created project has one audio track")
+            .id()
+            .to_owned();
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: vec![source],
+                track_id: track_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioImporting { files: 1 }
+        ));
+        let mut imported_clip_id = None;
+        let mut imported_reopened = false;
+        while imported_clip_id.is_none() || !imported_reopened {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::Running(snapshot) => {
+                    imported_reopened = snapshot.audio_clips().len() == 1;
+                }
+                IdeWorkerEvent::AudioImported(outcome) => {
+                    imported_clip_id = outcome.clip_ids().first().cloned();
+                }
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: None,
+                    redo_label: None,
+                } => {}
+                event => panic!("audio import emitted an unexpected lifecycle event: {event:?}"),
+            }
+        }
+        let imported_clip_id = imported_clip_id.expect("one source clip was imported");
+        worker
+            .try_send(IdeWorkerCommand::AddArrangementPlacement {
+                clip_id: imported_clip_id.clone(),
+                start_tick: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::ArrangementPlacementAdding { start_tick: 0 }
+        ));
+        let mut placement_reopened = false;
+        let mut placement_published = false;
+        while !placement_reopened || !placement_published {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::UndoStateChanged { .. } => {}
+                IdeWorkerEvent::Running(_) => placement_reopened = true,
+                IdeWorkerEvent::ArrangementPlacementAdded { start_tick: 0, .. } => {
+                    placement_published = true;
+                }
+                event => {
+                    panic!("placement creation emitted an unexpected lifecycle event: {event:?}")
+                }
+            }
+        }
+        add_compressor_history(&worker, track_id.clone());
+
+        worker
+            .try_send(IdeWorkerCommand::FreezeAudioTrack {
+                track_id: track_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioTrackFreezing
+        ));
+        let mut freeze_revision = None;
+        let mut frozen_reopened = false;
+        while freeze_revision.is_none() || !frozen_reopened {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: None,
+                    redo_label: None,
+                } => {}
+                IdeWorkerEvent::Running(snapshot) => {
+                    frozen_reopened = snapshot.audio_clips().len() == 1
+                        && snapshot.audio_clips()[0].track_id() == track_id;
+                }
+                IdeWorkerEvent::AudioTrackFrozen {
+                    revision,
+                    track_id: event_track,
+                } => {
+                    assert_eq!(event_track, track_id);
+                    freeze_revision = Some(revision);
+                }
+                event => panic!("track freeze emitted an unexpected lifecycle event: {event:?}"),
+            }
+        }
+        assert_eq!(freeze_revision, Some(5));
+
+        let package = verify_project_package(&project).unwrap();
+        assert_eq!(package.manifest().revision(), 5);
+        assert!(
+            package
+                .manifest()
+                .resources()
+                .iter()
+                .all(|resource| resource.id() != imported_clip_id),
+            "the active source clip must be retired by the freeze transaction"
+        );
+        assert_eq!(
+            package
+                .manifest()
+                .resources()
+                .iter()
+                .filter(|resource| resource.role() == hyper_project_model::ResourceRole::FreezeState)
+                .count(),
+            1,
+            "the exact unfreeze authority must be published with the replacement clip"
         );
         drop(package);
         assert_eq!(shutdown_report(worker).native_failure(), None);

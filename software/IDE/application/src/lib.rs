@@ -38,7 +38,7 @@ use hyper_desktop_audio::{
     discover_desktop_input_targets, discover_desktop_output_targets,
     export_prepared_project_flac_with_mixer, export_prepared_project_range_flac_with_mixer,
     export_prepared_project_range_wav_with_mixer, export_prepared_project_track_stems_with_mixer,
-    export_prepared_project_wav_with_mixer,
+    export_prepared_project_wav_with_mixer, render_prepared_audio_track_pre_fader_for_freeze,
 };
 pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
@@ -104,12 +104,13 @@ use hyper_playback_json::{
     AudioTrackContentRemovalDocuments, AudioTrackContentRemovalSerializationError,
     AudioTrackContentRemovalSource, AudioTrackDocumentSerializationError,
     AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
-    AudioTrackRemovalBlockers, AudioTrackRemovalSerializationError,
-    AudioTrackRenameSerializationError, AutomationTakeAddition,
-    AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
-    AutomationTargetSelection, CompiledMixerDestination, CompiledMixerGraph, CompiledMixerTap,
-    CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact,
-    MixerBaseState, MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
+    AudioTrackFreezeDocuments, AudioTrackFreezeSerializationError, AudioTrackRemovalBlockers,
+    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
+    AutomationTakeAddition, AutomationTakeAdditionSerializationError,
+    AutomationTakeEditSerializationError, AutomationTargetSelection, CompiledMixerDestination,
+    CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
+    LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact, MixerBaseState,
+    MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
     MixerStripReorderSerializationError, RecordedTakePlacementSerializationError,
     ReturnSendSerializationError, RoutingBusCreationSerializationError,
     RoutingBusDuplicationSerializationError, RoutingBusDuplicationSource,
@@ -130,7 +131,7 @@ use hyper_playback_json::{
     serialize_audio_clip_source_view, serialize_audio_primary_route_change,
     serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_content_removal, serialize_audio_track_duplication,
-    serialize_audio_track_removal, serialize_audio_track_rename,
+    serialize_audio_track_freeze, serialize_audio_track_removal, serialize_audio_track_rename,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_mixer_base_state, serialize_mixer_strip_reorder,
     serialize_recording_audio_clip_addition, serialize_recording_audio_clip_placement,
@@ -165,24 +166,25 @@ use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
     AudioClipRemovalOutcome, AudioClipRemovalRequest, AudioTrackContentRemovalPublicationOutcome,
     AudioTrackContentRemovalPublicationRequest, AudioTrackDuplicationPublicationOutcome,
-    AudioTrackDuplicationPublicationRequest, AudioTrackPublicationOutcome,
-    AudioTrackPublicationRequest, AudioTrackRemovalOutcome, AudioTrackRemovalRequest,
-    AutomationTakePublicationRequest, AutomationTakeRemovalRequest,
-    ControlMappingPublicationRequest, DeviceChainPublicationRequest, DeviceChainRemovalRequest,
-    ImportedAudioClipPublicationRequest, MixerRecoverySnapshotError, MixerRecoverySnapshotRequest,
-    ProjectResourcePublicationError, ProjectResourcePublicationOutcome,
-    ProjectResourcePublicationRequest, RecordedTakePlacementPublicationRequest,
-    RecordingDiscardOutcome, RecordingDiscardRequest, RequiredControlCapabilities,
-    RoutingBusPublicationKind, RoutingBusPublicationRequest, RoutingBusRemovalKind,
-    RoutingBusRemovalOutcome, RoutingBusRemovalRequest, SampleCleanupOutcome, SampleCleanupRequest,
-    ScenePublicationRequest, SceneRemovalRequest, StorageError, TrackOrderPublicationOutcome,
-    TrackOrderPublicationRequest, clean_unused_samples, discard_recording_take,
-    publish_arrangement, publish_audio_clip, publish_audio_track,
-    publish_audio_track_content_removal, publish_audio_track_duplication, publish_automation_take,
-    publish_control_mapping, publish_device_chain, publish_imported_audio_clip,
-    publish_project_resource, publish_recorded_take_placement, publish_routing_bus, publish_scene,
-    publish_track_order, remove_audio_clip, remove_audio_track, remove_automation_take,
-    remove_device_chain, remove_routing_bus, remove_scene, store_mixer_recovery_snapshot,
+    AudioTrackDuplicationPublicationRequest, AudioTrackFreezePublicationOutcome,
+    AudioTrackFreezePublicationRequest, AudioTrackPublicationOutcome, AudioTrackPublicationRequest,
+    AudioTrackRemovalOutcome, AudioTrackRemovalRequest, AutomationTakePublicationRequest,
+    AutomationTakeRemovalRequest, ControlMappingPublicationRequest, DeviceChainPublicationRequest,
+    DeviceChainRemovalRequest, ImportedAudioClipPublicationRequest, MixerRecoverySnapshotError,
+    MixerRecoverySnapshotRequest, ProjectResourcePublicationError,
+    ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
+    RecordedTakePlacementPublicationRequest, RecordingDiscardOutcome, RecordingDiscardRequest,
+    RequiredControlCapabilities, RoutingBusPublicationKind, RoutingBusPublicationRequest,
+    RoutingBusRemovalKind, RoutingBusRemovalOutcome, RoutingBusRemovalRequest,
+    SampleCleanupOutcome, SampleCleanupRequest, ScenePublicationRequest, SceneRemovalRequest,
+    StorageError, TrackOrderPublicationOutcome, TrackOrderPublicationRequest, clean_unused_samples,
+    discard_recording_take, publish_arrangement, publish_audio_clip, publish_audio_track,
+    publish_audio_track_content_removal, publish_audio_track_duplication,
+    publish_audio_track_freeze, publish_automation_take, publish_control_mapping,
+    publish_device_chain, publish_imported_audio_clip, publish_project_resource,
+    publish_recorded_take_placement, publish_routing_bus, publish_scene, publish_track_order,
+    remove_audio_clip, remove_audio_track, remove_automation_take, remove_device_chain,
+    remove_routing_bus, remove_scene, store_mixer_recovery_snapshot,
 };
 
 mod recording;
@@ -3066,6 +3068,154 @@ impl Error for IdeAudioTrackContentRemovalError {
             | Self::TrackResourceRoleMismatch
             | Self::DeviceChainAmbiguous
             | Self::ExternalReferences { .. }
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+/// Rejection or post-commit warning from rendering and freezing one audio
+/// track. A committed publication is never represented as an ordinary
+/// failure, even when reopening the project subsequently fails.
+#[derive(Debug)]
+pub enum IdeAudioTrackFreezeError {
+    InvalidTrackIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    Storage(StorageError),
+    TrackResourceMissing,
+    TrackResourceRoleMismatch,
+    ClipResourceMissing,
+    ClipResourceRoleMismatch,
+    ArrangementResourceMissing,
+    ArrangementResourceAmbiguous,
+    DeviceChainAmbiguous,
+    CapacityUnavailable,
+    Render(Box<OfflineExportError>),
+    Sample(DecodeError),
+    Serialization(AudioTrackFreezeSerializationError),
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAudioTrackFreezeError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: AudioTrackFreezePublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeAudioTrackFreezeError {
+    /// Whether the manifest commit completed despite a later warning.
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        matches!(self, Self::Publication(source) if source.published())
+            || matches!(self, Self::ReopenAfterPublication { .. })
+            || matches!(self, Self::ReopenAfterPreparation { preparation, .. }
+                if preparation.publication_committed())
+    }
+}
+
+impl fmt::Display for IdeAudioTrackFreezeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTrackIdentity => {
+                formatter.write_str("audio-track freeze requires a track identity")
+            }
+            Self::MixerSave(source) => write!(
+                formatter,
+                "live mixer state could not be preserved: {source}"
+            ),
+            Self::Storage(source) => source.fmt(formatter),
+            Self::TrackResourceMissing => {
+                formatter.write_str("the selected audio track is unavailable")
+            }
+            Self::TrackResourceRoleMismatch => {
+                formatter.write_str("the selected track cannot be frozen")
+            }
+            Self::ClipResourceMissing => {
+                formatter.write_str("a source clip for the selected track is unavailable")
+            }
+            Self::ClipResourceRoleMismatch => {
+                formatter.write_str("a source clip for the selected track has an invalid role")
+            }
+            Self::ArrangementResourceMissing => {
+                formatter.write_str("audio-track freeze requires an arrangement")
+            }
+            Self::ArrangementResourceAmbiguous => {
+                formatter.write_str("the project has multiple arrangement resources")
+            }
+            Self::DeviceChainAmbiguous => formatter.write_str(
+                "the selected track has multiple native device chains and cannot be frozen safely",
+            ),
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio-track freeze capacity is unavailable")
+            }
+            Self::Render(source) => source.fmt(formatter),
+            Self::Sample(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before freezing the audio track: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before freezing the audio track ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track freeze preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "audio track {} was frozen in project revision {} but the project could not be reopened: {source}",
+                outcome.track_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track freeze failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioTrackFreezeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Render(source) => Some(source.as_ref()),
+            Self::Sample(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidTrackIdentity
+            | Self::TrackResourceMissing
+            | Self::TrackResourceRoleMismatch
+            | Self::ClipResourceMissing
+            | Self::ClipResourceRoleMismatch
+            | Self::ArrangementResourceMissing
+            | Self::ArrangementResourceAmbiguous
+            | Self::DeviceChainAmbiguous
             | Self::CapacityUnavailable
             | Self::NativeClose(_) => None,
         }
@@ -7640,6 +7790,13 @@ struct IdeAudioTrackContentRemovalPlan {
 }
 
 #[derive(Debug)]
+struct IdeAudioTrackFreezePlan {
+    mixer: IdeMixerSavePlan,
+    documents: AudioTrackFreezeDocuments,
+    rendered_sample: Vec<u8>,
+}
+
+#[derive(Debug)]
 struct IdeAudioClipRemovalPlan {
     mixer: IdeMixerSavePlan,
     clip_id: String,
@@ -7777,6 +7934,25 @@ impl IdeAudioTrackContentRemovalPlan {
                 documents: &self.documents,
             },
         )
+    }
+}
+
+impl IdeAudioTrackFreezePlan {
+    fn publish(&self) -> Result<AudioTrackFreezePublicationOutcome, IdeAudioTrackFreezeError> {
+        let mixer = self.mixer.publish().map_err(|source| {
+            IdeAudioTrackFreezeError::MixerSave(Box::new(IdeProjectSaveError::Publication(
+                Box::new(source),
+            )))
+        })?;
+        publish_audio_track_freeze(
+            &self.mixer.project_path,
+            AudioTrackFreezePublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                documents: &self.documents,
+                rendered_sample: &self.rendered_sample,
+            },
+        )
+        .map_err(|source| IdeAudioTrackFreezeError::Publication(Box::new(source)))
     }
 }
 
@@ -9818,6 +9994,136 @@ impl RunningDesktopIdeApplication {
                 PlaybackRoutingBusKind::Group => RoutingBusRemovalKind::Group,
                 PlaybackRoutingBusKind::Return => RoutingBusRemovalKind::Return,
             },
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "freeze must retain verified source authority, render from the prepared session, and serialize one complete candidate before publication"
+    )]
+    fn prepare_audio_track_freeze(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        track_id: &str,
+    ) -> Result<IdeAudioTrackFreezePlan, IdeAudioTrackFreezeError> {
+        if track_id.is_empty() {
+            return Err(IdeAudioTrackFreezeError::InvalidTrackIdentity);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioTrackFreezeError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioTrackFreezeError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == track_id)
+            .ok_or(IdeAudioTrackFreezeError::TrackResourceMissing)?;
+        if descriptor.role() != ResourceRole::Track {
+            return Err(IdeAudioTrackFreezeError::TrackResourceRoleMismatch);
+        }
+        let source_track = package
+            .read_resource(track_id)
+            .map_err(IdeAudioTrackFreezeError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        if !project.is_audio_track(track_id) {
+            return Err(IdeAudioTrackFreezeError::TrackResourceRoleMismatch);
+        }
+        let clip_ids = project
+            .audio_track_clip_ids(track_id)
+            .ok_or(IdeAudioTrackFreezeError::TrackResourceRoleMismatch)?;
+        let mut source_clips = Vec::new();
+        source_clips
+            .try_reserve_exact(clip_ids.len())
+            .map_err(|_| IdeAudioTrackFreezeError::CapacityUnavailable)?;
+        for clip_id in clip_ids {
+            let descriptor = package
+                .manifest()
+                .resources()
+                .iter()
+                .find(|descriptor| descriptor.id() == clip_id)
+                .ok_or(IdeAudioTrackFreezeError::ClipResourceMissing)?;
+            if descriptor.role() != ResourceRole::Clip {
+                return Err(IdeAudioTrackFreezeError::ClipResourceRoleMismatch);
+            }
+            source_clips.push(
+                package
+                    .read_resource(clip_id)
+                    .map_err(IdeAudioTrackFreezeError::Storage)?,
+            );
+        }
+        let mut arrangements = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Arrangement);
+        let arrangement_descriptor = arrangements
+            .next()
+            .ok_or(IdeAudioTrackFreezeError::ArrangementResourceMissing)?;
+        if arrangements.next().is_some() {
+            return Err(IdeAudioTrackFreezeError::ArrangementResourceAmbiguous);
+        }
+        let source_arrangement = package
+            .read_resource(arrangement_descriptor.id())
+            .map_err(IdeAudioTrackFreezeError::Storage)?;
+        let mut chains = prepared
+            .device_chains()
+            .iter()
+            .filter(|chain| chain.track_id() == track_id);
+        let device_chain_id = chains.next().map(|chain| chain.id().to_owned());
+        if chains.next().is_some() {
+            return Err(IdeAudioTrackFreezeError::DeviceChainAmbiguous);
+        }
+        let rendered = render_prepared_audio_track_pre_fader_for_freeze(
+            prepared,
+            track_id,
+            OfflineExportSpec {
+                block_frames: application.config.maximum_block_frames(),
+            },
+        )
+        .map_err(|source| IdeAudioTrackFreezeError::Render(Box::new(source)))?;
+        let rendered_frame_count = u64::try_from(rendered.frame_count())
+            .map_err(|_| IdeAudioTrackFreezeError::CapacityUnavailable)?;
+        let rendered_sample =
+            encode_float_wav(&rendered).map_err(IdeAudioTrackFreezeError::Sample)?;
+        let frozen_asset_id = uuid::Uuid::new_v4().to_string();
+        let frozen_clip_id = uuid::Uuid::new_v4().to_string();
+        let frozen_placement_id = uuid::Uuid::new_v4().to_string();
+        let freeze_state_id = uuid::Uuid::new_v4().to_string();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAudioTrackFreezeError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let source_clip_bytes = source_clips.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let frozen_clip_name = project
+            .track_name(track_id)
+            .ok_or(IdeAudioTrackFreezeError::TrackResourceMissing)?;
+        let documents = serialize_audio_track_freeze(
+            project,
+            &assets,
+            &source_track,
+            &source_clip_bytes,
+            &source_arrangement,
+            track_id,
+            &frozen_asset_id,
+            rendered_frame_count,
+            &frozen_clip_id,
+            &frozen_placement_id,
+            &freeze_state_id,
+            frozen_clip_name,
+            device_chain_id,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeAudioTrackFreezeError::Serialization)?;
+        Ok(IdeAudioTrackFreezePlan {
+            mixer,
+            documents,
+            rendered_sample,
         })
     }
 
@@ -12435,7 +12741,8 @@ impl RunningDesktopIdeApplication {
                 ResourceRole::AutomationTake => takes.push(bytes),
                 ResourceRole::Mapping
                 | ResourceRole::RecordingMetadata
-                | ResourceRole::DeviceChain => {}
+                | ResourceRole::DeviceChain
+                | ResourceRole::FreezeState => {}
             }
         }
         let invalid = |source: Box<dyn Error + Send + Sync>| {

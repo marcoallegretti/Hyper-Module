@@ -8097,6 +8097,19 @@ impl LoadedPlaybackProject {
             .any(|track| track.id == track_id && track.kind == TrackKind::Audio)
     }
 
+    /// Returns the canonical clip identities owned by one audio track, in
+    /// persisted track-document order.
+    ///
+    /// This lets whole-track operations retain exactly the source authority
+    /// that the loader verified, without reparsing a track document.
+    #[must_use]
+    pub fn audio_track_clip_ids(&self, track_id: &str) -> Option<&[String]> {
+        self.tracks
+            .iter()
+            .find(|track| track.id == track_id && track.kind == TrackKind::Audio)
+            .map(|track| track.clip_ids.as_slice())
+    }
+
     #[must_use]
     pub fn is_reorderable_mixer_strip(&self, track_id: &str) -> bool {
         self.tracks.iter().any(|track| {
