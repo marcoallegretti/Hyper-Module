@@ -100,6 +100,7 @@ export struct MixerChannelRow {
     name: string,
     display-name: string,
     kind: string,
+    frozen: bool,
     state-available: bool,
     gain-percent: float,
     pan-percent: float,
@@ -2658,7 +2659,7 @@ export component MainWindow inherits Window {
                                         root.remove-track-content-visible = true;
                                     }
                                 }
-                                if channel.kind == "AUDIO" : Button {
+                                if channel.kind == "AUDIO" && !channel.frozen : Button {
                                     text: "Freeze…";
                                     accessible-label: "Freeze " + channel.name;
                                     enabled: root.app-mode == AppMode.running && channel.state-available;
@@ -2669,7 +2670,7 @@ export component MainWindow inherits Window {
                                         root.track-freeze-visible = true;
                                     }
                                 }
-                                if channel.kind == "AUDIO" : Button {
+                                if channel.kind == "AUDIO" && channel.frozen : Button {
                                     text: "Unfreeze…";
                                     accessible-label: "Unfreeze " + channel.name;
                                     enabled: root.app-mode == AppMode.running && channel.state-available;

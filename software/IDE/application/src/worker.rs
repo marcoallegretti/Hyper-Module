@@ -1208,6 +1208,7 @@ pub struct IdeMixerChannel {
     id: String,
     name: String,
     kind: IdeMixerChannelKind,
+    frozen: bool,
     active: bool,
     destination: IdeMixerChannelDestination,
     state: Option<IdeMixerChannelState>,
@@ -1404,6 +1405,7 @@ impl IdeMixerChannel {
             id: id.to_owned(),
             name: name.to_owned(),
             kind,
+            frozen: false,
             active: true,
             destination: IdeMixerChannelDestination::Main,
             state: None,
@@ -1424,6 +1426,11 @@ impl IdeMixerChannel {
     #[must_use]
     pub const fn kind(&self) -> IdeMixerChannelKind {
         self.kind
+    }
+
+    #[must_use]
+    pub const fn frozen(&self) -> bool {
+        self.frozen
     }
 
     #[must_use]
@@ -15170,6 +15177,7 @@ fn running_observation(
             id: try_project_owned(snapshot.mixer_channel_ids[channel_index])?,
             name: try_project_owned(snapshot.mixer_channel_names[channel_index])?,
             kind: snapshot.mixer_channel_kinds[channel_index],
+            frozen: snapshot.mixer_channel_frozen[channel_index],
             active: snapshot.mixer_channel_active[channel_index],
             destination: match snapshot.mixer_channel_destinations[channel_index] {
                 IdeMixerPrimaryDestination::Main => IdeMixerChannelDestination::Main,
@@ -17764,7 +17772,11 @@ mod tests {
                 } => {}
                 IdeWorkerEvent::Running(snapshot) => {
                     frozen_reopened = snapshot.audio_clips().len() == 1
-                        && snapshot.audio_clips()[0].track_id() == track_id;
+                        && snapshot.audio_clips()[0].track_id() == track_id
+                        && snapshot
+                            .mixer_channels()
+                            .iter()
+                            .any(|channel| channel.id() == track_id && channel.frozen());
                 }
                 IdeWorkerEvent::AudioTrackFrozen {
                     revision,
@@ -17797,7 +17809,11 @@ mod tests {
                 } => {}
                 IdeWorkerEvent::Running(snapshot) => {
                     unfrozen_reopened = snapshot.audio_clips().len() == 1
-                        && snapshot.audio_clips()[0].id() == imported_clip_id;
+                        && snapshot.audio_clips()[0].id() == imported_clip_id
+                        && snapshot
+                            .mixer_channels()
+                            .iter()
+                            .any(|channel| channel.id() == track_id && !channel.frozen());
                 }
                 IdeWorkerEvent::AudioTrackUnfrozen {
                     revision,

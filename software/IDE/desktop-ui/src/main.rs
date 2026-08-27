@@ -9967,6 +9967,7 @@ fn mixer_rows(
                 name: channel.name().into(),
                 display_name: compact_name(channel.name(), MAX_VISIBLE_MIXER_NAME_CHARS).into(),
                 kind: mixer_kind_name(channel.kind()).into(),
+                frozen: channel.frozen(),
                 state_available: state.is_some(),
                 gain_percent: state.map_or(0.0, |state| state.gain * 100.0),
                 pan_percent: state.map_or(0.0, |state| state.pan * 100.0),
@@ -12138,6 +12139,7 @@ fn set_mixer(
                     && actual.track_id.as_str() == expected.id()
                     && actual.name.as_str() == expected.name()
                     && actual.kind.as_str() == mixer_kind_name(expected.kind())
+                    && actual.frozen == expected.frozen()
                     && actual.state_available == state.is_some()
                     && actual.gain_percent.to_bits()
                         == state.map_or(0.0, |state| state.gain * 100.0).to_bits()
@@ -12483,6 +12485,7 @@ mod tests {
             name: "Audio channel".into(),
             display_name: "Audio".into(),
             kind: "AUDIO".into(),
+            frozen: false,
             state_available: true,
             gain_percent: 100.0,
             pan_percent: 0.0,
@@ -12496,6 +12499,54 @@ mod tests {
             active: true,
             activation_toggleable: true,
         }
+    }
+
+    #[test]
+    fn generated_track_freeze_control_follows_the_observed_frozen_state() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        let track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_visible(true);
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![
+            audio_track_mixer_row(0, track_id),
+        ]))));
+        ui.show().unwrap();
+
+        let freeze = ElementHandle::find_by_accessible_label(&ui, "Freeze Audio channel")
+            .next()
+            .expect("an unfrozen audio row exposes freeze");
+        assert_eq!(freeze.accessible_enabled(), Some(true));
+        assert!(
+            ElementHandle::find_by_accessible_label(&ui, "Unfreeze Audio channel")
+                .next()
+                .is_none(),
+            "an unfrozen audio row must not expose unfreeze"
+        );
+        freeze.mock_single_click(PointerEventButton::Left);
+        assert!(ui.get_track_freeze_visible());
+        assert!(!ui.get_track_freeze_is_unfreeze());
+        reset_audio_track_freeze_form(&ui);
+
+        let mut frozen = audio_track_mixer_row(0, track_id);
+        frozen.frozen = true;
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![frozen]))));
+
+        assert!(
+            ElementHandle::find_by_accessible_label(&ui, "Freeze Audio channel")
+                .next()
+                .is_none(),
+            "a frozen audio row must not expose freeze"
+        );
+        let unfreeze = ElementHandle::find_by_accessible_label(&ui, "Unfreeze Audio channel")
+            .next()
+            .expect("a frozen audio row exposes unfreeze");
+        assert_eq!(unfreeze.accessible_enabled(), Some(true));
+        unfreeze.mock_single_click(PointerEventButton::Left);
+        assert!(ui.get_track_freeze_visible());
+        assert!(ui.get_track_freeze_is_unfreeze());
+        ui.hide().unwrap();
     }
 
     fn dispatch_ide_shortcut(ui: &MainWindow, text: &str, shift: bool, repeated: bool) {
@@ -13561,6 +13612,7 @@ mod tests {
             name: name.into(),
             display_name: name.into(),
             kind: "AUDIO".into(),
+            frozen: false,
             state_available: true,
             gain_percent: 100.0,
             pan_percent: 0.0,
@@ -13644,6 +13696,7 @@ mod tests {
                 name: "Audio 1".into(),
                 display_name: "Audio 1".into(),
                 kind: "AUDIO".into(),
+                frozen: false,
                 state_available: true,
                 gain_percent: 100.0,
                 pan_percent: 0.0,
@@ -17962,6 +18015,7 @@ mod tests {
                 name: "Lead".into(),
                 display_name: "Lead".into(),
                 kind: "AUDIO".into(),
+                frozen: false,
                 state_available: true,
                 gain_percent: 100.0,
                 pan_percent: 0.0,
