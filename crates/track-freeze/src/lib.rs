@@ -9,7 +9,7 @@ use std::error::Error;
 use std::fmt;
 
 const FORMAT: &str = "hyper-track-freeze-state";
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 const MAX_DOCUMENT_BYTES: usize = 1_048_576;
 
 /// One complete arrangement placement displaced by a rendered freeze clip.
@@ -302,7 +302,7 @@ pub struct TrackFreezeState {
 }
 
 impl TrackFreezeState {
-    /// Creates one validated version-1 freeze authority.
+    /// Creates one validated version-2 freeze authority.
     ///
     /// # Errors
     ///
@@ -351,7 +351,7 @@ impl TrackFreezeState {
         })
     }
 
-    /// Parses one complete version-1 freeze-state resource.
+    /// Parses one complete version-2 freeze-state resource.
     ///
     /// # Errors
     ///
@@ -627,7 +627,7 @@ mod tests {
     use super::{TrackFreezeState, TrackFreezeStateError};
     use serde_json::Value;
 
-    const STATE: &[u8] = br#"{"format":"hyper-track-freeze-state","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337600","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","frozen_clip_id":"018f47a2-6b2d-7c11-8a44-001122337603","frozen_asset_id":"018f47a2-6b2d-7c11-8a44-001122337604","arrangement_id":"018f47a2-6b2d-7c11-8a44-001122337605","frozen_placement_id":"018f47a2-6b2d-7c11-8a44-001122337606","original_clips":[{"document":{"format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337607","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","name":"Lead","enabled":true,"duration_ticks":4,"source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337610","start_frame":0,"frame_count":100},"loop":{"enabled":false,"start_tick":0,"end_tick":4},"playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},"fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},"warp_markers":[],"extensions":{}}}],"original_placements":[{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337608","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","clip_id":"018f47a2-6b2d-7c11-8a44-001122337607","start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":"018f47a2-6b2d-7c11-8a44-001122337609","extensions":{}}"#;
+    const STATE: &[u8] = br#"{"format":"hyper-track-freeze-state","format_version":2,"id":"018f47a2-6b2d-7c11-8a44-001122337600","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","frozen_clip_id":"018f47a2-6b2d-7c11-8a44-001122337603","frozen_asset_id":"018f47a2-6b2d-7c11-8a44-001122337604","arrangement_id":"018f47a2-6b2d-7c11-8a44-001122337605","frozen_placement_id":"018f47a2-6b2d-7c11-8a44-001122337606","original_clips":[{"document":{"format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337607","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","name":"Lead","enabled":true,"duration_ticks":4,"source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337610","start_frame":0,"frame_count":100},"loop":{"enabled":false,"start_tick":0,"end_tick":4},"playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},"fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},"warp_markers":[],"extensions":{}}}],"original_placements":[{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337608","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","clip_id":"018f47a2-6b2d-7c11-8a44-001122337607","start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":"018f47a2-6b2d-7c11-8a44-001122337609","extensions":{}}"#;
 
     #[test]
     fn parses_complete_reversible_authority() {
@@ -651,6 +651,17 @@ mod tests {
         let duplicated = serde_json_canonicalizer::to_vec(&duplicated).unwrap();
         assert!(matches!(
             TrackFreezeState::parse(&duplicated),
+            Err(TrackFreezeStateError::InvalidDomain(_))
+        ));
+    }
+
+    #[test]
+    fn refuses_the_nonreversible_version_one_schema() {
+        let legacy = std::str::from_utf8(STATE)
+            .unwrap()
+            .replace("\"format_version\":2", "\"format_version\":1");
+        assert!(matches!(
+            TrackFreezeState::parse(legacy.as_bytes()),
             Err(TrackFreezeStateError::InvalidDomain(_))
         ));
     }
