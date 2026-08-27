@@ -2577,6 +2577,7 @@ dependencies = [
  "hyper-project-model",
  "hyper-recording-metadata",
  "hyper-strict-json",
+ "hyper-track-freeze",
  "junction",
  "same-file",
  "serde",

@@ -16,6 +16,7 @@ hyper-project-model = { path = "../project-model" }
 hyper-playback-json = { path = "../playback-json" }
 hyper-recording-metadata = { path = "../recording-metadata" }
 hyper-strict-json = { path = "../strict-json" }
+hyper-track-freeze = { path = "../track-freeze" }
 hound = "=3.5.1"
 same-file = "=1.0.6"
 serde = { version = "=1.0.229", features = ["derive"] }
