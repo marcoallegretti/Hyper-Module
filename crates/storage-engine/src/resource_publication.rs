@@ -43,7 +43,10 @@ pub use audio_track_duplication::{
 pub use audio_track_freeze::{
     AudioTrackFreezePublicationOutcome, AudioTrackFreezePublicationRecovery,
     AudioTrackFreezePublicationRecoveryDisposition, AudioTrackFreezePublicationRequest,
-    publish_audio_track_freeze, recover_audio_track_freezes,
+    AudioTrackUnfreezePublicationOutcome, AudioTrackUnfreezePublicationRecovery,
+    AudioTrackUnfreezePublicationRecoveryDisposition, AudioTrackUnfreezePublicationRequest,
+    publish_audio_track_freeze, publish_audio_track_unfreeze, recover_audio_track_freezes,
+    recover_audio_track_unfreezes,
 };
 pub use recording_discard::{
     RecordingDiscardOutcome, RecordingDiscardRecovery, RecordingDiscardRecoveryDisposition,

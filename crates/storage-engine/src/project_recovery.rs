@@ -5,13 +5,13 @@ use std::path::Path;
 use super::{
     AudioClipPublicationRecovery, AudioTrackContentRemovalPublicationRecovery,
     AudioTrackDuplicationPublicationRecovery, AudioTrackFreezePublicationRecovery,
-    AudioTrackPublicationRecovery, ControlMappingPublicationError,
-    ControlMappingPublicationRecovery, ProjectRenameError, ProjectRenameRecovery,
-    ProjectResourcePublicationError, ProjectResourcePublicationRecovery, RecordingDiscardRecovery,
-    RecordingImportError, RecordingImportRecovery, SampleCleanupRecovery,
+    AudioTrackPublicationRecovery, AudioTrackUnfreezePublicationRecovery,
+    ControlMappingPublicationError, ControlMappingPublicationRecovery, ProjectRenameError,
+    ProjectRenameRecovery, ProjectResourcePublicationError, ProjectResourcePublicationRecovery,
+    RecordingDiscardRecovery, RecordingImportError, RecordingImportRecovery, SampleCleanupRecovery,
     TrackOrderPublicationRecovery, recover_audio_clip_publications,
     recover_audio_track_content_removals, recover_audio_track_duplications,
-    recover_audio_track_freezes, recover_audio_track_publications,
+    recover_audio_track_freezes, recover_audio_track_publications, recover_audio_track_unfreezes,
     recover_control_mapping_publications, recover_project_renames,
     recover_project_resource_publications, recover_recording_discards, recover_recording_imports,
     recover_sample_cleanups, recover_track_order_publications,
@@ -32,6 +32,7 @@ struct ProjectTransactionRecoveryFamilies {
     audio_track_duplications: Vec<AudioTrackDuplicationPublicationRecovery>,
     audio_track_content_removals: Vec<AudioTrackContentRemovalPublicationRecovery>,
     audio_track_freezes: Vec<AudioTrackFreezePublicationRecovery>,
+    audio_track_unfreezes: Vec<AudioTrackUnfreezePublicationRecovery>,
     track_orders: Vec<TrackOrderPublicationRecovery>,
     audio_clips: Vec<AudioClipPublicationRecovery>,
     control_mappings: Vec<ControlMappingPublicationRecovery>,
@@ -63,6 +64,7 @@ impl ProjectTransactionRecoveryReport {
                 audio_track_duplications: Vec::new(),
                 audio_track_content_removals: Vec::new(),
                 audio_track_freezes: Vec::new(),
+                audio_track_unfreezes: Vec::new(),
                 track_orders,
                 audio_clips,
                 control_mappings,
@@ -94,6 +96,14 @@ impl ProjectTransactionRecoveryReport {
         audio_track_freezes: Vec<AudioTrackFreezePublicationRecovery>,
     ) -> Self {
         self.families.audio_track_freezes = audio_track_freezes;
+        self
+    }
+
+    fn with_audio_track_unfreezes(
+        mut self,
+        audio_track_unfreezes: Vec<AudioTrackUnfreezePublicationRecovery>,
+    ) -> Self {
+        self.families.audio_track_unfreezes = audio_track_unfreezes;
         self
     }
 
@@ -136,6 +146,11 @@ impl ProjectTransactionRecoveryReport {
     }
 
     #[must_use]
+    pub fn audio_track_unfreezes(&self) -> &[AudioTrackUnfreezePublicationRecovery] {
+        &self.families.audio_track_unfreezes
+    }
+
+    #[must_use]
     pub fn track_orders(&self) -> &[TrackOrderPublicationRecovery] {
         &self.families.track_orders
     }
@@ -173,6 +188,7 @@ impl ProjectTransactionRecoveryReport {
             && self.families.audio_track_duplications.is_empty()
             && self.families.audio_track_content_removals.is_empty()
             && self.families.audio_track_freezes.is_empty()
+            && self.families.audio_track_unfreezes.is_empty()
             && self.families.track_orders.is_empty()
             && self.families.audio_clips.is_empty()
             && self.families.control_mappings.is_empty()
@@ -190,6 +206,7 @@ pub enum ProjectTransactionRecoveryErrorSource {
     AudioTrackDuplication(ProjectResourcePublicationError),
     AudioTrackContentRemoval(ProjectResourcePublicationError),
     AudioTrackFreeze(ProjectResourcePublicationError),
+    AudioTrackUnfreeze(ProjectResourcePublicationError),
     TrackOrder(ProjectResourcePublicationError),
     AudioClip(ProjectResourcePublicationError),
     ControlMapping(ControlMappingPublicationError),
@@ -221,6 +238,9 @@ impl fmt::Display for ProjectTransactionRecoveryErrorSource {
             Self::AudioTrackFreeze(source) => {
                 write!(formatter, "audio-track freeze recovery failed: {source}")
             }
+            Self::AudioTrackUnfreeze(source) => {
+                write!(formatter, "audio-track unfreeze recovery failed: {source}")
+            }
             Self::TrackOrder(source) => write!(formatter, "track-order recovery failed: {source}"),
             Self::AudioClip(source) => write!(formatter, "audio-clip recovery failed: {source}"),
             Self::ControlMapping(source) => {
@@ -244,6 +264,7 @@ impl Error for ProjectTransactionRecoveryErrorSource {
             | Self::AudioTrackDuplication(source)
             | Self::AudioTrackContentRemoval(source)
             | Self::AudioTrackFreeze(source)
+            | Self::AudioTrackUnfreeze(source)
             | Self::TrackOrder(source)
             | Self::AudioClip(source)
             | Self::RecordingDiscard(source) => Some(source),
@@ -482,6 +503,29 @@ pub fn recover_project_transactions(
             });
         }
     };
+    let audio_track_unfreezes = match recover_audio_track_unfreezes(project_path) {
+        Ok(audio_track_unfreezes) => audio_track_unfreezes,
+        Err(source) => {
+            return Err(ProjectTransactionRecoveryError {
+                completed: ProjectTransactionRecoveryReport::from_parts(
+                    sample_cleanups,
+                    resources,
+                    audio_tracks,
+                    track_orders,
+                    audio_clips,
+                    control_mappings,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .with_audio_track_duplications(audio_track_duplications)
+                .with_audio_track_content_removals(audio_track_content_removals)
+                .with_audio_track_freezes(audio_track_freezes),
+                source: Box::new(ProjectTransactionRecoveryErrorSource::AudioTrackUnfreeze(
+                    source,
+                )),
+            });
+        }
+    };
     let recordings = match recover_recording_imports(project_path) {
         Ok(recordings) => recordings,
         Err(source) => {
@@ -498,7 +542,8 @@ pub fn recover_project_transactions(
                 )
                 .with_audio_track_duplications(audio_track_duplications)
                 .with_audio_track_content_removals(audio_track_content_removals)
-                .with_audio_track_freezes(audio_track_freezes),
+                .with_audio_track_freezes(audio_track_freezes)
+                .with_audio_track_unfreezes(audio_track_unfreezes),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::Recording(source)),
             });
         }
@@ -519,7 +564,8 @@ pub fn recover_project_transactions(
                 )
                 .with_audio_track_duplications(audio_track_duplications)
                 .with_audio_track_content_removals(audio_track_content_removals)
-                .with_audio_track_freezes(audio_track_freezes),
+                .with_audio_track_freezes(audio_track_freezes)
+                .with_audio_track_unfreezes(audio_track_unfreezes),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::RecordingDiscard(
                     source,
                 )),
@@ -543,6 +589,7 @@ pub fn recover_project_transactions(
                 .with_audio_track_duplications(audio_track_duplications)
                 .with_audio_track_content_removals(audio_track_content_removals)
                 .with_audio_track_freezes(audio_track_freezes)
+                .with_audio_track_unfreezes(audio_track_unfreezes)
                 .with_recording_discards(recording_discards),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::Rename(source)),
             });
@@ -561,6 +608,7 @@ pub fn recover_project_transactions(
     .with_audio_track_duplications(audio_track_duplications)
     .with_audio_track_content_removals(audio_track_content_removals)
     .with_audio_track_freezes(audio_track_freezes)
+    .with_audio_track_unfreezes(audio_track_unfreezes)
     .with_recording_discards(recording_discards))
 }
 

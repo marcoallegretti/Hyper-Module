@@ -15,15 +15,15 @@ use super::{
     verify_project_package, verify_retained_project_candidate, write_exclusive_synced,
 };
 use crate::project_lock::{
-    AUDIO_TRACK_FREEZE_TRANSACTION_PREFIX, ProjectLock, ProjectTransactionFamily,
-    find_unhandled_project_transaction,
+    AUDIO_TRACK_FREEZE_TRANSACTION_PREFIX, AUDIO_TRACK_UNFREEZE_TRANSACTION_PREFIX, ProjectLock,
+    ProjectTransactionFamily, find_unhandled_project_transaction,
 };
 use crate::stable_file::verify_open_stable;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 use hyper_audio_source::{AudioContainer, DecodeLimits, decode_bytes};
 use hyper_fs_authority::{identity, rename_no_replace};
-use hyper_playback_json::AudioTrackFreezeDocuments;
+use hyper_playback_json::{AudioTrackFreezeDocuments, AudioTrackUnfreezeDocuments};
 use hyper_project_model::{
     AssetRole, AudioMediaType, ProjectManifest, ResourceRole, is_valid_entity_id,
 };
@@ -41,6 +41,8 @@ use super::same_directory;
 
 const FORMAT: &str = "hyper-audio-track-freeze-transaction";
 const INTENT_FORMAT: &str = "hyper-audio-track-freeze-intent";
+const UNFREEZE_FORMAT: &str = "hyper-audio-track-unfreeze-transaction";
+const UNFREEZE_INTENT_FORMAT: &str = "hyper-audio-track-unfreeze-intent";
 const VERSION: u8 = 1;
 const SAMPLE_STAGING_NAME: &str = "rendered-sample.wav";
 
@@ -57,6 +59,39 @@ pub struct AudioTrackFreezePublicationOutcome {
     project_identity: [u8; 32],
     project_revision: u64,
     track_id: String,
+}
+
+/// The complete document delta for restoring one still-canonical rendered
+/// freeze. The rendered sample remains an asset until reference-aware cleanup
+/// can prove it unused.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioTrackUnfreezePublicationRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub documents: &'a AudioTrackUnfreezeDocuments,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioTrackUnfreezePublicationOutcome {
+    project_identity: [u8; 32],
+    project_revision: u64,
+    track_id: String,
+}
+
+impl AudioTrackUnfreezePublicationOutcome {
+    #[must_use]
+    pub const fn project_identity(&self) -> &[u8; 32] {
+        &self.project_identity
+    }
+
+    #[must_use]
+    pub const fn project_revision(&self) -> u64 {
+        self.project_revision
+    }
+
+    #[must_use]
+    pub fn track_id(&self) -> &str {
+        &self.track_id
+    }
 }
 
 impl AudioTrackFreezePublicationOutcome {
@@ -88,6 +123,30 @@ pub struct AudioTrackFreezePublicationRecovery {
     disposition: AudioTrackFreezePublicationRecoveryDisposition,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioTrackUnfreezePublicationRecoveryDisposition {
+    Committed,
+    RolledBack,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioTrackUnfreezePublicationRecovery {
+    transaction_id: String,
+    disposition: AudioTrackUnfreezePublicationRecoveryDisposition,
+}
+
+impl AudioTrackUnfreezePublicationRecovery {
+    #[must_use]
+    pub fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> AudioTrackUnfreezePublicationRecoveryDisposition {
+        self.disposition
+    }
+}
+
 impl AudioTrackFreezePublicationRecovery {
     #[must_use]
     pub fn transaction_id(&self) -> &str {
@@ -107,6 +166,14 @@ enum PublicationPhase {
     ResourcePublished(usize),
     SamplePublished,
     Manifest,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum TransactionOperation {
+    #[default]
+    Freeze,
+    Unfreeze,
 }
 
 #[derive(Debug)]
@@ -165,10 +232,17 @@ struct Transaction {
     frozen_clip_id: String,
     frozen_asset_id: String,
     freeze_state_id: String,
-    rendered_sample: TransactionFile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rendered_sample: Option<TransactionFile>,
+    #[serde(default)]
     created_assets_directory: bool,
+    #[serde(default)]
     created_samples_directory: bool,
+    #[serde(default)]
+    operation: TransactionOperation,
     entries: Vec<TransactionEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed_directories: Vec<String>,
     extensions: serde_json::Map<String, Value>,
 }
 
@@ -217,6 +291,51 @@ pub fn recover_audio_track_freezes(
     recover_locked(&root_path, &root, &backups)
 }
 
+/// Restores one unchanged rendered freeze through a recoverable,
+/// manifest-last transaction. The frozen sample asset is intentionally
+/// retained; only reference-aware sample cleanup may remove it later.
+///
+/// # Errors
+///
+/// Refuses a stale project, a diverged frozen track, resource collisions, or
+/// any document delta that cannot be proven against retained freeze authority.
+pub fn publish_audio_track_unfreeze(
+    project_path: impl AsRef<Path>,
+    request: AudioTrackUnfreezePublicationRequest<'_>,
+) -> Result<AudioTrackUnfreezePublicationOutcome, ProjectResourcePublicationError> {
+    publish_unfreeze_observed(project_path.as_ref(), request, |_, _| Ok(()))
+}
+
+/// Recovers interrupted unfreeze publications without accepting filesystem
+/// contents outside the authenticated journal.
+///
+/// # Errors
+///
+/// Returns an error when neither the pre-unfreeze nor post-unfreeze package
+/// can be proven from the transaction record.
+pub fn recover_audio_track_unfreezes(
+    project_path: impl AsRef<Path>,
+) -> Result<Vec<AudioTrackUnfreezePublicationRecovery>, ProjectResourcePublicationError> {
+    let (root_path, root) = open_stable_project_root(project_path.as_ref()).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "open project root for track-unfreeze recovery",
+            error,
+        )
+    })?;
+    let Some(backups) = open_optional_dir(&root, "backups")? else {
+        return Ok(Vec::new());
+    };
+    let _lock = ProjectLock::acquire(&backups).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::TransactionUnavailable,
+            "acquire project storage transaction lock",
+            error,
+        )
+    })?;
+    recover_unfreeze_locked(&root_path, &root, &backups)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "freeze validates its render, source authority, journal, and manifest boundary together"
@@ -256,7 +375,7 @@ fn publish_observed(
             "a prior track freeze was recovered; reopen the current project revision",
         ));
     }
-    reject_other_transactions(&backups)?;
+    reject_other_transactions(&backups, ProjectTransactionFamily::AudioTrackFreeze)?;
     verified.confirm_unchanged().map_err(|error| {
         caused(
             ProjectResourcePublicationErrorKind::ProjectChanged,
@@ -321,6 +440,116 @@ fn publish_observed(
         &mut observer,
     );
     finish_result(
+        verified.root(),
+        &verified.root_dir,
+        &backups,
+        transaction,
+        &name,
+        result,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "unfreeze keeps source authority, staged replacements, and its manifest commit visible together"
+)]
+fn publish_unfreeze_observed(
+    project_path: &Path,
+    request: AudioTrackUnfreezePublicationRequest<'_>,
+    mut observer: impl FnMut(PublicationPhase, &Path) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<AudioTrackUnfreezePublicationOutcome, ProjectResourcePublicationError> {
+    let verified = verify_project_package(project_path).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "project verification failed before track unfreeze",
+            error,
+        )
+    })?;
+    if request.expected_project_sha256 != *verified.manifest_sha256() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "project changed after track-unfreeze preparation",
+        ));
+    }
+    let (entries, state) = resolve_unfreeze_entries(&verified, request.documents)?;
+    let authorities = resource_authorities(&verified.root_dir, &entries)?;
+    let backups = open_or_create_dir(&verified.root_dir, "backups")?;
+    let _lock = ProjectLock::acquire(&backups).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::TransactionUnavailable,
+            "acquire project storage transaction lock",
+            error,
+        )
+    })?;
+    let recovered = recover_unfreeze_locked(verified.root(), &verified.root_dir, &backups)?;
+    if !recovered.is_empty() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "a prior track unfreeze was recovered; reopen the current project revision",
+        ));
+    }
+    reject_other_transactions(&backups, ProjectTransactionFamily::AudioTrackUnfreeze)?;
+    verified.confirm_unchanged().map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "project changed before track-unfreeze staging",
+            error,
+        )
+    })?;
+    let previous_project = read_bounded(&verified.root_dir, MANIFEST_NAME, MAX_JSON_BYTES)?;
+    if digest(&previous_project) != request.expected_project_sha256 {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "active project identity changed before track-unfreeze staging",
+        ));
+    }
+    let next_revision = verified
+        .manifest()
+        .revision()
+        .checked_add(1)
+        .filter(|revision| *revision <= MAX_SAFE_INTEGER)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "project revision cannot be incremented",
+            )
+        })?;
+    let candidate_project =
+        candidate_unfreeze_manifest(&previous_project, &entries, next_revision)?;
+    let name = format!(
+        "{AUDIO_TRACK_UNFREEZE_TRANSACTION_PREFIX}{}",
+        Uuid::new_v4()
+    );
+    backups.create_dir(&name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "create track-unfreeze transaction",
+            error,
+        )
+    })?;
+    sync_dir(&backups)?;
+    let transaction = backups.open_dir_nofollow(&name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "open track-unfreeze transaction",
+            error,
+        )
+    })?;
+    let result = run_unfreeze_publication(
+        &verified,
+        &backups,
+        &transaction,
+        &name,
+        &entries,
+        &authorities,
+        &state,
+        request.documents,
+        &previous_project,
+        &candidate_project,
+        next_revision,
+        &mut observer,
+    );
+    finish_unfreeze_result(
         verified.root(),
         &verified.root_dir,
         &backups,
@@ -483,6 +712,169 @@ fn resolve_entries<'a>(
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok((entries, state, sample_plan))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "unfreeze reauthenticates the live rendered state and every retained source before staging"
+)]
+fn resolve_unfreeze_entries<'a>(
+    verified: &StructurallyVerifiedProject,
+    documents: &'a AudioTrackUnfreezeDocuments,
+) -> Result<(Vec<Entry<'a>>, TrackFreezeState), ProjectResourcePublicationError> {
+    validate_canonical_resource(documents.track())?;
+    validate_canonical_resource(documents.arrangement())?;
+    let track_id = track_id_from_track(documents.track())?;
+    let arrangement_id = arrangement_id_from_arrangement(documents.arrangement())?;
+    validate_document(documents.track(), &track_id, ResourceRole::Track)?;
+    validate_document(
+        documents.arrangement(),
+        &arrangement_id,
+        ResourceRole::Arrangement,
+    )?;
+    let (track_path, track_before) = current_resource(verified, &track_id, ResourceRole::Track)?;
+    let (arrangement_path, arrangement_before) =
+        current_resource(verified, &arrangement_id, ResourceRole::Arrangement)?;
+    let (state_path, state_bytes) = current_resource(
+        verified,
+        documents.freeze_state_id(),
+        ResourceRole::FreezeState,
+    )?;
+    validate_canonical_resource(&state_bytes)?;
+    validate_freeze_state_document(&state_bytes, documents.freeze_state_id())?;
+    let state = TrackFreezeState::parse(&state_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse active track-unfreeze state",
+            error,
+        )
+    })?;
+    if state.project_id() != verified.manifest().project_id()
+        || state.track_id() != track_id
+        || state.arrangement_id() != arrangement_id
+        || state.frozen_clip_id() != documents.frozen_clip_id()
+        || state.frozen_asset_id() != documents.frozen_asset_id()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-unfreeze documents do not match active retained authority",
+        ));
+    }
+    let (frozen_clip_path, frozen_clip_before) =
+        current_resource(verified, documents.frozen_clip_id(), ResourceRole::Clip)?;
+    validate_unfreeze_document_delta(
+        &state,
+        documents,
+        &track_before,
+        &arrangement_before,
+        &frozen_clip_before,
+    )?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(4 + documents.clips().len())
+        .map_err(|_| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "allocate track-unfreeze resource entries",
+            )
+        })?;
+    entries.push(Entry {
+        id: state.track_id().to_owned(),
+        role: ResourceRole::Track,
+        path: track_path,
+        before: Some(track_before),
+        after: Some(documents.track()),
+        created_parent_directory: false,
+    });
+    entries.push(Entry {
+        id: state.arrangement_id().to_owned(),
+        role: ResourceRole::Arrangement,
+        path: arrangement_path,
+        before: Some(arrangement_before),
+        after: Some(documents.arrangement()),
+        created_parent_directory: false,
+    });
+    entries.push(Entry {
+        id: documents.frozen_clip_id().to_owned(),
+        role: ResourceRole::Clip,
+        path: frozen_clip_path,
+        before: Some(frozen_clip_before),
+        after: None,
+        created_parent_directory: false,
+    });
+    entries.push(Entry {
+        id: documents.freeze_state_id().to_owned(),
+        role: ResourceRole::FreezeState,
+        path: state_path,
+        before: Some(state_bytes),
+        after: None,
+        created_parent_directory: false,
+    });
+    for clip in documents.clips() {
+        validate_canonical_resource(clip.bytes())?;
+        validate_document(clip.bytes(), clip.id(), ResourceRole::Clip)?;
+        entries.push(Entry {
+            id: clip.id().to_owned(),
+            role: ResourceRole::Clip,
+            path: fresh_resource_path(verified, ResourceRole::Clip, clip.id())?,
+            before: None,
+            after: Some(clip.bytes()),
+            created_parent_directory: false,
+        });
+    }
+    if entries.len() > MAX_ENTRIES {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "track-unfreeze resource count exceeds package limits",
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    if entries
+        .iter()
+        .any(|entry| !ids.insert(entry.id.as_str()) || !paths.insert(entry.path.as_str()))
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-unfreeze resource identities are not unique",
+        ));
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((entries, state))
+}
+
+fn track_id_from_track(bytes: &[u8]) -> Result<String, ProjectResourcePublicationError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse restored track",
+            error,
+        )
+    })?;
+    value["id"].as_str().map(str::to_owned).ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "restored track has no identity",
+        )
+    })
+}
+
+fn arrangement_id_from_arrangement(
+    bytes: &[u8],
+) -> Result<String, ProjectResourcePublicationError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse restored arrangement",
+            error,
+        )
+    })?;
+    value["id"].as_str().map(str::to_owned).ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "restored arrangement has no identity",
+        )
+    })
 }
 
 fn current_resource(
@@ -955,6 +1347,168 @@ fn validate_freeze_document_delta(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the prepublication unfreeze authority is validated as one complete track, clip, and placement graph"
+)]
+fn validate_unfreeze_document_delta(
+    state: &TrackFreezeState,
+    documents: &AudioTrackUnfreezeDocuments,
+    previous_track: &[u8],
+    previous_arrangement: &[u8],
+    previous_frozen_clip: &[u8],
+) -> Result<(), ProjectResourcePublicationError> {
+    let retained_frozen_clip = serde_json_canonicalizer::to_vec(state.frozen_clip().document())
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "canonicalize retained frozen clip",
+                error,
+            )
+        })?;
+    if retained_frozen_clip != previous_frozen_clip {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "active rendered clip differs from retained track-freeze authority",
+        ));
+    }
+    let previous_track: Value = serde_json::from_slice(previous_track).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse active frozen track",
+            error,
+        )
+    })?;
+    let restored_track: Value = serde_json::from_slice(documents.track()).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse restored track",
+            error,
+        )
+    })?;
+    if previous_track["clip_ids"]
+        .as_array()
+        .is_none_or(|ids| ids.len() != 1 || ids[0].as_str() != Some(state.frozen_clip_id()))
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "active track no longer contains exactly its rendered clip",
+        ));
+    }
+    let expected_ids = state
+        .original_clips()
+        .iter()
+        .map(|clip| Value::String(clip.id().to_owned()))
+        .collect::<Vec<_>>();
+    if restored_track["clip_ids"].as_array() != Some(&expected_ids) {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "restored track does not retain the exact original clip order",
+        ));
+    }
+    let mut restored = BTreeMap::new();
+    for clip in documents.clips() {
+        if restored.insert(clip.id(), clip.bytes()).is_some() {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "restored clip identities are duplicated",
+            ));
+        }
+    }
+    if restored.len() != state.original_clips().len() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "restored clip count differs from retained authority",
+        ));
+    }
+    for original in state.original_clips() {
+        let expected = serde_json_canonicalizer::to_vec(original.document()).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "canonicalize retained original clip",
+                error,
+            )
+        })?;
+        if restored.get(original.id()).copied() != Some(expected.as_slice()) {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "restored clip differs from retained authority",
+            ));
+        }
+    }
+    let previous_arrangement: Value =
+        serde_json::from_slice(previous_arrangement).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "parse active frozen arrangement",
+                error,
+            )
+        })?;
+    let restored_arrangement: Value =
+        serde_json::from_slice(documents.arrangement()).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "parse restored arrangement",
+                error,
+            )
+        })?;
+    let previous_placements = previous_arrangement["placements"]
+        .as_array()
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "active arrangement placements are invalid",
+            )
+        })?;
+    let active_track_placements = previous_placements
+        .iter()
+        .filter(|placement| placement["track_id"].as_str() == Some(state.track_id()))
+        .collect::<Vec<_>>();
+    if active_track_placements.len() != 1
+        || active_track_placements[0]["id"].as_str() != Some(state.frozen_placement_id())
+        || active_track_placements[0]["clip_id"].as_str() != Some(state.frozen_clip_id())
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "active arrangement no longer contains exactly its rendered placement",
+        ));
+    }
+    let restored_placements = restored_arrangement["placements"]
+        .as_array()
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "restored arrangement placements are invalid",
+            )
+        })?;
+    let restored_track_placements = restored_placements
+        .iter()
+        .filter(|placement| placement["track_id"].as_str() == Some(state.track_id()))
+        .collect::<Vec<_>>();
+    if restored_track_placements.len() != state.original_placements().len()
+        || restored_track_placements
+            .iter()
+            .any(|placement| placement["id"].as_str() == Some(state.frozen_placement_id()))
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "restored arrangement does not replace the rendered placement exactly",
+        ));
+    }
+    for original in state.original_placements() {
+        if !restored_track_placements
+            .iter()
+            .any(|placement| *placement == original.document())
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "restored arrangement placement differs from retained authority",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn target_placements(
     arrangement: &Value,
     track_id: &str,
@@ -1079,6 +1633,94 @@ fn candidate_manifest(
         caused(
             ProjectResourcePublicationErrorKind::Integrity,
             "candidate track-freeze manifest is invalid",
+            error,
+        )
+    })?;
+    Ok(bytes)
+}
+
+fn candidate_unfreeze_manifest(
+    active: &[u8],
+    entries: &[Entry<'_>],
+    revision: u64,
+) -> Result<Vec<u8>, ProjectResourcePublicationError> {
+    let mut value: Value = serde_json::from_slice(active).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "parse active project manifest",
+            error,
+        )
+    })?;
+    value["revision"] = revision.into();
+    let resources = value["resources"].as_array_mut().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "project resource declarations are invalid",
+        )
+    })?;
+    for entry in entries {
+        match (entry.before.is_some(), entry.after) {
+            (true, Some(after)) => {
+                let descriptor = resources
+                    .iter_mut()
+                    .find(|descriptor| descriptor["id"].as_str() == Some(&entry.id))
+                    .ok_or_else(|| {
+                        failure(
+                            ProjectResourcePublicationErrorKind::Integrity,
+                            "track-unfreeze replacement descriptor disappeared",
+                        )
+                    })?;
+                if descriptor["role"].as_str() != Some(role_name(entry.role))
+                    || descriptor["path"].as_str() != Some(&entry.path)
+                {
+                    return Err(failure(
+                        ProjectResourcePublicationErrorKind::Integrity,
+                        "track-unfreeze replacement descriptor changed",
+                    ));
+                }
+                descriptor["byte_length"] = after.len().into();
+                descriptor["sha256"] = hex_digest(digest(after)).into();
+            }
+            (false, Some(after)) => resources.push(serde_json::json!({
+                "id": entry.id, "role": role_name(entry.role), "path": entry.path,
+                "media_type": "application/json", "byte_length": after.len(),
+                "sha256": hex_digest(digest(after)), "extensions": {},
+            })),
+            (true, None) => {
+                let before = resources.len();
+                resources.retain(|descriptor| descriptor["id"].as_str() != Some(&entry.id));
+                if resources.len().checked_add(1) != Some(before) {
+                    return Err(failure(
+                        ProjectResourcePublicationErrorKind::Integrity,
+                        "track-unfreeze retired descriptor disappeared",
+                    ));
+                }
+            }
+            (false, None) => {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "track-unfreeze entry has no active side",
+                ));
+            }
+        }
+    }
+    let bytes = serde_json_canonicalizer::to_vec(&value).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "serialize track-unfreeze project manifest",
+            error,
+        )
+    })?;
+    if bytes.len() > MAX_JSON_BYTES {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "candidate track-unfreeze manifest exceeds its size limit",
+        ));
+    }
+    ProjectManifest::parse(&bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "candidate track-unfreeze manifest is invalid",
             error,
         )
     })?;
@@ -1240,12 +1882,18 @@ fn run_publication(
             observer(PublicationPhase::ResourcePublished(index), verified.root())?;
         }
     }
+    let sample = tx.rendered_sample.as_ref().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "track-freeze transaction has no rendered sample",
+        )
+    })?;
     let sample_parent = prepare_sample_parent(&verified.root_dir, &tx)?;
     transaction
         .hard_link(
             SAMPLE_STAGING_NAME,
             &sample_parent,
-            file_name(&tx.rendered_sample.path)?,
+            file_name(&sample.path)?,
         )
         .map_err(|error| {
             caused(
@@ -1292,6 +1940,174 @@ fn run_publication(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "unfreeze retains every current rendered resource until a verified manifest commits its restoration"
+)]
+fn run_unfreeze_publication(
+    verified: &StructurallyVerifiedProject,
+    backups: &Dir,
+    transaction: &Dir,
+    name: &str,
+    entries: &[Entry<'_>],
+    authorities: &BTreeMap<String, Handle>,
+    state: &TrackFreezeState,
+    documents: &AudioTrackUnfreezeDocuments,
+    previous_project: &[u8],
+    candidate_project: &[u8],
+    next_revision: u64,
+    observer: &mut impl FnMut(PublicationPhase, &Path) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<AudioTrackUnfreezePublicationOutcome, ProjectResourcePublicationError> {
+    write_unfreeze_intent(transaction, name, entries.len())?;
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(before) = &entry.before {
+            write_exclusive_synced(transaction, &previous_name(index), before)?;
+        }
+        if let Some(after) = entry.after {
+            write_exclusive_synced(transaction, &staged_name(index), after)?;
+        }
+    }
+    write_exclusive_synced(transaction, PROJECT_STAGING_NAME, candidate_project)?;
+    write_exclusive_synced(transaction, PREVIOUS_PROJECT_NAME, previous_project)?;
+    let tx = unfreeze_transaction_record(
+        name,
+        entries,
+        state,
+        documents,
+        verified,
+        candidate_project,
+        next_revision,
+    )?;
+    let bytes = serde_json_canonicalizer::to_vec(&tx).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "serialize track-unfreeze transaction",
+            error,
+        )
+    })?;
+    write_exclusive_synced(transaction, TRANSACTION_NAME, &bytes)?;
+    sync_dir(transaction)?;
+    sync_dir(backups)?;
+    observer(PublicationPhase::Transaction, verified.root())?;
+    for (index, entry) in tx.entries.iter().enumerate() {
+        if let Some(before) = &entry.before {
+            let authority = authorities.get(&entry.path).ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "track-unfreeze source authority disappeared before publication",
+                )
+            })?;
+            move_verified_resource(&verified.root_dir, transaction, entry, before, authority)?;
+            observer(PublicationPhase::SourceMoved(index), verified.root())?;
+        }
+        if entry.after.is_some() {
+            let parent = prepare_parent(&verified.root_dir, entry)?;
+            publish_staged_file_no_replace(
+                transaction,
+                &staged_name(index),
+                &parent,
+                file_name(&entry.path)?,
+                &format!(".track-unfreeze-{index}-{}.json", tx.id),
+                "track-unfreeze resource",
+            )?;
+            observer(PublicationPhase::ResourcePublished(index), verified.root())?;
+        }
+    }
+    for directory in &tx.removed_directories {
+        verified.root_dir.remove_dir(directory).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::ProjectChanged,
+                "remove empty track-unfreeze resource directory",
+                error,
+            )
+        })?;
+        sync_dir(&verified.root_dir)?;
+    }
+    let candidate =
+        verify_project_candidate(verified.root(), &verified.root_dir, candidate_project).map_err(
+            |error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "track-unfreeze candidate does not verify",
+                    error,
+                )
+            },
+        )?;
+    if candidate.revision() != next_revision {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "track-unfreeze candidate revision changed",
+        ));
+    }
+    publish_staged_file(
+        transaction,
+        PROJECT_STAGING_NAME,
+        backups,
+        &verified.root_dir,
+        MANIFEST_NAME,
+        &format!(".track-unfreeze-project-{}.json", tx.id),
+        "track-unfreeze project manifest",
+    )?;
+    observer(PublicationPhase::Manifest, verified.root())?;
+    verify_committed(
+        verified.root(),
+        &verified.root_dir,
+        digest(candidate_project),
+    )?;
+    unfreeze_outcome(&tx)
+}
+
+fn unfreeze_transaction_record(
+    name: &str,
+    entries: &[Entry<'_>],
+    state: &TrackFreezeState,
+    documents: &AudioTrackUnfreezeDocuments,
+    verified: &StructurallyVerifiedProject,
+    candidate_project: &[u8],
+    revision: u64,
+) -> Result<Transaction, ProjectResourcePublicationError> {
+    let removed_directories = removed_directories(verified, entries)?;
+    let transaction_entries = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| TransactionEntry {
+            id: entry.id.clone(),
+            role: role_name(entry.role).to_owned(),
+            path: entry.path.clone(),
+            before: entry
+                .before
+                .as_deref()
+                .map(|bytes| transaction_file(&entry.path, bytes)),
+            after: entry
+                .after
+                .map(|bytes| transaction_file(&entry.path, bytes)),
+            backup_name: entry.before.as_ref().map(|_| backup_name(index)),
+            created_parent_directory: entry.created_parent_directory,
+        })
+        .collect::<Vec<_>>();
+    Ok(Transaction {
+        format: UNFREEZE_FORMAT.to_owned(),
+        format_version: VERSION,
+        id: transaction_id(name)?,
+        before_project_sha256: hex_digest(*verified.manifest_sha256()),
+        after_project_sha256: hex_digest(digest(candidate_project)),
+        before_project_revision: verified.manifest().revision(),
+        after_project_revision: revision,
+        track_id: state.track_id().to_owned(),
+        frozen_clip_id: documents.frozen_clip_id().to_owned(),
+        frozen_asset_id: documents.frozen_asset_id().to_owned(),
+        freeze_state_id: documents.freeze_state_id().to_owned(),
+        rendered_sample: None,
+        created_assets_directory: false,
+        created_samples_directory: false,
+        operation: TransactionOperation::Unfreeze,
+        removed_directories,
+        entries: transaction_entries,
+        extensions: serde_json::Map::new(),
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
     reason = "the complete transaction record binds every durable publication input"
 )]
 fn transaction_record(
@@ -1334,13 +2150,15 @@ fn transaction_record(
         frozen_clip_id: state.frozen_clip_id().to_owned(),
         frozen_asset_id: state.frozen_asset_id().to_owned(),
         freeze_state_id: state.id().to_owned(),
-        rendered_sample: transaction_file(
+        rendered_sample: Some(transaction_file(
             &format!("assets/samples/{}.wav", state.frozen_asset_id()),
             rendered_sample,
-        ),
+        )),
         created_assets_directory: sample_plan.created_assets_directory,
         created_samples_directory: sample_plan.created_samples_directory,
+        operation: TransactionOperation::Freeze,
         entries,
+        removed_directories: Vec::new(),
         extensions: serde_json::Map::new(),
     })
 }
@@ -1567,9 +2385,42 @@ fn write_intent(
     sync_dir(transaction)
 }
 
+fn write_unfreeze_intent(
+    transaction: &Dir,
+    name: &str,
+    entry_count: usize,
+) -> Result<(), ProjectResourcePublicationError> {
+    let intent = Intent {
+        format: UNFREEZE_INTENT_FORMAT.to_owned(),
+        format_version: VERSION,
+        id: transaction_id(name)?,
+        entry_count,
+        extensions: serde_json::Map::new(),
+    };
+    let bytes = serde_json_canonicalizer::to_vec(&intent).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "serialize track-unfreeze transaction intent",
+            error,
+        )
+    })?;
+    write_exclusive_synced(transaction, INTENT_STAGING_NAME, &bytes)?;
+    transaction
+        .rename(INTENT_STAGING_NAME, transaction, INTENT_NAME)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "publish track-unfreeze transaction intent",
+                error,
+            )
+        })?;
+    sync_dir(transaction)
+}
+
 fn transaction_id(name: &str) -> Result<String, ProjectResourcePublicationError> {
     let id = name
         .strip_prefix(AUDIO_TRACK_FREEZE_TRANSACTION_PREFIX)
+        .or_else(|| name.strip_prefix(AUDIO_TRACK_UNFREEZE_TRANSACTION_PREFIX))
         .ok_or_else(|| {
             failure(
                 ProjectResourcePublicationErrorKind::Recovery,
@@ -1603,16 +2454,53 @@ fn resource_parent(path: &str) -> Result<&str, ProjectResourcePublicationError> 
         })
 }
 
-fn reject_other_transactions(backups: &Dir) -> Result<(), ProjectResourcePublicationError> {
-    let found =
-        find_unhandled_project_transaction(backups, &[ProjectTransactionFamily::AudioTrackFreeze])
-            .map_err(|error| {
-                caused(
-                    ProjectResourcePublicationErrorKind::TransactionUnavailable,
-                    "inspect project transactions before track freeze",
-                    error,
-                )
-            })?;
+fn removed_directories(
+    verified: &StructurallyVerifiedProject,
+    entries: &[Entry<'_>],
+) -> Result<Vec<String>, ProjectResourcePublicationError> {
+    let retired = entries
+        .iter()
+        .filter(|entry| entry.before.is_some() && entry.after.is_none())
+        .map(|entry| entry.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut directories = BTreeSet::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.before.is_some() && entry.after.is_none())
+    {
+        let directory = resource_parent(&entry.path)?;
+        if entries.iter().any(|entry| {
+            entry.after.is_some()
+                && resource_parent(&entry.path).is_ok_and(|parent| parent == directory)
+        }) {
+            continue;
+        }
+        if verified
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| {
+                resource_parent(descriptor.path()).is_ok_and(|parent| parent == directory)
+            })
+            .all(|descriptor| retired.contains(descriptor.id()))
+        {
+            directories.insert(directory.to_owned());
+        }
+    }
+    Ok(directories.into_iter().collect())
+}
+
+fn reject_other_transactions(
+    backups: &Dir,
+    family: ProjectTransactionFamily,
+) -> Result<(), ProjectResourcePublicationError> {
+    let found = find_unhandled_project_transaction(backups, &[family]).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::TransactionUnavailable,
+            "inspect project transactions before track freeze",
+            error,
+        )
+    })?;
     if found.is_some() {
         return Err(failure(
             ProjectResourcePublicationErrorKind::ProjectChanged,
@@ -1718,9 +2606,135 @@ fn recover_locked(
             }
             Err(error) => return Err(error),
         };
+        if tx.operation != TransactionOperation::Freeze {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-freeze journal has the wrong operation",
+            ));
+        }
         let disposition = recover_one(root_path, root, backups, &transaction, &tx)?;
         clear_and_remove(backups, transaction, &name)?;
         recovered.push(AudioTrackFreezePublicationRecovery {
+            transaction_id: tx.id,
+            disposition,
+        });
+    }
+    Ok(recovered)
+}
+
+fn finish_unfreeze_result(
+    root_path: &Path,
+    root: &Dir,
+    backups: &Dir,
+    transaction: Dir,
+    name: &str,
+    result: Result<AudioTrackUnfreezePublicationOutcome, ProjectResourcePublicationError>,
+) -> Result<AudioTrackUnfreezePublicationOutcome, ProjectResourcePublicationError> {
+    match result {
+        Ok(outcome) => {
+            clear_and_remove(backups, transaction, name).map_err(|error| {
+                ProjectResourcePublicationError {
+                    kind: ProjectResourcePublicationErrorKind::Recovery,
+                    message: "track unfreeze committed but transaction cleanup is incomplete"
+                        .to_owned(),
+                    published: true,
+                    source: Some(Box::new(error)),
+                }
+            })?;
+            Ok(outcome)
+        }
+        Err(operation) => {
+            let tx = match read_transaction(&transaction, name) {
+                Ok(tx) => tx,
+                Err(_) if missing_file(&transaction, TRANSACTION_NAME)? => {
+                    validate_incomplete(&transaction, name)?;
+                    clear_and_remove(backups, transaction, name)?;
+                    return Err(operation);
+                }
+                Err(error) => return Err(error),
+            };
+            match recover_one(root_path, root, backups, &transaction, &tx)? {
+                AudioTrackFreezePublicationRecoveryDisposition::RolledBack => {
+                    clear_and_remove(backups, transaction, name)?;
+                    Err(operation)
+                }
+                AudioTrackFreezePublicationRecoveryDisposition::Committed => {
+                    let outcome = unfreeze_outcome(&tx)?;
+                    clear_and_remove(backups, transaction, name).map_err(|error| {
+                        ProjectResourcePublicationError {
+                            kind: ProjectResourcePublicationErrorKind::Recovery,
+                            message:
+                                "track unfreeze committed but transaction cleanup is incomplete"
+                                    .to_owned(),
+                            published: true,
+                            source: Some(Box::new(error)),
+                        }
+                    })?;
+                    Ok(outcome)
+                }
+            }
+        }
+    }
+}
+
+fn recover_unfreeze_locked(
+    root_path: &Path,
+    root: &Dir,
+    backups: &Dir,
+) -> Result<Vec<AudioTrackUnfreezePublicationRecovery>, ProjectResourcePublicationError> {
+    let mut names = backups
+        .entries()
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "read track-unfreeze backups",
+                error,
+            )
+        })?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|name| name.starts_with(AUDIO_TRACK_UNFREEZE_TRANSACTION_PREFIX))
+        .collect::<Vec<_>>();
+    names.sort();
+    let mut recovered = Vec::new();
+    for name in names {
+        let transaction = backups.open_dir_nofollow(&name).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "open track-unfreeze recovery transaction",
+                error,
+            )
+        })?;
+        let tx = match read_transaction(&transaction, &name) {
+            Ok(tx) => tx,
+            Err(_) if missing_file(&transaction, TRANSACTION_NAME)? => {
+                validate_incomplete(&transaction, &name)?;
+                let id = transaction_id(&name)?;
+                clear_and_remove(backups, transaction, &name)?;
+                recovered.push(AudioTrackUnfreezePublicationRecovery {
+                    transaction_id: id,
+                    disposition: AudioTrackUnfreezePublicationRecoveryDisposition::RolledBack,
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if tx.operation != TransactionOperation::Unfreeze {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-unfreeze journal has the wrong operation",
+            ));
+        }
+        let disposition = match recover_one(root_path, root, backups, &transaction, &tx)? {
+            AudioTrackFreezePublicationRecoveryDisposition::Committed => {
+                AudioTrackUnfreezePublicationRecoveryDisposition::Committed
+            }
+            AudioTrackFreezePublicationRecoveryDisposition::RolledBack => {
+                AudioTrackUnfreezePublicationRecoveryDisposition::RolledBack
+            }
+        };
+        clear_and_remove(backups, transaction, &name)?;
+        recovered.push(AudioTrackUnfreezePublicationRecovery {
             transaction_id: tx.id,
             disposition,
         });
@@ -1761,6 +2775,7 @@ fn recover_one(
             "track-freeze recovery found an unrelated project identity",
         ));
     }
+    restore_removed_directories(root, tx)?;
     preflight_rollback(root, transaction, tx)?;
     for entry in &tx.entries {
         let Some(parent) = optional_resource_parent(root, entry)? else {
@@ -1807,25 +2822,27 @@ fn recover_one(
             remove_optional_empty_directory(root, resource_parent(&entry.path)?)?;
         }
     }
-    let (sample_parent, sample) = optional_sample(root, &tx.rendered_sample)?;
-    if let (Some(sample_parent), Some(_)) = (sample_parent, sample) {
-        let sample_name = file_name(&tx.rendered_sample.path)?;
-        sample_parent.remove_file(sample_name).map_err(|error| {
-            caused(
-                ProjectResourcePublicationErrorKind::Recovery,
-                "remove rolled-back rendered track-freeze sample",
-                error,
-            )
-        })?;
-        sync_dir(&sample_parent)?;
-    }
-    if tx.created_samples_directory
-        && let Ok(assets) = root.open_dir_nofollow("assets")
-    {
-        remove_optional_empty_directory(&assets, "samples")?;
-    }
-    if tx.created_assets_directory {
-        remove_optional_empty_directory(root, "assets")?;
+    if let Some(rendered_sample) = &tx.rendered_sample {
+        let (sample_parent, sample) = optional_sample(root, rendered_sample)?;
+        if let (Some(sample_parent), Some(_)) = (sample_parent, sample) {
+            let sample_name = file_name(&rendered_sample.path)?;
+            sample_parent.remove_file(sample_name).map_err(|error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "remove rolled-back rendered track-freeze sample",
+                    error,
+                )
+            })?;
+            sync_dir(&sample_parent)?;
+        }
+        if tx.created_samples_directory
+            && let Ok(assets) = root.open_dir_nofollow("assets")
+        {
+            remove_optional_empty_directory(&assets, "samples")?;
+        }
+        if tx.created_assets_directory {
+            remove_optional_empty_directory(root, "assets")?;
+        }
     }
     verify_retained_project_candidate(
         root,
@@ -1892,16 +2909,18 @@ fn preflight_rollback(
             }
         }
     }
-    let (sample_parent, sample) = optional_sample(root, &tx.rendered_sample)?;
-    if let Some(sample) = sample
-        && digest(&sample) != decode_digest(&tx.rendered_sample.sha256)?
-    {
-        return Err(failure(
-            ProjectResourcePublicationErrorKind::Recovery,
-            "track-freeze rollback refuses an unrelated rendered sample",
-        ));
+    if let Some(rendered_sample) = &tx.rendered_sample {
+        let (sample_parent, sample) = optional_sample(root, rendered_sample)?;
+        if let Some(sample) = sample
+            && digest(&sample) != decode_digest(&rendered_sample.sha256)?
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-freeze rollback refuses an unrelated rendered sample",
+            ));
+        }
+        let _ = sample_parent;
     }
-    let _ = sample_parent;
     Ok(())
 }
 
@@ -1913,6 +2932,15 @@ fn validate_staged_transaction(
     transaction: &Dir,
     tx: &Transaction,
 ) -> Result<(), ProjectResourcePublicationError> {
+    if tx.operation == TransactionOperation::Unfreeze {
+        return validate_unfreeze_staged_transaction(transaction, tx);
+    }
+    let rendered_sample = tx.rendered_sample.as_ref().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-freeze transaction has no rendered sample",
+        )
+    })?;
     let previous = read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?;
     let candidate = read_bounded(transaction, PROJECT_STAGING_NAME, MAX_JSON_BYTES)?;
     if digest(&previous) != decode_digest(&tx.before_project_sha256)?
@@ -1974,15 +3002,15 @@ fn validate_staged_transaction(
         TRANSACTION_NAME.to_owned(),
         SAMPLE_STAGING_NAME.to_owned(),
     ]);
-    let sample_max = usize::try_from(tx.rendered_sample.byte_length).map_err(|_| {
+    let sample_max = usize::try_from(rendered_sample.byte_length).map_err(|_| {
         failure(
             ProjectResourcePublicationErrorKind::Recovery,
             "staged rendered sample length is not addressable",
         )
     })?;
     let sample = read_bounded(transaction, SAMPLE_STAGING_NAME, sample_max)?;
-    if sample.len() as u64 != tx.rendered_sample.byte_length
-        || digest(&sample) != decode_digest(&tx.rendered_sample.sha256)?
+    if sample.len() as u64 != rendered_sample.byte_length
+        || digest(&sample) != decode_digest(&rendered_sample.sha256)?
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
@@ -2166,7 +3194,7 @@ fn validate_staged_transaction(
     let sample_descriptor = candidate_manifest
         .assets()
         .iter()
-        .find(|descriptor| descriptor.path() == tx.rendered_sample.path)
+        .find(|descriptor| descriptor.path() == rendered_sample.path)
         .ok_or_else(|| {
             failure(
                 ProjectResourcePublicationErrorKind::Recovery,
@@ -2176,8 +3204,8 @@ fn validate_staged_transaction(
     if sample_descriptor.id() != tx.frozen_asset_id
         || sample_descriptor.role() != AssetRole::Sample
         || sample_descriptor.media_type() != AudioMediaType::AudioWav
-        || sample_descriptor.byte_length() != tx.rendered_sample.byte_length
-        || sample_descriptor.sha256() != tx.rendered_sample.sha256
+        || sample_descriptor.byte_length() != rendered_sample.byte_length
+        || sample_descriptor.sha256() != rendered_sample.sha256
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
@@ -2225,6 +3253,365 @@ fn validate_entry_document(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "unfreeze recovery authenticates every retained source and restored destination before changing paths"
+)]
+fn validate_unfreeze_staged_transaction(
+    transaction: &Dir,
+    tx: &Transaction,
+) -> Result<(), ProjectResourcePublicationError> {
+    let previous = read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?;
+    let candidate = read_bounded(transaction, PROJECT_STAGING_NAME, MAX_JSON_BYTES)?;
+    if digest(&previous) != decode_digest(&tx.before_project_sha256)?
+        || digest(&candidate) != decode_digest(&tx.after_project_sha256)?
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-unfreeze staged project identity changed",
+        ));
+    }
+    let previous_manifest = ProjectManifest::parse(&previous).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "staged previous track-unfreeze project is invalid",
+            error,
+        )
+    })?;
+    let candidate_manifest = ProjectManifest::parse(&candidate).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "staged candidate track-unfreeze project is invalid",
+            error,
+        )
+    })?;
+    if previous_manifest.project_id() != candidate_manifest.project_id()
+        || previous_manifest.revision() != tx.before_project_revision
+        || candidate_manifest.revision() != tx.after_project_revision
+        || tx.before_project_revision.checked_add(1) != Some(tx.after_project_revision)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-unfreeze staged project revisions are inconsistent",
+        ));
+    }
+    let intent_bytes = read_bounded(transaction, INTENT_NAME, MAX_JSON_BYTES)?;
+    require_canonical(&intent_bytes, "track-unfreeze transaction intent")?;
+    let intent: Intent = serde_json::from_slice(&intent_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "parse track-unfreeze transaction intent",
+            error,
+        )
+    })?;
+    if intent.format != UNFREEZE_INTENT_FORMAT
+        || intent.format_version != VERSION
+        || intent.id != tx.id
+        || intent.entry_count != tx.entries.len()
+        || !intent.extensions.is_empty()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-unfreeze transaction intent is invalid",
+        ));
+    }
+    let previous_value: Value = serde_json::from_slice(&previous).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "parse previous track-unfreeze manifest",
+            error,
+        )
+    })?;
+    let candidate_value: Value = serde_json::from_slice(&candidate).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "parse candidate track-unfreeze manifest",
+            error,
+        )
+    })?;
+    if previous_value["assets"] != candidate_value["assets"] {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-unfreeze changed asset declarations",
+        ));
+    }
+    let mut expected_names = BTreeSet::from([
+        INTENT_NAME.to_owned(),
+        PROJECT_STAGING_NAME.to_owned(),
+        PREVIOUS_PROJECT_NAME.to_owned(),
+        TRANSACTION_NAME.to_owned(),
+    ]);
+    let mut state_bytes = None;
+    let mut frozen_clip_bytes = None;
+    let mut restored_clips = BTreeMap::new();
+    let mut restored_track = None;
+    let mut restored_arrangement = None;
+    for (index, entry) in tx.entries.iter().enumerate() {
+        let role = role_from_name(&entry.role).ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-unfreeze transaction has unsupported resource role",
+            )
+        })?;
+        if !is_valid_entity_id(&entry.id) || entry.before.is_none() && entry.after.is_none() {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-unfreeze transaction resource entry is invalid",
+            ));
+        }
+        if let Some(before) = &entry.before {
+            if entry.backup_name.as_deref() != Some(&backup_name(index)) {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "track-unfreeze source backup name is invalid",
+                ));
+            }
+            let bytes = read_bounded(
+                transaction,
+                &previous_name(index),
+                usize::try_from(before.byte_length).map_err(|_| {
+                    failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "track-unfreeze source length is not addressable",
+                    )
+                })?,
+            )?;
+            if bytes.len() as u64 != before.byte_length
+                || digest(&bytes) != decode_digest(&before.sha256)?
+            {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "track-unfreeze staged source changed",
+                ));
+            }
+            if role == ResourceRole::FreezeState {
+                validate_freeze_state_document(&bytes, &entry.id)?;
+                state_bytes = Some(bytes.clone());
+            } else {
+                validate_entry_document(&bytes, &entry.id, role)?;
+            }
+            let descriptor = previous_manifest
+                .resources()
+                .iter()
+                .find(|descriptor| descriptor.id() == entry.id)
+                .ok_or_else(|| {
+                    failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "track-unfreeze previous descriptor is absent",
+                    )
+                })?;
+            if descriptor.role() != role || descriptor.path() != entry.path {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "track-unfreeze previous descriptor changed",
+                ));
+            }
+            expected_names.insert(previous_name(index));
+            expected_names.insert(backup_name(index));
+            if entry.id == tx.frozen_clip_id {
+                frozen_clip_bytes = Some(bytes);
+            }
+        } else if entry.backup_name.is_some() {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-unfreeze added resource has backup authority",
+            ));
+        }
+        if let Some(after) = &entry.after {
+            let bytes = read_bounded(
+                transaction,
+                &staged_name(index),
+                usize::try_from(after.byte_length).map_err(|_| {
+                    failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "track-unfreeze replacement length is not addressable",
+                    )
+                })?,
+            )?;
+            if bytes.len() as u64 != after.byte_length
+                || digest(&bytes) != decode_digest(&after.sha256)?
+            {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "track-unfreeze staged replacement changed",
+                ));
+            }
+            validate_entry_document(&bytes, &entry.id, role)?;
+            let descriptor = candidate_manifest
+                .resources()
+                .iter()
+                .find(|descriptor| descriptor.id() == entry.id)
+                .ok_or_else(|| {
+                    failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "track-unfreeze candidate descriptor is absent",
+                    )
+                })?;
+            if descriptor.role() != role
+                || descriptor.path() != entry.path
+                || descriptor.byte_length() != after.byte_length
+                || descriptor.sha256() != after.sha256
+            {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "track-unfreeze candidate descriptor changed",
+                ));
+            }
+            expected_names.insert(staged_name(index));
+            match role {
+                ResourceRole::Track => restored_track = Some(bytes),
+                ResourceRole::Arrangement => restored_arrangement = Some(bytes),
+                ResourceRole::Clip if entry.before.is_none() => {
+                    restored_clips.insert(entry.id.as_str(), bytes);
+                }
+                _ => {}
+            }
+        } else if candidate_manifest
+            .resources()
+            .iter()
+            .any(|descriptor| descriptor.id() == entry.id)
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-unfreeze candidate retained a retired resource",
+            ));
+        }
+    }
+    let state = TrackFreezeState::parse(&state_bytes.ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-unfreeze transaction has no retained freeze state",
+        )
+    })?)
+    .map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "parse retained track-unfreeze state",
+            error,
+        )
+    })?;
+    let frozen_clip = frozen_clip_bytes.ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-unfreeze transaction has no retained rendered clip",
+        )
+    })?;
+    let retained_frozen_clip = serde_json_canonicalizer::to_vec(state.frozen_clip().document())
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "canonicalize retained rendered clip",
+                error,
+            )
+        })?;
+    if state.id() != tx.freeze_state_id
+        || state.track_id() != tx.track_id
+        || state.frozen_clip_id() != tx.frozen_clip_id
+        || state.frozen_asset_id() != tx.frozen_asset_id
+        || frozen_clip != retained_frozen_clip
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-unfreeze retained authority is inconsistent",
+        ));
+    }
+    if restored_track.is_none()
+        || restored_arrangement.is_none()
+        || restored_clips.len() != state.original_clips().len()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-unfreeze restored resource set is incomplete",
+        ));
+    }
+    for original in state.original_clips() {
+        let expected = serde_json_canonicalizer::to_vec(original.document()).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "canonicalize retained original clip",
+                error,
+            )
+        })?;
+        if restored_clips
+            .get(original.id())
+            .is_none_or(|bytes| *bytes != expected)
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-unfreeze restored clip differs from retained authority",
+            ));
+        }
+    }
+    let retired = tx
+        .entries
+        .iter()
+        .filter(|entry| entry.before.is_some() && entry.after.is_none())
+        .map(|entry| entry.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut expected_directories = BTreeSet::new();
+    for entry in tx
+        .entries
+        .iter()
+        .filter(|entry| entry.before.is_some() && entry.after.is_none())
+    {
+        let directory = resource_parent(&entry.path)?;
+        if tx.entries.iter().any(|entry| {
+            entry.after.is_some()
+                && resource_parent(&entry.path).is_ok_and(|parent| parent == directory)
+        }) {
+            continue;
+        }
+        if previous_manifest
+            .resources()
+            .iter()
+            .filter(|descriptor| {
+                resource_parent(descriptor.path()).is_ok_and(|parent| parent == directory)
+            })
+            .all(|descriptor| retired.contains(descriptor.id()))
+        {
+            expected_directories.insert(directory.to_owned());
+        }
+    }
+    if tx.removed_directories.iter().collect::<BTreeSet<_>>()
+        != expected_directories.iter().collect::<BTreeSet<_>>()
+        || tx
+            .removed_directories
+            .iter()
+            .any(|directory| directory.is_empty() || directory.contains('/'))
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-unfreeze removed directories are inconsistent",
+        ));
+    }
+    for entry in transaction.entries().map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "read track-unfreeze transaction entries",
+            error,
+        )
+    })? {
+        let name = entry
+            .map_err(|error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "read track-unfreeze transaction entry",
+                    error,
+                )
+            })?
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if !expected_names.contains(&name) {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-unfreeze transaction contains an unknown entry",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn read_transaction(
     transaction: &Dir,
     name: &str,
@@ -2238,7 +3625,20 @@ fn read_transaction(
             error,
         )
     })?;
-    if tx.format != FORMAT
+    let expected_format = match tx.operation {
+        TransactionOperation::Freeze => FORMAT,
+        TransactionOperation::Unfreeze => UNFREEZE_FORMAT,
+    };
+    let rendered_sample_valid = match (&tx.operation, &tx.rendered_sample) {
+        (TransactionOperation::Freeze, Some(sample)) => {
+            sample.path == format!("assets/samples/{}.wav", tx.frozen_asset_id)
+                && sample.byte_length != 0
+                && decode_digest(&sample.sha256).is_ok()
+        }
+        (TransactionOperation::Unfreeze, None) => true,
+        _ => false,
+    };
+    if tx.format != expected_format
         || tx.format_version != VERSION
         || tx.id != transaction_id(name)?
         || !is_valid_entity_id(&tx.track_id)
@@ -2248,11 +3648,9 @@ fn read_transaction(
         || tx.entries.is_empty()
         || tx.entries.len() > MAX_ENTRIES
         || tx.before_project_revision.checked_add(1) != Some(tx.after_project_revision)
-        || tx.rendered_sample.path != format!("assets/samples/{}.wav", tx.frozen_asset_id)
-        || tx.rendered_sample.byte_length == 0
         || decode_digest(&tx.before_project_sha256).is_err()
         || decode_digest(&tx.after_project_sha256).is_err()
-        || decode_digest(&tx.rendered_sample.sha256).is_err()
+        || !rendered_sample_valid
         || !tx.extensions.is_empty()
     {
         return Err(failure(
@@ -2377,10 +3775,53 @@ fn remove_optional_empty_directory(
     }
 }
 
+fn restore_removed_directories(
+    root: &Dir,
+    tx: &Transaction,
+) -> Result<(), ProjectResourcePublicationError> {
+    for directory in &tx.removed_directories {
+        match root.create_dir(directory) {
+            Ok(()) => sync_dir(root)?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let metadata = root.symlink_metadata(directory).map_err(|error| {
+                    caused(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "inspect restored track-unfreeze directory",
+                        error,
+                    )
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "restored track-unfreeze directory is not real",
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(caused(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "restore track-unfreeze directory",
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_incomplete(
     transaction: &Dir,
     name: &str,
 ) -> Result<(), ProjectResourcePublicationError> {
+    let operation = if name.starts_with(AUDIO_TRACK_UNFREEZE_TRANSACTION_PREFIX) {
+        TransactionOperation::Unfreeze
+    } else {
+        TransactionOperation::Freeze
+    };
+    let intent_format = match operation {
+        TransactionOperation::Freeze => INTENT_FORMAT,
+        TransactionOperation::Unfreeze => UNFREEZE_INTENT_FORMAT,
+    };
     let count = if missing_file(transaction, INTENT_NAME)? {
         0
     } else {
@@ -2393,7 +3834,7 @@ fn validate_incomplete(
                 error,
             )
         })?;
-        if intent.format != INTENT_FORMAT
+        if intent.format != intent_format
             || intent.format_version != VERSION
             || intent.id != transaction_id(name)?
             || intent.entry_count == 0
@@ -2412,8 +3853,10 @@ fn validate_incomplete(
         INTENT_NAME.to_owned(),
         PROJECT_STAGING_NAME.to_owned(),
         PREVIOUS_PROJECT_NAME.to_owned(),
-        SAMPLE_STAGING_NAME.to_owned(),
     ]);
+    if operation == TransactionOperation::Freeze {
+        expected.insert(SAMPLE_STAGING_NAME.to_owned());
+    }
     for index in 0..count {
         expected.insert(previous_name(index));
         expected.insert(staged_name(index));
@@ -2460,22 +3903,39 @@ fn cleanup_temporaries(
             };
             remove_optional_matching_file(
                 &parent,
-                &format!(".track-freeze-{index}-{}.json", tx.id),
+                &format!(".{}-{index}-{}.json", transaction_label(tx), tx.id),
                 decode_digest(&after.sha256)?,
             )?;
         }
     }
     remove_optional_matching_file(
         backups,
-        &format!(".track-freeze-project-{}.json", tx.id),
+        &format!(".{}-project-{}.json", transaction_label(tx), tx.id),
         decode_digest(&tx.after_project_sha256)?,
     )
+}
+
+const fn transaction_label(tx: &Transaction) -> &'static str {
+    match tx.operation {
+        TransactionOperation::Freeze => "track-freeze",
+        TransactionOperation::Unfreeze => "track-unfreeze",
+    }
 }
 
 fn outcome(
     tx: &Transaction,
 ) -> Result<AudioTrackFreezePublicationOutcome, ProjectResourcePublicationError> {
     Ok(AudioTrackFreezePublicationOutcome {
+        project_identity: decode_digest(&tx.after_project_sha256)?,
+        project_revision: tx.after_project_revision,
+        track_id: tx.track_id.clone(),
+    })
+}
+
+fn unfreeze_outcome(
+    tx: &Transaction,
+) -> Result<AudioTrackUnfreezePublicationOutcome, ProjectResourcePublicationError> {
+    Ok(AudioTrackUnfreezePublicationOutcome {
         project_identity: decode_digest(&tx.after_project_sha256)?,
         project_revision: tx.after_project_revision,
         track_id: tx.track_id.clone(),
@@ -2587,6 +4047,7 @@ mod tests {
     use hyper_audio_source::{DecodedAudio, encode_float_wav};
     use hyper_playback_json::{
         LoaderLimits, MediaAssetFact, PlaybackJsonInput, load, serialize_audio_track_freeze,
+        serialize_audio_track_unfreeze,
     };
     use serde_json::json;
     use std::fs;
@@ -2734,6 +4195,52 @@ mod tests {
             .unwrap();
             (*package.manifest_sha256(), documents)
         }
+
+        fn unfreeze_request(&self) -> ([u8; 32], AudioTrackUnfreezeDocuments) {
+            let package = verify_project_package(&self.root).unwrap();
+            let track = package.read_resource(TRACK_ID).unwrap();
+            let clip = package.read_resource(FROZEN_CLIP_ID).unwrap();
+            let arrangement = package.read_resource(ARRANGEMENT_ID).unwrap();
+            let freeze_state = package.read_resource(FREEZE_STATE_ID).unwrap();
+            let tracks = [track.as_slice()];
+            let clips = [clip.as_slice()];
+            let project = load(
+                PlaybackJsonInput {
+                    project_id: PROJECT_ID,
+                    sample_rate_hz: 48_000,
+                    timeline: &self.timeline,
+                    tracks: &tracks,
+                    clips: &clips,
+                    scenes: &[],
+                    arrangement: Some(&arrangement),
+                },
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+            let assets = [
+                MediaAssetFact {
+                    id: SOURCE_ASSET_ID,
+                    sample_rate_hz: 48_000,
+                    frame_count: 50,
+                },
+                MediaAssetFact {
+                    id: FROZEN_ASSET_ID,
+                    sample_rate_hz: 48_000,
+                    frame_count: 50,
+                },
+            ];
+            let documents = serialize_audio_track_unfreeze(
+                &project,
+                &assets,
+                &track,
+                &arrangement,
+                &freeze_state,
+                TRACK_ID,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+            (*package.manifest_sha256(), documents)
+        }
     }
 
     impl Drop for Fixture {
@@ -2797,6 +4304,135 @@ mod tests {
             .unwrap(),
             fixture.sample
         );
+    }
+
+    #[test]
+    fn unfreezes_complete_rendered_track_without_deleting_its_sample_asset() {
+        let fixture = Fixture::new();
+        let (identity, freeze) = fixture.request();
+        publish_audio_track_freeze(
+            &fixture.root,
+            AudioTrackFreezePublicationRequest {
+                expected_project_sha256: identity,
+                documents: &freeze,
+                rendered_sample: &fixture.sample,
+            },
+        )
+        .unwrap();
+        let (identity, documents) = fixture.unfreeze_request();
+        let outcome = publish_audio_track_unfreeze(
+            &fixture.root,
+            AudioTrackUnfreezePublicationRequest {
+                expected_project_sha256: identity,
+                documents: &documents,
+            },
+        )
+        .unwrap();
+        let package = verify_project_package(&fixture.root).unwrap();
+        assert_eq!(package.manifest().revision(), 3);
+        assert_eq!(*package.manifest_sha256(), *outcome.project_identity());
+        assert_eq!(package.read_resource(TRACK_ID).unwrap(), documents.track());
+        assert_eq!(
+            package.read_resource(SOURCE_CLIP_ID).unwrap(),
+            documents.clips()[0].bytes()
+        );
+        assert!(
+            package
+                .manifest()
+                .resources()
+                .iter()
+                .all(|entry| entry.id() != FROZEN_CLIP_ID && entry.id() != FREEZE_STATE_ID)
+        );
+        assert!(
+            package
+                .manifest()
+                .assets()
+                .iter()
+                .any(|asset| asset.id() == FROZEN_ASSET_ID)
+        );
+        assert_eq!(
+            fs::read(
+                fixture
+                    .root
+                    .join(format!("assets/samples/{FROZEN_ASSET_ID}.wav"))
+            )
+            .unwrap(),
+            fixture.sample
+        );
+    }
+
+    #[test]
+    fn crash_recovery_preserves_one_verified_track_unfreeze_side() {
+        for phase in [
+            PublicationPhase::Transaction,
+            PublicationPhase::SourceMoved(0),
+            PublicationPhase::ResourcePublished(0),
+            PublicationPhase::ResourcePublished(1),
+            PublicationPhase::SourceMoved(2),
+            PublicationPhase::SourceMoved(3),
+            PublicationPhase::SourceMoved(4),
+            PublicationPhase::ResourcePublished(4),
+            PublicationPhase::Manifest,
+        ] {
+            let fixture = Fixture::new();
+            let (identity, freeze) = fixture.request();
+            publish_audio_track_freeze(
+                &fixture.root,
+                AudioTrackFreezePublicationRequest {
+                    expected_project_sha256: identity,
+                    documents: &freeze,
+                    rendered_sample: &fixture.sample,
+                },
+            )
+            .unwrap();
+            let (identity, documents) = fixture.unfreeze_request();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_unfreeze_observed(
+                    &fixture.root,
+                    AudioTrackUnfreezePublicationRequest {
+                        expected_project_sha256: identity,
+                        documents: &documents,
+                    },
+                    |current, _| {
+                        assert_ne!(current, phase, "simulate process termination");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+            let report = recover_project_transactions(&fixture.root).unwrap();
+            assert_eq!(report.audio_track_unfreezes().len(), 1);
+            let expected = if phase == PublicationPhase::Manifest {
+                AudioTrackUnfreezePublicationRecoveryDisposition::Committed
+            } else {
+                AudioTrackUnfreezePublicationRecoveryDisposition::RolledBack
+            };
+            assert_eq!(report.audio_track_unfreezes()[0].disposition(), expected);
+            let package = verify_project_package(&fixture.root).unwrap();
+            if expected == AudioTrackUnfreezePublicationRecoveryDisposition::Committed {
+                assert_eq!(
+                    package.read_resource(SOURCE_CLIP_ID).unwrap(),
+                    documents.clips()[0].bytes()
+                );
+                assert!(
+                    package
+                        .manifest()
+                        .resources()
+                        .iter()
+                        .all(|entry| entry.id() != FROZEN_CLIP_ID && entry.id() != FREEZE_STATE_ID)
+                );
+            } else {
+                assert_eq!(*package.manifest_sha256(), identity);
+                assert_eq!(
+                    package.read_resource(FROZEN_CLIP_ID).unwrap(),
+                    freeze.clip()
+                );
+                assert_eq!(
+                    package.read_resource(FREEZE_STATE_ID).unwrap(),
+                    freeze.freeze_state()
+                );
+            }
+        }
     }
 
     #[test]
