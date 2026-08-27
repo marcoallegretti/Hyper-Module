@@ -19756,6 +19756,71 @@ mod tests {
     }
 
     #[test]
+    fn audio_track_unfreeze_refuses_a_modified_rendered_clip() {
+        let track =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(TRACK).unwrap())
+                .unwrap();
+        let clip =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(CLIP).unwrap())
+                .unwrap();
+        let arrangement = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
+        )
+        .unwrap();
+        let tracks = [track.as_slice()];
+        let clips = [clip.as_slice()];
+        let project = load(
+            input(TIMELINE, &tracks, &clips, Some(&arrangement)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let frozen = serialize_audio_track_freeze(
+            &project,
+            &asset_facts(),
+            &track,
+            &clips,
+            &arrangement,
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            "018f47a2-6b2d-7c11-8a44-001122334470",
+            100,
+            "018f47a2-6b2d-7c11-8a44-001122334471",
+            "018f47a2-6b2d-7c11-8a44-001122334472",
+            "018f47a2-6b2d-7c11-8a44-001122334473",
+            "Frozen",
+            None,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut changed_clip: Value = serde_json::from_slice(frozen.clip()).unwrap();
+        changed_clip["name"] = json!("Edited");
+        let changed_clip = serde_json_canonicalizer::to_vec(&changed_clip).unwrap();
+        let frozen_tracks = [frozen.track()];
+        let frozen_clips = [changed_clip.as_slice()];
+        let changed_project = load(
+            input(
+                TIMELINE,
+                &frozen_tracks,
+                &frozen_clips,
+                Some(frozen.arrangement()),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_audio_track_unfreeze(
+                &changed_project,
+                &asset_facts(),
+                frozen.track(),
+                frozen.arrangement(),
+                frozen.freeze_state(),
+                "018f47a2-6b2d-7c11-8a44-001122334456",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackUnfreezeSerializationError::FrozenStateMismatch)
+        ));
+    }
+
+    #[test]
     fn audio_track_unfreeze_refuses_noncanonical_freeze_authority() {
         let track =
             serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(TRACK).unwrap())
