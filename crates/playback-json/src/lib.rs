@@ -45,6 +45,9 @@ use hyper_playback_compiler::{
     compile_scene_audio_clip,
 };
 use hyper_project_model::{is_valid_entity_id, is_valid_extension_key};
+use hyper_track_freeze::{
+    FrozenClipState, FrozenPlacementState, TrackFreezeState, TrackFreezeStateError,
+};
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
@@ -679,6 +682,124 @@ pub struct AudioClipAdditionDocuments {
     track: Vec<u8>,
     clip: Vec<u8>,
     duration_ticks: u64,
+}
+
+/// Complete canonical delta for one reversible rendered audio-track freeze.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioTrackFreezeDocuments {
+    track: Vec<u8>,
+    clip: Vec<u8>,
+    arrangement: Vec<u8>,
+    freeze_state: Vec<u8>,
+    frozen_clip_id: String,
+    frozen_asset_id: String,
+    freeze_state_id: String,
+}
+
+impl AudioTrackFreezeDocuments {
+    #[must_use]
+    pub fn track(&self) -> &[u8] {
+        &self.track
+    }
+    #[must_use]
+    pub fn clip(&self) -> &[u8] {
+        &self.clip
+    }
+    #[must_use]
+    pub fn arrangement(&self) -> &[u8] {
+        &self.arrangement
+    }
+    #[must_use]
+    pub fn freeze_state(&self) -> &[u8] {
+        &self.freeze_state
+    }
+    #[must_use]
+    pub fn frozen_clip_id(&self) -> &str {
+        &self.frozen_clip_id
+    }
+    #[must_use]
+    pub fn frozen_asset_id(&self) -> &str {
+        &self.frozen_asset_id
+    }
+    #[must_use]
+    pub fn freeze_state_id(&self) -> &str {
+        &self.freeze_state_id
+    }
+}
+
+#[derive(Debug)]
+pub enum AudioTrackFreezeSerializationError {
+    TrackNotAudio,
+    ScenesUnsupported,
+    ArrangementMissing,
+    NoTrackPlacements,
+    InvalidIdentity,
+    SourceTrackMismatch,
+    SourceClipMismatch,
+    SourceArrangementMismatch,
+    Clip(AudioClipAdditionSerializationError),
+    State(TrackFreezeStateError),
+    Source(LoadError),
+    Serialization(serde_json::Error),
+    ProjectCompilation(AdapterCompileError),
+}
+
+impl fmt::Display for AudioTrackFreezeSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TrackNotAudio => formatter.write_str("track freeze supports audio tracks only"),
+            Self::ScenesUnsupported => {
+                formatter.write_str("track freeze does not replace interactive scenes")
+            }
+            Self::ArrangementMissing => {
+                formatter.write_str("track freeze requires a linear arrangement")
+            }
+            Self::NoTrackPlacements => {
+                formatter.write_str("track freeze requires at least one arrangement placement")
+            }
+            Self::InvalidIdentity => {
+                formatter.write_str("track freeze has invalid or colliding identities")
+            }
+            Self::SourceTrackMismatch => {
+                formatter.write_str("track freeze source track differs from the loaded project")
+            }
+            Self::SourceClipMismatch => {
+                formatter.write_str("track freeze source clips differ from the loaded project")
+            }
+            Self::SourceArrangementMismatch => formatter
+                .write_str("track freeze source arrangement differs from the loaded project"),
+            Self::Clip(source) => source.fmt(formatter),
+            Self::State(source) => source.fmt(formatter),
+            Self::Source(source) => source.fmt(formatter),
+            Self::Serialization(source) => write!(
+                formatter,
+                "track freeze cannot serialize a candidate: {source}"
+            ),
+            Self::ProjectCompilation(source) => {
+                write!(formatter, "track freeze candidate cannot compile: {source}")
+            }
+        }
+    }
+}
+
+impl Error for AudioTrackFreezeSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Clip(source) => Some(source),
+            Self::State(source) => Some(source),
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::TrackNotAudio
+            | Self::ScenesUnsupported
+            | Self::ArrangementMissing
+            | Self::NoTrackPlacements
+            | Self::InvalidIdentity
+            | Self::SourceTrackMismatch
+            | Self::SourceClipMismatch
+            | Self::SourceArrangementMismatch => None,
+        }
+    }
 }
 
 /// Canonical resources required to create a finalized recorded take and place
@@ -3658,6 +3779,270 @@ pub fn serialize_recording_audio_clip_addition(
         track,
         clip,
         duration_ticks,
+    })
+}
+
+/// Creates the complete compiled document delta for freezing one audio track
+/// into a sample-locked rendered clip. Interactive scenes are refused because
+/// a static arrangement render cannot retain their future launch semantics.
+///
+/// # Errors
+///
+/// Returns a classified refusal when source authority is stale, the selected
+/// track has no linear content, identities collide, or the candidate cannot
+/// compile with the supplied rendered asset fact.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "freeze binds source authority, replacement identities, arrangement transformation, and complete candidate compilation in one transaction"
+)]
+pub fn serialize_audio_track_freeze(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_track: &[u8],
+    source_clips: &[&[u8]],
+    source_arrangement: &[u8],
+    track_id: &str,
+    frozen_asset_id: &str,
+    frozen_frame_count: u64,
+    frozen_clip_id: &str,
+    frozen_placement_id: &str,
+    freeze_state_id: &str,
+    frozen_clip_name: &str,
+    device_chain_id: Option<String>,
+    limits: LoaderLimits,
+) -> Result<AudioTrackFreezeDocuments, AudioTrackFreezeSerializationError> {
+    if !project.is_audio_track(track_id) {
+        return Err(AudioTrackFreezeSerializationError::TrackNotAudio);
+    }
+    if project.scene_count() != 0 {
+        return Err(AudioTrackFreezeSerializationError::ScenesUnsupported);
+    }
+    let track_index = project
+        .track_index(track_id)
+        .ok_or(AudioTrackFreezeSerializationError::TrackNotAudio)?;
+    let arrangement = project
+        .arrangement
+        .as_ref()
+        .ok_or(AudioTrackFreezeSerializationError::ArrangementMissing)?;
+    if arrangement.canonical_source.as_ref() != source_arrangement {
+        return Err(AudioTrackFreezeSerializationError::SourceArrangementMismatch);
+    }
+    let source = load_track(
+        source_track,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(AudioTrackFreezeSerializationError::Source)?;
+    if source.id != project.tracks[track_index].id
+        || source.clip_ids != project.tracks[track_index].clip_ids
+    {
+        return Err(AudioTrackFreezeSerializationError::SourceTrackMismatch);
+    }
+    if source_clips.len() != source.clip_ids.len() {
+        return Err(AudioTrackFreezeSerializationError::SourceClipMismatch);
+    }
+    let mut source_clip_documents = Vec::new();
+    source_clip_documents
+        .try_reserve_exact(source_clips.len())
+        .map_err(|_| AudioTrackFreezeSerializationError::InvalidIdentity)?;
+    for (clip_id, source_clip) in source.clip_ids.iter().zip(source_clips) {
+        let source_value: Value = serde_json::from_slice(source_clip)
+            .map_err(AudioTrackFreezeSerializationError::Serialization)?;
+        let canonical_source = serde_json_canonicalizer::to_vec(&source_value)
+            .map_err(AudioTrackFreezeSerializationError::Serialization)?;
+        if canonical_source != *source_clip {
+            return Err(AudioTrackFreezeSerializationError::SourceClipMismatch);
+        }
+        let project_clip_index = project
+            .clips
+            .iter()
+            .position(|clip| &clip.id == clip_id)
+            .ok_or(AudioTrackFreezeSerializationError::SourceClipMismatch)?;
+        let parsed = load_clip(
+            &canonical_source,
+            project_clip_index,
+            project.project_id(),
+            limits.max_document_bytes,
+            limits.max_warp_markers,
+        )
+        .map_err(AudioTrackFreezeSerializationError::Source)?;
+        if parsed != project.clips[project_clip_index] {
+            return Err(AudioTrackFreezeSerializationError::SourceClipMismatch);
+        }
+        source_clip_documents.push(source_value);
+    }
+    if [
+        frozen_asset_id,
+        frozen_clip_id,
+        frozen_placement_id,
+        freeze_state_id,
+    ]
+    .iter()
+    .any(|id| !is_valid_entity_id(id))
+        || [
+            frozen_asset_id,
+            frozen_clip_id,
+            frozen_placement_id,
+            freeze_state_id,
+        ]
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .len()
+            != 4
+        || [
+            frozen_asset_id,
+            frozen_clip_id,
+            frozen_placement_id,
+            freeze_state_id,
+        ]
+        .iter()
+        .any(|id| {
+            *id == project.project_id
+                || project_contains_identity(project, id)
+                || assets.iter().any(|asset| asset.id == *id)
+        })
+    {
+        return Err(AudioTrackFreezeSerializationError::InvalidIdentity);
+    }
+    if !arrangement
+        .placements
+        .iter()
+        .any(|placement| placement.track_id == track_id)
+    {
+        return Err(AudioTrackFreezeSerializationError::NoTrackPlacements);
+    }
+    let mut candidate_assets = Vec::new();
+    candidate_assets
+        .try_reserve_exact(assets.len() + 1)
+        .map_err(|_| AudioTrackFreezeSerializationError::InvalidIdentity)?;
+    candidate_assets.extend_from_slice(assets);
+    candidate_assets.push(MediaAssetFact {
+        id: frozen_asset_id,
+        sample_rate_hz: project.sample_rate_hz(),
+        frame_count: usize::try_from(frozen_frame_count)
+            .map_err(|_| AudioTrackFreezeSerializationError::InvalidIdentity)?,
+    });
+    let added = serialize_recording_audio_clip_addition(
+        project,
+        &candidate_assets,
+        source_track,
+        track_id,
+        frozen_asset_id,
+        0,
+        frozen_frame_count,
+        frozen_clip_id,
+        frozen_clip_name,
+        limits,
+    )
+    .map_err(AudioTrackFreezeSerializationError::Clip)?;
+    let frozen_clip = load_clip(
+        &added.clip,
+        project.clips.len(),
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_warp_markers,
+    )
+    .map_err(AudioTrackFreezeSerializationError::Source)?;
+    let mut track_value: Value = serde_json::from_slice(&added.track)
+        .map_err(AudioTrackFreezeSerializationError::Serialization)?;
+    *track_value
+        .get_mut("clip_ids")
+        .and_then(Value::as_array_mut)
+        .ok_or(AudioTrackFreezeSerializationError::SourceTrackMismatch)? =
+        vec![Value::String(frozen_clip_id.to_owned())];
+    let track = serde_json_canonicalizer::to_vec(&track_value)
+        .map_err(AudioTrackFreezeSerializationError::Serialization)?;
+    let frozen_track = load_track(
+        &track,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(AudioTrackFreezeSerializationError::Source)?;
+    let mut arrangement_value: Value = serde_json::from_slice(source_arrangement)
+        .map_err(AudioTrackFreezeSerializationError::Serialization)?;
+    let placements = arrangement_value
+        .get_mut("placements")
+        .and_then(Value::as_array_mut)
+        .ok_or(AudioTrackFreezeSerializationError::SourceArrangementMismatch)?;
+    let mut displaced_documents = Vec::new();
+    displaced_documents
+        .try_reserve_exact(placements.len())
+        .map_err(|_| AudioTrackFreezeSerializationError::InvalidIdentity)?;
+    placements.retain(|placement| {
+        if placement.get("track_id").and_then(Value::as_str) == Some(track_id) {
+            displaced_documents.push(placement.clone());
+            false
+        } else {
+            true
+        }
+    });
+    placements.push(json!({"id": frozen_placement_id, "track_id": track_id, "clip_id": frozen_clip_id, "start_tick": 0, "clip_start_tick": 0, "duration_ticks": added.duration_ticks, "enabled": true}));
+    placements
+        .sort_unstable_by(|left, right| placement_sort_key(left).cmp(&placement_sort_key(right)));
+    let arrangement_bytes = serde_json_canonicalizer::to_vec(&arrangement_value)
+        .map_err(AudioTrackFreezeSerializationError::Serialization)?;
+    let frozen_arrangement = load_arrangement(
+        &arrangement_bytes,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_placements,
+        limits.max_scene_launches,
+    )
+    .map_err(AudioTrackFreezeSerializationError::Source)?;
+    let states = displaced_documents
+        .into_iter()
+        .map(FrozenPlacementState::try_new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AudioTrackFreezeSerializationError::State)?;
+    let original_clips = source_clip_documents
+        .into_iter()
+        .map(FrozenClipState::try_new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AudioTrackFreezeSerializationError::State)?;
+    let state = TrackFreezeState::try_new(
+        freeze_state_id.to_owned(),
+        project.project_id().to_owned(),
+        track_id.to_owned(),
+        frozen_clip_id.to_owned(),
+        frozen_asset_id.to_owned(),
+        arrangement.id.clone(),
+        frozen_placement_id.to_owned(),
+        original_clips,
+        states,
+        device_chain_id,
+    )
+    .map_err(AudioTrackFreezeSerializationError::State)?;
+    let freeze_state = state
+        .to_canonical_bytes()
+        .map_err(AudioTrackFreezeSerializationError::Serialization)?;
+    let mut candidate = project.clone();
+    candidate.tracks[track_index] = frozen_track;
+    candidate
+        .clips
+        .retain(|clip| !source.clip_ids.iter().any(|id| id == &clip.id));
+    candidate.clips.push(frozen_clip);
+    candidate.arrangement = Some(frozen_arrangement);
+    validate_loaded_identities(&candidate).map_err(AudioTrackFreezeSerializationError::Source)?;
+    candidate
+        .compile_playback(
+            &candidate_assets,
+            GraphLimits::VERSION_1,
+            SceneLimits::VERSION_1,
+        )
+        .map_err(AudioTrackFreezeSerializationError::ProjectCompilation)?;
+    Ok(AudioTrackFreezeDocuments {
+        track,
+        clip: added.clip,
+        arrangement: arrangement_bytes,
+        freeze_state,
+        frozen_clip_id: frozen_clip_id.to_owned(),
+        frozen_asset_id: frozen_asset_id.to_owned(),
+        freeze_state_id: freeze_state_id.to_owned(),
     })
 }
 
@@ -18799,6 +19184,64 @@ mod tests {
             ),
             Err(AdapterCompileError::AssetIdentityCollision { asset_index: 0 })
         ));
+    }
+
+    #[test]
+    fn audio_track_freeze_replaces_linear_content_with_one_reversible_render() {
+        let track =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(TRACK).unwrap())
+                .unwrap();
+        let clip =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(CLIP).unwrap())
+                .unwrap();
+        let arrangement = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
+        )
+        .unwrap();
+        let tracks = [track.as_slice()];
+        let clips = [clip.as_slice()];
+        let project = load(
+            input(TIMELINE, &tracks, &clips, Some(&arrangement)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let documents = serialize_audio_track_freeze(
+            &project,
+            &asset_facts(),
+            &track,
+            &clips,
+            &arrangement,
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            "018f47a2-6b2d-7c11-8a44-001122334470",
+            100,
+            "018f47a2-6b2d-7c11-8a44-001122334471",
+            "018f47a2-6b2d-7c11-8a44-001122334472",
+            "018f47a2-6b2d-7c11-8a44-001122334473",
+            "Frozen",
+            None,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let track: Value = serde_json::from_slice(documents.track()).unwrap();
+        let arrangement: Value = serde_json::from_slice(documents.arrangement()).unwrap();
+        assert_eq!(
+            track["clip_ids"],
+            serde_json::json!([documents.frozen_clip_id()])
+        );
+        assert_eq!(arrangement["placements"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            arrangement["placements"][0]["clip_id"],
+            documents.frozen_clip_id()
+        );
+        let state = TrackFreezeState::parse(documents.freeze_state()).unwrap();
+        assert_eq!(
+            state.original_clips()[0].id(),
+            "018f47a2-6b2d-7c11-8a44-001122334460"
+        );
+        assert_eq!(
+            state.original_placements()[0].document()["clip_id"],
+            "018f47a2-6b2d-7c11-8a44-001122334460"
+        );
     }
 
     #[test]

@@ -12,12 +12,16 @@ const FORMAT: &str = "hyper-track-freeze-state";
 const FORMAT_VERSION: u8 = 1;
 const MAX_DOCUMENT_BYTES: usize = 1_048_576;
 
-/// The preserved enabled state of one arrangement placement displaced by a
-/// rendered freeze clip.
+/// One complete arrangement placement displaced by a rendered freeze clip.
+///
+/// The original document is retained rather than a reduced projection: an
+/// unfreeze must restore the exact placement, including its clip range and
+/// any versioned extension data.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FrozenPlacementState {
+    #[serde(skip_serializing)]
     id: String,
-    enabled: bool,
+    document: serde_json::Value,
 }
 
 impl FrozenPlacementState {
@@ -25,14 +29,52 @@ impl FrozenPlacementState {
     ///
     /// # Errors
     ///
-    /// Returns a domain rejection when the placement identity is invalid.
-    pub fn try_new(id: String, enabled: bool) -> Result<Self, TrackFreezeStateError> {
-        if !is_valid_entity_id(&id) {
-            return Err(TrackFreezeStateError::InvalidDomain(
+    /// Returns a domain rejection when the placement cannot be restored as a
+    /// complete arrangement placement.
+    pub fn try_new(document: serde_json::Value) -> Result<Self, TrackFreezeStateError> {
+        let object = document
+            .as_object()
+            .ok_or(TrackFreezeStateError::InvalidDomain(
+                "track freeze state displaced placement is not an object",
+            ))?;
+        let id = object
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| is_valid_entity_id(id))
+            .ok_or(TrackFreezeStateError::InvalidDomain(
                 "track freeze state has an invalid displaced placement identity",
+            ))?
+            .to_owned();
+        if object
+            .get("track_id")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|track_id| !is_valid_entity_id(track_id))
+            || object
+                .get("clip_id")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|clip_id| !is_valid_entity_id(clip_id))
+            || object
+                .get("start_tick")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            || object
+                .get("clip_start_tick")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            || object
+                .get("duration_ticks")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            || object
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .is_none()
+        {
+            return Err(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an invalid displaced placement document",
             ));
         }
-        Ok(Self { id, enabled })
+        Ok(Self { id, document })
     }
 
     #[must_use]
@@ -41,8 +83,88 @@ impl FrozenPlacementState {
     }
 
     #[must_use]
-    pub const fn enabled(&self) -> bool {
-        self.enabled
+    pub const fn document(&self) -> &serde_json::Value {
+        &self.document
+    }
+}
+
+/// One complete audio-clip document displaced by a rendered freeze clip.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FrozenClipState {
+    #[serde(skip_serializing)]
+    id: String,
+    #[serde(skip_serializing)]
+    track_id: String,
+    #[serde(skip_serializing)]
+    asset_id: String,
+    document: serde_json::Value,
+}
+
+impl FrozenClipState {
+    /// Creates one validated displaced-clip record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain rejection when the clip cannot be restored as a
+    /// complete audio-clip document.
+    pub fn try_new(document: serde_json::Value) -> Result<Self, TrackFreezeStateError> {
+        let object = document
+            .as_object()
+            .ok_or(TrackFreezeStateError::InvalidDomain(
+                "track freeze state displaced clip is not an object",
+            ))?;
+        let id = object
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| is_valid_entity_id(id))
+            .ok_or(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an invalid displaced clip identity",
+            ))?
+            .to_owned();
+        let track_id = object
+            .get("track_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|track_id| is_valid_entity_id(track_id))
+            .ok_or(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an invalid displaced clip document",
+            ))?
+            .to_owned();
+        let asset_id = object
+            .get("source")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|source| source.get("asset_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|asset_id| is_valid_entity_id(asset_id))
+            .ok_or(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an invalid displaced clip document",
+            ))?
+            .to_owned();
+        Ok(Self {
+            id,
+            track_id,
+            asset_id,
+            document,
+        })
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn track_id(&self) -> &str {
+        &self.track_id
+    }
+
+    #[must_use]
+    pub fn asset_id(&self) -> &str {
+        &self.asset_id
+    }
+
+    #[must_use]
+    pub const fn document(&self) -> &serde_json::Value {
+        &self.document
     }
 }
 
@@ -56,7 +178,7 @@ pub struct TrackFreezeState {
     frozen_asset_id: String,
     arrangement_id: String,
     frozen_placement_id: String,
-    original_clip_ids: Vec<String>,
+    original_clips: Vec<FrozenClipState>,
     original_placements: Vec<FrozenPlacementState>,
     device_chain_id: Option<String>,
     extensions: BTreeMap<String, serde_json::Value>,
@@ -81,7 +203,7 @@ impl TrackFreezeState {
         frozen_asset_id: String,
         arrangement_id: String,
         frozen_placement_id: String,
-        original_clip_ids: Vec<String>,
+        original_clips: Vec<FrozenClipState>,
         original_placements: Vec<FrozenPlacementState>,
         device_chain_id: Option<String>,
     ) -> Result<Self, TrackFreezeStateError> {
@@ -95,12 +217,16 @@ impl TrackFreezeState {
             frozen_asset_id,
             arrangement_id,
             frozen_placement_id,
-            original_clip_ids,
+            original_clips: original_clips
+                .into_iter()
+                .map(|clip| RawFrozenClipState {
+                    document: clip.document,
+                })
+                .collect(),
             original_placements: original_placements
                 .into_iter()
                 .map(|placement| RawFrozenPlacementState {
-                    id: placement.id,
-                    enabled: placement.enabled,
+                    document: placement.document,
                 })
                 .collect(),
             device_chain_id,
@@ -147,8 +273,8 @@ impl TrackFreezeState {
         &self.frozen_placement_id
     }
     #[must_use]
-    pub fn original_clip_ids(&self) -> &[String] {
-        &self.original_clip_ids
+    pub fn original_clips(&self) -> &[FrozenClipState] {
+        &self.original_clips
     }
     #[must_use]
     pub fn original_placements(&self) -> &[FrozenPlacementState] {
@@ -179,7 +305,7 @@ impl TrackFreezeState {
             frozen_asset_id: &self.frozen_asset_id,
             arrangement_id: &self.arrangement_id,
             frozen_placement_id: &self.frozen_placement_id,
-            original_clip_ids: &self.original_clip_ids,
+            original_clips: &self.original_clips,
             original_placements: &self.original_placements,
             device_chain_id: self.device_chain_id.as_deref(),
             extensions: &self.extensions,
@@ -229,7 +355,7 @@ struct RawTrackFreezeState {
     frozen_asset_id: String,
     arrangement_id: String,
     frozen_placement_id: String,
-    original_clip_ids: Vec<String>,
+    original_clips: Vec<RawFrozenClipState>,
     original_placements: Vec<RawFrozenPlacementState>,
     #[serde(default)]
     device_chain_id: Option<String>,
@@ -239,8 +365,13 @@ struct RawTrackFreezeState {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFrozenPlacementState {
-    id: String,
-    enabled: bool,
+    document: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFrozenClipState {
+    document: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -254,13 +385,17 @@ struct CanonicalTrackFreezeState<'a> {
     frozen_asset_id: &'a str,
     arrangement_id: &'a str,
     frozen_placement_id: &'a str,
-    original_clip_ids: &'a [String],
+    original_clips: &'a [FrozenClipState],
     original_placements: &'a [FrozenPlacementState],
     #[serde(skip_serializing_if = "Option::is_none")]
     device_chain_id: Option<&'a str>,
     extensions: &'a BTreeMap<String, serde_json::Value>,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the one persistence boundary validates every cross-resource identity before exposing reversible authority"
+)]
 fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeStateError> {
     if raw.format != FORMAT || raw.format_version != FORMAT_VERSION {
         return Err(TrackFreezeStateError::InvalidDomain(
@@ -284,32 +419,38 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
     let mut unique = BTreeSet::new();
     if identities
         .iter()
-        .any(|value| !unique.insert(value.as_str()))
+        .any(|value| !unique.insert((*value).clone()))
     {
         return Err(TrackFreezeStateError::InvalidDomain(
             "track freeze state identities must be distinct",
         ));
     }
     if let Some(device_chain_id) = &raw.device_chain_id
-        && (!is_valid_entity_id(device_chain_id) || !unique.insert(device_chain_id))
+        && (!is_valid_entity_id(device_chain_id) || !unique.insert(device_chain_id.clone()))
     {
         return Err(TrackFreezeStateError::InvalidDomain(
             "track freeze state has an invalid device-chain identity",
         ));
     }
-    if raw.original_clip_ids.is_empty()
-        || raw
-            .original_clip_ids
-            .iter()
-            .any(|id| !is_valid_entity_id(id))
-        || raw
-            .original_clip_ids
-            .iter()
-            .any(|id| !unique.insert(id.as_str()))
-    {
+    if raw.original_clips.is_empty() {
         return Err(TrackFreezeStateError::InvalidDomain(
-            "track freeze state has invalid original clip identities",
+            "track freeze state has no displaced clips",
         ));
+    }
+    let mut original_clips = Vec::new();
+    original_clips
+        .try_reserve_exact(raw.original_clips.len())
+        .map_err(|_| {
+            TrackFreezeStateError::InvalidDomain("track freeze state clip capacity is unavailable")
+        })?;
+    for raw_clip in raw.original_clips {
+        let clip = FrozenClipState::try_new(raw_clip.document)?;
+        if clip.track_id() != raw.track_id.as_str() || !unique.insert(clip.id().to_owned()) {
+            return Err(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has invalid displaced clips",
+            ));
+        }
+        original_clips.push(clip);
     }
     if raw.original_placements.is_empty() {
         return Err(TrackFreezeStateError::InvalidDomain(
@@ -325,8 +466,18 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
                 "track freeze state placement capacity is unavailable",
             )
         })?;
-    for placement in raw.original_placements {
-        if !is_valid_entity_id(&placement.id)
+    for raw_placement in raw.original_placements {
+        let placement = FrozenPlacementState::try_new(raw_placement.document)?;
+        if placement
+            .document()
+            .get("track_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(raw.track_id.as_str())
+            || placement
+                .document()
+                .get("clip_id")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|clip_id| !original_clips.iter().any(|clip| clip.id() == clip_id))
             || placement.id == raw.frozen_placement_id
             || !placement_ids.insert(placement.id.clone())
         {
@@ -334,10 +485,7 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
                 "track freeze state has invalid displaced placements",
             ));
         }
-        original_placements.push(FrozenPlacementState {
-            id: placement.id,
-            enabled: placement.enabled,
-        });
+        original_placements.push(placement);
     }
     Ok(TrackFreezeState {
         id: raw.id,
@@ -347,7 +495,7 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
         frozen_asset_id: raw.frozen_asset_id,
         arrangement_id: raw.arrangement_id,
         frozen_placement_id: raw.frozen_placement_id,
-        original_clip_ids: raw.original_clip_ids,
+        original_clips,
         original_placements,
         device_chain_id: raw.device_chain_id,
         extensions: raw.extensions,
@@ -358,14 +506,17 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
 mod tests {
     use super::{TrackFreezeState, TrackFreezeStateError};
 
-    const STATE: &[u8] = br#"{"format":"hyper-track-freeze-state","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337600","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","frozen_clip_id":"018f47a2-6b2d-7c11-8a44-001122337603","frozen_asset_id":"018f47a2-6b2d-7c11-8a44-001122337604","arrangement_id":"018f47a2-6b2d-7c11-8a44-001122337605","frozen_placement_id":"018f47a2-6b2d-7c11-8a44-001122337606","original_clip_ids":["018f47a2-6b2d-7c11-8a44-001122337607"],"original_placements":[{"id":"018f47a2-6b2d-7c11-8a44-001122337608","enabled":true}],"device_chain_id":"018f47a2-6b2d-7c11-8a44-001122337609","extensions":{}}"#;
+    const STATE: &[u8] = br#"{"format":"hyper-track-freeze-state","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337600","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","frozen_clip_id":"018f47a2-6b2d-7c11-8a44-001122337603","frozen_asset_id":"018f47a2-6b2d-7c11-8a44-001122337604","arrangement_id":"018f47a2-6b2d-7c11-8a44-001122337605","frozen_placement_id":"018f47a2-6b2d-7c11-8a44-001122337606","original_clips":[{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337607","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337610"}}}],"original_placements":[{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337608","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","clip_id":"018f47a2-6b2d-7c11-8a44-001122337607","start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":"018f47a2-6b2d-7c11-8a44-001122337609","extensions":{}}"#;
 
     #[test]
     fn parses_complete_reversible_authority() {
         let state = TrackFreezeState::parse(STATE).unwrap();
         assert_eq!(state.track_id(), "018f47a2-6b2d-7c11-8a44-001122337602");
-        assert_eq!(state.original_clip_ids().len(), 1);
-        assert!(state.original_placements()[0].enabled());
+        assert_eq!(state.original_clips().len(), 1);
+        assert_eq!(
+            state.original_placements()[0].document()["duration_ticks"],
+            4
+        );
         assert!(state.device_chain_id().is_some());
         let round_trip = TrackFreezeState::parse(&state.to_canonical_bytes().unwrap()).unwrap();
         assert_eq!(state, round_trip);
@@ -373,7 +524,7 @@ mod tests {
 
     #[test]
     fn refuses_a_duplicate_original_clip_identity() {
-        let duplicated = br#"{"format":"hyper-track-freeze-state","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337600","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","frozen_clip_id":"018f47a2-6b2d-7c11-8a44-001122337603","frozen_asset_id":"018f47a2-6b2d-7c11-8a44-001122337604","arrangement_id":"018f47a2-6b2d-7c11-8a44-001122337605","frozen_placement_id":"018f47a2-6b2d-7c11-8a44-001122337606","original_clip_ids":["018f47a2-6b2d-7c11-8a44-001122337607","018f47a2-6b2d-7c11-8a44-001122337607"],"original_placements":[{"id":"018f47a2-6b2d-7c11-8a44-001122337608","enabled":true}],"extensions":{}}"#;
+        let duplicated = br#"{"format":"hyper-track-freeze-state","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337600","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","frozen_clip_id":"018f47a2-6b2d-7c11-8a44-001122337603","frozen_asset_id":"018f47a2-6b2d-7c11-8a44-001122337604","arrangement_id":"018f47a2-6b2d-7c11-8a44-001122337605","frozen_placement_id":"018f47a2-6b2d-7c11-8a44-001122337606","original_clips":[{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337607","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337610"}}},{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337607","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337610"}}}],"original_placements":[{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337608","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","clip_id":"018f47a2-6b2d-7c11-8a44-001122337607","start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"extensions":{}}"#;
         assert!(matches!(
             TrackFreezeState::parse(duplicated),
             Err(TrackFreezeStateError::InvalidDomain(_))

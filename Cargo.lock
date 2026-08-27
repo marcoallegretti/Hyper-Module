@@ -2340,6 +2340,7 @@ dependencies = [
  "hyper-playback-compiler",
  "hyper-project-model",
  "hyper-strict-json",
+ "hyper-track-freeze",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",

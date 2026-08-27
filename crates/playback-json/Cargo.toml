@@ -12,6 +12,7 @@ hyper-native-device = { path = "../native-device" }
 hyper-playback-compiler = { path = "../playback-compiler" }
 hyper-project-model = { path = "../project-model" }
 hyper-strict-json = { path = "../strict-json" }
+hyper-track-freeze = { path = "../track-freeze" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 serde_json_canonicalizer = "=0.3.2"

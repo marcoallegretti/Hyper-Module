@@ -1272,12 +1272,7 @@ fn validate_freeze_state_inventory(
                     && loaded.clip_track_id_at(index) == Some(document.track_id())
             })
         };
-        if !clip_belongs_to_track(document.frozen_clip_id())
-            || document
-                .original_clip_ids()
-                .iter()
-                .any(|clip_id| !clip_belongs_to_track(clip_id))
-        {
+        if !clip_belongs_to_track(document.frozen_clip_id()) {
             return Err(fail("freeze-state clip does not belong to its track"));
         }
         for (id, role) in [
@@ -1296,12 +1291,20 @@ fn validate_freeze_state_inventory(
         }) {
             return Err(fail("freeze-state references a missing rendered sample"));
         }
-        if document.original_clip_ids().iter().any(|id| {
-            !descriptors
-                .iter()
-                .any(|descriptor| descriptor.id() == id && descriptor.role() == ResourceRole::Clip)
+        if document.original_clips().iter().any(|clip| {
+            clip.track_id() != document.track_id()
+                || descriptors.iter().any(|descriptor| {
+                    descriptor.id() == clip.id() && descriptor.role() == ResourceRole::Clip
+                })
+                || !package
+                    .manifest()
+                    .assets()
+                    .iter()
+                    .any(|asset| asset.id() == clip.asset_id() && asset.role() == AssetRole::Sample)
         }) {
-            return Err(fail("freeze-state references a missing original clip"));
+            return Err(fail(
+                "freeze-state has inconsistent original clip authority",
+            ));
         }
         if let Some(chain_id) = document.device_chain_id()
             && !descriptors.iter().any(|descriptor| {
