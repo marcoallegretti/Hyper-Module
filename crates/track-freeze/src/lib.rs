@@ -21,6 +21,20 @@ pub struct FrozenPlacementState {
 }
 
 impl FrozenPlacementState {
+    /// Creates one validated displaced-placement record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain rejection when the placement identity is invalid.
+    pub fn try_new(id: String, enabled: bool) -> Result<Self, TrackFreezeStateError> {
+        if !is_valid_entity_id(&id) {
+            return Err(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an invalid displaced placement identity",
+            ));
+        }
+        Ok(Self { id, enabled })
+    }
+
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
@@ -49,6 +63,51 @@ pub struct TrackFreezeState {
 }
 
 impl TrackFreezeState {
+    /// Creates one validated version-1 freeze authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain rejection when identities or displaced source state
+    /// cannot describe one reversible audio-track freeze.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the persisted authority intentionally names every resource that freeze and unfreeze must coordinate"
+    )]
+    pub fn try_new(
+        id: String,
+        project_id: String,
+        track_id: String,
+        frozen_clip_id: String,
+        frozen_asset_id: String,
+        arrangement_id: String,
+        frozen_placement_id: String,
+        original_clip_ids: Vec<String>,
+        original_placements: Vec<FrozenPlacementState>,
+        device_chain_id: Option<String>,
+    ) -> Result<Self, TrackFreezeStateError> {
+        validate(RawTrackFreezeState {
+            format: FORMAT.to_owned(),
+            format_version: FORMAT_VERSION,
+            id,
+            project_id,
+            track_id,
+            frozen_clip_id,
+            frozen_asset_id,
+            arrangement_id,
+            frozen_placement_id,
+            original_clip_ids,
+            original_placements: original_placements
+                .into_iter()
+                .map(|placement| RawFrozenPlacementState {
+                    id: placement.id,
+                    enabled: placement.enabled,
+                })
+                .collect(),
+            device_chain_id,
+            extensions: BTreeMap::new(),
+        })
+    }
+
     /// Parses one complete version-1 freeze-state resource.
     ///
     /// # Errors
@@ -102,6 +161,29 @@ impl TrackFreezeState {
     #[must_use]
     pub const fn extensions(&self) -> &BTreeMap<String, serde_json::Value> {
         &self.extensions
+    }
+
+    /// Returns canonical JSON suitable for one manifest-declared resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error if canonical JSON capacity is unavailable.
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json_canonicalizer::to_vec(&CanonicalTrackFreezeState {
+            format: FORMAT,
+            format_version: FORMAT_VERSION,
+            id: &self.id,
+            project_id: &self.project_id,
+            track_id: &self.track_id,
+            frozen_clip_id: &self.frozen_clip_id,
+            frozen_asset_id: &self.frozen_asset_id,
+            arrangement_id: &self.arrangement_id,
+            frozen_placement_id: &self.frozen_placement_id,
+            original_clip_ids: &self.original_clip_ids,
+            original_placements: &self.original_placements,
+            device_chain_id: self.device_chain_id.as_deref(),
+            extensions: &self.extensions,
+        })
     }
 }
 
@@ -159,6 +241,24 @@ struct RawTrackFreezeState {
 struct RawFrozenPlacementState {
     id: String,
     enabled: bool,
+}
+
+#[derive(Serialize)]
+struct CanonicalTrackFreezeState<'a> {
+    format: &'static str,
+    format_version: u8,
+    id: &'a str,
+    project_id: &'a str,
+    track_id: &'a str,
+    frozen_clip_id: &'a str,
+    frozen_asset_id: &'a str,
+    arrangement_id: &'a str,
+    frozen_placement_id: &'a str,
+    original_clip_ids: &'a [String],
+    original_placements: &'a [FrozenPlacementState],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_chain_id: Option<&'a str>,
+    extensions: &'a BTreeMap<String, serde_json::Value>,
 }
 
 fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeStateError> {
@@ -267,6 +367,8 @@ mod tests {
         assert_eq!(state.original_clip_ids().len(), 1);
         assert!(state.original_placements()[0].enabled());
         assert!(state.device_chain_id().is_some());
+        let round_trip = TrackFreezeState::parse(&state.to_canonical_bytes().unwrap()).unwrap();
+        assert_eq!(state, round_trip);
     }
 
     #[test]

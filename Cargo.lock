@@ -2605,6 +2605,7 @@ dependencies = [
  "hyper-strict-json",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
 ]
 
 [[package]]
