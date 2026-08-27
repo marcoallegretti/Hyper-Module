@@ -94,6 +94,8 @@ pub struct FrozenClipState {
     #[serde(skip_serializing)]
     id: String,
     #[serde(skip_serializing)]
+    project_id: String,
+    #[serde(skip_serializing)]
     track_id: String,
     #[serde(skip_serializing)]
     asset_id: String,
@@ -107,6 +109,10 @@ impl FrozenClipState {
     ///
     /// Returns a domain rejection when the clip cannot be restored as a
     /// complete audio-clip document.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the persistence boundary validates the complete retained clip before exposing reversible authority"
+    )]
     pub fn try_new(document: serde_json::Value) -> Result<Self, TrackFreezeStateError> {
         let object = document
             .as_object()
@@ -119,6 +125,14 @@ impl FrozenClipState {
             .filter(|id| is_valid_entity_id(id))
             .ok_or(TrackFreezeStateError::InvalidDomain(
                 "track freeze state has an invalid displaced clip identity",
+            ))?
+            .to_owned();
+        let project_id = object
+            .get("project_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|project_id| is_valid_entity_id(project_id))
+            .ok_or(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an invalid displaced clip document",
             ))?
             .to_owned();
         let track_id = object
@@ -139,8 +153,106 @@ impl FrozenClipState {
                 "track freeze state has an invalid displaced clip document",
             ))?
             .to_owned();
+        let source = object
+            .get("source")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an invalid displaced clip document",
+            ))?;
+        let loop_spec = object
+            .get("loop")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an invalid displaced clip document",
+            ))?;
+        let playback = object
+            .get("playback")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an invalid displaced clip document",
+            ))?;
+        let fades = object
+            .get("fades")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an invalid displaced clip document",
+            ))?;
+        if object.get("format").and_then(serde_json::Value::as_str) != Some("hyper-audio-clip")
+            || !matches!(
+                object
+                    .get("format_version")
+                    .and_then(serde_json::Value::as_u64),
+                Some(1 | 2)
+            )
+            || object
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            || object
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .is_none()
+            || object
+                .get("duration_ticks")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            || source
+                .get("start_frame")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            || source
+                .get("frame_count")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            || loop_spec
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .is_none()
+            || loop_spec
+                .get("start_tick")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            || loop_spec
+                .get("end_tick")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            || playback
+                .get("gain_decibels")
+                .and_then(serde_json::Value::as_f64)
+                .is_none()
+            || playback
+                .get("reverse")
+                .and_then(serde_json::Value::as_bool)
+                .is_none()
+            || playback
+                .get("transpose_cents")
+                .and_then(serde_json::Value::as_i64)
+                .is_none()
+            || fades.get("curve").and_then(serde_json::Value::as_str) != Some("linear-amplitude")
+            || fades
+                .get("in_ticks")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            || fades
+                .get("out_ticks")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            || object
+                .get("warp_markers")
+                .and_then(serde_json::Value::as_array)
+                .is_none()
+            || object
+                .get("extensions")
+                .and_then(serde_json::Value::as_object)
+                .is_none()
+        {
+            return Err(TrackFreezeStateError::InvalidDomain(
+                "track freeze state has an incomplete displaced clip document",
+            ));
+        }
         Ok(Self {
             id,
+            project_id,
             track_id,
             asset_id,
             document,
@@ -155,6 +267,11 @@ impl FrozenClipState {
     #[must_use]
     pub fn track_id(&self) -> &str {
         &self.track_id
+    }
+
+    #[must_use]
+    pub fn project_id(&self) -> &str {
+        &self.project_id
     }
 
     #[must_use]
@@ -445,7 +562,10 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
         })?;
     for raw_clip in raw.original_clips {
         let clip = FrozenClipState::try_new(raw_clip.document)?;
-        if clip.track_id() != raw.track_id.as_str() || !unique.insert(clip.id().to_owned()) {
+        if clip.project_id() != raw.project_id.as_str()
+            || clip.track_id() != raw.track_id.as_str()
+            || !unique.insert(clip.id().to_owned())
+        {
             return Err(TrackFreezeStateError::InvalidDomain(
                 "track freeze state has invalid displaced clips",
             ));
@@ -505,8 +625,9 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
 #[cfg(test)]
 mod tests {
     use super::{TrackFreezeState, TrackFreezeStateError};
+    use serde_json::Value;
 
-    const STATE: &[u8] = br#"{"format":"hyper-track-freeze-state","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337600","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","frozen_clip_id":"018f47a2-6b2d-7c11-8a44-001122337603","frozen_asset_id":"018f47a2-6b2d-7c11-8a44-001122337604","arrangement_id":"018f47a2-6b2d-7c11-8a44-001122337605","frozen_placement_id":"018f47a2-6b2d-7c11-8a44-001122337606","original_clips":[{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337607","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337610"}}}],"original_placements":[{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337608","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","clip_id":"018f47a2-6b2d-7c11-8a44-001122337607","start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":"018f47a2-6b2d-7c11-8a44-001122337609","extensions":{}}"#;
+    const STATE: &[u8] = br#"{"format":"hyper-track-freeze-state","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337600","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","frozen_clip_id":"018f47a2-6b2d-7c11-8a44-001122337603","frozen_asset_id":"018f47a2-6b2d-7c11-8a44-001122337604","arrangement_id":"018f47a2-6b2d-7c11-8a44-001122337605","frozen_placement_id":"018f47a2-6b2d-7c11-8a44-001122337606","original_clips":[{"document":{"format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337607","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","name":"Lead","enabled":true,"duration_ticks":4,"source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337610","start_frame":0,"frame_count":100},"loop":{"enabled":false,"start_tick":0,"end_tick":4},"playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},"fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},"warp_markers":[],"extensions":{}}}],"original_placements":[{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337608","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","clip_id":"018f47a2-6b2d-7c11-8a44-001122337607","start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":"018f47a2-6b2d-7c11-8a44-001122337609","extensions":{}}"#;
 
     #[test]
     fn parses_complete_reversible_authority() {
@@ -524,9 +645,12 @@ mod tests {
 
     #[test]
     fn refuses_a_duplicate_original_clip_identity() {
-        let duplicated = br#"{"format":"hyper-track-freeze-state","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337600","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","frozen_clip_id":"018f47a2-6b2d-7c11-8a44-001122337603","frozen_asset_id":"018f47a2-6b2d-7c11-8a44-001122337604","arrangement_id":"018f47a2-6b2d-7c11-8a44-001122337605","frozen_placement_id":"018f47a2-6b2d-7c11-8a44-001122337606","original_clips":[{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337607","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337610"}}},{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337607","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337610"}}}],"original_placements":[{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337608","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","clip_id":"018f47a2-6b2d-7c11-8a44-001122337607","start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"extensions":{}}"#;
+        let mut duplicated: Value = serde_json::from_slice(STATE).unwrap();
+        let clips = duplicated["original_clips"].as_array_mut().unwrap();
+        clips.push(clips[0].clone());
+        let duplicated = serde_json_canonicalizer::to_vec(&duplicated).unwrap();
         assert!(matches!(
-            TrackFreezeState::parse(duplicated),
+            TrackFreezeState::parse(&duplicated),
             Err(TrackFreezeStateError::InvalidDomain(_))
         ));
     }
