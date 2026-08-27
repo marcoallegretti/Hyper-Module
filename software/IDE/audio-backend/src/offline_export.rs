@@ -57,6 +57,11 @@ pub struct OfflineExportRange {
 impl OfflineExportRange {
     /// Returns an export range when `end_frame` is strictly after
     /// `start_frame`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OfflineExportRangeError::EmptyRange`] when the end does not
+    /// follow the start.
     pub const fn new(
         start_frame: usize,
         end_frame: usize,
@@ -384,6 +389,12 @@ pub fn render_prepared_project_offline_with_mixer(
 ///
 /// The renderer prerolls from frame zero so the window matches linear project
 /// playback at every returned frame.
+///
+/// # Errors
+///
+/// Returns the same classified rejections as
+/// [`render_project_offline_with_mixer`], including a refusal for a range
+/// outside the verified project extent.
 pub fn render_prepared_project_offline_range_with_mixer(
     project: &PreparedProjectPlayback,
     spec: OfflineExportSpec,
@@ -399,6 +410,10 @@ pub fn render_prepared_project_offline_range_with_mixer(
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the offline render loop keeps range validation, preroll, device processing, and output assembly in one ordered operation"
+)]
 fn render_project_offline_with_devices(
     session: &PreparedPlaybackSession,
     device_chains: &[DeviceChain],
@@ -1629,6 +1644,10 @@ pub fn export_prepared_project_wav_with_mixer(
 ///
 /// The requested window is preroll-rendered from frame zero before it is
 /// written, so automation and native device state match ordinary playback.
+///
+/// # Errors
+///
+/// Returns the classified render, range, journal, or WAV publication failure.
 pub fn export_prepared_project_range_wav_with_mixer(
     project: &PreparedProjectPlayback,
     spec: OfflineExportSpec,
@@ -1674,6 +1693,10 @@ pub fn export_prepared_project_flac_with_mixer(
 ///
 /// The requested window is preroll-rendered from frame zero before it is
 /// encoded, so automation and native device state match ordinary playback.
+///
+/// # Errors
+///
+/// Returns the classified render, range, encoding, or FLAC publication failure.
 pub fn export_prepared_project_range_flac_with_mixer(
     project: &PreparedProjectPlayback,
     spec: OfflineExportSpec,

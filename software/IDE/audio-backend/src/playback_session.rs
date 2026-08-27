@@ -3025,6 +3025,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the mono preview path copies each sample identically into both output channels"
+    )]
     fn clip_audition_uses_the_current_source_view_not_the_full_asset() {
         let clip = String::from_utf8(LIVE_CLIP.to_vec())
             .unwrap()
