@@ -23,6 +23,8 @@ export enum AppMode {
     adding-routing-bus,
     duplicating-track,
     removing-track,
+    freezing-track,
+    unfreezing-track,
     renaming-track,
     changing-track-activation,
     adding-arrangement-placement,
@@ -381,6 +383,8 @@ export global IdeActions {
     callback duplicate-mixer-strip(int, string);
     callback remove-audio-track(string);
     callback remove-audio-track-content(string);
+    callback freeze-audio-track(string);
+    callback unfreeze-audio-track(string);
     callback reorder-audio-track(int, bool);
     callback rename-audio-track(int, string);
     callback rename-routing-bus(int, string);
@@ -558,6 +562,10 @@ export component MainWindow inherits Window {
     in-out property <bool> remove-track-content-visible: false;
     in-out property <string> remove-track-content-id: "";
     in-out property <string> remove-track-content-name: "";
+    in-out property <bool> track-freeze-visible: false;
+    in-out property <string> track-freeze-id: "";
+    in-out property <string> track-freeze-name: "";
+    in-out property <bool> track-freeze-is-unfreeze: false;
     in-out property <bool> routing-bus-removal-visible: false;
     in-out property <string> routing-bus-removal-id: "";
     in-out property <string> routing-bus-removal-name: "";
@@ -683,6 +691,7 @@ export component MainWindow inherits Window {
         || root.rename-track-visible
         || root.remove-track-visible
         || root.remove-track-content-visible
+        || root.track-freeze-visible
         || root.routing-bus-removal-visible
         || root.take-clip-visible
         || root.take-rename-visible
@@ -1054,6 +1063,8 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.preparing-runtime ? "◌  PREPARING RUNTIME"
                         : root.app-mode == AppMode.adding-track ? "◌  ADDING TRACK"
                         : root.app-mode == AppMode.removing-track ? "◌  REMOVING TRACK"
+                        : root.app-mode == AppMode.freezing-track ? "◌  FREEZING TRACK"
+                        : root.app-mode == AppMode.unfreezing-track ? "◌  UNFREEZING TRACK"
                         : root.app-mode == AppMode.renaming-track ? "◌  RENAMING TRACK"
                         : root.app-mode == AppMode.changing-track-activation ? "◌  UPDATING TRACK"
                         : root.app-mode == AppMode.adding-arrangement-placement ? "◌  PLACING CLIP"
@@ -2282,7 +2293,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.remove-track-visible && !root.remove-track-content-visible && !root.routing-bus-removal-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && root.remove-track-visible && !root.remove-track-content-visible && !root.track-freeze-visible && !root.routing-bus-removal-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -2314,7 +2325,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.remove-track-content-visible && !root.remove-track-visible && !root.routing-bus-removal-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && root.remove-track-content-visible && !root.remove-track-visible && !root.track-freeze-visible && !root.routing-bus-removal-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -2346,7 +2357,56 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.routing-bus-removal-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && root.track-freeze-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.routing-bus-removal-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 14px;
+                        Text { text: root.track-freeze-is-unfreeze ? "UNFREEZE AUDIO TRACK" : "FREEZE AUDIO TRACK"; color: #ffd166; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.track-freeze-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Rectangle { height: 1px; background: #27313d; }
+                        Text {
+                            text: root.track-freeze-is-unfreeze
+                                ? "Unfreeze restores the retained original clips and placements only when the rendered track still matches its retained freeze state. The rendered sample remains until unused-sample cleanup proves it unreferenced."
+                                : "Freeze renders this audio track's pre-fader playback output and retains its original clips and placements for a guarded Unfreeze. The project validates the complete state before making any change.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button {
+                                text: "Cancel";
+                                enabled: root.app-mode == AppMode.running;
+                                clicked => {
+                                    root.track-freeze-visible = false;
+                                    root.track-freeze-id = "";
+                                    root.track-freeze-name = "";
+                                    root.track-freeze-is-unfreeze = false;
+                                }
+                            }
+                            Button {
+                                horizontal-stretch: 1;
+                                text: root.app-mode == AppMode.freezing-track ? "Freezing track..."
+                                    : root.app-mode == AppMode.unfreezing-track ? "Unfreezing track..."
+                                    : root.track-freeze-is-unfreeze ? "Unfreeze audio track" : "Freeze audio track";
+                                accessible-label: root.track-freeze-is-unfreeze ? "Confirm unfreeze audio track" : "Confirm freeze audio track";
+                                enabled: root.app-mode == AppMode.running && root.track-freeze-id != "";
+                                clicked => {
+                                    if root.track-freeze-is-unfreeze {
+                                        IdeActions.unfreeze-audio-track(root.track-freeze-id);
+                                    } else {
+                                        IdeActions.freeze-audio-track(root.track-freeze-id);
+                                    }
+                                }
+                            }
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                    }
+                }
+
+                if root.mixer-visible && root.routing-bus-removal-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.track-freeze-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -2379,7 +2439,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.rename-track-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.routing-bus-removal-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && root.rename-track-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.track-freeze-visible && !root.routing-bus-removal-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -2427,7 +2487,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.duplicate-track-visible && !root.rename-track-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.routing-bus-removal-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && root.duplicate-track-visible && !root.rename-track-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.track-freeze-visible && !root.routing-bus-removal-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -2475,7 +2535,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && !root.duplicate-track-visible && !root.rename-track-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.routing-bus-removal-visible && !root.mixer-sends-visible && !root.mixer-automation-visible && !root.mixer-control-visible && !root.mixer-native-filter-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && !root.duplicate-track-visible && !root.rename-track-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.track-freeze-visible && !root.routing-bus-removal-visible && !root.mixer-sends-visible && !root.mixer-automation-visible && !root.mixer-control-visible && !root.mixer-native-filter-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -2596,6 +2656,28 @@ export component MainWindow inherits Window {
                                         root.remove-track-content-id = channel.track-id;
                                         root.remove-track-content-name = channel.name;
                                         root.remove-track-content-visible = true;
+                                    }
+                                }
+                                if channel.kind == "AUDIO" : Button {
+                                    text: "Freeze…";
+                                    accessible-label: "Freeze " + channel.name;
+                                    enabled: root.app-mode == AppMode.running && channel.state-available;
+                                    clicked => {
+                                        root.track-freeze-id = channel.track-id;
+                                        root.track-freeze-name = channel.name;
+                                        root.track-freeze-is-unfreeze = false;
+                                        root.track-freeze-visible = true;
+                                    }
+                                }
+                                if channel.kind == "AUDIO" : Button {
+                                    text: "Unfreeze…";
+                                    accessible-label: "Unfreeze " + channel.name;
+                                    enabled: root.app-mode == AppMode.running && channel.state-available;
+                                    clicked => {
+                                        root.track-freeze-id = channel.track-id;
+                                        root.track-freeze-name = channel.name;
+                                        root.track-freeze-is-unfreeze = true;
+                                        root.track-freeze-visible = true;
                                     }
                                 }
                                 HorizontalLayout {

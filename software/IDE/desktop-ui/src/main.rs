@@ -2373,6 +2373,7 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
     bind_audio_track_activation_callback(ui, worker);
     bind_audio_track_removal_callback(ui, worker);
     bind_audio_track_content_removal_callback(ui, worker);
+    bind_audio_track_freeze_callbacks(ui, worker);
 }
 
 fn bind_routing_bus_callbacks(ui: &MainWindow, worker: &WorkerCell) {
@@ -2727,6 +2728,68 @@ fn bind_audio_track_content_removal_callback(ui: &MainWindow, worker: &WorkerCel
             IdeWorkerCommand::RemoveAudioTrackContent { track_id },
         );
     });
+}
+
+fn bind_audio_track_freeze_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let worker = Rc::clone(worker);
+    bind_audio_track_freeze_callbacks_with(
+        ui,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker, command)),
+    );
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the generated callbacks retain the shared command submitter for the window lifetime"
+)]
+fn bind_audio_track_freeze_callbacks_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
+    let actions = ui.global::<IdeActions>();
+
+    let weak = ui.as_weak();
+    let freeze_submitter = Rc::clone(&submitter);
+    actions.on_freeze_audio_track(move |track_id| {
+        submit_audio_track_freeze_request(&weak, &freeze_submitter, track_id.as_str(), false);
+    });
+
+    let weak = ui.as_weak();
+    actions.on_unfreeze_audio_track(move |track_id| {
+        submit_audio_track_freeze_request(&weak, &submitter, track_id.as_str(), true);
+    });
+}
+
+fn submit_audio_track_freeze_request(
+    weak: &slint::Weak<MainWindow>,
+    submitter: &UiCommandSubmitter,
+    requested_track_id: &str,
+    unfreeze: bool,
+) {
+    let Some(ui) = weak.upgrade() else {
+        return;
+    };
+    if ui.get_app_mode() != AppMode::Running
+        || !ui.get_track_freeze_visible()
+        || ui.get_track_freeze_id() != requested_track_id
+        || ui.get_track_freeze_is_unfreeze() != unfreeze
+    {
+        ui.set_error_text("Audio-track freeze confirmation is no longer current".into());
+        return;
+    }
+    let Ok(track_id) = validate_audio_track_freeze_operation(
+        ui.get_app_mode(),
+        requested_track_id,
+        &ui.get_mixer_channels(),
+    ) else {
+        ui.set_error_text("The selected audio track is no longer available".into());
+        return;
+    };
+    submitter(
+        &ui,
+        if unfreeze {
+            IdeWorkerCommand::UnfreezeAudioTrack { track_id }
+        } else {
+            IdeWorkerCommand::FreezeAudioTrack { track_id }
+        },
+    );
 }
 
 fn bind_loudness_callbacks(ui: &MainWindow, worker: &WorkerCell) {
@@ -4784,6 +4847,8 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::RemoveAudioTrack | IdeWorkerCommandKind::RemoveAudioTrackContent => {
             AppMode::RemovingTrack
         }
+        IdeWorkerCommandKind::FreezeAudioTrack => AppMode::FreezingTrack,
+        IdeWorkerCommandKind::UnfreezeAudioTrack => AppMode::UnfreezingTrack,
         IdeWorkerCommandKind::RenameAudioTrack | IdeWorkerCommandKind::RenameRoutingBus => {
             AppMode::RenamingTrack
         }
@@ -4930,6 +4995,12 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::RemoveAudioTrackContent => {
             "Preserving mixer state, removing the audio track and its content, and reopening project…"
+        }
+        IdeWorkerCommandKind::FreezeAudioTrack => {
+            "Saving mixer state, rendering the audio track, and reopening project…"
+        }
+        IdeWorkerCommandKind::UnfreezeAudioTrack => {
+            "Saving mixer state, restoring the retained audio-track sources, and reopening project…"
         }
         IdeWorkerCommandKind::ReorderMixerStrips => {
             "Preserving mixer state, reordering mixer strips, and reopening project…"
@@ -5287,6 +5358,16 @@ fn apply_event(
         | IdeWorkerEvent::AudioTrackContentRemoving
         | IdeWorkerEvent::AudioTrackContentRemovalCommittedWithWarning { .. }) => {
             apply_audio_track_content_removal_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioTrackFrozen { .. }
+        | IdeWorkerEvent::AudioTrackFreezing
+        | IdeWorkerEvent::AudioTrackFreezeCommittedWithWarning { .. }) => {
+            apply_audio_track_freeze_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioTrackUnfrozen { .. }
+        | IdeWorkerEvent::AudioTrackUnfreezing
+        | IdeWorkerEvent::AudioTrackUnfreezeCommittedWithWarning { .. }) => {
+            apply_audio_track_unfreeze_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioTrackDuplicated { .. }
         | IdeWorkerEvent::AudioTrackDuplicating) => {
@@ -5822,6 +5903,61 @@ fn apply_audio_track_content_removal_event(ui: &MainWindow, event: &IdeWorkerEve
             ui.set_error_text(warning.to_string().into());
         }
         _ => unreachable!("audio-track content removal event dispatcher received another event"),
+    }
+}
+
+fn reset_audio_track_freeze_form(ui: &MainWindow) {
+    ui.set_track_freeze_visible(false);
+    ui.set_track_freeze_id(SharedString::default());
+    ui.set_track_freeze_name(SharedString::default());
+    ui.set_track_freeze_is_unfreeze(false);
+}
+
+fn apply_audio_track_freeze_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioTrackFrozen { revision, track_id } => {
+            reset_audio_track_freeze_form(ui);
+            ui.set_status_text(
+                format!("Audio track {track_id} frozen in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioTrackFreezing => {
+            ui.set_app_mode(AppMode::FreezingTrack);
+            ui.set_status_text("Waiting for native output before freezing the audio track…".into());
+        }
+        IdeWorkerEvent::AudioTrackFreezeCommittedWithWarning { warning } => {
+            reset_audio_track_freeze_form(ui);
+            ui.set_status_text("Audio track freeze committed, but recovery needs attention".into());
+            ui.set_error_text(warning.to_string().into());
+        }
+        _ => unreachable!("audio-track freeze event dispatcher received another event"),
+    }
+}
+
+fn apply_audio_track_unfreeze_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioTrackUnfrozen { revision, track_id } => {
+            reset_audio_track_freeze_form(ui);
+            ui.set_status_text(
+                format!("Audio track {track_id} unfrozen in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioTrackUnfreezing => {
+            ui.set_app_mode(AppMode::UnfreezingTrack);
+            ui.set_status_text(
+                "Waiting for native output before unfreezing the audio track…".into(),
+            );
+        }
+        IdeWorkerEvent::AudioTrackUnfreezeCommittedWithWarning { warning } => {
+            reset_audio_track_freeze_form(ui);
+            ui.set_status_text(
+                "Audio track unfreeze committed, but recovery needs attention".into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        _ => unreachable!("audio-track unfreeze event dispatcher received another event"),
     }
 }
 
@@ -8653,6 +8789,7 @@ fn reset_project(
     ui.set_remove_track_content_visible(false);
     ui.set_remove_track_content_id(SharedString::default());
     ui.set_remove_track_content_name(SharedString::default());
+    reset_audio_track_freeze_form(ui);
     ui.set_routing_bus_removal_visible(false);
     ui.set_routing_bus_removal_id(SharedString::default());
     ui.set_routing_bus_removal_name(SharedString::default());
@@ -8884,6 +9021,12 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::RemoveAudioTrack | IdeWorkerCommandKind::RemoveAudioTrackContent
             if current == AppMode::RemovingTrack =>
         {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::FreezeAudioTrack if current == AppMode::FreezingTrack => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::UnfreezeAudioTrack if current == AppMode::UnfreezingTrack => {
             AppMode::Running
         }
         IdeWorkerCommandKind::RenameAudioTrack | IdeWorkerCommandKind::RenameRoutingBus
@@ -9689,6 +9832,28 @@ fn validate_audio_track_content_removal(
         .find(|row| row.track_id.as_str() == track_id)
         .ok_or(MixerControlFailure::StaleSelection)?;
     if mode != AppMode::Running || !row.state_available || !row.activation_toggleable {
+        return Err(MixerControlFailure::StateUnavailable);
+    }
+    Ok(row.track_id.to_string())
+}
+
+fn validate_audio_track_freeze_operation(
+    mode: AppMode,
+    track_id: &str,
+    channels: &ModelRc<MixerChannelRow>,
+) -> Result<String, MixerControlFailure> {
+    if track_id.is_empty() {
+        return Err(MixerControlFailure::InvalidSelection);
+    }
+    let row = (0..channels.row_count())
+        .filter_map(|index| channels.row_data(index))
+        .find(|row| row.track_id.as_str() == track_id)
+        .ok_or(MixerControlFailure::StaleSelection)?;
+    if mode != AppMode::Running
+        || !row.state_available
+        || !row.activation_toggleable
+        || row.kind.as_str() != "AUDIO"
+    {
         return Err(MixerControlFailure::StateUnavailable);
     }
     Ok(row.track_id.to_string())
@@ -17672,6 +17837,7 @@ mod tests {
         assert_recent_project_window_contract(ui);
         assert_audio_import_window_contract(ui);
         assert_audio_track_content_removal_window_contract(ui);
+        assert_audio_track_freeze_window_contract(ui);
         assert_audio_clip_removal_window_contract(ui);
         assert_audio_clip_source_trim_window_contract(ui);
         assert_unused_sample_cleanup_window_contract(ui);
@@ -17844,6 +18010,95 @@ mod tests {
         assert!(!ui.get_remove_track_content_visible());
         assert!(ui.get_remove_track_content_id().is_empty());
         assert!(ui.get_status_text().contains("revision 9"));
+        assert!(ui.get_error_text().is_empty());
+    }
+
+    fn assert_audio_track_freeze_window_contract(ui: &MainWindow) {
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_audio_track_freeze_callbacks_with(
+            ui,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+        let track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![
+            audio_track_mixer_row(0, track_id),
+        ]))));
+        ui.set_app_mode(AppMode::Running);
+        reset_audio_track_freeze_form(ui);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_freeze_audio_track(track_id.into());
+        assert!(
+            ui.get_error_text()
+                .contains("freeze confirmation is no longer current")
+        );
+        assert!(submitted.borrow().is_empty());
+
+        ui.set_track_freeze_visible(true);
+        ui.set_track_freeze_id(track_id.into());
+        ui.set_track_freeze_name("Lead".into());
+        ui.set_track_freeze_is_unfreeze(false);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_freeze_audio_track(track_id.into());
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::FreezeAudioTrack { track_id: submitted_track_id }]
+                if submitted_track_id == track_id
+        ));
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_track_freeze_is_unfreeze(true);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_freeze_audio_track(track_id.into());
+        assert!(
+            ui.get_error_text()
+                .contains("freeze confirmation is no longer current")
+        );
+        assert_eq!(submitted.borrow().len(), 1);
+
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_unfreeze_audio_track(track_id.into());
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::FreezeAudioTrack { track_id: frozen_track_id }, IdeWorkerCommand::UnfreezeAudioTrack { track_id: unfrozen_track_id }]
+                if frozen_track_id == track_id && unfrozen_track_id == track_id
+        ));
+        assert!(ui.get_error_text().is_empty());
+
+        apply_audio_track_freeze_event(ui, &IdeWorkerEvent::AudioTrackFreezing);
+        assert_eq!(ui.get_app_mode(), AppMode::FreezingTrack);
+        apply_audio_track_freeze_event(
+            ui,
+            &IdeWorkerEvent::AudioTrackFrozen {
+                revision: 9,
+                track_id: track_id.to_owned(),
+            },
+        );
+        assert!(!ui.get_track_freeze_visible());
+        assert!(ui.get_track_freeze_id().is_empty());
+        assert!(ui.get_status_text().contains("revision 9"));
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_track_freeze_visible(true);
+        ui.set_track_freeze_id(track_id.into());
+        ui.set_track_freeze_name("Lead".into());
+        ui.set_track_freeze_is_unfreeze(true);
+        apply_audio_track_unfreeze_event(ui, &IdeWorkerEvent::AudioTrackUnfreezing);
+        assert_eq!(ui.get_app_mode(), AppMode::UnfreezingTrack);
+        apply_audio_track_unfreeze_event(
+            ui,
+            &IdeWorkerEvent::AudioTrackUnfrozen {
+                revision: 10,
+                track_id: track_id.to_owned(),
+            },
+        );
+        assert!(!ui.get_track_freeze_visible());
+        assert!(ui.get_track_freeze_id().is_empty());
+        assert!(ui.get_status_text().contains("revision 10"));
         assert!(ui.get_error_text().is_empty());
     }
 
