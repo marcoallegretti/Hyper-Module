@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 hound = "=3.5.1"
 rubato = { version = "=4.0.0", default-features = false }
-symphonia = { version = "=0.5.5", default-features = false, features = ["aiff", "flac", "mp3", "pcm", "wav"] }
+symphonia = { version = "=0.5.5", default-features = false, features = ["aiff", "flac", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 
 [lints]
 workspace = true

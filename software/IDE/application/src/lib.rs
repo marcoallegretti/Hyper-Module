@@ -362,7 +362,7 @@ struct AudioImportFormat {
     container: AudioContainer,
 }
 
-const AUDIO_IMPORT_FORMATS: [AudioImportFormat; 5] = [
+const AUDIO_IMPORT_FORMATS: [AudioImportFormat; 6] = [
     AudioImportFormat {
         extension: "wav",
         container: AudioContainer::Wav,
@@ -376,6 +376,10 @@ const AUDIO_IMPORT_FORMATS: [AudioImportFormat; 5] = [
         container: AudioContainer::Mp3,
     },
     AudioImportFormat {
+        extension: "ogg",
+        container: AudioContainer::OggVorbis,
+    },
+    AudioImportFormat {
         extension: "aiff",
         container: AudioContainer::Aiff,
     },
@@ -386,7 +390,7 @@ const AUDIO_IMPORT_FORMATS: [AudioImportFormat; 5] = [
 ];
 
 /// File-dialog label for the audio containers accepted by project import.
-pub const AUDIO_IMPORT_FILE_FILTER_LABEL: &str = "WAV, FLAC, MP3, and AIFF audio";
+pub const AUDIO_IMPORT_FILE_FILTER_LABEL: &str = "WAV, FLAC, MP3, Ogg/Vorbis, and AIFF audio";
 
 /// Iterates over file extensions accepted by project import in picker order.
 #[must_use]
@@ -3513,9 +3517,9 @@ impl fmt::Display for IdeAudioImportError {
             Self::InvalidDestinationTrack => {
                 formatter.write_str("audio import requires an existing audio track")
             }
-            Self::UnsupportedContainer => {
-                formatter.write_str("audio import accepts WAV, native FLAC, MP3, and AIFF files")
-            }
+            Self::UnsupportedContainer => formatter.write_str(
+                "audio import accepts WAV, native FLAC, MP3, Ogg/Vorbis, and AIFF files",
+            ),
             Self::InvalidClipName => formatter.write_str(
                 "the imported file name must contain 1 through 120 characters after normalization",
             ),
@@ -15523,6 +15527,7 @@ mod tests {
             ("wav", AudioContainer::Wav),
             ("flac", AudioContainer::Flac),
             ("mp3", AudioContainer::Mp3),
+            ("ogg", AudioContainer::OggVorbis),
             ("aiff", AudioContainer::Aiff),
             ("aif", AudioContainer::Aiff),
         ];
