@@ -15,21 +15,25 @@ use super::{
     verify_project_package, verify_retained_project_candidate, write_exclusive_synced,
 };
 use crate::project_lock::{
-    AUDIO_TRACK_FREEZE_TRANSACTION_PREFIX, AUDIO_TRACK_UNFREEZE_TRANSACTION_PREFIX, ProjectLock,
-    ProjectTransactionFamily, find_unhandled_project_transaction,
+    AUDIO_TRACK_FLATTEN_TRANSACTION_PREFIX, AUDIO_TRACK_FREEZE_TRANSACTION_PREFIX,
+    AUDIO_TRACK_UNFREEZE_TRANSACTION_PREFIX, ProjectLock, ProjectTransactionFamily,
+    find_unhandled_project_transaction,
 };
 use crate::stable_file::verify_open_stable;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 use hyper_audio_source::{AudioContainer, DecodeLimits, decode_bytes};
 use hyper_fs_authority::{identity, rename_no_replace};
+use hyper_native_device::DeviceChain;
 use hyper_playback_json::{
     AudioTrackFreezeDocuments, AudioTrackFreezeReactivationDocuments, AudioTrackUnfreezeDocuments,
 };
 use hyper_project_model::{
     AssetRole, AudioMediaType, ProjectManifest, ResourceRole, is_valid_entity_id,
 };
-use hyper_track_freeze::TrackFreezeState;
+use hyper_track_freeze::{
+    ActiveTrackFreezeAuthority, TrackFreezeState, validate_active_track_freeze_authority,
+};
 use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -47,6 +51,8 @@ const REACTIVATION_FORMAT: &str = "hyper-audio-track-freeze-reactivation-transac
 const REACTIVATION_INTENT_FORMAT: &str = "hyper-audio-track-freeze-reactivation-intent";
 const UNFREEZE_FORMAT: &str = "hyper-audio-track-unfreeze-transaction";
 const UNFREEZE_INTENT_FORMAT: &str = "hyper-audio-track-unfreeze-intent";
+const FLATTEN_FORMAT: &str = "hyper-audio-track-flatten-transaction";
+const FLATTEN_INTENT_FORMAT: &str = "hyper-audio-track-flatten-intent";
 const VERSION: u8 = 1;
 const SAMPLE_STAGING_NAME: &str = "rendered-sample.wav";
 
@@ -74,6 +80,19 @@ pub struct AudioTrackUnfreezePublicationRequest<'a> {
     pub documents: &'a AudioTrackUnfreezeDocuments,
 }
 
+/// The exact retained authority to discard after explicitly accepting the
+/// frozen render as the track's new source of truth.
+///
+/// Flatten preserves the rendered clip and sample asset. It retires only the
+/// reversible freeze state and the native device chain already baked into that
+/// render, when one was retained.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioTrackFlattenPublicationRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub track_id: &'a str,
+    pub freeze_state_id: &'a str,
+}
+
 /// The exact retained artifact and document delta required to reactivate a
 /// prior freeze without rendering a new sample.
 ///
@@ -94,7 +113,31 @@ pub struct AudioTrackUnfreezePublicationOutcome {
     track_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioTrackFlattenPublicationOutcome {
+    project_identity: [u8; 32],
+    project_revision: u64,
+    track_id: String,
+}
+
 impl AudioTrackUnfreezePublicationOutcome {
+    #[must_use]
+    pub const fn project_identity(&self) -> &[u8; 32] {
+        &self.project_identity
+    }
+
+    #[must_use]
+    pub const fn project_revision(&self) -> u64 {
+        self.project_revision
+    }
+
+    #[must_use]
+    pub fn track_id(&self) -> &str {
+        &self.track_id
+    }
+}
+
+impl AudioTrackFlattenPublicationOutcome {
     #[must_use]
     pub const fn project_identity(&self) -> &[u8; 32] {
         &self.project_identity
@@ -152,6 +195,18 @@ pub struct AudioTrackUnfreezePublicationRecovery {
     disposition: AudioTrackUnfreezePublicationRecoveryDisposition,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioTrackFlattenPublicationRecoveryDisposition {
+    Committed,
+    RolledBack,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioTrackFlattenPublicationRecovery {
+    transaction_id: String,
+    disposition: AudioTrackFlattenPublicationRecoveryDisposition,
+}
+
 impl AudioTrackUnfreezePublicationRecovery {
     #[must_use]
     pub fn transaction_id(&self) -> &str {
@@ -160,6 +215,18 @@ impl AudioTrackUnfreezePublicationRecovery {
 
     #[must_use]
     pub const fn disposition(&self) -> AudioTrackUnfreezePublicationRecoveryDisposition {
+        self.disposition
+    }
+}
+
+impl AudioTrackFlattenPublicationRecovery {
+    #[must_use]
+    pub fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> AudioTrackFlattenPublicationRecoveryDisposition {
         self.disposition
     }
 }
@@ -192,6 +259,7 @@ enum TransactionOperation {
     Freeze,
     Reactivate,
     Unfreeze,
+    Flatten,
 }
 
 #[derive(Debug)]
@@ -338,6 +406,24 @@ pub fn publish_audio_track_unfreeze(
     publish_unfreeze_observed(project_path.as_ref(), request, |_, _| Ok(()))
 }
 
+/// Commits one explicit, irreversible acceptance of a frozen audio render.
+///
+/// The rendered clip and sample asset remain active. The retained unfreeze
+/// authority and any native device chain baked into the render retire together,
+/// so reopening the project cannot apply that processing a second time.
+///
+/// # Errors
+///
+/// Refuses legacy or diverged freeze authority, a stale project, ambiguous
+/// resource ownership, and any transaction state that cannot be recovered
+/// without overwriting unrelated content.
+pub fn publish_audio_track_flatten(
+    project_path: impl AsRef<Path>,
+    request: AudioTrackFlattenPublicationRequest<'_>,
+) -> Result<AudioTrackFlattenPublicationOutcome, ProjectResourcePublicationError> {
+    publish_flatten_observed(project_path.as_ref(), request, |_, _| Ok(()))
+}
+
 /// Recovers interrupted unfreeze publications without accepting filesystem
 /// contents outside the authenticated journal.
 ///
@@ -366,6 +452,36 @@ pub fn recover_audio_track_unfreezes(
         )
     })?;
     recover_unfreeze_locked(&root_path, &root, &backups)
+}
+
+/// Recovers interrupted frozen-track flatten publications without accepting
+/// ambiguous active project or filesystem state.
+///
+/// # Errors
+///
+/// Returns a recovery error when neither the pre-flatten nor post-flatten
+/// package can be proven from the transaction record.
+pub fn recover_audio_track_flattens(
+    project_path: impl AsRef<Path>,
+) -> Result<Vec<AudioTrackFlattenPublicationRecovery>, ProjectResourcePublicationError> {
+    let (root_path, root) = open_stable_project_root(project_path.as_ref()).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "open project root for track-flatten recovery",
+            error,
+        )
+    })?;
+    let Some(backups) = open_optional_dir(&root, "backups")? else {
+        return Ok(Vec::new());
+    };
+    let _lock = ProjectLock::acquire(&backups).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::TransactionUnavailable,
+            "acquire project storage transaction lock",
+            error,
+        )
+    })?;
+    recover_flatten_locked(&root_path, &root, &backups)
 }
 
 #[allow(
@@ -582,6 +698,111 @@ fn publish_unfreeze_observed(
         &mut observer,
     );
     finish_unfreeze_result(
+        verified.root(),
+        &verified.root_dir,
+        &backups,
+        transaction,
+        &name,
+        result,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "flatten must prove its irreversible authority, journal, and manifest boundary together"
+)]
+fn publish_flatten_observed(
+    project_path: &Path,
+    request: AudioTrackFlattenPublicationRequest<'_>,
+    mut observer: impl FnMut(PublicationPhase, &Path) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<AudioTrackFlattenPublicationOutcome, ProjectResourcePublicationError> {
+    let verified = verify_project_package(project_path).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "project verification failed before track flatten",
+            error,
+        )
+    })?;
+    if request.expected_project_sha256 != *verified.manifest_sha256() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "project changed after track-flatten preparation",
+        ));
+    }
+    let (entries, state) = resolve_flatten_entries(&verified, request)?;
+    let authorities = resource_authorities(&verified.root_dir, &entries)?;
+    let backups = open_or_create_dir(&verified.root_dir, "backups")?;
+    let _lock = ProjectLock::acquire(&backups).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::TransactionUnavailable,
+            "acquire project storage transaction lock",
+            error,
+        )
+    })?;
+    let recovered = recover_flatten_locked(verified.root(), &verified.root_dir, &backups)?;
+    if !recovered.is_empty() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "a prior track flatten was recovered; reopen the current project revision",
+        ));
+    }
+    reject_other_transactions(&backups, ProjectTransactionFamily::AudioTrackFlatten)?;
+    verified.confirm_unchanged().map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "project changed before track-flatten staging",
+            error,
+        )
+    })?;
+    let previous_project = read_bounded(&verified.root_dir, MANIFEST_NAME, MAX_JSON_BYTES)?;
+    if digest(&previous_project) != request.expected_project_sha256 {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "active project identity changed before track-flatten staging",
+        ));
+    }
+    let next_revision = verified
+        .manifest()
+        .revision()
+        .checked_add(1)
+        .filter(|revision| *revision <= MAX_SAFE_INTEGER)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "project revision cannot be incremented",
+            )
+        })?;
+    let candidate_project = candidate_flatten_manifest(&previous_project, &entries, next_revision)?;
+    let name = format!("{AUDIO_TRACK_FLATTEN_TRANSACTION_PREFIX}{}", Uuid::new_v4());
+    backups.create_dir(&name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "create track-flatten transaction",
+            error,
+        )
+    })?;
+    sync_dir(&backups)?;
+    let transaction = backups.open_dir_nofollow(&name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "open track-flatten transaction",
+            error,
+        )
+    })?;
+    let result = run_flatten_publication(
+        &verified,
+        &backups,
+        &transaction,
+        &name,
+        &entries,
+        &authorities,
+        &state,
+        &previous_project,
+        &candidate_project,
+        next_revision,
+        &mut observer,
+    );
+    finish_flatten_result(
         verified.root(),
         &verified.root_dir,
         &backups,
@@ -1009,6 +1230,164 @@ fn resolve_unfreeze_entries<'a>(
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
             "track-unfreeze resource identities are not unique",
+        ));
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((entries, state))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "flatten verifies the active rendered graph and retired device authority before accepting an irreversible state transition"
+)]
+fn resolve_flatten_entries(
+    verified: &StructurallyVerifiedProject,
+    request: AudioTrackFlattenPublicationRequest<'_>,
+) -> Result<(Vec<Entry<'static>>, TrackFreezeState), ProjectResourcePublicationError> {
+    if !is_valid_entity_id(request.track_id) || !is_valid_entity_id(request.freeze_state_id) {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-flatten resource identity is invalid",
+        ));
+    }
+    let (state_path, state_bytes) =
+        current_resource(verified, request.freeze_state_id, ResourceRole::FreezeState)?;
+    validate_freeze_state_document(&state_bytes, request.freeze_state_id)?;
+    let state = TrackFreezeState::parse(&state_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse active track-flatten state",
+            error,
+        )
+    })?;
+    if state.id() != request.freeze_state_id
+        || state.track_id() != request.track_id
+        || state.project_id() != verified.manifest().project_id()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-flatten state does not identify the selected frozen track",
+        ));
+    }
+    if !state.has_complete_rendered_authority() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "legacy track-freeze authority must be unfrozen and rendered again before flattening",
+        ));
+    }
+    let (_, track_bytes) = current_resource(verified, state.track_id(), ResourceRole::Track)?;
+    let (_, frozen_clip_bytes) =
+        current_resource(verified, state.frozen_clip_id(), ResourceRole::Clip)?;
+    let (_, arrangement_bytes) =
+        current_resource(verified, state.arrangement_id(), ResourceRole::Arrangement)?;
+    let sample_asset_ids = verified
+        .manifest()
+        .assets()
+        .iter()
+        .filter(|asset| asset.role() == AssetRole::Sample)
+        .map(hyper_project_model::AssetDescriptor::id)
+        .collect::<Vec<_>>();
+    let device_chain = if let Some(chain_id) = state.device_chain_id() {
+        let (path, bytes) = current_resource(verified, chain_id, ResourceRole::DeviceChain)?;
+        let descriptor = verified
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| {
+                descriptor.id() == chain_id && descriptor.role() == ResourceRole::DeviceChain
+            })
+            .ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "track-flatten device-chain descriptor is missing",
+                )
+            })?;
+        if state.device_chain_sha256() != Some(descriptor.sha256()) {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::ProjectChanged,
+                "track-flatten device-chain authority differs from the active project",
+            ));
+        }
+        let chain = DeviceChain::parse(&bytes).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "parse active track-flatten device chain",
+                error,
+            )
+        })?;
+        if chain.id() != chain_id
+            || chain.project_id() != state.project_id()
+            || chain.track_id() != state.track_id()
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "active track-flatten device chain does not belong to the frozen track",
+            ));
+        }
+        Some((chain_id.to_owned(), path, bytes, descriptor.sha256()))
+    } else {
+        if state.device_chain_sha256().is_some() {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-flatten state has incomplete device-chain authority",
+            ));
+        }
+        None
+    };
+    validate_active_track_freeze_authority(
+        &state,
+        ActiveTrackFreezeAuthority::new(
+            verified.manifest().project_id(),
+            &track_bytes,
+            &frozen_clip_bytes,
+            &arrangement_bytes,
+            &sample_asset_ids,
+            device_chain.as_ref().map(|(_, _, _, sha256)| *sha256),
+        ),
+    )
+    .map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "track-flatten retained authority differs from the active project",
+            error,
+        )
+    })?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(1 + usize::from(device_chain.is_some()))
+        .map_err(|_| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "allocate track-flatten resource entries",
+            )
+        })?;
+    entries.push(Entry {
+        id: state.id().to_owned(),
+        role: ResourceRole::FreezeState,
+        path: state_path,
+        before: Some(state_bytes),
+        after: None,
+        created_parent_directory: false,
+    });
+    if let Some((chain_id, path, bytes, _)) = device_chain {
+        entries.push(Entry {
+            id: chain_id,
+            role: ResourceRole::DeviceChain,
+            path,
+            before: Some(bytes),
+            after: None,
+            created_parent_directory: false,
+        });
+    }
+    let mut ids = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    if entries
+        .iter()
+        .any(|entry| !ids.insert(entry.id.as_str()) || !paths.insert(entry.path.as_str()))
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-flatten resource identities are not unique",
         ));
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1538,7 +1917,9 @@ fn validate_document(
     let version = value["format_version"].as_u64();
     let valid_version = match role {
         ResourceRole::Clip => matches!(version, Some(1 | 2)),
-        ResourceRole::Track | ResourceRole::Arrangement => version == Some(1),
+        ResourceRole::Track | ResourceRole::Arrangement | ResourceRole::DeviceChain => {
+            version == Some(1)
+        }
         _ => false,
     };
     if value["format"].as_str() != Some(resource_format(role))
@@ -1550,6 +1931,21 @@ fn validate_document(
             ProjectResourcePublicationErrorKind::InvalidResource,
             "track-freeze resource document is invalid",
         ));
+    }
+    if role == ResourceRole::DeviceChain {
+        let chain = DeviceChain::parse(bytes).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "parse track-freeze device-chain resource",
+                error,
+            )
+        })?;
+        if chain.id() != id {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-freeze device-chain identity is invalid",
+            ));
+        }
     }
     Ok(())
 }
@@ -2133,11 +2529,22 @@ fn candidate_reactivation_manifest(
     candidate_unfreeze_manifest(active, entries, revision)
 }
 
+/// Flatten changes only resource declarations; it deliberately retains every
+/// manifest asset until separate reference-aware cleanup proves it unused.
+fn candidate_flatten_manifest(
+    active: &[u8],
+    entries: &[Entry<'_>],
+    revision: u64,
+) -> Result<Vec<u8>, ProjectResourcePublicationError> {
+    candidate_unfreeze_manifest(active, entries, revision)
+}
+
 const fn resource_format(role: ResourceRole) -> &'static str {
     match role {
         ResourceRole::Track => "hyper-track",
         ResourceRole::Clip => "hyper-audio-clip",
         ResourceRole::Arrangement => "hyper-arrangement",
+        ResourceRole::DeviceChain => "hyper-device-chain",
         _ => "",
     }
 }
@@ -2147,6 +2554,7 @@ const fn role_name(role: ResourceRole) -> &'static str {
         ResourceRole::Track => "track",
         ResourceRole::Clip => "clip",
         ResourceRole::Arrangement => "arrangement",
+        ResourceRole::DeviceChain => "device-chain",
         ResourceRole::FreezeState => "freeze-state",
         _ => "",
     }
@@ -2157,6 +2565,7 @@ fn role_from_name(value: &str) -> Option<ResourceRole> {
         "track" => ResourceRole::Track,
         "clip" => ResourceRole::Clip,
         "arrangement" => ResourceRole::Arrangement,
+        "device-chain" => ResourceRole::DeviceChain,
         "freeze-state" => ResourceRole::FreezeState,
         _ => return None,
     })
@@ -2465,6 +2874,122 @@ fn run_unfreeze_publication(
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
+    reason = "flatten moves every irreversible source under one recoverable manifest-last boundary"
+)]
+fn run_flatten_publication(
+    verified: &StructurallyVerifiedProject,
+    backups: &Dir,
+    transaction: &Dir,
+    name: &str,
+    entries: &[Entry<'_>],
+    authorities: &BTreeMap<String, Handle>,
+    state: &TrackFreezeState,
+    previous_project: &[u8],
+    candidate_project: &[u8],
+    next_revision: u64,
+    observer: &mut impl FnMut(PublicationPhase, &Path) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<AudioTrackFlattenPublicationOutcome, ProjectResourcePublicationError> {
+    write_flatten_intent(transaction, name, entries.len())?;
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(before) = &entry.before {
+            write_exclusive_synced(transaction, &previous_name(index), before)?;
+        }
+        if let Some(after) = entry.after {
+            write_exclusive_synced(transaction, &staged_name(index), after)?;
+        }
+    }
+    write_exclusive_synced(transaction, PROJECT_STAGING_NAME, candidate_project)?;
+    write_exclusive_synced(transaction, PREVIOUS_PROJECT_NAME, previous_project)?;
+    let tx = flatten_transaction_record(
+        name,
+        entries,
+        state,
+        verified,
+        candidate_project,
+        next_revision,
+    )?;
+    let bytes = serde_json_canonicalizer::to_vec(&tx).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "serialize track-flatten transaction",
+            error,
+        )
+    })?;
+    write_exclusive_synced(transaction, TRANSACTION_NAME, &bytes)?;
+    sync_dir(transaction)?;
+    sync_dir(backups)?;
+    observer(PublicationPhase::Transaction, verified.root())?;
+    for (index, entry) in tx.entries.iter().enumerate() {
+        if let Some(before) = &entry.before {
+            let authority = authorities.get(&entry.path).ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "track-flatten source authority disappeared before publication",
+                )
+            })?;
+            move_verified_resource(&verified.root_dir, transaction, entry, before, authority)?;
+            observer(PublicationPhase::SourceMoved(index), verified.root())?;
+        }
+        if entry.after.is_some() {
+            let parent = prepare_parent(&verified.root_dir, entry)?;
+            publish_staged_file_no_replace(
+                transaction,
+                &staged_name(index),
+                &parent,
+                file_name(&entry.path)?,
+                &format!(".track-flatten-{index}-{}.json", tx.id),
+                "track-flatten resource",
+            )?;
+            observer(PublicationPhase::ResourcePublished(index), verified.root())?;
+        }
+    }
+    for directory in &tx.removed_directories {
+        verified.root_dir.remove_dir(directory).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::ProjectChanged,
+                "remove empty track-flatten resource directory",
+                error,
+            )
+        })?;
+        sync_dir(&verified.root_dir)?;
+    }
+    let candidate =
+        verify_project_candidate(verified.root(), &verified.root_dir, candidate_project).map_err(
+            |error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "track-flatten candidate does not verify",
+                    error,
+                )
+            },
+        )?;
+    if candidate.revision() != next_revision {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "track-flatten candidate revision changed",
+        ));
+    }
+    publish_staged_file(
+        transaction,
+        PROJECT_STAGING_NAME,
+        backups,
+        &verified.root_dir,
+        MANIFEST_NAME,
+        &format!(".track-flatten-project-{}.json", tx.id),
+        "track-flatten project manifest",
+    )?;
+    observer(PublicationPhase::Manifest, verified.root())?;
+    verify_committed(
+        verified.root(),
+        &verified.root_dir,
+        digest(candidate_project),
+    )?;
+    flatten_outcome(&tx)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "exact reactivation stages the old source retirement and retained artifact restoration under one manifest-last transaction"
 )]
 fn run_reactivation_publication(
@@ -2616,6 +3141,55 @@ fn unfreeze_transaction_record(
         operation: TransactionOperation::Unfreeze,
         removed_directories,
         entries: transaction_entries,
+        extensions: serde_json::Map::new(),
+    })
+}
+
+fn flatten_transaction_record(
+    name: &str,
+    entries: &[Entry<'_>],
+    state: &TrackFreezeState,
+    verified: &StructurallyVerifiedProject,
+    candidate_project: &[u8],
+    revision: u64,
+) -> Result<Transaction, ProjectResourcePublicationError> {
+    let removed_directories = removed_directories(verified, entries)?;
+    let entries = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| TransactionEntry {
+            id: entry.id.clone(),
+            role: role_name(entry.role).to_owned(),
+            path: entry.path.clone(),
+            before: entry
+                .before
+                .as_deref()
+                .map(|bytes| transaction_file(&entry.path, bytes)),
+            after: entry
+                .after
+                .map(|bytes| transaction_file(&entry.path, bytes)),
+            backup_name: entry.before.as_ref().map(|_| backup_name(index)),
+            created_parent_directory: entry.created_parent_directory,
+        })
+        .collect::<Vec<_>>();
+    Ok(Transaction {
+        format: FLATTEN_FORMAT.to_owned(),
+        format_version: VERSION,
+        id: transaction_id(name)?,
+        before_project_sha256: hex_digest(*verified.manifest_sha256()),
+        after_project_sha256: hex_digest(digest(candidate_project)),
+        before_project_revision: verified.manifest().revision(),
+        after_project_revision: revision,
+        track_id: state.track_id().to_owned(),
+        frozen_clip_id: state.frozen_clip_id().to_owned(),
+        frozen_asset_id: state.frozen_asset_id().to_owned(),
+        freeze_state_id: state.id().to_owned(),
+        rendered_sample: None,
+        created_assets_directory: false,
+        created_samples_directory: false,
+        operation: TransactionOperation::Flatten,
+        removed_directories,
+        entries,
         extensions: serde_json::Map::new(),
     })
 }
@@ -2980,6 +3554,38 @@ fn write_unfreeze_intent(
     sync_dir(transaction)
 }
 
+fn write_flatten_intent(
+    transaction: &Dir,
+    name: &str,
+    entry_count: usize,
+) -> Result<(), ProjectResourcePublicationError> {
+    let intent = Intent {
+        format: FLATTEN_INTENT_FORMAT.to_owned(),
+        format_version: VERSION,
+        id: transaction_id(name)?,
+        entry_count,
+        extensions: serde_json::Map::new(),
+    };
+    let bytes = serde_json_canonicalizer::to_vec(&intent).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "serialize track-flatten transaction intent",
+            error,
+        )
+    })?;
+    write_exclusive_synced(transaction, INTENT_STAGING_NAME, &bytes)?;
+    transaction
+        .rename(INTENT_STAGING_NAME, transaction, INTENT_NAME)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "publish track-flatten transaction intent",
+                error,
+            )
+        })?;
+    sync_dir(transaction)
+}
+
 fn write_reactivation_intent(
     transaction: &Dir,
     name: &str,
@@ -3016,6 +3622,7 @@ fn transaction_id(name: &str) -> Result<String, ProjectResourcePublicationError>
     let id = name
         .strip_prefix(AUDIO_TRACK_FREEZE_TRANSACTION_PREFIX)
         .or_else(|| name.strip_prefix(AUDIO_TRACK_UNFREEZE_TRANSACTION_PREFIX))
+        .or_else(|| name.strip_prefix(AUDIO_TRACK_FLATTEN_TRANSACTION_PREFIX))
         .ok_or_else(|| {
             failure(
                 ProjectResourcePublicationErrorKind::Recovery,
@@ -3275,6 +3882,61 @@ fn finish_unfreeze_result(
     }
 }
 
+fn finish_flatten_result(
+    root_path: &Path,
+    root: &Dir,
+    backups: &Dir,
+    transaction: Dir,
+    name: &str,
+    result: Result<AudioTrackFlattenPublicationOutcome, ProjectResourcePublicationError>,
+) -> Result<AudioTrackFlattenPublicationOutcome, ProjectResourcePublicationError> {
+    match result {
+        Ok(outcome) => {
+            clear_and_remove(backups, transaction, name).map_err(|error| {
+                ProjectResourcePublicationError {
+                    kind: ProjectResourcePublicationErrorKind::Recovery,
+                    message: "track flatten committed but transaction cleanup is incomplete"
+                        .to_owned(),
+                    published: true,
+                    source: Some(Box::new(error)),
+                }
+            })?;
+            Ok(outcome)
+        }
+        Err(operation) => {
+            let tx = match read_transaction(&transaction, name) {
+                Ok(tx) => tx,
+                Err(_) if missing_file(&transaction, TRANSACTION_NAME)? => {
+                    validate_incomplete(&transaction, name)?;
+                    clear_and_remove(backups, transaction, name)?;
+                    return Err(operation);
+                }
+                Err(error) => return Err(error),
+            };
+            match recover_one(root_path, root, backups, &transaction, &tx)? {
+                AudioTrackFreezePublicationRecoveryDisposition::RolledBack => {
+                    clear_and_remove(backups, transaction, name)?;
+                    Err(operation)
+                }
+                AudioTrackFreezePublicationRecoveryDisposition::Committed => {
+                    let outcome = flatten_outcome(&tx)?;
+                    clear_and_remove(backups, transaction, name).map_err(|error| {
+                        ProjectResourcePublicationError {
+                            kind: ProjectResourcePublicationErrorKind::Recovery,
+                            message:
+                                "track flatten committed but transaction cleanup is incomplete"
+                                    .to_owned(),
+                            published: true,
+                            source: Some(Box::new(error)),
+                        }
+                    })?;
+                    Ok(outcome)
+                }
+            }
+        }
+    }
+}
+
 fn recover_unfreeze_locked(
     root_path: &Path,
     root: &Dir,
@@ -3333,6 +3995,71 @@ fn recover_unfreeze_locked(
         };
         clear_and_remove(backups, transaction, &name)?;
         recovered.push(AudioTrackUnfreezePublicationRecovery {
+            transaction_id: tx.id,
+            disposition,
+        });
+    }
+    Ok(recovered)
+}
+
+fn recover_flatten_locked(
+    root_path: &Path,
+    root: &Dir,
+    backups: &Dir,
+) -> Result<Vec<AudioTrackFlattenPublicationRecovery>, ProjectResourcePublicationError> {
+    let mut names = backups
+        .entries()
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "read track-flatten backups",
+                error,
+            )
+        })?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|name| name.starts_with(AUDIO_TRACK_FLATTEN_TRANSACTION_PREFIX))
+        .collect::<Vec<_>>();
+    names.sort();
+    let mut recovered = Vec::new();
+    for name in names {
+        let transaction = backups.open_dir_nofollow(&name).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "open track-flatten recovery transaction",
+                error,
+            )
+        })?;
+        let tx = match read_transaction(&transaction, &name) {
+            Ok(tx) => tx,
+            Err(_) if missing_file(&transaction, TRANSACTION_NAME)? => {
+                validate_incomplete(&transaction, &name)?;
+                let id = transaction_id(&name)?;
+                clear_and_remove(backups, transaction, &name)?;
+                recovered.push(AudioTrackFlattenPublicationRecovery {
+                    transaction_id: id,
+                    disposition: AudioTrackFlattenPublicationRecoveryDisposition::RolledBack,
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if tx.operation != TransactionOperation::Flatten {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-flatten journal has the wrong operation",
+            ));
+        }
+        let disposition = match recover_one(root_path, root, backups, &transaction, &tx)? {
+            AudioTrackFreezePublicationRecoveryDisposition::Committed => {
+                AudioTrackFlattenPublicationRecoveryDisposition::Committed
+            }
+            AudioTrackFreezePublicationRecoveryDisposition::RolledBack => {
+                AudioTrackFlattenPublicationRecoveryDisposition::RolledBack
+            }
+        };
+        clear_and_remove(backups, transaction, &name)?;
+        recovered.push(AudioTrackFlattenPublicationRecovery {
             transaction_id: tx.id,
             disposition,
         });
@@ -3533,6 +4260,9 @@ fn validate_staged_transaction(
     match tx.operation {
         TransactionOperation::Unfreeze => {
             return validate_unfreeze_staged_transaction(transaction, tx);
+        }
+        TransactionOperation::Flatten => {
+            return validate_flatten_staged_transaction(transaction, tx);
         }
         TransactionOperation::Reactivate => {
             return validate_reactivation_staged_transaction(transaction, tx);
@@ -4531,6 +5261,351 @@ fn validate_unfreeze_staged_transaction(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "flatten recovery proves the discarded authority and exact resource-only manifest delta before accepting an irreversible commit"
+)]
+fn validate_flatten_staged_transaction(
+    transaction: &Dir,
+    tx: &Transaction,
+) -> Result<(), ProjectResourcePublicationError> {
+    let previous = read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?;
+    let candidate = read_bounded(transaction, PROJECT_STAGING_NAME, MAX_JSON_BYTES)?;
+    if digest(&previous) != decode_digest(&tx.before_project_sha256)?
+        || digest(&candidate) != decode_digest(&tx.after_project_sha256)?
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-flatten staged project identity changed",
+        ));
+    }
+    let previous_manifest = ProjectManifest::parse(&previous).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "staged previous track-flatten project is invalid",
+            error,
+        )
+    })?;
+    let candidate_manifest = ProjectManifest::parse(&candidate).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "staged candidate track-flatten project is invalid",
+            error,
+        )
+    })?;
+    if previous_manifest.project_id() != candidate_manifest.project_id()
+        || previous_manifest.revision() != tx.before_project_revision
+        || candidate_manifest.revision() != tx.after_project_revision
+        || tx.before_project_revision.checked_add(1) != Some(tx.after_project_revision)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-flatten staged project revisions are inconsistent",
+        ));
+    }
+    let intent_bytes = read_bounded(transaction, INTENT_NAME, MAX_JSON_BYTES)?;
+    require_canonical(&intent_bytes, "track-flatten transaction intent")?;
+    let intent: Intent = serde_json::from_slice(&intent_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "parse track-flatten transaction intent",
+            error,
+        )
+    })?;
+    if intent.format != FLATTEN_INTENT_FORMAT
+        || intent.format_version != VERSION
+        || intent.id != tx.id
+        || intent.entry_count != tx.entries.len()
+        || !intent.extensions.is_empty()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-flatten transaction intent is invalid",
+        ));
+    }
+    let previous_value: Value = serde_json::from_slice(&previous).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "parse previous track-flatten manifest",
+            error,
+        )
+    })?;
+    let mut expected_candidate = previous_value.clone();
+    expected_candidate["revision"] = tx.after_project_revision.into();
+    let retired_ids = tx
+        .entries
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_resources = expected_candidate["resources"]
+        .as_array_mut()
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "previous track-flatten resource declarations are invalid",
+            )
+        })?;
+    expected_resources.retain(|descriptor| {
+        !descriptor["id"]
+            .as_str()
+            .is_some_and(|id| retired_ids.contains(id))
+    });
+    let expected_candidate =
+        serde_json_canonicalizer::to_vec(&expected_candidate).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "serialize expected track-flatten manifest",
+                error,
+            )
+        })?;
+    if candidate != expected_candidate {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-flatten candidate changes more than its retired authority",
+        ));
+    }
+    let mut expected_names = BTreeSet::from([
+        INTENT_NAME.to_owned(),
+        PROJECT_STAGING_NAME.to_owned(),
+        PREVIOUS_PROJECT_NAME.to_owned(),
+        TRANSACTION_NAME.to_owned(),
+    ]);
+    let mut state = None;
+    let mut chain = None;
+    for (index, entry) in tx.entries.iter().enumerate() {
+        let role = role_from_name(&entry.role).ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-flatten transaction has an unsupported resource role",
+            )
+        })?;
+        if !matches!(role, ResourceRole::FreezeState | ResourceRole::DeviceChain)
+            || entry.after.is_some()
+            || entry.before.is_none()
+            || entry.backup_name.as_deref() != Some(&backup_name(index))
+            || entry.created_parent_directory
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-flatten resource operation is invalid",
+            ));
+        }
+        let Some(before) = entry.before.as_ref() else {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-flatten source authority is absent",
+            ));
+        };
+        let bytes = read_bounded(
+            transaction,
+            &previous_name(index),
+            usize::try_from(before.byte_length).map_err(|_| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "track-flatten source length is not addressable",
+                )
+            })?,
+        )?;
+        if bytes.len() as u64 != before.byte_length
+            || digest(&bytes) != decode_digest(&before.sha256)?
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-flatten staged source changed",
+            ));
+        }
+        let descriptor = previous_manifest
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == entry.id)
+            .ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "track-flatten previous descriptor is absent",
+                )
+            })?;
+        if descriptor.role() != role
+            || descriptor.path() != entry.path
+            || descriptor.byte_length() != before.byte_length
+            || descriptor.sha256() != before.sha256
+            || candidate_manifest
+                .resources()
+                .iter()
+                .any(|descriptor| descriptor.id() == entry.id)
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-flatten retired descriptor is inconsistent",
+            ));
+        }
+        expected_names.insert(previous_name(index));
+        expected_names.insert(backup_name(index));
+        match role {
+            ResourceRole::FreezeState => {
+                validate_freeze_state_document(&bytes, &entry.id)?;
+                let parsed = TrackFreezeState::parse(&bytes).map_err(|error| {
+                    caused(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "parse retained track-flatten state",
+                        error,
+                    )
+                })?;
+                if state.replace(parsed).is_some() {
+                    return Err(failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "track-flatten transaction retains multiple freeze states",
+                    ));
+                }
+            }
+            ResourceRole::DeviceChain => {
+                validate_document(&bytes, &entry.id, role)?;
+                let parsed = DeviceChain::parse(&bytes).map_err(|error| {
+                    caused(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "parse retained track-flatten device chain",
+                        error,
+                    )
+                })?;
+                if chain
+                    .replace((entry.id.as_str(), descriptor.sha256(), parsed))
+                    .is_some()
+                {
+                    return Err(failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "track-flatten transaction retires multiple device chains",
+                    ));
+                }
+            }
+            _ => {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "track-flatten transaction has an unsupported resource role",
+                ));
+            }
+        }
+    }
+    let state = state.ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-flatten transaction has no retained freeze state",
+        )
+    })?;
+    if !state.has_complete_rendered_authority()
+        || state.id() != tx.freeze_state_id
+        || state.track_id() != tx.track_id
+        || state.frozen_clip_id() != tx.frozen_clip_id
+        || state.frozen_asset_id() != tx.frozen_asset_id
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-flatten retained freeze authority is inconsistent",
+        ));
+    }
+    match (state.device_chain_id(), state.device_chain_sha256(), chain) {
+        (None, None, None) => {}
+        (Some(id), Some(expected_sha256), Some((retired_id, actual_sha256, chain)))
+            if id == retired_id
+                && expected_sha256 == actual_sha256
+                && chain.project_id() == state.project_id()
+                && chain.track_id() == state.track_id() => {}
+        _ => {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-flatten retired device-chain authority is inconsistent",
+            ));
+        }
+    }
+    for (id, role) in [
+        (state.track_id(), ResourceRole::Track),
+        (state.frozen_clip_id(), ResourceRole::Clip),
+        (state.arrangement_id(), ResourceRole::Arrangement),
+    ] {
+        if retired_ids.contains(id)
+            || !previous_manifest
+                .resources()
+                .iter()
+                .any(|descriptor| descriptor.id() == id && descriptor.role() == role)
+            || !candidate_manifest
+                .resources()
+                .iter()
+                .any(|descriptor| descriptor.id() == id && descriptor.role() == role)
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-flatten rendered graph is not retained",
+            ));
+        }
+    }
+    if !previous_manifest
+        .assets()
+        .iter()
+        .any(|asset| asset.id() == state.frozen_asset_id())
+        || !candidate_manifest
+            .assets()
+            .iter()
+            .any(|asset| asset.id() == state.frozen_asset_id())
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-flatten rendered sample asset is not retained",
+        ));
+    }
+    let mut expected_directories = BTreeSet::new();
+    for entry in &tx.entries {
+        let directory = resource_parent(&entry.path)?;
+        if previous_manifest
+            .resources()
+            .iter()
+            .filter(|descriptor| {
+                resource_parent(descriptor.path()).is_ok_and(|parent| parent == directory)
+            })
+            .all(|descriptor| retired_ids.contains(descriptor.id()))
+        {
+            expected_directories.insert(directory.to_owned());
+        }
+    }
+    if tx.removed_directories.iter().collect::<BTreeSet<_>>()
+        != expected_directories.iter().collect::<BTreeSet<_>>()
+        || tx
+            .removed_directories
+            .iter()
+            .any(|directory| directory.is_empty() || directory.contains('/'))
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-flatten removed directories are inconsistent",
+        ));
+    }
+    for entry in transaction.entries().map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "read track-flatten transaction entries",
+            error,
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "read track-flatten transaction entry",
+                error,
+            )
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-flatten transaction contains a non-Unicode entry",
+            ));
+        };
+        if !expected_names.contains(&name) {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-flatten transaction contains an unknown entry",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn read_transaction(
     transaction: &Dir,
     name: &str,
@@ -4548,6 +5623,7 @@ fn read_transaction(
         TransactionOperation::Freeze => FORMAT,
         TransactionOperation::Reactivate => REACTIVATION_FORMAT,
         TransactionOperation::Unfreeze => UNFREEZE_FORMAT,
+        TransactionOperation::Flatten => FLATTEN_FORMAT,
     };
     let rendered_sample_valid = match (&tx.operation, &tx.rendered_sample) {
         (TransactionOperation::Freeze, Some(sample)) => {
@@ -4555,7 +5631,12 @@ fn read_transaction(
                 && sample.byte_length != 0
                 && decode_digest(&sample.sha256).is_ok()
         }
-        (TransactionOperation::Reactivate | TransactionOperation::Unfreeze, None) => true,
+        (
+            TransactionOperation::Reactivate
+            | TransactionOperation::Unfreeze
+            | TransactionOperation::Flatten,
+            None,
+        ) => true,
         _ => false,
     };
     if tx.format != expected_format
@@ -4735,6 +5816,8 @@ fn validate_incomplete(
 ) -> Result<(), ProjectResourcePublicationError> {
     let default_operation = if name.starts_with(AUDIO_TRACK_UNFREEZE_TRANSACTION_PREFIX) {
         TransactionOperation::Unfreeze
+    } else if name.starts_with(AUDIO_TRACK_FLATTEN_TRANSACTION_PREFIX) {
+        TransactionOperation::Flatten
     } else {
         TransactionOperation::Freeze
     };
@@ -4759,6 +5842,9 @@ fn validate_incomplete(
             }
             UNFREEZE_INTENT_FORMAT if default_operation == TransactionOperation::Unfreeze => {
                 TransactionOperation::Unfreeze
+            }
+            FLATTEN_INTENT_FORMAT if default_operation == TransactionOperation::Flatten => {
+                TransactionOperation::Flatten
             }
             _ => {
                 return Err(failure(
@@ -4852,6 +5938,7 @@ const fn transaction_label(tx: &Transaction) -> &'static str {
         TransactionOperation::Freeze => "track-freeze",
         TransactionOperation::Reactivate => "track-freeze-reactivation",
         TransactionOperation::Unfreeze => "track-unfreeze",
+        TransactionOperation::Flatten => "track-flatten",
     }
 }
 
@@ -4869,6 +5956,16 @@ fn unfreeze_outcome(
     tx: &Transaction,
 ) -> Result<AudioTrackUnfreezePublicationOutcome, ProjectResourcePublicationError> {
     Ok(AudioTrackUnfreezePublicationOutcome {
+        project_identity: decode_digest(&tx.after_project_sha256)?,
+        project_revision: tx.after_project_revision,
+        track_id: tx.track_id.clone(),
+    })
+}
+
+fn flatten_outcome(
+    tx: &Transaction,
+) -> Result<AudioTrackFlattenPublicationOutcome, ProjectResourcePublicationError> {
+    Ok(AudioTrackFlattenPublicationOutcome {
         project_identity: decode_digest(&tx.after_project_sha256)?,
         project_revision: tx.after_project_revision,
         track_id: tx.track_id.clone(),
@@ -5513,6 +6610,216 @@ mod tests {
             .unwrap(),
             fixture.sample
         );
+    }
+
+    #[test]
+    fn flattens_a_complete_rendered_track_without_deleting_its_rendered_or_source_assets() {
+        let fixture = Fixture::new();
+        let (identity, freeze) = fixture.request();
+        publish_audio_track_freeze(
+            &fixture.root,
+            AudioTrackFreezePublicationRequest {
+                expected_project_sha256: identity,
+                documents: &freeze,
+                rendered_sample: &fixture.sample,
+            },
+        )
+        .unwrap();
+        let package = verify_project_package(&fixture.root).unwrap();
+        let flatten_identity = *package.manifest_sha256();
+        let outcome = publish_audio_track_flatten(
+            &fixture.root,
+            AudioTrackFlattenPublicationRequest {
+                expected_project_sha256: flatten_identity,
+                track_id: TRACK_ID,
+                freeze_state_id: FREEZE_STATE_ID,
+            },
+        )
+        .unwrap();
+
+        let flattened = verify_project_package(&fixture.root).unwrap();
+        assert_eq!(outcome.track_id(), TRACK_ID);
+        assert_eq!(flattened.manifest().revision(), 3);
+        assert_eq!(*flattened.manifest_sha256(), *outcome.project_identity());
+        assert_eq!(
+            flattened.read_resource(FROZEN_CLIP_ID).unwrap(),
+            freeze.clip()
+        );
+        assert!(flattened.manifest().resources().iter().all(|resource| {
+            resource.id() != FREEZE_STATE_ID && resource.id() != DEVICE_CHAIN_ID
+        }));
+        assert!(
+            flattened
+                .manifest()
+                .assets()
+                .iter()
+                .any(|asset| asset.id() == FROZEN_ASSET_ID)
+        );
+        assert!(
+            flattened
+                .manifest()
+                .assets()
+                .iter()
+                .any(|asset| asset.id() == SOURCE_ASSET_ID)
+        );
+        assert_eq!(
+            fs::read(
+                fixture
+                    .root
+                    .join(format!("assets/samples/{FROZEN_ASSET_ID}.wav"))
+            )
+            .unwrap(),
+            fixture.sample
+        );
+        assert!(fixture.root.join("assets/samples/source.wav").is_file());
+        assert!(!fixture.root.join("devices").exists());
+        assert!(!fixture.root.join("freezes").exists());
+    }
+
+    #[test]
+    fn flatten_refuses_legacy_freeze_authority_without_changing_the_project() {
+        let fixture = Fixture::new();
+        let (identity, freeze) = fixture.request();
+        publish_audio_track_freeze(
+            &fixture.root,
+            AudioTrackFreezePublicationRequest {
+                expected_project_sha256: identity,
+                documents: &freeze,
+                rendered_sample: &fixture.sample,
+            },
+        )
+        .unwrap();
+        let package = verify_project_package(&fixture.root).unwrap();
+        let state_path = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.id() == FREEZE_STATE_ID)
+            .unwrap()
+            .path()
+            .to_owned();
+        let mut state: Value =
+            serde_json::from_slice(&package.read_resource(FREEZE_STATE_ID).unwrap()).unwrap();
+        state["format_version"] = json!(3);
+        state.as_object_mut().unwrap().remove("frozen_placement");
+        state.as_object_mut().unwrap().remove("device_chain_sha256");
+        let state = canonical(state);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(fixture.root.join(MANIFEST_NAME)).unwrap()).unwrap();
+        let descriptor = manifest["resources"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|resource| resource["id"].as_str() == Some(FREEZE_STATE_ID))
+            .unwrap();
+        descriptor["byte_length"] = json!(state.len());
+        descriptor["sha256"] = json!(hex_digest(digest(&state)));
+        let manifest = canonical(manifest);
+        drop(package);
+        fs::write(fixture.root.join(state_path), state).unwrap();
+        fs::write(fixture.root.join(MANIFEST_NAME), &manifest).unwrap();
+        let legacy = verify_project_package(&fixture.root).unwrap();
+        let legacy_identity = *legacy.manifest_sha256();
+        drop(legacy);
+
+        let error = publish_audio_track_flatten(
+            &fixture.root,
+            AudioTrackFlattenPublicationRequest {
+                expected_project_sha256: legacy_identity,
+                track_id: TRACK_ID,
+                freeze_state_id: FREEZE_STATE_ID,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+        let current = verify_project_package(&fixture.root).unwrap();
+        assert_eq!(*current.manifest_sha256(), legacy_identity);
+        assert!(
+            current
+                .manifest()
+                .resources()
+                .iter()
+                .any(|resource| resource.id() == FREEZE_STATE_ID)
+        );
+        assert!(
+            current
+                .manifest()
+                .resources()
+                .iter()
+                .any(|resource| resource.id() == DEVICE_CHAIN_ID)
+        );
+    }
+
+    #[test]
+    fn crash_recovery_preserves_one_verified_track_flatten_side() {
+        for phase in [
+            PublicationPhase::Transaction,
+            PublicationPhase::SourceMoved(0),
+            PublicationPhase::SourceMoved(1),
+            PublicationPhase::Manifest,
+        ] {
+            let fixture = Fixture::new();
+            let (identity, freeze) = fixture.request();
+            publish_audio_track_freeze(
+                &fixture.root,
+                AudioTrackFreezePublicationRequest {
+                    expected_project_sha256: identity,
+                    documents: &freeze,
+                    rendered_sample: &fixture.sample,
+                },
+            )
+            .unwrap();
+            let package = verify_project_package(&fixture.root).unwrap();
+            let flatten_identity = *package.manifest_sha256();
+            drop(package);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_flatten_observed(
+                    &fixture.root,
+                    AudioTrackFlattenPublicationRequest {
+                        expected_project_sha256: flatten_identity,
+                        track_id: TRACK_ID,
+                        freeze_state_id: FREEZE_STATE_ID,
+                    },
+                    |current, _| {
+                        assert_ne!(current, phase, "simulate process termination");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+            let report = recover_project_transactions(&fixture.root).unwrap();
+            assert_eq!(report.audio_track_flattens().len(), 1);
+            let expected = if phase == PublicationPhase::Manifest {
+                AudioTrackFlattenPublicationRecoveryDisposition::Committed
+            } else {
+                AudioTrackFlattenPublicationRecoveryDisposition::RolledBack
+            };
+            assert_eq!(report.audio_track_flattens()[0].disposition(), expected);
+            let package = verify_project_package(&fixture.root).unwrap();
+            if expected == AudioTrackFlattenPublicationRecoveryDisposition::Committed {
+                assert_eq!(
+                    package.read_resource(FROZEN_CLIP_ID).unwrap(),
+                    freeze.clip()
+                );
+                assert!(package.manifest().resources().iter().all(|resource| {
+                    resource.id() != FREEZE_STATE_ID && resource.id() != DEVICE_CHAIN_ID
+                }));
+            } else {
+                assert_eq!(*package.manifest_sha256(), flatten_identity);
+                assert_eq!(
+                    package.read_resource(FREEZE_STATE_ID).unwrap(),
+                    freeze.freeze_state()
+                );
+                assert_eq!(
+                    package.read_resource(DEVICE_CHAIN_ID).unwrap(),
+                    fixture.chain
+                );
+            }
+        }
     }
 
     #[test]

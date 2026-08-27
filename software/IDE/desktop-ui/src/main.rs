@@ -2752,8 +2752,14 @@ fn bind_audio_track_freeze_callbacks_with(ui: &MainWindow, submitter: UiCommandS
     });
 
     let weak = ui.as_weak();
+    let unfreeze_submitter = Rc::clone(&submitter);
     actions.on_unfreeze_audio_track(move |track_id| {
-        submit_audio_track_freeze_request(&weak, &submitter, track_id.as_str(), true);
+        submit_audio_track_freeze_request(&weak, &unfreeze_submitter, track_id.as_str(), true);
+    });
+
+    let weak = ui.as_weak();
+    actions.on_flatten_audio_track(move |track_id| {
+        submit_audio_track_flatten_request(&weak, &submitter, track_id.as_str());
     });
 }
 
@@ -2770,6 +2776,7 @@ fn submit_audio_track_freeze_request(
         || !ui.get_track_freeze_visible()
         || ui.get_track_freeze_id() != requested_track_id
         || ui.get_track_freeze_is_unfreeze() != unfreeze
+        || ui.get_track_freeze_is_flatten()
     {
         ui.set_error_text("Audio-track freeze confirmation is no longer current".into());
         return;
@@ -2778,6 +2785,7 @@ fn submit_audio_track_freeze_request(
         ui.get_app_mode(),
         requested_track_id,
         &ui.get_mixer_channels(),
+        unfreeze,
     ) else {
         ui.set_error_text("The selected audio track is no longer available".into());
         return;
@@ -2790,6 +2798,36 @@ fn submit_audio_track_freeze_request(
             IdeWorkerCommand::FreezeAudioTrack { track_id }
         },
     );
+}
+
+fn submit_audio_track_flatten_request(
+    weak: &slint::Weak<MainWindow>,
+    submitter: &UiCommandSubmitter,
+    requested_track_id: &str,
+) {
+    let Some(ui) = weak.upgrade() else {
+        return;
+    };
+    if ui.get_app_mode() != AppMode::Running
+        || !ui.get_track_freeze_visible()
+        || ui.get_track_freeze_id() != requested_track_id
+        || ui.get_track_freeze_is_unfreeze()
+        || !ui.get_track_freeze_is_flatten()
+    {
+        ui.set_error_text("Audio-track flatten confirmation is no longer current".into());
+        return;
+    }
+    let Ok(track_id) = validate_audio_track_flatten_operation(
+        ui.get_app_mode(),
+        requested_track_id,
+        &ui.get_mixer_channels(),
+    ) else {
+        ui.set_error_text(
+            "The selected frozen audio track no longer has complete freeze authority".into(),
+        );
+        return;
+    };
+    submitter(&ui, IdeWorkerCommand::FlattenAudioTrack { track_id });
 }
 
 fn bind_loudness_callbacks(ui: &MainWindow, worker: &WorkerCell) {
@@ -4849,6 +4887,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         }
         IdeWorkerCommandKind::FreezeAudioTrack => AppMode::FreezingTrack,
         IdeWorkerCommandKind::UnfreezeAudioTrack => AppMode::UnfreezingTrack,
+        IdeWorkerCommandKind::FlattenAudioTrack => AppMode::FlatteningTrack,
         IdeWorkerCommandKind::RenameAudioTrack | IdeWorkerCommandKind::RenameRoutingBus => {
             AppMode::RenamingTrack
         }
@@ -5001,6 +5040,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::UnfreezeAudioTrack => {
             "Saving mixer state, restoring the retained audio-track sources, and reopening project…"
+        }
+        IdeWorkerCommandKind::FlattenAudioTrack => {
+            "Saving mixer state, accepting the rendered audio track, and reopening project…"
         }
         IdeWorkerCommandKind::ReorderMixerStrips => {
             "Preserving mixer state, reordering mixer strips, and reopening project…"
@@ -5368,6 +5410,11 @@ fn apply_event(
         | IdeWorkerEvent::AudioTrackUnfreezing
         | IdeWorkerEvent::AudioTrackUnfreezeCommittedWithWarning { .. }) => {
             apply_audio_track_unfreeze_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioTrackFlattened { .. }
+        | IdeWorkerEvent::AudioTrackFlattening
+        | IdeWorkerEvent::AudioTrackFlattenCommittedWithWarning { .. }) => {
+            apply_audio_track_flatten_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioTrackDuplicated { .. }
         | IdeWorkerEvent::AudioTrackDuplicating) => {
@@ -5911,6 +5958,7 @@ fn reset_audio_track_freeze_form(ui: &MainWindow) {
     ui.set_track_freeze_id(SharedString::default());
     ui.set_track_freeze_name(SharedString::default());
     ui.set_track_freeze_is_unfreeze(false);
+    ui.set_track_freeze_is_flatten(false);
 }
 
 fn apply_audio_track_freeze_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -5958,6 +6006,32 @@ fn apply_audio_track_unfreeze_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_error_text(warning.to_string().into());
         }
         _ => unreachable!("audio-track unfreeze event dispatcher received another event"),
+    }
+}
+
+fn apply_audio_track_flatten_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioTrackFlattened { revision, track_id } => {
+            reset_audio_track_freeze_form(ui);
+            ui.set_status_text(
+                format!("Audio track {track_id} flattened in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioTrackFlattening => {
+            ui.set_app_mode(AppMode::FlatteningTrack);
+            ui.set_status_text(
+                "Waiting for native output before flattening the audio track…".into(),
+            );
+        }
+        IdeWorkerEvent::AudioTrackFlattenCommittedWithWarning { warning } => {
+            reset_audio_track_freeze_form(ui);
+            ui.set_status_text(
+                "Audio track flatten committed, but recovery needs attention".into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        _ => unreachable!("audio-track flatten event dispatcher received another event"),
     }
 }
 
@@ -9029,6 +9103,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::UnfreezeAudioTrack if current == AppMode::UnfreezingTrack => {
             AppMode::Running
         }
+        IdeWorkerCommandKind::FlattenAudioTrack if current == AppMode::FlatteningTrack => {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::RenameAudioTrack | IdeWorkerCommandKind::RenameRoutingBus
             if current == AppMode::RenamingTrack =>
         {
@@ -9841,6 +9918,7 @@ fn validate_audio_track_freeze_operation(
     mode: AppMode,
     track_id: &str,
     channels: &ModelRc<MixerChannelRow>,
+    expected_frozen: bool,
 ) -> Result<String, MixerControlFailure> {
     if track_id.is_empty() {
         return Err(MixerControlFailure::InvalidSelection);
@@ -9853,10 +9931,27 @@ fn validate_audio_track_freeze_operation(
         || !row.state_available
         || !row.activation_toggleable
         || row.kind.as_str() != "AUDIO"
+        || row.frozen != expected_frozen
     {
         return Err(MixerControlFailure::StateUnavailable);
     }
     Ok(row.track_id.to_string())
+}
+
+fn validate_audio_track_flatten_operation(
+    mode: AppMode,
+    track_id: &str,
+    channels: &ModelRc<MixerChannelRow>,
+) -> Result<String, MixerControlFailure> {
+    let track_id = validate_audio_track_freeze_operation(mode, track_id, channels, true)?;
+    let row = (0..channels.row_count())
+        .filter_map(|index| channels.row_data(index))
+        .find(|row| row.track_id.as_str() == track_id)
+        .ok_or(MixerControlFailure::StaleSelection)?;
+    if !row.frozen || !row.flattenable {
+        return Err(MixerControlFailure::StateUnavailable);
+    }
+    Ok(track_id)
 }
 
 #[allow(
@@ -9968,6 +10063,7 @@ fn mixer_rows(
                 display_name: compact_name(channel.name(), MAX_VISIBLE_MIXER_NAME_CHARS).into(),
                 kind: mixer_kind_name(channel.kind()).into(),
                 frozen: channel.frozen(),
+                flattenable: channel.flattenable(),
                 state_available: state.is_some(),
                 gain_percent: state.map_or(0.0, |state| state.gain * 100.0),
                 pan_percent: state.map_or(0.0, |state| state.pan * 100.0),
@@ -12486,6 +12582,7 @@ mod tests {
             display_name: "Audio".into(),
             kind: "AUDIO".into(),
             frozen: false,
+            flattenable: false,
             state_available: true,
             gain_percent: 100.0,
             pan_percent: 0.0,
@@ -12524,6 +12621,12 @@ mod tests {
                 .is_none(),
             "an unfrozen audio row must not expose unfreeze"
         );
+        assert!(
+            ElementHandle::find_by_accessible_label(&ui, "Flatten Audio channel")
+                .next()
+                .is_none(),
+            "an unfrozen audio row must not expose flatten"
+        );
         freeze.mock_single_click(PointerEventButton::Left);
         assert!(ui.get_track_freeze_visible());
         assert!(!ui.get_track_freeze_is_unfreeze());
@@ -12543,9 +12646,29 @@ mod tests {
             .next()
             .expect("a frozen audio row exposes unfreeze");
         assert_eq!(unfreeze.accessible_enabled(), Some(true));
+        assert!(
+            ElementHandle::find_by_accessible_label(&ui, "Flatten Audio channel")
+                .next()
+                .is_none(),
+            "a frozen row without complete rendered authority must not expose flatten"
+        );
         unfreeze.mock_single_click(PointerEventButton::Left);
         assert!(ui.get_track_freeze_visible());
         assert!(ui.get_track_freeze_is_unfreeze());
+        reset_audio_track_freeze_form(&ui);
+
+        let mut flattenable = audio_track_mixer_row(0, track_id);
+        flattenable.frozen = true;
+        flattenable.flattenable = true;
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![flattenable]))));
+        let flatten = ElementHandle::find_by_accessible_label(&ui, "Flatten Audio channel")
+            .next()
+            .expect("a fully authoritative frozen audio row exposes flatten");
+        assert_eq!(flatten.accessible_enabled(), Some(true));
+        flatten.mock_single_click(PointerEventButton::Left);
+        assert!(ui.get_track_freeze_visible());
+        assert!(ui.get_track_freeze_is_flatten());
+        assert!(!ui.get_track_freeze_is_unfreeze());
         ui.hide().unwrap();
     }
 
@@ -13613,6 +13736,7 @@ mod tests {
             display_name: name.into(),
             kind: "AUDIO".into(),
             frozen: false,
+            flattenable: false,
             state_available: true,
             gain_percent: 100.0,
             pan_percent: 0.0,
@@ -13697,6 +13821,7 @@ mod tests {
                 display_name: "Audio 1".into(),
                 kind: "AUDIO".into(),
                 frozen: false,
+                flattenable: false,
                 state_available: true,
                 gain_percent: 100.0,
                 pan_percent: 0.0,
@@ -17891,6 +18016,7 @@ mod tests {
         assert_audio_import_window_contract(ui);
         assert_audio_track_content_removal_window_contract(ui);
         assert_audio_track_freeze_window_contract(ui);
+        assert_audio_track_flatten_window_contract(ui);
         assert_audio_clip_removal_window_contract(ui);
         assert_audio_clip_source_trim_window_contract(ui);
         assert_unused_sample_cleanup_window_contract(ui);
@@ -18016,6 +18142,7 @@ mod tests {
                 display_name: "Lead".into(),
                 kind: "AUDIO".into(),
                 frozen: false,
+                flattenable: false,
                 state_available: true,
                 gain_percent: 100.0,
                 pan_percent: 0.0,
@@ -18113,6 +18240,9 @@ mod tests {
         );
         assert_eq!(submitted.borrow().len(), 1);
 
+        let mut frozen = audio_track_mixer_row(0, track_id);
+        frozen.frozen = true;
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![frozen]))));
         ui.set_error_text(SharedString::default());
         ui.global::<IdeActions>()
             .invoke_unfreeze_audio_track(track_id.into());
@@ -18122,6 +18252,18 @@ mod tests {
                 if frozen_track_id == track_id && unfrozen_track_id == track_id
         ));
         assert!(ui.get_error_text().is_empty());
+
+        ui.set_track_freeze_is_unfreeze(false);
+        ui.set_track_freeze_is_flatten(true);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_freeze_audio_track(track_id.into());
+        assert!(
+            ui.get_error_text()
+                .contains("freeze confirmation is no longer current")
+        );
+        assert_eq!(submitted.borrow().len(), 2);
+        reset_audio_track_freeze_form(ui);
 
         apply_audio_track_freeze_event(ui, &IdeWorkerEvent::AudioTrackFreezing);
         assert_eq!(ui.get_app_mode(), AppMode::FreezingTrack);
@@ -18153,6 +18295,72 @@ mod tests {
         assert!(!ui.get_track_freeze_visible());
         assert!(ui.get_track_freeze_id().is_empty());
         assert!(ui.get_status_text().contains("revision 10"));
+        assert!(ui.get_error_text().is_empty());
+    }
+
+    fn assert_audio_track_flatten_window_contract(ui: &MainWindow) {
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_audio_track_freeze_callbacks_with(
+            ui,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+        let track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let mut frozen = audio_track_mixer_row(0, track_id);
+        frozen.frozen = true;
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![frozen]))));
+        ui.set_app_mode(AppMode::Running);
+        reset_audio_track_freeze_form(ui);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_flatten_audio_track(track_id.into());
+        assert!(
+            ui.get_error_text()
+                .contains("flatten confirmation is no longer current")
+        );
+        assert!(submitted.borrow().is_empty());
+
+        ui.set_track_freeze_visible(true);
+        ui.set_track_freeze_id(track_id.into());
+        ui.set_track_freeze_name("Lead".into());
+        ui.set_track_freeze_is_unfreeze(false);
+        ui.set_track_freeze_is_flatten(true);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_flatten_audio_track(track_id.into());
+        assert!(
+            ui.get_error_text()
+                .contains("no longer has complete freeze authority")
+        );
+        assert!(submitted.borrow().is_empty());
+
+        let mut flattenable = audio_track_mixer_row(0, track_id);
+        flattenable.frozen = true;
+        flattenable.flattenable = true;
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![flattenable]))));
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_flatten_audio_track(track_id.into());
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::FlattenAudioTrack {
+                track_id: flattened_track_id
+            }] if flattened_track_id == track_id
+        ));
+        assert!(ui.get_error_text().is_empty());
+
+        apply_audio_track_flatten_event(ui, &IdeWorkerEvent::AudioTrackFlattening);
+        assert_eq!(ui.get_app_mode(), AppMode::FlatteningTrack);
+        apply_audio_track_flatten_event(
+            ui,
+            &IdeWorkerEvent::AudioTrackFlattened {
+                revision: 11,
+                track_id: track_id.to_owned(),
+            },
+        );
+        assert!(!ui.get_track_freeze_visible());
+        assert!(ui.get_track_freeze_id().is_empty());
+        assert!(ui.get_status_text().contains("revision 11"));
         assert!(ui.get_error_text().is_empty());
     }
 

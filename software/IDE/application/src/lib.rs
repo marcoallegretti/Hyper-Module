@@ -168,7 +168,8 @@ use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
     AudioClipRemovalOutcome, AudioClipRemovalRequest, AudioTrackContentRemovalPublicationOutcome,
     AudioTrackContentRemovalPublicationRequest, AudioTrackDuplicationPublicationOutcome,
-    AudioTrackDuplicationPublicationRequest, AudioTrackFreezePublicationOutcome,
+    AudioTrackDuplicationPublicationRequest, AudioTrackFlattenPublicationOutcome,
+    AudioTrackFlattenPublicationRequest, AudioTrackFreezePublicationOutcome,
     AudioTrackFreezePublicationRequest, AudioTrackFreezeReactivationPublicationRequest,
     AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
     AudioTrackRemovalRequest, AudioTrackUnfreezePublicationOutcome,
@@ -184,12 +185,12 @@ use hyper_storage_engine::{
     StorageError, TrackOrderPublicationOutcome, TrackOrderPublicationRequest, clean_unused_samples,
     discard_recording_take, publish_arrangement, publish_audio_clip, publish_audio_track,
     publish_audio_track_content_removal, publish_audio_track_duplication,
-    publish_audio_track_freeze, publish_audio_track_freeze_reactivation,
-    publish_audio_track_unfreeze, publish_automation_take, publish_control_mapping,
-    publish_device_chain, publish_imported_audio_clip, publish_project_resource,
-    publish_recorded_take_placement, publish_routing_bus, publish_scene, publish_track_order,
-    remove_audio_clip, remove_audio_track, remove_automation_take, remove_device_chain,
-    remove_routing_bus, remove_scene, store_mixer_recovery_snapshot,
+    publish_audio_track_flatten, publish_audio_track_freeze,
+    publish_audio_track_freeze_reactivation, publish_audio_track_unfreeze, publish_automation_take,
+    publish_control_mapping, publish_device_chain, publish_imported_audio_clip,
+    publish_project_resource, publish_recorded_take_placement, publish_routing_bus, publish_scene,
+    publish_track_order, remove_audio_clip, remove_audio_track, remove_automation_take,
+    remove_device_chain, remove_routing_bus, remove_scene, store_mixer_recovery_snapshot,
 };
 use hyper_track_freeze::TrackFreezeState;
 use sha2::{Digest, Sha256};
@@ -3392,6 +3393,134 @@ impl Error for IdeAudioTrackUnfreezeError {
             | Self::ArrangementResourceAmbiguous
             | Self::FreezeStateMissing
             | Self::FreezeStateInvalid
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+/// Rejection or post-commit warning from explicitly accepting a rendered
+/// frozen audio track as its new source of truth.
+#[derive(Debug)]
+pub enum IdeAudioTrackFlattenError {
+    InvalidTrackIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    Storage(StorageError),
+    TrackResourceMissing,
+    TrackResourceRoleMismatch,
+    FreezeStateMissing,
+    FreezeStateInvalid,
+    FreezeStateIncomplete,
+    CapacityUnavailable,
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAudioTrackFlattenError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: AudioTrackFlattenPublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeAudioTrackFlattenError {
+    /// Whether the manifest commit completed despite a later warning.
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        matches!(self, Self::Publication(source) if source.published())
+            || matches!(self, Self::ReopenAfterPublication { .. })
+            || matches!(self, Self::ReopenAfterPreparation { preparation, .. }
+                if preparation.publication_committed())
+    }
+}
+
+impl fmt::Display for IdeAudioTrackFlattenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTrackIdentity => {
+                formatter.write_str("audio-track flatten requires a track identity")
+            }
+            Self::MixerSave(source) => write!(
+                formatter,
+                "live mixer state could not be preserved: {source}"
+            ),
+            Self::Storage(source) => source.fmt(formatter),
+            Self::TrackResourceMissing => {
+                formatter.write_str("the selected audio track is unavailable")
+            }
+            Self::TrackResourceRoleMismatch => {
+                formatter.write_str("the selected track cannot be flattened")
+            }
+            Self::FreezeStateMissing => {
+                formatter.write_str("the selected audio track has no retained freeze state")
+            }
+            Self::FreezeStateInvalid => {
+                formatter.write_str("the selected audio track has an invalid retained freeze state")
+            }
+            Self::FreezeStateIncomplete => formatter.write_str(
+                "the selected audio track has legacy freeze authority and must be unfrozen before it can be flattened",
+            ),
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio-track flatten capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before flattening the audio track: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before flattening the audio track ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track flatten preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "audio track {} was flattened in project revision {} but the project could not be reopened: {source}",
+                outcome.track_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track flatten failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioTrackFlattenError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidTrackIdentity
+            | Self::TrackResourceMissing
+            | Self::TrackResourceRoleMismatch
+            | Self::FreezeStateMissing
+            | Self::FreezeStateInvalid
+            | Self::FreezeStateIncomplete
             | Self::CapacityUnavailable
             | Self::NativeClose(_) => None,
         }
@@ -8005,6 +8134,13 @@ struct IdeAudioTrackUnfreezePlan {
 }
 
 #[derive(Debug)]
+struct IdeAudioTrackFlattenPlan {
+    mixer: IdeMixerSavePlan,
+    track_id: String,
+    freeze_state_id: String,
+}
+
+#[derive(Debug)]
 struct IdeAudioTrackFreezeReactivationPlan {
     mixer: IdeMixerSavePlan,
     documents: AudioTrackFreezeReactivationDocuments,
@@ -8212,6 +8348,25 @@ impl IdeAudioTrackUnfreezePlan {
             },
         )
         .map_err(|source| IdeResourceRestoreError::Publication(Box::new(source)))
+    }
+}
+
+impl IdeAudioTrackFlattenPlan {
+    fn publish(&self) -> Result<AudioTrackFlattenPublicationOutcome, IdeAudioTrackFlattenError> {
+        let mixer = self.mixer.publish().map_err(|source| {
+            IdeAudioTrackFlattenError::MixerSave(Box::new(IdeProjectSaveError::Publication(
+                Box::new(source),
+            )))
+        })?;
+        publish_audio_track_flatten(
+            &self.mixer.project_path,
+            AudioTrackFlattenPublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                track_id: &self.track_id,
+                freeze_state_id: &self.freeze_state_id,
+            },
+        )
+        .map_err(|source| IdeAudioTrackFlattenError::Publication(Box::new(source)))
     }
 }
 
@@ -9678,6 +9833,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub mixer_channel_names: [&'a str; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_kinds: [IdeMixerChannelKind; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_frozen: [bool; MAX_IDE_MIXER_CHANNELS],
+    pub mixer_channel_flattenable: [bool; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_active: [bool; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_destinations: [IdeMixerPrimaryDestination<'a>; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_states: [Option<IdeMixerChannelState>; MAX_IDE_MIXER_CHANNELS],
@@ -10668,6 +10824,96 @@ impl RunningDesktopIdeApplication {
             mixer,
             documents,
             history_authority,
+        })
+    }
+
+    fn prepare_audio_track_flatten(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        track_id: &str,
+    ) -> Result<IdeAudioTrackFlattenPlan, IdeAudioTrackFlattenError> {
+        if track_id.is_empty() {
+            return Err(IdeAudioTrackFlattenError::InvalidTrackIdentity);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioTrackFlattenError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioTrackFlattenError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == track_id)
+            .ok_or(IdeAudioTrackFlattenError::TrackResourceMissing)?;
+        if descriptor.role() != ResourceRole::Track {
+            return Err(IdeAudioTrackFlattenError::TrackResourceRoleMismatch);
+        }
+        let (project, _, _, _) = prepared.session().parts();
+        if !project.is_audio_track(track_id) {
+            return Err(IdeAudioTrackFlattenError::TrackResourceRoleMismatch);
+        }
+        let freeze_state_count = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::FreezeState)
+            .count();
+        let mut freeze_states = Vec::new();
+        freeze_states
+            .try_reserve_exact(freeze_state_count)
+            .map_err(|_| IdeAudioTrackFlattenError::CapacityUnavailable)?;
+        for descriptor in package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::FreezeState)
+        {
+            let bytes = package
+                .read_resource(descriptor.id())
+                .map_err(IdeAudioTrackFlattenError::Storage)?;
+            let state = TrackFreezeState::parse(&bytes)
+                .map_err(|_| IdeAudioTrackFlattenError::FreezeStateInvalid)?;
+            if state.track_id() == track_id {
+                let mut state_id = String::new();
+                state_id
+                    .try_reserve_exact(descriptor.id().len())
+                    .map_err(|_| IdeAudioTrackFlattenError::CapacityUnavailable)?;
+                state_id.push_str(descriptor.id());
+                freeze_states.push((state_id, state));
+            }
+        }
+        let (freeze_state_id, state) = match freeze_states.as_slice() {
+            [] => return Err(IdeAudioTrackFlattenError::FreezeStateMissing),
+            [state] => state,
+            _ => return Err(IdeAudioTrackFlattenError::FreezeStateInvalid),
+        };
+        if state.id() != freeze_state_id
+            || state.project_id() != package.manifest().project_id()
+            || state.track_id() != track_id
+        {
+            return Err(IdeAudioTrackFlattenError::FreezeStateInvalid);
+        }
+        if !state.has_complete_rendered_authority() {
+            return Err(IdeAudioTrackFlattenError::FreezeStateIncomplete);
+        }
+        let mut planned_track_id = String::new();
+        planned_track_id
+            .try_reserve_exact(track_id.len())
+            .map_err(|_| IdeAudioTrackFlattenError::CapacityUnavailable)?;
+        planned_track_id.push_str(track_id);
+        let mut planned_freeze_state_id = String::new();
+        planned_freeze_state_id
+            .try_reserve_exact(freeze_state_id.len())
+            .map_err(|_| IdeAudioTrackFlattenError::CapacityUnavailable)?;
+        planned_freeze_state_id.push_str(freeze_state_id);
+        Ok(IdeAudioTrackFlattenPlan {
+            mixer,
+            track_id: planned_track_id,
+            freeze_state_id: planned_freeze_state_id,
         })
     }
 
@@ -14710,6 +14956,7 @@ impl RunningDesktopIdeApplication {
         let mut mixer_channel_names = [""; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_kinds = [IdeMixerChannelKind::Audio; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_frozen = [false; MAX_IDE_MIXER_CHANNELS];
+        let mut mixer_channel_flattenable = [false; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_active = [false; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_destinations =
             [IdeMixerPrimaryDestination::Main; MAX_IDE_MIXER_CHANNELS];
@@ -14739,6 +14986,10 @@ impl RunningDesktopIdeApplication {
                 .freeze_states()
                 .iter()
                 .any(|state| state.track_id() == slot.track_id());
+            mixer_channel_flattenable[channel_index] =
+                project.freeze_states().iter().any(|state| {
+                    state.track_id() == slot.track_id() && state.has_complete_rendered_authority()
+                });
             mixer_channel_destinations[channel_index] = match slot.destination() {
                 CompiledMixerDestination::Main => IdeMixerPrimaryDestination::Main,
                 CompiledMixerDestination::Slot(target) => {
@@ -14807,6 +15058,7 @@ impl RunningDesktopIdeApplication {
             mixer_channel_names,
             mixer_channel_kinds,
             mixer_channel_frozen,
+            mixer_channel_flattenable,
             mixer_channel_active,
             mixer_channel_destinations,
             mixer_channel_states,

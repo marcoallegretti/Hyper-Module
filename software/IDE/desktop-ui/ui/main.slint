@@ -25,6 +25,7 @@ export enum AppMode {
     removing-track,
     freezing-track,
     unfreezing-track,
+    flattening-track,
     renaming-track,
     changing-track-activation,
     adding-arrangement-placement,
@@ -101,6 +102,7 @@ export struct MixerChannelRow {
     display-name: string,
     kind: string,
     frozen: bool,
+    flattenable: bool,
     state-available: bool,
     gain-percent: float,
     pan-percent: float,
@@ -386,6 +388,7 @@ export global IdeActions {
     callback remove-audio-track-content(string);
     callback freeze-audio-track(string);
     callback unfreeze-audio-track(string);
+    callback flatten-audio-track(string);
     callback reorder-audio-track(int, bool);
     callback rename-audio-track(int, string);
     callback rename-routing-bus(int, string);
@@ -567,6 +570,7 @@ export component MainWindow inherits Window {
     in-out property <string> track-freeze-id: "";
     in-out property <string> track-freeze-name: "";
     in-out property <bool> track-freeze-is-unfreeze: false;
+    in-out property <bool> track-freeze-is-flatten: false;
     in-out property <bool> routing-bus-removal-visible: false;
     in-out property <string> routing-bus-removal-id: "";
     in-out property <string> routing-bus-removal-name: "";
@@ -2364,13 +2368,23 @@ export component MainWindow inherits Window {
                     VerticalLayout {
                         padding: 22px;
                         spacing: 14px;
-                        Text { text: root.track-freeze-is-unfreeze ? "UNFREEZE AUDIO TRACK" : "FREEZE AUDIO TRACK"; color: #ffd166; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text {
+                            text: root.track-freeze-is-flatten
+                                ? "FLATTEN FROZEN AUDIO TRACK"
+                                : root.track-freeze-is-unfreeze ? "UNFREEZE AUDIO TRACK" : "FREEZE AUDIO TRACK";
+                            color: root.track-freeze-is-flatten ? #ff9d76 : #ffd166;
+                            font-size: 11px;
+                            font-weight: 700;
+                            letter-spacing: 1px;
+                        }
                         Text { text: root.track-freeze-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
                         Rectangle { height: 1px; background: #27313d; }
                         Text {
-                            text: root.track-freeze-is-unfreeze
-                                ? "Unfreeze restores the retained original clips and placements only when the rendered track still matches its retained freeze state. The rendered sample remains until unused-sample cleanup proves it unreferenced."
-                                : "Freeze renders this audio track's pre-fader playback output and retains its original clips and placements for a guarded Unfreeze. The project validates the complete state before making any change.";
+                            text: root.track-freeze-is-flatten
+                                ? "Flatten permanently discards the retained original clips, placements, and any native device chain baked into this rendered track. The rendered clip and sample remain. This cannot be undone."
+                                : root.track-freeze-is-unfreeze
+                                    ? "Unfreeze restores the retained original clips and placements only when the rendered track still matches its retained freeze state. The rendered sample remains until unused-sample cleanup proves it unreferenced."
+                                    : "Freeze renders this audio track's pre-fader playback output and retains its original clips and placements for a guarded Unfreeze. The project validates the complete state before making any change.";
                             color: #aebccc;
                             font-size: 11px;
                             wrap: word-wrap;
@@ -2385,17 +2399,22 @@ export component MainWindow inherits Window {
                                     root.track-freeze-id = "";
                                     root.track-freeze-name = "";
                                     root.track-freeze-is-unfreeze = false;
+                                    root.track-freeze-is-flatten = false;
                                 }
                             }
                             Button {
                                 horizontal-stretch: 1;
                                 text: root.app-mode == AppMode.freezing-track ? "Freezing track..."
                                     : root.app-mode == AppMode.unfreezing-track ? "Unfreezing track..."
+                                    : root.app-mode == AppMode.flattening-track ? "Flattening track..."
+                                    : root.track-freeze-is-flatten ? "Flatten audio track"
                                     : root.track-freeze-is-unfreeze ? "Unfreeze audio track" : "Freeze audio track";
-                                accessible-label: root.track-freeze-is-unfreeze ? "Confirm unfreeze audio track" : "Confirm freeze audio track";
+                                accessible-label: root.track-freeze-is-flatten ? "Confirm flatten audio track" : root.track-freeze-is-unfreeze ? "Confirm unfreeze audio track" : "Confirm freeze audio track";
                                 enabled: root.app-mode == AppMode.running && root.track-freeze-id != "";
                                 clicked => {
-                                    if root.track-freeze-is-unfreeze {
+                                    if root.track-freeze-is-flatten {
+                                        IdeActions.flatten-audio-track(root.track-freeze-id);
+                                    } else if root.track-freeze-is-unfreeze {
                                         IdeActions.unfreeze-audio-track(root.track-freeze-id);
                                     } else {
                                         IdeActions.freeze-audio-track(root.track-freeze-id);
@@ -2667,6 +2686,7 @@ export component MainWindow inherits Window {
                                         root.track-freeze-id = channel.track-id;
                                         root.track-freeze-name = channel.name;
                                         root.track-freeze-is-unfreeze = false;
+                                        root.track-freeze-is-flatten = false;
                                         root.track-freeze-visible = true;
                                     }
                                 }
@@ -2678,6 +2698,19 @@ export component MainWindow inherits Window {
                                         root.track-freeze-id = channel.track-id;
                                         root.track-freeze-name = channel.name;
                                         root.track-freeze-is-unfreeze = true;
+                                        root.track-freeze-is-flatten = false;
+                                        root.track-freeze-visible = true;
+                                    }
+                                }
+                                if channel.kind == "AUDIO" && channel.frozen && channel.flattenable : Button {
+                                    text: "Flatten…";
+                                    accessible-label: "Flatten " + channel.name;
+                                    enabled: root.app-mode == AppMode.running && channel.state-available;
+                                    clicked => {
+                                        root.track-freeze-id = channel.track-id;
+                                        root.track-freeze-name = channel.name;
+                                        root.track-freeze-is-unfreeze = false;
+                                        root.track-freeze-is-flatten = true;
                                         root.track-freeze-visible = true;
                                     }
                                 }

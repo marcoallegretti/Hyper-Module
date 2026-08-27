@@ -41,13 +41,15 @@ pub use audio_track_duplication::{
     publish_routing_bus_duplication, recover_audio_track_duplications,
 };
 pub use audio_track_freeze::{
+    AudioTrackFlattenPublicationOutcome, AudioTrackFlattenPublicationRecovery,
+    AudioTrackFlattenPublicationRecoveryDisposition, AudioTrackFlattenPublicationRequest,
     AudioTrackFreezePublicationOutcome, AudioTrackFreezePublicationRecovery,
     AudioTrackFreezePublicationRecoveryDisposition, AudioTrackFreezePublicationRequest,
     AudioTrackFreezeReactivationPublicationRequest, AudioTrackUnfreezePublicationOutcome,
     AudioTrackUnfreezePublicationRecovery, AudioTrackUnfreezePublicationRecoveryDisposition,
-    AudioTrackUnfreezePublicationRequest, publish_audio_track_freeze,
+    AudioTrackUnfreezePublicationRequest, publish_audio_track_flatten, publish_audio_track_freeze,
     publish_audio_track_freeze_reactivation, publish_audio_track_unfreeze,
-    recover_audio_track_freezes, recover_audio_track_unfreezes,
+    recover_audio_track_flattens, recover_audio_track_freezes, recover_audio_track_unfreezes,
 };
 pub use recording_discard::{
     RecordingDiscardOutcome, RecordingDiscardRecovery, RecordingDiscardRecoveryDisposition,

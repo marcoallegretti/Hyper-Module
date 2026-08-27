@@ -43,13 +43,13 @@ use super::{
     IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
     IdeAudioPreviewError, IdeAudioPrimaryRouteError, IdeAudioTrackAdditionError,
     IdeAudioTrackContentRemovalError, IdeAudioTrackDuplicationError, IdeAudioTrackEditError,
-    IdeAudioTrackFreezeError, IdeAudioTrackRemovalError, IdeAudioTrackUnfreezeError,
-    IdeAutomationTakeCreationError, IdeAutomationTakeEditError, IdeAutomationTakeRequest,
-    IdeAutomationTarget, IdeCloseOutcome, IdeControlMappingEdit, IdeControlMappingEditError,
-    IdeHistoryOperation, IdeInputDiscoveryError, IdeInputSelection, IdeInputSelectionError,
-    IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessCommandError, IdeMixerChannelKind,
-    IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError, IdeMixerMainState,
-    IdeMixerPrimaryDestination, IdeMixerStripReorderError, IdeMonitoringCommand,
+    IdeAudioTrackFlattenError, IdeAudioTrackFreezeError, IdeAudioTrackRemovalError,
+    IdeAudioTrackUnfreezeError, IdeAutomationTakeCreationError, IdeAutomationTakeEditError,
+    IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome, IdeControlMappingEdit,
+    IdeControlMappingEditError, IdeHistoryOperation, IdeInputDiscoveryError, IdeInputSelection,
+    IdeInputSelectionError, IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessCommandError,
+    IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
+    IdeMixerMainState, IdeMixerPrimaryDestination, IdeMixerStripReorderError, IdeMonitoringCommand,
     IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure, IdeNativeFilterEdit,
     IdeNativeFilterEditError, IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError,
     IdeOutputTestError, IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
@@ -169,6 +169,7 @@ pub enum IdeWorkerCommandKind {
     RemoveAudioTrackContent,
     FreezeAudioTrack,
     UnfreezeAudioTrack,
+    FlattenAudioTrack,
     ReorderMixerStrips,
     DuplicateAudioTrack,
     RenameAudioTrack,
@@ -321,6 +322,9 @@ pub enum IdeWorkerCommand {
         track_id: String,
     },
     UnfreezeAudioTrack {
+        track_id: String,
+    },
+    FlattenAudioTrack {
         track_id: String,
     },
     ReorderMixerStrips {
@@ -584,6 +588,7 @@ impl IdeWorkerCommand {
             Self::RemoveAudioTrackContent { .. } => IdeWorkerCommandKind::RemoveAudioTrackContent,
             Self::FreezeAudioTrack { .. } => IdeWorkerCommandKind::FreezeAudioTrack,
             Self::UnfreezeAudioTrack { .. } => IdeWorkerCommandKind::UnfreezeAudioTrack,
+            Self::FlattenAudioTrack { .. } => IdeWorkerCommandKind::FlattenAudioTrack,
             Self::ReorderMixerStrips { .. } => IdeWorkerCommandKind::ReorderMixerStrips,
             Self::DuplicateAudioTrack { .. } => IdeWorkerCommandKind::DuplicateAudioTrack,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
@@ -1209,6 +1214,7 @@ pub struct IdeMixerChannel {
     name: String,
     kind: IdeMixerChannelKind,
     frozen: bool,
+    flattenable: bool,
     active: bool,
     destination: IdeMixerChannelDestination,
     state: Option<IdeMixerChannelState>,
@@ -1406,6 +1412,7 @@ impl IdeMixerChannel {
             name: name.to_owned(),
             kind,
             frozen: false,
+            flattenable: false,
             active: true,
             destination: IdeMixerChannelDestination::Main,
             state: None,
@@ -1431,6 +1438,11 @@ impl IdeMixerChannel {
     #[must_use]
     pub const fn frozen(&self) -> bool {
         self.frozen
+    }
+
+    #[must_use]
+    pub const fn flattenable(&self) -> bool {
+        self.flattenable
     }
 
     #[must_use]
@@ -2107,6 +2119,7 @@ pub enum IdeWorkerCommandFailure {
     AudioTrackContentRemoval(Box<super::IdeAudioTrackContentRemovalError>),
     AudioTrackFreeze(Box<super::IdeAudioTrackFreezeError>),
     AudioTrackUnfreeze(Box<super::IdeAudioTrackUnfreezeError>),
+    AudioTrackFlatten(Box<super::IdeAudioTrackFlattenError>),
     MixerStripReorder(Box<super::IdeMixerStripReorderError>),
     AudioTrackDuplication(Box<super::IdeAudioTrackDuplicationError>),
     AudioTrackRename(Box<super::IdeAudioTrackEditError>),
@@ -2266,6 +2279,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioTrackContentRemoval(source) => source.fmt(formatter),
             Self::AudioTrackFreeze(source) => source.fmt(formatter),
             Self::AudioTrackUnfreeze(source) => source.fmt(formatter),
+            Self::AudioTrackFlatten(source) => source.fmt(formatter),
             Self::MixerStripReorder(source) => source.fmt(formatter),
             Self::AudioTrackDuplication(source) => source.fmt(formatter),
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => {
@@ -2372,6 +2386,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioTrackContentRemoval(source) => Some(source),
             Self::AudioTrackFreeze(source) => Some(source),
             Self::AudioTrackUnfreeze(source) => Some(source),
+            Self::AudioTrackFlatten(source) => Some(source),
             Self::MixerStripReorder(source) => Some(source),
             Self::AudioTrackDuplication(source) => Some(source),
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => Some(source),
@@ -2567,11 +2582,18 @@ pub enum IdeWorkerEvent {
         revision: u64,
         track_id: String,
     },
+    AudioTrackFlattened {
+        revision: u64,
+        track_id: String,
+    },
     AudioTrackUnfreezeCommittedWithWarning {
         warning: Box<IdeAudioTrackUnfreezeError>,
     },
     AudioTrackFreezeCommittedWithWarning {
         warning: Box<IdeAudioTrackFreezeError>,
+    },
+    AudioTrackFlattenCommittedWithWarning {
+        warning: Box<IdeAudioTrackFlattenError>,
     },
     MixerStripsReordered {
         revision: u64,
@@ -2890,6 +2912,7 @@ pub enum IdeWorkerEvent {
     AudioTrackContentRemoving,
     AudioTrackFreezing,
     AudioTrackUnfreezing,
+    AudioTrackFlattening,
     MixerStripsReordering,
     AudioTrackDuplicating,
     AudioTrackRenaming,
@@ -3433,6 +3456,9 @@ enum ProjectMutation {
     UnfreezeAudioTrack {
         track_id: String,
     },
+    FlattenAudioTrack {
+        track_id: String,
+    },
     ReorderMixerStrips {
         track_id: String,
         destination_index: usize,
@@ -3641,6 +3667,7 @@ impl ProjectMutation {
             Self::RemoveAudioTrackContent { .. } => IdeWorkerCommandKind::RemoveAudioTrackContent,
             Self::FreezeAudioTrack { .. } => IdeWorkerCommandKind::FreezeAudioTrack,
             Self::UnfreezeAudioTrack { .. } => IdeWorkerCommandKind::UnfreezeAudioTrack,
+            Self::FlattenAudioTrack { .. } => IdeWorkerCommandKind::FlattenAudioTrack,
             Self::ReorderMixerStrips { .. } => IdeWorkerCommandKind::ReorderMixerStrips,
             Self::DuplicateAudioTrack { .. } => IdeWorkerCommandKind::DuplicateAudioTrack,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
@@ -3731,6 +3758,7 @@ impl ProjectMutation {
             Self::RemoveAudioTrackContent { .. } => IdeWorkerEvent::AudioTrackContentRemoving,
             Self::FreezeAudioTrack { .. } => IdeWorkerEvent::AudioTrackFreezing,
             Self::UnfreezeAudioTrack { .. } => IdeWorkerEvent::AudioTrackUnfreezing,
+            Self::FlattenAudioTrack { .. } => IdeWorkerEvent::AudioTrackFlattening,
             Self::ReorderMixerStrips { .. } => IdeWorkerEvent::MixerStripsReordering,
             Self::DuplicateAudioTrack { .. } => IdeWorkerEvent::AudioTrackDuplicating,
             Self::RenameAudioTrack { .. } => IdeWorkerEvent::AudioTrackRenaming,
@@ -4006,6 +4034,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetAudioTrackActive => "track activation",
         IdeWorkerCommandKind::FreezeAudioTrack => "track freeze",
         IdeWorkerCommandKind::UnfreezeAudioTrack => "track unfreeze",
+        IdeWorkerCommandKind::FlattenAudioTrack => "track flatten",
         IdeWorkerCommandKind::MoveArrangementPlacement => "placement move",
         IdeWorkerCommandKind::SetArrangementPlacementDuration => "placement duration",
         IdeWorkerCommandKind::TrimArrangementPlacementFront => "placement trim",
@@ -4400,6 +4429,7 @@ fn process_command(
         | IdeWorkerCommand::RemoveAudioTrackContent { .. }
         | IdeWorkerCommand::FreezeAudioTrack { .. }
         | IdeWorkerCommand::UnfreezeAudioTrack { .. }
+        | IdeWorkerCommand::FlattenAudioTrack { .. }
         | IdeWorkerCommand::ReorderMixerStrips { .. }
         | IdeWorkerCommand::DuplicateAudioTrack { .. }
         | IdeWorkerCommand::RenameAudioTrack { .. }
@@ -4619,6 +4649,9 @@ fn process_project_mutation_command(
         }
         IdeWorkerCommand::UnfreezeAudioTrack { track_id } => {
             unfreeze_audio_track(state, events, &track_id)
+        }
+        IdeWorkerCommand::FlattenAudioTrack { track_id } => {
+            flatten_audio_track(state, events, &track_id)
         }
         IdeWorkerCommand::ReorderMixerStrips {
             track_id,
@@ -6518,6 +6551,40 @@ fn unfreeze_audio_track(
     )
 }
 
+fn flatten_audio_track(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    track_id: &str,
+) -> bool {
+    if track_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::FlattenAudioTrack,
+            IdeWorkerCommandFailure::AudioTrackFlatten(Box::new(
+                IdeAudioTrackFlattenError::InvalidTrackIdentity,
+            )),
+        );
+    }
+    let mut owned_track_id = String::new();
+    if owned_track_id.try_reserve_exact(track_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::FlattenAudioTrack,
+            IdeWorkerCommandFailure::AudioTrackFlatten(Box::new(
+                IdeAudioTrackFlattenError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_track_id.push_str(track_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::FlattenAudioTrack {
+            track_id: owned_track_id,
+        },
+    )
+}
+
 fn reorder_mixer_strips(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -7884,6 +7951,7 @@ fn observe_history(
                     history.clear()
                 }
             }
+            ProjectMutationAttempt::FlattenAudioTrack(Ok(_)) => history.clear(),
             other => match history_effect(other) {
                 HistoryEffect::Replacement(outcome) => match outcome.previous_resource() {
                     Some(previous) => {
@@ -8138,8 +8206,14 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         {
             HistoryEffect::Invalidate
         }
+        ProjectMutationAttempt::FlattenAudioTrack(Err(reason))
+            if reason.publication_committed() =>
+        {
+            HistoryEffect::Invalidate
+        }
         ProjectMutationAttempt::FreezeAudioTrack(Ok(_) | Err(_))
         | ProjectMutationAttempt::UnfreezeAudioTrack(Ok(_) | Err(_))
+        | ProjectMutationAttempt::FlattenAudioTrack(Ok(_) | Err(_))
         | ProjectMutationAttempt::EditNativeFilter { .. }
         | ProjectMutationAttempt::SaveProjectAs(_)
         | ProjectMutationAttempt::RenameProject(_)
@@ -8925,6 +8999,9 @@ fn project_mutation_save_failure(
         ProjectMutation::UnfreezeAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackUnfreeze(
             Box::new(IdeAudioTrackUnfreezeError::MixerSave(Box::new(reason))),
         ),
+        ProjectMutation::FlattenAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackFlatten(
+            Box::new(IdeAudioTrackFlattenError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::ReorderMixerStrips { .. } => IdeWorkerCommandFailure::MixerStripReorder(
             Box::new(IdeMixerStripReorderError::MixerSave(Box::new(reason))),
         ),
@@ -9237,6 +9314,9 @@ fn project_mutation_native_close_failure(
         ),
         ProjectMutation::UnfreezeAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackUnfreeze(
             Box::new(IdeAudioTrackUnfreezeError::NativeClose(failure)),
+        ),
+        ProjectMutation::FlattenAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackFlatten(
+            Box::new(IdeAudioTrackFlattenError::NativeClose(failure)),
         ),
         ProjectMutation::ReorderMixerStrips { .. } => IdeWorkerCommandFailure::MixerStripReorder(
             Box::new(IdeMixerStripReorderError::NativeClose(failure)),
@@ -9554,6 +9634,12 @@ enum ProjectMutationAttempt {
     FreezeAudioTrack(Result<AudioTrackFreezePublicationWithHistory, IdeAudioTrackFreezeError>),
     UnfreezeAudioTrack(
         Result<AudioTrackUnfreezePublicationWithHistory, IdeAudioTrackUnfreezeError>,
+    ),
+    FlattenAudioTrack(
+        Result<
+            hyper_storage_engine::AudioTrackFlattenPublicationOutcome,
+            IdeAudioTrackFlattenError,
+        >,
     ),
     ReorderMixerStrips(
         Result<hyper_storage_engine::TrackOrderPublicationOutcome, IdeMixerStripReorderError>,
@@ -9918,6 +10004,19 @@ fn audio_track_unfreeze_failure_event(reason: IdeAudioTrackUnfreezeError) -> Ide
         IdeWorkerEvent::CommandFailed {
             command: IdeWorkerCommandKind::UnfreezeAudioTrack,
             reason: IdeWorkerCommandFailure::AudioTrackUnfreeze(Box::new(reason)),
+        }
+    }
+}
+
+fn audio_track_flatten_failure_event(reason: IdeAudioTrackFlattenError) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::AudioTrackFlattenCommittedWithWarning {
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::FlattenAudioTrack,
+            reason: IdeWorkerCommandFailure::AudioTrackFlatten(Box::new(reason)),
         }
     }
 }
@@ -10384,6 +10483,16 @@ fn complete_project_mutation(
                 ),
                 ProjectMutationAttempt::UnfreezeAudioTrack(Err(reason)) => {
                     send_event(events, audio_track_unfreeze_failure_event(reason))
+                }
+                ProjectMutationAttempt::FlattenAudioTrack(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::AudioTrackFlattened {
+                        revision: outcome.project_revision(),
+                        track_id: outcome.track_id().to_owned(),
+                    },
+                ),
+                ProjectMutationAttempt::FlattenAudioTrack(Err(reason)) => {
+                    send_event(events, audio_track_flatten_failure_event(reason))
                 }
                 ProjectMutationAttempt::ReorderMixerStrips(Ok(outcome)) => send_event(
                     events,
@@ -11778,6 +11887,18 @@ fn attempt_project_mutation(
                             authority,
                         })
                 })
+            })
+        }
+        ProjectMutation::FlattenAudioTrack { track_id } => {
+            ProjectMutationAttempt::FlattenAudioTrack(if let Some(failure) = native_failure {
+                Err(IdeAudioTrackFlattenError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_audio_track_flatten(
+                    application,
+                    recovery,
+                    &track_id,
+                )
+                .and_then(|plan| plan.publish())
             })
         }
         ProjectMutation::ReorderMixerStrips {
@@ -13413,6 +13534,38 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::UnfreezeAudioTrack(Err(preparation)) => {
             IdeWorkerCommandFailure::AudioTrackUnfreeze(Box::new(
                 IdeAudioTrackUnfreezeError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
+                    reopen: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::FlattenAudioTrack(Ok(outcome)) => {
+            IdeWorkerCommandFailure::AudioTrackFlatten(Box::new(
+                IdeAudioTrackFlattenError::ReopenAfterPublication {
+                    outcome,
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::FlattenAudioTrack(Err(IdeAudioTrackFlattenError::Publication(
+            publication,
+        ))) => IdeWorkerCommandFailure::AudioTrackFlatten(Box::new(
+            IdeAudioTrackFlattenError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::FlattenAudioTrack(Err(IdeAudioTrackFlattenError::NativeClose(
+            close,
+        ))) => IdeWorkerCommandFailure::AudioTrackFlatten(Box::new(
+            IdeAudioTrackFlattenError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::FlattenAudioTrack(Err(preparation)) => {
+            IdeWorkerCommandFailure::AudioTrackFlatten(Box::new(
+                IdeAudioTrackFlattenError::ReopenAfterPreparation {
                     preparation: Box::new(preparation),
                     reopen: Box::new(reopen),
                 },
@@ -15287,6 +15440,7 @@ fn running_observation(
             name: try_project_owned(snapshot.mixer_channel_names[channel_index])?,
             kind: snapshot.mixer_channel_kinds[channel_index],
             frozen: snapshot.mixer_channel_frozen[channel_index],
+            flattenable: snapshot.mixer_channel_flattenable[channel_index],
             active: snapshot.mixer_channel_active[channel_index],
             destination: match snapshot.mixer_channel_destinations[channel_index] {
                 IdeMixerPrimaryDestination::Main => IdeMixerChannelDestination::Main,
@@ -18300,6 +18454,292 @@ mod tests {
         ));
         drop(package);
         assert_eq!(shutdown_report(legacy_worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker sequence proves that flatten retains rendered output, retires reversible authority, and invalidates history"
+    )]
+    fn audio_track_flatten_retires_reversible_authority_and_history() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-track-flatten-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let source = fixture.join("Source.wav");
+        std::fs::write(&source, mono_pcm16_wav(48_000, &[500; 96])).unwrap();
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 8)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the verified project must open before track flatten");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the created project has one audio track")
+            .id()
+            .to_owned();
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: vec![source],
+                track_id: track_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioImporting { files: 1 }
+        ));
+        let mut imported_clip_id = None;
+        let mut imported_reopened = false;
+        while imported_clip_id.is_none() || !imported_reopened {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::Running(snapshot) => {
+                    imported_reopened = snapshot.audio_clips().len() == 1
+                        && snapshot.audio_clips()[0].track_id() == track_id;
+                }
+                IdeWorkerEvent::AudioImported(outcome) => {
+                    imported_clip_id = outcome.clip_ids().first().cloned();
+                }
+                IdeWorkerEvent::UndoStateChanged { .. } => {}
+                event => panic!("audio import emitted an unexpected lifecycle event: {event:?}"),
+            }
+        }
+        let imported_clip_id = imported_clip_id.expect("one source clip was imported");
+        worker
+            .try_send(IdeWorkerCommand::AddArrangementPlacement {
+                clip_id: imported_clip_id.clone(),
+                start_tick: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::ArrangementPlacementAdding { start_tick: 0 }
+        ));
+        let mut placement_reopened = false;
+        let mut placement_published = false;
+        while !placement_reopened || !placement_published {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::UndoStateChanged { .. } => {}
+                IdeWorkerEvent::Running(_) => placement_reopened = true,
+                IdeWorkerEvent::ArrangementPlacementAdded { start_tick: 0, .. } => {
+                    placement_published = true;
+                }
+                event => {
+                    panic!("placement creation emitted an unexpected lifecycle event: {event:?}")
+                }
+            }
+        }
+        let imported = verify_project_package(&project).unwrap();
+        let source_asset_ids = imported
+            .manifest()
+            .assets()
+            .iter()
+            .map(hyper_project_model::AssetDescriptor::id)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(!source_asset_ids.is_empty());
+        drop(imported);
+
+        add_compressor_history(&worker, track_id.clone());
+        worker
+            .try_send(IdeWorkerCommand::FreezeAudioTrack {
+                track_id: track_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioTrackFreezing
+        ));
+        let mut freeze_revision = None;
+        let mut frozen_reopened = false;
+        while freeze_revision.is_none() || !frozen_reopened {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: Some("track freeze"),
+                    redo_label: None,
+                } => {}
+                IdeWorkerEvent::Running(snapshot) => {
+                    frozen_reopened = snapshot.audio_clips().len() == 1
+                        && snapshot.audio_clips()[0].track_id() == track_id
+                        && snapshot.mixer_channels().iter().any(|channel| {
+                            channel.id() == track_id && channel.frozen() && channel.flattenable()
+                        });
+                }
+                IdeWorkerEvent::AudioTrackFrozen {
+                    revision,
+                    track_id: event_track,
+                } => {
+                    assert_eq!(event_track, track_id);
+                    freeze_revision = Some(revision);
+                }
+                event => panic!("track freeze emitted an unexpected lifecycle event: {event:?}"),
+            }
+        }
+
+        let frozen = verify_project_package(&project).unwrap();
+        let frozen_clip_id = frozen
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.role() == ResourceRole::Clip)
+            .expect("the frozen project has one rendered clip")
+            .id()
+            .to_owned();
+        let freeze_state_id = frozen
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.role() == ResourceRole::FreezeState)
+            .expect("the frozen project retains its reversible authority")
+            .id()
+            .to_owned();
+        let freeze_state = frozen.read_resource(&freeze_state_id).unwrap();
+        let frozen_asset_id =
+            serde_json::from_slice::<serde_json::Value>(&freeze_state).unwrap()["frozen_asset_id"]
+                .as_str()
+                .expect("the retained state identifies the rendered sample")
+                .to_owned();
+        let frozen_asset = frozen
+            .manifest()
+            .assets()
+            .iter()
+            .find(|asset| asset.id() == frozen_asset_id)
+            .expect("the frozen render remains manifest declared");
+        let frozen_asset_sha256 = frozen_asset.sha256().to_owned();
+        let frozen_asset_byte_length = frozen_asset.byte_length();
+        let device_chain_ids = frozen
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|resource| resource.role() == ResourceRole::DeviceChain)
+            .map(|resource| resource.id().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            device_chain_ids.len(),
+            1,
+            "the retained state must keep the native chain baked into the render"
+        );
+        drop(frozen);
+
+        worker
+            .try_send(IdeWorkerCommand::FlattenAudioTrack {
+                track_id: track_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioTrackFlattening
+        ));
+        let mut history_cleared = false;
+        let mut flatten_revision = None;
+        let mut flattened_reopened = false;
+        while !history_cleared || flatten_revision.is_none() || !flattened_reopened {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: None,
+                    redo_label: None,
+                } => history_cleared = true,
+                IdeWorkerEvent::Running(snapshot) => {
+                    flattened_reopened = snapshot.audio_clips().len() == 1
+                        && snapshot.audio_clips()[0].id() == frozen_clip_id
+                        && snapshot.mixer_channels().iter().any(|channel| {
+                            channel.id() == track_id && !channel.frozen() && !channel.flattenable()
+                        })
+                        && snapshot.native_devices().is_empty();
+                }
+                IdeWorkerEvent::AudioTrackFlattened {
+                    revision,
+                    track_id: event_track,
+                } => {
+                    assert_eq!(event_track, track_id);
+                    flatten_revision = Some(revision);
+                }
+                event => panic!("track flatten emitted an unexpected lifecycle event: {event:?}"),
+            }
+        }
+        assert_eq!(
+            flatten_revision,
+            freeze_revision.map(|revision| revision + 1),
+            "flatten commits exactly one irreversible manifest revision"
+        );
+
+        let flattened = verify_project_package(&project).unwrap();
+        assert_eq!(flattened.manifest().revision(), flatten_revision.unwrap());
+        assert!(
+            flattened
+                .manifest()
+                .resources()
+                .iter()
+                .all(|resource| resource.id() != freeze_state_id),
+            "flatten removes the retained reversible state"
+        );
+        assert!(
+            device_chain_ids.iter().all(|chain_id| {
+                flattened
+                    .manifest()
+                    .resources()
+                    .iter()
+                    .all(|resource| resource.id() != chain_id)
+            }),
+            "flatten removes only the device chain baked into the accepted render"
+        );
+        assert!(
+            flattened
+                .manifest()
+                .resources()
+                .iter()
+                .any(|resource| resource.id() == frozen_clip_id),
+            "flatten retains the active rendered clip"
+        );
+        assert!(matches!(
+            flattened
+                .manifest()
+                .assets()
+                .iter()
+                .find(|asset| asset.id() == frozen_asset_id),
+            Some(asset) if asset.sha256() == frozen_asset_sha256
+                && asset.byte_length() == frozen_asset_byte_length
+        ));
+        assert!(
+            source_asset_ids.iter().all(|source_asset_id| {
+                flattened
+                    .manifest()
+                    .assets()
+                    .iter()
+                    .any(|asset| asset.id() == source_asset_id)
+            }),
+            "flatten must leave source assets for reference-aware cleanup"
+        );
+        drop(flattened);
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Undo,
+                reason: IdeWorkerCommandFailure::NothingToRestore,
+            }
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
 
