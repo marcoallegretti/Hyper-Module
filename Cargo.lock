@@ -2212,6 +2212,7 @@ dependencies = [
  "hyper-runtime-bundle-builder",
  "hyper-storage-engine",
  "hyper-thread-supervisor",
+ "hyper-track-freeze",
  "junction",
  "serde_json",
  "serde_json_canonicalizer",

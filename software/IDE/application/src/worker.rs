@@ -62,11 +62,11 @@ use super::{
     IdeRoutingBusRemovalError, IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability,
     IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization,
     IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError,
-    IdeTempoEditError, IdeTransportSeekError, IdeUnusedSampleCleanupError,
-    IdeUnusedSampleCleanupSummary, InputInventoryError, LocateState, MAX_DEVICES_PER_CHAIN,
-    NativeFilterMode, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
-    OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication, RunningIdeSnapshot,
-    TimelineMapEdit, control_binding_references_scene,
+    IdeTempoEditError, IdeTrackFreezeHistoryAuthority, IdeTransportSeekError,
+    IdeUnusedSampleCleanupError, IdeUnusedSampleCleanupSummary, InputInventoryError, LocateState,
+    MAX_DEVICES_PER_CHAIN, NativeFilterMode, OutputInventoryError, OutputStreamSnapshot,
+    OutputStreamState, OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication,
+    RunningIdeSnapshot, TimelineMapEdit, control_binding_references_scene,
 };
 
 #[cfg(test)]
@@ -3881,91 +3881,52 @@ const MAX_UNDO_DEPTH: usize = 20;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct UndoEntry {
-    resource_id: String,
-    bytes: Vec<u8>,
-    kind: UndoEntryKind,
+    operation: IdeHistoryOperation,
     label: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UndoEntryKind {
-    ResourceReplacement,
-    DeviceChainAddition,
-    DeviceChainRemoval,
-    AutomationTakeAddition,
-    AutomationTakeRemoval,
 }
 
 impl UndoEntry {
     fn from_operation(operation: IdeHistoryOperation, label: &'static str) -> Self {
-        match operation {
-            IdeHistoryOperation::ResourceReplacement { resource_id, bytes } => Self {
-                resource_id,
-                bytes,
-                kind: UndoEntryKind::ResourceReplacement,
-                label,
-            },
-            IdeHistoryOperation::DeviceChainAddition { chain_id, bytes } => Self {
-                resource_id: chain_id,
-                bytes,
-                kind: UndoEntryKind::DeviceChainAddition,
-                label,
-            },
-            IdeHistoryOperation::DeviceChainRemoval {
-                chain_id,
-                expected_bytes,
-            } => Self {
-                resource_id: chain_id,
-                bytes: expected_bytes,
-                kind: UndoEntryKind::DeviceChainRemoval,
-                label,
-            },
-            IdeHistoryOperation::AutomationTakeAddition { take_id, bytes } => Self {
-                resource_id: take_id,
-                bytes,
-                kind: UndoEntryKind::AutomationTakeAddition,
-                label,
-            },
-            IdeHistoryOperation::AutomationTakeRemoval {
-                take_id,
-                expected_bytes,
-            } => Self {
-                resource_id: take_id,
-                bytes: expected_bytes,
-                kind: UndoEntryKind::AutomationTakeRemoval,
-                label,
-            },
-        }
+        Self { operation, label }
     }
 
     fn operation(&self) -> IdeHistoryOperation {
-        match self.kind {
-            UndoEntryKind::ResourceReplacement => IdeHistoryOperation::ResourceReplacement {
-                resource_id: self.resource_id.clone(),
-                bytes: self.bytes.clone(),
-            },
-            UndoEntryKind::DeviceChainAddition => IdeHistoryOperation::DeviceChainAddition {
-                chain_id: self.resource_id.clone(),
-                bytes: self.bytes.clone(),
-            },
-            UndoEntryKind::DeviceChainRemoval => IdeHistoryOperation::DeviceChainRemoval {
-                chain_id: self.resource_id.clone(),
-                expected_bytes: self.bytes.clone(),
-            },
-            UndoEntryKind::AutomationTakeAddition => IdeHistoryOperation::AutomationTakeAddition {
-                take_id: self.resource_id.clone(),
-                bytes: self.bytes.clone(),
-            },
-            UndoEntryKind::AutomationTakeRemoval => IdeHistoryOperation::AutomationTakeRemoval {
-                take_id: self.resource_id.clone(),
-                expected_bytes: self.bytes.clone(),
-            },
+        self.operation.clone()
+    }
+
+    #[cfg(test)]
+    fn resource_id(&self) -> &str {
+        match &self.operation {
+            IdeHistoryOperation::ResourceReplacement { resource_id, .. } => resource_id,
+            IdeHistoryOperation::DeviceChainAddition { chain_id, .. }
+            | IdeHistoryOperation::DeviceChainRemoval { chain_id, .. } => chain_id,
+            IdeHistoryOperation::AutomationTakeAddition { take_id, .. }
+            | IdeHistoryOperation::AutomationTakeRemoval { take_id, .. } => take_id,
+            IdeHistoryOperation::AudioTrackUnfreeze { authority }
+            | IdeHistoryOperation::AudioTrackFreezeReactivation { authority } => {
+                authority.track_id()
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn bytes(&self) -> &[u8] {
+        match &self.operation {
+            IdeHistoryOperation::ResourceReplacement { bytes, .. }
+            | IdeHistoryOperation::DeviceChainAddition { bytes, .. }
+            | IdeHistoryOperation::AutomationTakeAddition { bytes, .. } => bytes,
+            IdeHistoryOperation::DeviceChainRemoval { expected_bytes, .. }
+            | IdeHistoryOperation::AutomationTakeRemoval { expected_bytes, .. } => expected_bytes,
+            IdeHistoryOperation::AudioTrackUnfreeze { authority }
+            | IdeHistoryOperation::AudioTrackFreezeReactivation { authority } => {
+                authority.freeze_state()
+            }
         }
     }
 }
 
-/// Two bounded per-session lists retain complete resource states or explicit
-/// device-chain presence transitions. History dies with the open project.
+/// Two bounded per-session lists retain complete resource states and explicit
+/// structural transitions. History dies with the open project.
 #[derive(Debug, Default)]
 struct UndoHistory {
     undo: Vec<UndoEntry>,
@@ -4043,6 +4004,8 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::RenameRoutingBus => "routing-bus rename",
         IdeWorkerCommandKind::RenameAudioTrack => "track rename",
         IdeWorkerCommandKind::SetAudioTrackActive => "track activation",
+        IdeWorkerCommandKind::FreezeAudioTrack => "track freeze",
+        IdeWorkerCommandKind::UnfreezeAudioTrack => "track unfreeze",
         IdeWorkerCommandKind::MoveArrangementPlacement => "placement move",
         IdeWorkerCommandKind::SetArrangementPlacementDuration => "placement duration",
         IdeWorkerCommandKind::TrimArrangementPlacementFront => "placement trim",
@@ -4102,8 +4065,6 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::AddRoutingBus
         | IdeWorkerCommandKind::RemoveAudioTrack
         | IdeWorkerCommandKind::RemoveAudioTrackContent
-        | IdeWorkerCommandKind::FreezeAudioTrack
-        | IdeWorkerCommandKind::UnfreezeAudioTrack
         | IdeWorkerCommandKind::ReorderMixerStrips
         | IdeWorkerCommandKind::DuplicateAudioTrack
         | IdeWorkerCommandKind::ImportAudio
@@ -7899,6 +7860,24 @@ fn observe_history(
                 ));
                 true
             }
+            ProjectMutationAttempt::FreezeAudioTrack(Ok(outcome)) => {
+                history.record_edit(UndoEntry::from_operation(
+                    IdeHistoryOperation::AudioTrackUnfreeze {
+                        authority: Box::new(outcome.authority().clone()),
+                    },
+                    undo_label(command),
+                ));
+                true
+            }
+            ProjectMutationAttempt::UnfreezeAudioTrack(Ok(outcome)) => {
+                history.record_edit(UndoEntry::from_operation(
+                    IdeHistoryOperation::AudioTrackFreezeReactivation {
+                        authority: Box::new(outcome.authority().clone()),
+                    },
+                    undo_label(command),
+                ));
+                true
+            }
             other => match history_effect(other) {
                 HistoryEffect::Replacement(outcome) => match outcome.previous_resource() {
                     Some(previous) => {
@@ -8080,10 +8059,6 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::SetSceneActive {
             result: Ok(outcome),
             ..
-        }
-        | ProjectMutationAttempt::RestoreResource {
-            result: Ok(outcome),
-            ..
         } => HistoryEffect::Replacement(outcome),
         ProjectMutationAttempt::AddArrangementPlacement {
             result: Ok(publication),
@@ -8102,8 +8077,6 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::RemoveRoutingBus(Ok(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Ok(_))
         | ProjectMutationAttempt::RemoveAudioTrackContent(Ok(_))
-        | ProjectMutationAttempt::FreezeAudioTrack(Ok(_))
-        | ProjectMutationAttempt::UnfreezeAudioTrack(Ok(_))
         | ProjectMutationAttempt::ReorderMixerStrips(Ok(_))
         | ProjectMutationAttempt::DuplicateAudioTrack(Ok(_))
         | ProjectMutationAttempt::ImportAudio(
@@ -8159,7 +8132,9 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         {
             HistoryEffect::Invalidate
         }
-        ProjectMutationAttempt::EditNativeFilter { .. }
+        ProjectMutationAttempt::FreezeAudioTrack(Ok(_) | Err(_))
+        | ProjectMutationAttempt::UnfreezeAudioTrack(Ok(_) | Err(_))
+        | ProjectMutationAttempt::EditNativeFilter { .. }
         | ProjectMutationAttempt::SaveProjectAs(_)
         | ProjectMutationAttempt::RenameProject(_)
         | ProjectMutationAttempt::RemoveAutomationTake { .. }
@@ -8170,8 +8145,6 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::AddRoutingBus(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrackContent(Err(_))
-        | ProjectMutationAttempt::FreezeAudioTrack(Err(_))
-        | ProjectMutationAttempt::UnfreezeAudioTrack(Err(_))
         | ProjectMutationAttempt::ReorderMixerStrips(Err(_))
         | ProjectMutationAttempt::DuplicateAudioTrack(Err(_))
         | ProjectMutationAttempt::ImportAudio(Err(IdeAudioImportBatchFailure {
@@ -8221,6 +8194,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::DuplicateScene { result: Err(_), .. }
         | ProjectMutationAttempt::RenameScene { result: Err(_), .. }
         | ProjectMutationAttempt::SetSceneActive { result: Err(_), .. }
+        | ProjectMutationAttempt::RestoreResource { result: Ok(_), .. }
         | ProjectMutationAttempt::RestoreResource { result: Err(_), .. }
         | ProjectMutationAttempt::RemoveRoutingBus(Err(_)) => HistoryEffect::None,
     }
@@ -9474,6 +9448,71 @@ impl ProjectCopyAttempt {
     }
 }
 
+#[derive(Debug)]
+struct AudioTrackFreezePublicationWithHistory {
+    outcome: hyper_storage_engine::AudioTrackFreezePublicationOutcome,
+    authority: IdeTrackFreezeHistoryAuthority,
+}
+
+impl AudioTrackFreezePublicationWithHistory {
+    fn project_revision(&self) -> u64 {
+        self.outcome.project_revision()
+    }
+
+    fn track_id(&self) -> &str {
+        self.outcome.track_id()
+    }
+
+    fn authority(&self) -> &IdeTrackFreezeHistoryAuthority {
+        &self.authority
+    }
+
+    fn into_outcome(self) -> hyper_storage_engine::AudioTrackFreezePublicationOutcome {
+        self.outcome
+    }
+}
+
+#[derive(Debug)]
+struct AudioTrackUnfreezePublicationWithHistory {
+    outcome: hyper_storage_engine::AudioTrackUnfreezePublicationOutcome,
+    authority: IdeTrackFreezeHistoryAuthority,
+}
+
+impl AudioTrackUnfreezePublicationWithHistory {
+    fn project_revision(&self) -> u64 {
+        self.outcome.project_revision()
+    }
+
+    fn track_id(&self) -> &str {
+        self.outcome.track_id()
+    }
+
+    fn authority(&self) -> &IdeTrackFreezeHistoryAuthority {
+        &self.authority
+    }
+
+    fn into_outcome(self) -> hyper_storage_engine::AudioTrackUnfreezePublicationOutcome {
+        self.outcome
+    }
+}
+
+#[derive(Debug)]
+enum HistoryRestorePublication {
+    Resource(hyper_storage_engine::ProjectResourcePublicationOutcome),
+    TrackFreeze(hyper_storage_engine::AudioTrackFreezePublicationOutcome),
+    TrackUnfreeze(hyper_storage_engine::AudioTrackUnfreezePublicationOutcome),
+}
+
+impl HistoryRestorePublication {
+    fn project_revision(&self) -> u64 {
+        match self {
+            Self::Resource(outcome) => outcome.project_revision(),
+            Self::TrackFreeze(outcome) => outcome.project_revision(),
+            Self::TrackUnfreeze(outcome) => outcome.project_revision(),
+        }
+    }
+}
+
 enum ProjectMutationAttempt {
     Save(Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeProjectSaveError>),
     SaveProjectAs(ProjectCopyAttempt),
@@ -9506,14 +9545,9 @@ enum ProjectMutationAttempt {
             IdeAudioTrackContentRemovalError,
         >,
     ),
-    FreezeAudioTrack(
-        Result<hyper_storage_engine::AudioTrackFreezePublicationOutcome, IdeAudioTrackFreezeError>,
-    ),
+    FreezeAudioTrack(Result<AudioTrackFreezePublicationWithHistory, IdeAudioTrackFreezeError>),
     UnfreezeAudioTrack(
-        Result<
-            hyper_storage_engine::AudioTrackUnfreezePublicationOutcome,
-            IdeAudioTrackUnfreezeError,
-        >,
+        Result<AudioTrackUnfreezePublicationWithHistory, IdeAudioTrackUnfreezeError>,
     ),
     ReorderMixerStrips(
         Result<hyper_storage_engine::TrackOrderPublicationOutcome, IdeMixerStripReorderError>,
@@ -9770,10 +9804,7 @@ enum ProjectMutationAttempt {
         entry: UndoEntry,
         redo: bool,
         displaced: Option<UndoEntry>,
-        result: Result<
-            hyper_storage_engine::ProjectResourcePublicationOutcome,
-            IdeResourceRestoreError,
-        >,
+        result: Result<HistoryRestorePublication, IdeResourceRestoreError>,
     },
     DuplicateScene {
         name: String,
@@ -11714,7 +11745,14 @@ fn attempt_project_mutation(
                     recovery,
                     &track_id,
                 )
-                .and_then(|plan| plan.publish())
+                .and_then(|plan| {
+                    let authority = plan.history_authority().clone();
+                    plan.publish()
+                        .map(|outcome| AudioTrackFreezePublicationWithHistory {
+                            outcome,
+                            authority,
+                        })
+                })
             })
         }
         ProjectMutation::UnfreezeAudioTrack { track_id } => {
@@ -11726,7 +11764,14 @@ fn attempt_project_mutation(
                     recovery,
                     &track_id,
                 )
-                .and_then(|plan| plan.publish())
+                .and_then(|plan| {
+                    let authority = plan.history_authority().clone();
+                    plan.publish()
+                        .map(|outcome| AudioTrackUnfreezePublicationWithHistory {
+                            outcome,
+                            authority,
+                        })
+                })
             })
         }
         ProjectMutation::ReorderMixerStrips {
@@ -12273,7 +12318,10 @@ fn attempt_project_mutation(
                                 let displaced = plan.displaced().map(|operation| {
                                     UndoEntry::from_operation(operation, entry.label)
                                 });
-                                (displaced, plan.publish())
+                                (
+                                    displaced,
+                                    plan.publish().map(HistoryRestorePublication::Resource),
+                                )
                             }
                             Err(reason) => (None, Err(reason)),
                         }
@@ -12288,7 +12336,10 @@ fn attempt_project_mutation(
                             Ok(plan) => {
                                 let displaced =
                                     Some(UndoEntry::from_operation(plan.displaced(), entry.label));
-                                (displaced, plan.publish())
+                                (
+                                    displaced,
+                                    plan.publish().map(HistoryRestorePublication::Resource),
+                                )
                             }
                             Err(reason) => (None, Err(reason)),
                         }
@@ -12303,7 +12354,53 @@ fn attempt_project_mutation(
                             Ok(plan) => {
                                 let displaced =
                                     Some(UndoEntry::from_operation(plan.displaced(), entry.label));
-                                (displaced, plan.publish())
+                                (
+                                    displaced,
+                                    plan.publish().map(HistoryRestorePublication::Resource),
+                                )
+                            }
+                            Err(reason) => (None, Err(reason)),
+                        }
+                    }
+                    IdeHistoryOperation::AudioTrackUnfreeze { authority } => {
+                        match RunningDesktopIdeApplication::prepare_audio_track_unfreeze_history(
+                            application,
+                            recovery,
+                            authority,
+                        ) {
+                            Ok(plan) => {
+                                let displaced = Some(UndoEntry::from_operation(
+                                    IdeHistoryOperation::AudioTrackFreezeReactivation {
+                                        authority: authority.clone(),
+                                    },
+                                    entry.label,
+                                ));
+                                (
+                                    displaced,
+                                    plan.publish_for_history()
+                                        .map(HistoryRestorePublication::TrackUnfreeze),
+                                )
+                            }
+                            Err(reason) => (None, Err(reason)),
+                        }
+                    }
+                    IdeHistoryOperation::AudioTrackFreezeReactivation { authority } => {
+                        match RunningDesktopIdeApplication::prepare_audio_track_freeze_reactivation(
+                            application,
+                            recovery,
+                            authority,
+                        ) {
+                            Ok(plan) => {
+                                let displaced = Some(UndoEntry::from_operation(
+                                    IdeHistoryOperation::AudioTrackUnfreeze {
+                                        authority: authority.clone(),
+                                    },
+                                    entry.label,
+                                ));
+                                (
+                                    displaced,
+                                    plan.publish().map(HistoryRestorePublication::TrackFreeze),
+                                )
                             }
                             Err(reason) => (None, Err(reason)),
                         }
@@ -13254,7 +13351,7 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::FreezeAudioTrack(Ok(outcome)) => {
             IdeWorkerCommandFailure::AudioTrackFreeze(Box::new(
                 IdeAudioTrackFreezeError::ReopenAfterPublication {
-                    outcome,
+                    outcome: outcome.into_outcome(),
                     source: Box::new(reopen),
                 },
             ))
@@ -13286,7 +13383,7 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::UnfreezeAudioTrack(Ok(outcome)) => {
             IdeWorkerCommandFailure::AudioTrackUnfreeze(Box::new(
                 IdeAudioTrackUnfreezeError::ReopenAfterPublication {
-                    outcome,
+                    outcome: outcome.into_outcome(),
                     source: Box::new(reopen),
                 },
             ))
@@ -13651,8 +13748,14 @@ fn project_mutation_reopen_failure(
         }
         ProjectMutationAttempt::RestoreResource { result, .. } => {
             let reason = match result {
-                Ok(outcome) => IdeResourceRestoreError::ReopenAfterPublication {
-                    outcome: Box::new(outcome),
+                Ok(HistoryRestorePublication::Resource(outcome)) => {
+                    IdeResourceRestoreError::ReopenAfterPublication {
+                        outcome: Box::new(outcome),
+                        source: Box::new(reopen),
+                    }
+                }
+                Ok(outcome) => IdeResourceRestoreError::ReopenAfterStructuralPublication {
+                    project_revision: outcome.project_revision(),
                     source: Box::new(reopen),
                 },
                 Err(IdeResourceRestoreError::NativeClose(close)) => {
@@ -17767,7 +17870,7 @@ mod tests {
         while freeze_revision.is_none() || !frozen_reopened {
             match recv_native_mutation(&worker) {
                 IdeWorkerEvent::UndoStateChanged {
-                    undo_label: None,
+                    undo_label: Some("track freeze"),
                     redo_label: None,
                 } => {}
                 IdeWorkerEvent::Running(snapshot) => {
@@ -17790,6 +17893,166 @@ mod tests {
         }
         assert_eq!(freeze_revision, Some(5));
 
+        let frozen = verify_project_package(&project).unwrap();
+        let frozen_track = frozen.read_resource(&track_id).unwrap();
+        let frozen_clip_descriptor = frozen
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.role() == hyper_project_model::ResourceRole::Clip)
+            .expect("the frozen project has one rendered clip");
+        let frozen_clip_id = frozen_clip_descriptor.id().to_owned();
+        let frozen_clip = frozen.read_resource(&frozen_clip_id).unwrap();
+        let freeze_state_descriptor = frozen
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.role() == hyper_project_model::ResourceRole::FreezeState)
+            .expect("the frozen project retains one exact freeze state");
+        let freeze_state_id = freeze_state_descriptor.id().to_owned();
+        let freeze_state = frozen.read_resource(&freeze_state_id).unwrap();
+        let frozen_arrangement_descriptor = frozen
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.role() == hyper_project_model::ResourceRole::Arrangement)
+            .expect("the frozen project has one arrangement");
+        let frozen_arrangement_id = frozen_arrangement_descriptor.id().to_owned();
+        let frozen_arrangement = frozen.read_resource(&frozen_arrangement_id).unwrap();
+        let frozen_asset_id =
+            serde_json::from_slice::<serde_json::Value>(&freeze_state).unwrap()["frozen_asset_id"]
+                .as_str()
+                .expect("the retained state names its rendered asset")
+                .to_owned();
+        let frozen_asset = frozen
+            .manifest()
+            .assets()
+            .iter()
+            .find(|asset| asset.id() == frozen_asset_id)
+            .expect("the rendered asset remains manifest declared");
+        let frozen_asset_sha256 = frozen_asset.sha256().to_owned();
+        let frozen_asset_byte_length = frozen_asset.byte_length();
+        drop(frozen);
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "track freeze",
+            }
+        ));
+        let mut undo_revision = None;
+        let mut undo_reopened = false;
+        let mut undo_history = false;
+        while undo_revision.is_none() || !undo_reopened || !undo_history {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: Some("native device"),
+                    redo_label: Some("track freeze"),
+                } => undo_history = true,
+                IdeWorkerEvent::Running(snapshot) => {
+                    undo_reopened = snapshot.audio_clips().len() == 1
+                        && snapshot.audio_clips()[0].id() == imported_clip_id
+                        && snapshot
+                            .mixer_channels()
+                            .iter()
+                            .any(|channel| channel.id() == track_id && !channel.frozen());
+                }
+                IdeWorkerEvent::EditRestored {
+                    revision,
+                    redo: false,
+                    label: "track freeze",
+                } => undo_revision = Some(revision),
+                event => {
+                    panic!("track-freeze undo emitted an unexpected lifecycle event: {event:?}")
+                }
+            }
+        }
+        assert_eq!(undo_revision, Some(6));
+        let unfrozen = verify_project_package(&project).unwrap();
+        assert_eq!(unfrozen.manifest().revision(), 6);
+        assert!(
+            unfrozen
+                .manifest()
+                .resources()
+                .iter()
+                .all(|resource| resource.id() != frozen_clip_id && resource.id() != freeze_state_id),
+            "undo removes only the active frozen clip and its freeze-state resource"
+        );
+        assert!(matches!(
+            unfrozen
+                .manifest()
+                .assets()
+                .iter()
+                .find(|asset| asset.id() == frozen_asset_id.as_str()),
+            Some(asset) if asset.sha256() == frozen_asset_sha256
+                && asset.byte_length() == frozen_asset_byte_length
+        ));
+        drop(unfrozen);
+
+        worker.try_send(IdeWorkerCommand::Redo).unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: true,
+                label: "track freeze",
+            }
+        ));
+        let mut redo_revision = None;
+        let mut redo_reopened = false;
+        let mut redo_history = false;
+        while redo_revision.is_none() || !redo_reopened || !redo_history {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: Some("track freeze"),
+                    redo_label: None,
+                } => redo_history = true,
+                IdeWorkerEvent::Running(snapshot) => {
+                    redo_reopened = snapshot.audio_clips().len() == 1
+                        && snapshot.audio_clips()[0].id() == frozen_clip_id
+                        && snapshot
+                            .mixer_channels()
+                            .iter()
+                            .any(|channel| channel.id() == track_id && channel.frozen());
+                }
+                IdeWorkerEvent::EditRestored {
+                    revision,
+                    redo: true,
+                    label: "track freeze",
+                } => redo_revision = Some(revision),
+                event => {
+                    panic!("track-freeze redo emitted an unexpected lifecycle event: {event:?}")
+                }
+            }
+        }
+        assert_eq!(redo_revision, Some(7));
+        let reactivated = verify_project_package(&project).unwrap();
+        assert_eq!(reactivated.manifest().revision(), 7);
+        assert_eq!(reactivated.read_resource(&track_id).unwrap(), frozen_track);
+        assert_eq!(
+            reactivated.read_resource(&frozen_clip_id).unwrap(),
+            frozen_clip
+        );
+        assert_eq!(
+            reactivated.read_resource(&freeze_state_id).unwrap(),
+            freeze_state
+        );
+        assert_eq!(
+            reactivated.read_resource(&frozen_arrangement_id).unwrap(),
+            frozen_arrangement
+        );
+        assert!(matches!(
+            reactivated
+                .manifest()
+                .assets()
+                .iter()
+                .find(|asset| asset.id() == frozen_asset_id.as_str()),
+            Some(asset) if asset.sha256() == frozen_asset_sha256
+                && asset.byte_length() == frozen_asset_byte_length
+        ));
+        drop(reactivated);
+
         worker
             .try_send(IdeWorkerCommand::UnfreezeAudioTrack {
                 track_id: track_id.clone(),
@@ -17804,7 +18067,7 @@ mod tests {
         while unfreeze_revision.is_none() || !unfrozen_reopened {
             match recv_native_mutation(&worker) {
                 IdeWorkerEvent::UndoStateChanged {
-                    undo_label: None,
+                    undo_label: Some("track unfreeze"),
                     redo_label: None,
                 } => {}
                 IdeWorkerEvent::Running(snapshot) => {
@@ -17825,10 +18088,10 @@ mod tests {
                 event => panic!("track unfreeze emitted an unexpected lifecycle event: {event:?}"),
             }
         }
-        assert_eq!(unfreeze_revision, Some(6));
+        assert_eq!(unfreeze_revision, Some(8));
 
         let package = verify_project_package(&project).unwrap();
-        assert_eq!(package.manifest().revision(), 6);
+        assert_eq!(package.manifest().revision(), 8);
         assert!(
             package
                 .manifest()
@@ -23379,12 +23642,13 @@ mod tests {
     }
 
     fn labelled(id: &str, label: &'static str) -> UndoEntry {
-        UndoEntry {
-            resource_id: id.to_owned(),
-            bytes: id.as_bytes().to_vec(),
-            kind: UndoEntryKind::ResourceReplacement,
+        UndoEntry::from_operation(
+            IdeHistoryOperation::ResourceReplacement {
+                resource_id: id.to_owned(),
+                bytes: id.as_bytes().to_vec(),
+            },
             label,
-        }
+        )
     }
 
     fn entry(id: &str) -> UndoEntry {
@@ -23399,14 +23663,14 @@ mod tests {
         }
         assert_eq!(history.undo.len(), MAX_UNDO_DEPTH, "depth is bounded");
         assert_eq!(
-            history.undo.first().unwrap().resource_id,
+            history.undo.first().unwrap().resource_id(),
             "edit-5",
             "the oldest entries are dropped first"
         );
 
         let peeked = history.peek(false).unwrap().clone();
         assert_eq!(
-            peeked.resource_id,
+            peeked.resource_id(),
             format!("edit-{}", MAX_UNDO_DEPTH + 4),
             "undo targets the newest entry"
         );
@@ -23523,8 +23787,8 @@ mod tests {
             &events,
         );
         assert_eq!(history.undo.len(), 1, "a changed replacement is captured");
-        assert_eq!(&history.undo[0].resource_id, mixer_id);
-        assert_eq!(&history.undo[0].bytes, original);
+        assert_eq!(history.undo[0].resource_id(), mixer_id);
+        assert_eq!(history.undo[0].bytes(), original);
         assert_eq!(history.undo[0].label, "mixer save");
         assert!(matches!(
             receiver.try_recv(),
@@ -23547,7 +23811,7 @@ mod tests {
                     },
                     entry.label,
                 )),
-                result: Ok(outcome.clone()),
+                result: Ok(HistoryRestorePublication::Resource(outcome.clone())),
             },
             IdeWorkerCommandKind::Undo,
             &events,
@@ -23562,10 +23826,11 @@ mod tests {
             "an undo's own previous bytes become the redo entry"
         );
         assert_eq!(
-            &history.redo[0].resource_id, mixer_id,
+            history.redo[0].resource_id(),
+            mixer_id,
             "aimed at the same resource, so the redo can actually be applied"
         );
-        assert_eq!(&history.redo[0].bytes, original);
+        assert_eq!(history.redo[0].bytes(), original);
         assert_eq!(history.redo[0].label, "mixer save");
     }
 
@@ -23780,7 +24045,7 @@ mod tests {
             1,
             "and the entry survives so the user can retry"
         );
-        assert_eq!(history.peek(false).unwrap().resource_id, "scene");
+        assert_eq!(history.peek(false).unwrap().resource_id(), "scene");
     }
 
     #[test]
@@ -24063,7 +24328,7 @@ mod tests {
             &events,
         );
         assert_eq!(history.undo.len(), 1, "and reaches the history");
-        assert_eq!(history.undo[0].bytes, edit.original);
+        assert_eq!(history.undo[0].bytes(), edit.original);
         assert_eq!(history.undo[0].label, "placement");
         assert!(receiver.try_recv().is_ok());
     }
@@ -24469,7 +24734,7 @@ mod tests {
             history.record_edit(entry(&format!("edit-{index}")));
         }
         assert_eq!(history.undo.len(), 20);
-        assert_eq!(history.undo.first().unwrap().resource_id, "edit-5");
+        assert_eq!(history.undo.first().unwrap().resource_id(), "edit-5");
 
         let mut redo_side = UndoHistory::default();
         for index in 0..25 {
@@ -24480,7 +24745,7 @@ mod tests {
             20,
             "the bound holds on the redo stack too"
         );
-        assert_eq!(redo_side.redo.first().unwrap().resource_id, "undone-5");
+        assert_eq!(redo_side.redo.first().unwrap().resource_id(), "undone-5");
     }
 
     #[test]
@@ -24494,9 +24759,9 @@ mod tests {
         );
 
         history.record_restore(false, labelled("displaced", "scene rename"));
-        assert_eq!(history.peek(false).unwrap().resource_id, "edited");
+        assert_eq!(history.peek(false).unwrap().resource_id(), "edited");
         assert_eq!(
-            history.peek(true).unwrap().resource_id,
+            history.peek(true).unwrap().resource_id(),
             "displaced",
             "redo reads the redo stack, not the undo stack"
         );
@@ -24511,7 +24776,7 @@ mod tests {
             2,
             "and feeds the undo stack with what it displaced"
         );
-        assert_eq!(history.peek(false).unwrap().resource_id, "back");
+        assert_eq!(history.peek(false).unwrap().resource_id(), "back");
     }
 
     #[test]
@@ -24566,7 +24831,7 @@ mod tests {
             }
         ));
         assert_eq!(
-            history.peek(false).unwrap().resource_id,
+            history.peek(false).unwrap().resource_id(),
             "older",
             "the entry behind it becomes reachable"
         );
@@ -24627,8 +24892,8 @@ mod tests {
             "history was completed before authoritative reopen"
         );
         assert_eq!(
-            history.redo.last().unwrap().resource_id,
-            displaced.resource_id
+            history.redo.last().unwrap().resource_id(),
+            displaced.resource_id()
         );
     }
 

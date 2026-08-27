@@ -23,7 +23,9 @@ use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 use hyper_audio_source::{AudioContainer, DecodeLimits, decode_bytes};
 use hyper_fs_authority::{identity, rename_no_replace};
-use hyper_playback_json::{AudioTrackFreezeDocuments, AudioTrackUnfreezeDocuments};
+use hyper_playback_json::{
+    AudioTrackFreezeDocuments, AudioTrackFreezeReactivationDocuments, AudioTrackUnfreezeDocuments,
+};
 use hyper_project_model::{
     AssetRole, AudioMediaType, ProjectManifest, ResourceRole, is_valid_entity_id,
 };
@@ -41,6 +43,8 @@ use super::same_directory;
 
 const FORMAT: &str = "hyper-audio-track-freeze-transaction";
 const INTENT_FORMAT: &str = "hyper-audio-track-freeze-intent";
+const REACTIVATION_FORMAT: &str = "hyper-audio-track-freeze-reactivation-transaction";
+const REACTIVATION_INTENT_FORMAT: &str = "hyper-audio-track-freeze-reactivation-intent";
 const UNFREEZE_FORMAT: &str = "hyper-audio-track-unfreeze-transaction";
 const UNFREEZE_INTENT_FORMAT: &str = "hyper-audio-track-unfreeze-intent";
 const VERSION: u8 = 1;
@@ -68,6 +72,19 @@ pub struct AudioTrackFreezePublicationOutcome {
 pub struct AudioTrackUnfreezePublicationRequest<'a> {
     pub expected_project_sha256: [u8; 32],
     pub documents: &'a AudioTrackUnfreezeDocuments,
+}
+
+/// The exact retained artifact and document delta required to reactivate a
+/// prior freeze without rendering a new sample.
+///
+/// The asset digest and length are captured in the session history entry and
+/// are compared with the still-manifest-declared sample before publication.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioTrackFreezeReactivationPublicationRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub documents: &'a AudioTrackFreezeReactivationDocuments,
+    pub frozen_asset_sha256: &'a str,
+    pub frozen_asset_byte_length: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +190,7 @@ enum PublicationPhase {
 enum TransactionOperation {
     #[default]
     Freeze,
+    Reactivate,
     Unfreeze,
 }
 
@@ -259,6 +277,20 @@ pub fn publish_audio_track_freeze(
     request: AudioTrackFreezePublicationRequest<'_>,
 ) -> Result<AudioTrackFreezePublicationOutcome, ProjectResourcePublicationError> {
     publish_observed(project_path.as_ref(), request, |_, _| Ok(()))
+}
+
+/// Reactivates one exact previously rendered freeze as a recoverable,
+/// manifest-last transaction without writing any audio sample bytes.
+///
+/// # Errors
+///
+/// Refuses a stale project, a changed retained asset, diverged source clips or
+/// placements, resource collisions, and all ambiguous recovery states.
+pub fn publish_audio_track_freeze_reactivation(
+    project_path: impl AsRef<Path>,
+    request: AudioTrackFreezeReactivationPublicationRequest<'_>,
+) -> Result<AudioTrackFreezePublicationOutcome, ProjectResourcePublicationError> {
+    publish_reactivation_observed(project_path.as_ref(), request, |_, _| Ok(()))
 }
 
 /// Recovers interrupted frozen-track publications without accepting an
@@ -561,6 +593,113 @@ fn publish_unfreeze_observed(
 
 #[allow(
     clippy::too_many_lines,
+    reason = "exact artifact reactivation keeps retained authority, staged replacements, and its manifest commit visible together"
+)]
+fn publish_reactivation_observed(
+    project_path: &Path,
+    request: AudioTrackFreezeReactivationPublicationRequest<'_>,
+    mut observer: impl FnMut(PublicationPhase, &Path) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<AudioTrackFreezePublicationOutcome, ProjectResourcePublicationError> {
+    let verified = verify_project_package(project_path).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "project verification failed before track-freeze reactivation",
+            error,
+        )
+    })?;
+    if request.expected_project_sha256 != *verified.manifest_sha256() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "project changed after track-freeze reactivation preparation",
+        ));
+    }
+    let (entries, state) = resolve_reactivation_entries(&verified, request)?;
+    let authorities = resource_authorities(&verified.root_dir, &entries)?;
+    let backups = open_or_create_dir(&verified.root_dir, "backups")?;
+    let _lock = ProjectLock::acquire(&backups).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::TransactionUnavailable,
+            "acquire project storage transaction lock",
+            error,
+        )
+    })?;
+    let recovered = recover_locked(verified.root(), &verified.root_dir, &backups)?;
+    if !recovered.is_empty() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "a prior track freeze was recovered; reopen the current project revision",
+        ));
+    }
+    reject_other_transactions(&backups, ProjectTransactionFamily::AudioTrackFreeze)?;
+    verified.confirm_unchanged().map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "project changed before track-freeze reactivation staging",
+            error,
+        )
+    })?;
+    let previous_project = read_bounded(&verified.root_dir, MANIFEST_NAME, MAX_JSON_BYTES)?;
+    if digest(&previous_project) != request.expected_project_sha256 {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "active project identity changed before track-freeze reactivation staging",
+        ));
+    }
+    let next_revision = verified
+        .manifest()
+        .revision()
+        .checked_add(1)
+        .filter(|revision| *revision <= MAX_SAFE_INTEGER)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "project revision cannot be incremented",
+            )
+        })?;
+    let candidate_project =
+        candidate_reactivation_manifest(&previous_project, &entries, next_revision)?;
+    let name = format!("{AUDIO_TRACK_FREEZE_TRANSACTION_PREFIX}{}", Uuid::new_v4());
+    backups.create_dir(&name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "create track-freeze reactivation transaction",
+            error,
+        )
+    })?;
+    sync_dir(&backups)?;
+    let transaction = backups.open_dir_nofollow(&name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "open track-freeze reactivation transaction",
+            error,
+        )
+    })?;
+    let result = run_reactivation_publication(
+        &verified,
+        &backups,
+        &transaction,
+        &name,
+        &entries,
+        &authorities,
+        &state,
+        request.documents,
+        &previous_project,
+        &candidate_project,
+        next_revision,
+        &mut observer,
+    );
+    finish_result(
+        verified.root(),
+        &verified.root_dir,
+        &backups,
+        transaction,
+        &name,
+        result,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
     reason = "freeze source, rendered replacement, and retained unfreeze authority are validated as one graph"
 )]
 fn resolve_entries<'a>(
@@ -650,7 +789,13 @@ fn resolve_entries<'a>(
     let track_before = current_resource(verified, state.track_id(), ResourceRole::Track)?;
     let arrangement_before =
         current_resource(verified, state.arrangement_id(), ResourceRole::Arrangement)?;
-    validate_freeze_document_delta(&state, documents, &track_before.1, &arrangement_before.1)?;
+    validate_freeze_document_delta(
+        &state,
+        documents.track(),
+        documents.arrangement(),
+        &track_before.1,
+        &arrangement_before.1,
+    )?;
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(4 + state.original_clips().len())
@@ -864,6 +1009,213 @@ fn resolve_unfreeze_entries<'a>(
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
             "track-unfreeze resource identities are not unique",
+        ));
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((entries, state))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "reactivation proves the retained rendered artifact, source graph, and manifest asset before staging one inverse structural transaction"
+)]
+fn resolve_reactivation_entries<'a>(
+    verified: &StructurallyVerifiedProject,
+    request: AudioTrackFreezeReactivationPublicationRequest<'a>,
+) -> Result<(Vec<Entry<'a>>, TrackFreezeState), ProjectResourcePublicationError> {
+    let documents = request.documents;
+    validate_canonical_resource(documents.track())?;
+    validate_canonical_resource(documents.clip())?;
+    validate_canonical_resource(documents.arrangement())?;
+    validate_canonical_resource(documents.freeze_state())?;
+    let state = TrackFreezeState::parse(documents.freeze_state()).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse track-freeze reactivation state",
+            error,
+        )
+    })?;
+    if state.id() != documents.freeze_state_id()
+        || state.project_id() != verified.manifest().project_id()
+        || state.frozen_clip_id() != documents.frozen_clip_id()
+        || state.frozen_asset_id() != documents.frozen_asset_id()
+        || !state.has_complete_rendered_authority()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-freeze reactivation state does not match its publication documents",
+        ));
+    }
+    if request.frozen_asset_byte_length == 0 || decode_digest(request.frozen_asset_sha256).is_err()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-freeze reactivation retained asset authority is invalid",
+        ));
+    }
+    let asset = verified
+        .manifest()
+        .assets()
+        .iter()
+        .find(|asset| asset.id() == state.frozen_asset_id())
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "track-freeze reactivation rendered asset is absent from the active project",
+            )
+        })?;
+    if asset.role() != AssetRole::Sample
+        || asset.media_type() != AudioMediaType::AudioWav
+        || asset.path() != format!("assets/samples/{}.wav", state.frozen_asset_id())
+        || asset.sha256() != request.frozen_asset_sha256
+        || asset.byte_length() != request.frozen_asset_byte_length
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "track-freeze reactivation rendered asset differs from retained authority",
+        ));
+    }
+    if let Some(chain_id) = state.device_chain_id() {
+        let descriptor = verified
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| {
+                descriptor.id() == chain_id && descriptor.role() == ResourceRole::DeviceChain
+            })
+            .ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::InvalidResource,
+                    "track-freeze reactivation state references a missing device chain",
+                )
+            })?;
+        if state.device_chain_sha256() != Some(descriptor.sha256()) {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::ProjectChanged,
+                "track-freeze reactivation device-chain authority differs from the active project",
+            ));
+        }
+    }
+    let frozen_state_clip = serde_json_canonicalizer::to_vec(state.frozen_clip().document())
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "serialize retained reactivated clip",
+                error,
+            )
+        })?;
+    if frozen_state_clip != documents.clip() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-freeze reactivation state does not retain the rendered clip exactly",
+        ));
+    }
+    validate_document(documents.track(), state.track_id(), ResourceRole::Track)?;
+    validate_document(
+        documents.clip(),
+        documents.frozen_clip_id(),
+        ResourceRole::Clip,
+    )?;
+    validate_document(
+        documents.arrangement(),
+        state.arrangement_id(),
+        ResourceRole::Arrangement,
+    )?;
+    validate_freeze_state_document(documents.freeze_state(), state.id())?;
+    let track_before = current_resource(verified, state.track_id(), ResourceRole::Track)?;
+    let arrangement_before =
+        current_resource(verified, state.arrangement_id(), ResourceRole::Arrangement)?;
+    validate_freeze_document_delta(
+        &state,
+        documents.track(),
+        documents.arrangement(),
+        &track_before.1,
+        &arrangement_before.1,
+    )?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(4 + state.original_clips().len())
+        .map_err(|_| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "allocate track-freeze reactivation resource entries",
+            )
+        })?;
+    entries.push(Entry {
+        id: state.track_id().to_owned(),
+        role: ResourceRole::Track,
+        path: track_before.0,
+        before: Some(track_before.1),
+        after: Some(documents.track()),
+        created_parent_directory: false,
+    });
+    entries.push(Entry {
+        id: state.arrangement_id().to_owned(),
+        role: ResourceRole::Arrangement,
+        path: arrangement_before.0,
+        before: Some(arrangement_before.1),
+        after: Some(documents.arrangement()),
+        created_parent_directory: false,
+    });
+    for clip in state.original_clips() {
+        let (path, bytes) = current_resource(verified, clip.id(), ResourceRole::Clip)?;
+        let retained = serde_json_canonicalizer::to_vec(clip.document()).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "serialize retained reactivation source clip",
+                error,
+            )
+        })?;
+        if bytes != retained {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::ProjectChanged,
+                "reactivation source clip differs from retained track-freeze authority",
+            ));
+        }
+        entries.push(Entry {
+            id: clip.id().to_owned(),
+            role: ResourceRole::Clip,
+            path,
+            before: Some(bytes),
+            after: None,
+            created_parent_directory: false,
+        });
+    }
+    let frozen_clip_path =
+        fresh_resource_path(verified, ResourceRole::Clip, documents.frozen_clip_id())?;
+    entries.push(Entry {
+        id: documents.frozen_clip_id().to_owned(),
+        role: ResourceRole::Clip,
+        path: frozen_clip_path,
+        before: None,
+        after: Some(documents.clip()),
+        created_parent_directory: false,
+    });
+    let (freeze_state_path, created_parent_directory) =
+        fresh_freeze_state_path(verified, documents.freeze_state_id())?;
+    entries.push(Entry {
+        id: documents.freeze_state_id().to_owned(),
+        role: ResourceRole::FreezeState,
+        path: freeze_state_path,
+        before: None,
+        after: Some(documents.freeze_state()),
+        created_parent_directory,
+    });
+    if entries.len() > MAX_ENTRIES {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "track-freeze reactivation resource count exceeds package limits",
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    if entries
+        .iter()
+        .any(|entry| !ids.insert(entry.id.as_str()) || !paths.insert(entry.path.as_str()))
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-freeze reactivation resource identities are not unique",
         ));
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1275,11 +1627,12 @@ fn validate_rendered_sample(
 
 fn validate_freeze_document_delta(
     state: &TrackFreezeState,
-    documents: &AudioTrackFreezeDocuments,
+    track_bytes: &[u8],
+    arrangement_bytes: &[u8],
     previous_track: &[u8],
     previous_arrangement: &[u8],
 ) -> Result<(), ProjectResourcePublicationError> {
-    let track: Value = serde_json::from_slice(documents.track()).map_err(|error| {
+    let track: Value = serde_json::from_slice(track_bytes).map_err(|error| {
         caused(
             ProjectResourcePublicationErrorKind::InvalidResource,
             "parse candidate frozen track",
@@ -1293,7 +1646,7 @@ fn validate_freeze_document_delta(
             error,
         )
     })?;
-    let arrangement: Value = serde_json::from_slice(documents.arrangement()).map_err(|error| {
+    let arrangement: Value = serde_json::from_slice(arrangement_bytes).map_err(|error| {
         caused(
             ProjectResourcePublicationErrorKind::InvalidResource,
             "parse candidate frozen arrangement",
@@ -1769,6 +2122,17 @@ fn candidate_unfreeze_manifest(
     Ok(bytes)
 }
 
+/// Applies a resource-only manifest delta while retaining every current asset
+/// declaration. Exact freeze reactivation reuses its already-verified rendered
+/// sample rather than staging a new one.
+fn candidate_reactivation_manifest(
+    active: &[u8],
+    entries: &[Entry<'_>],
+    revision: u64,
+) -> Result<Vec<u8>, ProjectResourcePublicationError> {
+    candidate_unfreeze_manifest(active, entries, revision)
+}
+
 const fn resource_format(role: ResourceRole) -> &'static str {
     match role {
         ResourceRole::Track => "hyper-track",
@@ -2098,6 +2462,114 @@ fn run_unfreeze_publication(
     unfreeze_outcome(&tx)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "exact reactivation stages the old source retirement and retained artifact restoration under one manifest-last transaction"
+)]
+fn run_reactivation_publication(
+    verified: &StructurallyVerifiedProject,
+    backups: &Dir,
+    transaction: &Dir,
+    name: &str,
+    entries: &[Entry<'_>],
+    authorities: &BTreeMap<String, Handle>,
+    state: &TrackFreezeState,
+    documents: &AudioTrackFreezeReactivationDocuments,
+    previous_project: &[u8],
+    candidate_project: &[u8],
+    next_revision: u64,
+    observer: &mut impl FnMut(PublicationPhase, &Path) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<AudioTrackFreezePublicationOutcome, ProjectResourcePublicationError> {
+    write_reactivation_intent(transaction, name, entries.len())?;
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(before) = &entry.before {
+            write_exclusive_synced(transaction, &previous_name(index), before)?;
+        }
+        if let Some(after) = entry.after {
+            write_exclusive_synced(transaction, &staged_name(index), after)?;
+        }
+    }
+    write_exclusive_synced(transaction, PROJECT_STAGING_NAME, candidate_project)?;
+    write_exclusive_synced(transaction, PREVIOUS_PROJECT_NAME, previous_project)?;
+    let tx = reactivation_transaction_record(
+        name,
+        entries,
+        state,
+        documents,
+        verified,
+        candidate_project,
+        next_revision,
+    )?;
+    let bytes = serde_json_canonicalizer::to_vec(&tx).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "serialize track-freeze reactivation transaction",
+            error,
+        )
+    })?;
+    write_exclusive_synced(transaction, TRANSACTION_NAME, &bytes)?;
+    sync_dir(transaction)?;
+    sync_dir(backups)?;
+    observer(PublicationPhase::Transaction, verified.root())?;
+    for (index, entry) in tx.entries.iter().enumerate() {
+        if let Some(before) = &entry.before {
+            let authority = authorities.get(&entry.path).ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "track-freeze reactivation source authority disappeared before publication",
+                )
+            })?;
+            move_verified_resource(&verified.root_dir, transaction, entry, before, authority)?;
+            observer(PublicationPhase::SourceMoved(index), verified.root())?;
+        }
+        if entry.after.is_some() {
+            let parent = prepare_parent(&verified.root_dir, entry)?;
+            publish_staged_file_no_replace(
+                transaction,
+                &staged_name(index),
+                &parent,
+                file_name(&entry.path)?,
+                &format!(".track-freeze-reactivation-{index}-{}.json", tx.id),
+                "track-freeze reactivation resource",
+            )?;
+            observer(PublicationPhase::ResourcePublished(index), verified.root())?;
+        }
+    }
+    let candidate =
+        verify_project_candidate(verified.root(), &verified.root_dir, candidate_project).map_err(
+            |error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "track-freeze reactivation candidate does not verify",
+                    error,
+                )
+            },
+        )?;
+    if candidate.revision() != next_revision {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "track-freeze reactivation candidate revision changed",
+        ));
+    }
+    publish_staged_file(
+        transaction,
+        PROJECT_STAGING_NAME,
+        backups,
+        &verified.root_dir,
+        MANIFEST_NAME,
+        &format!(".track-freeze-reactivation-project-{}.json", tx.id),
+        "track-freeze reactivation project manifest",
+    )?;
+    observer(PublicationPhase::Manifest, verified.root())?;
+    verify_committed(
+        verified.root(),
+        &verified.root_dir,
+        digest(candidate_project),
+    )?;
+    outcome(&tx)
+}
+
 fn unfreeze_transaction_record(
     name: &str,
     entries: &[Entry<'_>],
@@ -2144,6 +2616,55 @@ fn unfreeze_transaction_record(
         operation: TransactionOperation::Unfreeze,
         removed_directories,
         entries: transaction_entries,
+        extensions: serde_json::Map::new(),
+    })
+}
+
+fn reactivation_transaction_record(
+    name: &str,
+    entries: &[Entry<'_>],
+    state: &TrackFreezeState,
+    documents: &AudioTrackFreezeReactivationDocuments,
+    verified: &StructurallyVerifiedProject,
+    candidate_project: &[u8],
+    revision: u64,
+) -> Result<Transaction, ProjectResourcePublicationError> {
+    let entries = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| TransactionEntry {
+            id: entry.id.clone(),
+            role: role_name(entry.role).to_owned(),
+            path: entry.path.clone(),
+            before: entry
+                .before
+                .as_deref()
+                .map(|bytes| transaction_file(&entry.path, bytes)),
+            after: entry
+                .after
+                .map(|bytes| transaction_file(&entry.path, bytes)),
+            backup_name: entry.before.as_ref().map(|_| backup_name(index)),
+            created_parent_directory: entry.created_parent_directory,
+        })
+        .collect::<Vec<_>>();
+    Ok(Transaction {
+        format: REACTIVATION_FORMAT.to_owned(),
+        format_version: VERSION,
+        id: transaction_id(name)?,
+        before_project_sha256: hex_digest(*verified.manifest_sha256()),
+        after_project_sha256: hex_digest(digest(candidate_project)),
+        before_project_revision: verified.manifest().revision(),
+        after_project_revision: revision,
+        track_id: state.track_id().to_owned(),
+        frozen_clip_id: documents.frozen_clip_id().to_owned(),
+        frozen_asset_id: documents.frozen_asset_id().to_owned(),
+        freeze_state_id: documents.freeze_state_id().to_owned(),
+        rendered_sample: None,
+        created_assets_directory: false,
+        created_samples_directory: false,
+        operation: TransactionOperation::Reactivate,
+        removed_directories: Vec::new(),
+        entries,
         extensions: serde_json::Map::new(),
     })
 }
@@ -2459,6 +2980,38 @@ fn write_unfreeze_intent(
     sync_dir(transaction)
 }
 
+fn write_reactivation_intent(
+    transaction: &Dir,
+    name: &str,
+    entry_count: usize,
+) -> Result<(), ProjectResourcePublicationError> {
+    let intent = Intent {
+        format: REACTIVATION_INTENT_FORMAT.to_owned(),
+        format_version: VERSION,
+        id: transaction_id(name)?,
+        entry_count,
+        extensions: serde_json::Map::new(),
+    };
+    let bytes = serde_json_canonicalizer::to_vec(&intent).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "serialize track-freeze reactivation transaction intent",
+            error,
+        )
+    })?;
+    write_exclusive_synced(transaction, INTENT_STAGING_NAME, &bytes)?;
+    transaction
+        .rename(INTENT_STAGING_NAME, transaction, INTENT_NAME)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "publish track-freeze reactivation transaction intent",
+                error,
+            )
+        })?;
+    sync_dir(transaction)
+}
+
 fn transaction_id(name: &str) -> Result<String, ProjectResourcePublicationError> {
     let id = name
         .strip_prefix(AUDIO_TRACK_FREEZE_TRANSACTION_PREFIX)
@@ -2648,7 +3201,10 @@ fn recover_locked(
             }
             Err(error) => return Err(error),
         };
-        if tx.operation != TransactionOperation::Freeze {
+        if !matches!(
+            tx.operation,
+            TransactionOperation::Freeze | TransactionOperation::Reactivate
+        ) {
             return Err(failure(
                 ProjectResourcePublicationErrorKind::Recovery,
                 "track-freeze journal has the wrong operation",
@@ -2974,8 +3530,14 @@ fn validate_staged_transaction(
     transaction: &Dir,
     tx: &Transaction,
 ) -> Result<(), ProjectResourcePublicationError> {
-    if tx.operation == TransactionOperation::Unfreeze {
-        return validate_unfreeze_staged_transaction(transaction, tx);
+    match tx.operation {
+        TransactionOperation::Unfreeze => {
+            return validate_unfreeze_staged_transaction(transaction, tx);
+        }
+        TransactionOperation::Reactivate => {
+            return validate_reactivation_staged_transaction(transaction, tx);
+        }
+        TransactionOperation::Freeze => {}
     }
     let rendered_sample = tx.rendered_sample.as_ref().ok_or_else(|| {
         failure(
@@ -3293,6 +3855,321 @@ fn validate_entry_document(
         ResourceRole::FreezeState => validate_freeze_state_document(bytes, id),
         _ => validate_document(bytes, id, role),
     }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "reactivation recovery authenticates the retained artifact, every retired source, and each restored resource before changing active paths"
+)]
+fn validate_reactivation_staged_transaction(
+    transaction: &Dir,
+    tx: &Transaction,
+) -> Result<(), ProjectResourcePublicationError> {
+    let previous = read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?;
+    let candidate = read_bounded(transaction, PROJECT_STAGING_NAME, MAX_JSON_BYTES)?;
+    if digest(&previous) != decode_digest(&tx.before_project_sha256)?
+        || digest(&candidate) != decode_digest(&tx.after_project_sha256)?
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-freeze reactivation staged project identity changed",
+        ));
+    }
+    let previous_manifest = ProjectManifest::parse(&previous).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "staged previous track-freeze reactivation project is invalid",
+            error,
+        )
+    })?;
+    let candidate_manifest = ProjectManifest::parse(&candidate).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "staged candidate track-freeze reactivation project is invalid",
+            error,
+        )
+    })?;
+    if previous_manifest.project_id() != candidate_manifest.project_id()
+        || previous_manifest.revision() != tx.before_project_revision
+        || candidate_manifest.revision() != tx.after_project_revision
+        || tx.before_project_revision.checked_add(1) != Some(tx.after_project_revision)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-freeze reactivation staged project revisions are inconsistent",
+        ));
+    }
+    let intent_bytes = read_bounded(transaction, INTENT_NAME, MAX_JSON_BYTES)?;
+    require_canonical(
+        &intent_bytes,
+        "track-freeze reactivation transaction intent",
+    )?;
+    let intent: Intent = serde_json::from_slice(&intent_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "parse track-freeze reactivation transaction intent",
+            error,
+        )
+    })?;
+    if intent.format != REACTIVATION_INTENT_FORMAT
+        || intent.format_version != VERSION
+        || intent.id != tx.id
+        || intent.entry_count != tx.entries.len()
+        || !intent.extensions.is_empty()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-freeze reactivation transaction intent is invalid",
+        ));
+    }
+    let previous_value: Value = serde_json::from_slice(&previous).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "parse previous track-freeze reactivation manifest",
+            error,
+        )
+    })?;
+    let candidate_value: Value = serde_json::from_slice(&candidate).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "parse candidate track-freeze reactivation manifest",
+            error,
+        )
+    })?;
+    if previous_value["assets"] != candidate_value["assets"] {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-freeze reactivation changed asset declarations",
+        ));
+    }
+    let mut expected_names = BTreeSet::from([
+        INTENT_NAME.to_owned(),
+        PROJECT_STAGING_NAME.to_owned(),
+        PREVIOUS_PROJECT_NAME.to_owned(),
+        TRANSACTION_NAME.to_owned(),
+    ]);
+    let mut resource_ids = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    let mut retained_state = None;
+    let mut frozen_clip_bytes = None;
+    for (index, entry) in tx.entries.iter().enumerate() {
+        if !resource_ids.insert(entry.id.as_str()) || !paths.insert(entry.path.as_str()) {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-freeze reactivation resource identities are not unique",
+            ));
+        }
+        let role = role_from_name(&entry.role).ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-freeze reactivation transaction contains an unsupported resource role",
+            )
+        })?;
+        if !is_valid_entity_id(&entry.id) || entry.before.is_none() && entry.after.is_none() {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-freeze reactivation transaction resource entry is invalid",
+            ));
+        }
+        match (&entry.before, &entry.after, &entry.backup_name) {
+            (Some(before), after, Some(backup)) if backup == &backup_name(index) => {
+                let maximum = usize::try_from(before.byte_length).map_err(|_| {
+                    failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "staged track-freeze reactivation source length is not addressable",
+                    )
+                })?;
+                let bytes = read_bounded(transaction, &previous_name(index), maximum)?;
+                if bytes.len() as u64 != before.byte_length
+                    || digest(&bytes) != decode_digest(&before.sha256)?
+                {
+                    return Err(failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "staged track-freeze reactivation source changed",
+                    ));
+                }
+                validate_entry_document(&bytes, &entry.id, role)?;
+                expected_names.insert(previous_name(index));
+                expected_names.insert(backup.clone());
+                let previous_descriptor = previous_manifest
+                    .resources()
+                    .iter()
+                    .find(|descriptor| descriptor.id() == entry.id)
+                    .ok_or_else(|| {
+                        failure(
+                            ProjectResourcePublicationErrorKind::Recovery,
+                            "track-freeze reactivation source descriptor is absent from previous project",
+                        )
+                    })?;
+                if previous_descriptor.role() != role || previous_descriptor.path() != entry.path {
+                    return Err(failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "track-freeze reactivation source descriptor changed",
+                    ));
+                }
+                if after.is_none()
+                    && candidate_manifest
+                        .resources()
+                        .iter()
+                        .any(|descriptor| descriptor.id() == entry.id)
+                {
+                    return Err(failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "candidate track-freeze reactivation project retained a retired source",
+                    ));
+                }
+            }
+            (None, _, None) => {}
+            _ => {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "track-freeze reactivation transaction resource operation is invalid",
+                ));
+            }
+        }
+        if let Some(after) = &entry.after {
+            let maximum = usize::try_from(after.byte_length).map_err(|_| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "staged track-freeze reactivation replacement length is not addressable",
+                )
+            })?;
+            let bytes = read_bounded(transaction, &staged_name(index), maximum)?;
+            if bytes.len() as u64 != after.byte_length
+                || digest(&bytes) != decode_digest(&after.sha256)?
+            {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "staged track-freeze reactivation replacement changed",
+                ));
+            }
+            validate_entry_document(&bytes, &entry.id, role)?;
+            if entry.id == tx.frozen_clip_id {
+                frozen_clip_bytes = Some(bytes.clone());
+            }
+            if role == ResourceRole::FreezeState {
+                retained_state = Some(TrackFreezeState::parse(&bytes).map_err(|error| {
+                    caused(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "parse staged track-freeze reactivation state",
+                        error,
+                    )
+                })?);
+            }
+            expected_names.insert(staged_name(index));
+            let descriptor = candidate_manifest
+                .resources()
+                .iter()
+                .find(|descriptor| descriptor.id() == entry.id)
+                .ok_or_else(|| {
+                    failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "candidate track-freeze reactivation descriptor is absent",
+                    )
+                })?;
+            if descriptor.role() != role
+                || descriptor.path() != entry.path
+                || descriptor.byte_length() != after.byte_length
+                || descriptor.sha256() != after.sha256
+            {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "candidate track-freeze reactivation descriptor changed",
+                ));
+            }
+        }
+    }
+    let state = retained_state.ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-freeze reactivation transaction has no retained freeze-state resource",
+        )
+    })?;
+    let frozen_clip_bytes = frozen_clip_bytes.ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-freeze reactivation transaction has no rendered clip resource",
+        )
+    })?;
+    let retained_frozen_clip = serde_json_canonicalizer::to_vec(state.frozen_clip().document())
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "canonicalize retained track-freeze reactivation clip",
+                error,
+            )
+        })?;
+    let retired_source_ids = tx
+        .entries
+        .iter()
+        .filter(|entry| entry.before.is_some() && entry.after.is_none())
+        .map(|entry| entry.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if !state.has_complete_rendered_authority()
+        || state.id() != tx.freeze_state_id
+        || state.track_id() != tx.track_id
+        || state.frozen_clip_id() != tx.frozen_clip_id
+        || state.frozen_asset_id() != tx.frozen_asset_id
+        || retained_frozen_clip != frozen_clip_bytes
+        || state
+            .original_clips()
+            .iter()
+            .map(hyper_track_freeze::FrozenClipState::id)
+            .collect::<BTreeSet<_>>()
+            != retired_source_ids
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-freeze reactivation journal does not match retained authority",
+        ));
+    }
+    let asset = candidate_manifest
+        .assets()
+        .iter()
+        .find(|descriptor| descriptor.id() == tx.frozen_asset_id)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "candidate reactivated sample descriptor is absent",
+            )
+        })?;
+    if asset.role() != AssetRole::Sample
+        || asset.media_type() != AudioMediaType::AudioWav
+        || asset.path() != format!("assets/samples/{}.wav", tx.frozen_asset_id)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "candidate reactivated sample descriptor changed",
+        ));
+    }
+    for entry in transaction.entries().map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "read track-freeze reactivation transaction entries",
+            error,
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "read track-freeze reactivation transaction entry",
+                error,
+            )
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-freeze reactivation transaction contains a non-Unicode entry",
+            ));
+        };
+        if !expected_names.contains(&name) {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-freeze reactivation transaction contains an unknown entry",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[allow(
@@ -3669,6 +4546,7 @@ fn read_transaction(
     })?;
     let expected_format = match tx.operation {
         TransactionOperation::Freeze => FORMAT,
+        TransactionOperation::Reactivate => REACTIVATION_FORMAT,
         TransactionOperation::Unfreeze => UNFREEZE_FORMAT,
     };
     let rendered_sample_valid = match (&tx.operation, &tx.rendered_sample) {
@@ -3677,7 +4555,7 @@ fn read_transaction(
                 && sample.byte_length != 0
                 && decode_digest(&sample.sha256).is_ok()
         }
-        (TransactionOperation::Unfreeze, None) => true,
+        (TransactionOperation::Reactivate | TransactionOperation::Unfreeze, None) => true,
         _ => false,
     };
     if tx.format != expected_format
@@ -3855,17 +4733,13 @@ fn validate_incomplete(
     transaction: &Dir,
     name: &str,
 ) -> Result<(), ProjectResourcePublicationError> {
-    let operation = if name.starts_with(AUDIO_TRACK_UNFREEZE_TRANSACTION_PREFIX) {
+    let default_operation = if name.starts_with(AUDIO_TRACK_UNFREEZE_TRANSACTION_PREFIX) {
         TransactionOperation::Unfreeze
     } else {
         TransactionOperation::Freeze
     };
-    let intent_format = match operation {
-        TransactionOperation::Freeze => INTENT_FORMAT,
-        TransactionOperation::Unfreeze => UNFREEZE_INTENT_FORMAT,
-    };
-    let count = if missing_file(transaction, INTENT_NAME)? {
-        0
+    let (operation, count) = if missing_file(transaction, INTENT_NAME)? {
+        (default_operation, 0)
     } else {
         let bytes = read_bounded(transaction, INTENT_NAME, MAX_JSON_BYTES)?;
         require_canonical(&bytes, "incomplete track-freeze intent")?;
@@ -3876,8 +4750,24 @@ fn validate_incomplete(
                 error,
             )
         })?;
-        if intent.format != intent_format
-            || intent.format_version != VERSION
+        let operation = match intent.format.as_str() {
+            INTENT_FORMAT if default_operation == TransactionOperation::Freeze => {
+                TransactionOperation::Freeze
+            }
+            REACTIVATION_INTENT_FORMAT if default_operation == TransactionOperation::Freeze => {
+                TransactionOperation::Reactivate
+            }
+            UNFREEZE_INTENT_FORMAT if default_operation == TransactionOperation::Unfreeze => {
+                TransactionOperation::Unfreeze
+            }
+            _ => {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "incomplete track-freeze intent has an invalid operation",
+                ));
+            }
+        };
+        if intent.format_version != VERSION
             || intent.id != transaction_id(name)?
             || intent.entry_count == 0
             || intent.entry_count > MAX_ENTRIES
@@ -3888,7 +4778,7 @@ fn validate_incomplete(
                 "incomplete track-freeze intent is invalid",
             ));
         }
-        intent.entry_count
+        (operation, intent.entry_count)
     };
     let mut expected = BTreeSet::from([
         INTENT_STAGING_NAME.to_owned(),
@@ -3960,6 +4850,7 @@ fn cleanup_temporaries(
 const fn transaction_label(tx: &Transaction) -> &'static str {
     match tx.operation {
         TransactionOperation::Freeze => "track-freeze",
+        TransactionOperation::Reactivate => "track-freeze-reactivation",
         TransactionOperation::Unfreeze => "track-unfreeze",
     }
 }
@@ -4092,7 +4983,8 @@ mod tests {
     use hyper_audio_source::{DecodedAudio, encode_float_wav};
     use hyper_playback_json::{
         AudioTrackFreezeDeviceChain, LoaderLimits, MediaAssetFact, PlaybackJsonInput, load,
-        serialize_audio_track_freeze, serialize_audio_track_unfreeze,
+        serialize_audio_track_freeze, serialize_audio_track_freeze_reactivation,
+        serialize_audio_track_unfreeze,
     };
     use serde_json::{Value, json};
     use std::fs;
@@ -4305,6 +5197,66 @@ mod tests {
             )
             .unwrap();
             (*package.manifest_sha256(), documents)
+        }
+
+        fn reactivation_request(
+            &self,
+            freeze_state: &[u8],
+        ) -> ([u8; 32], AudioTrackFreezeReactivationDocuments, String, u64) {
+            let package = verify_project_package(&self.root).unwrap();
+            let track = package.read_resource(TRACK_ID).unwrap();
+            let clip = package.read_resource(SOURCE_CLIP_ID).unwrap();
+            let arrangement = package.read_resource(ARRANGEMENT_ID).unwrap();
+            let tracks = [track.as_slice()];
+            let clips = [clip.as_slice()];
+            let project = load(
+                PlaybackJsonInput {
+                    project_id: PROJECT_ID,
+                    sample_rate_hz: 48_000,
+                    timeline: &self.timeline,
+                    tracks: &tracks,
+                    clips: &clips,
+                    scenes: &[],
+                    arrangement: Some(&arrangement),
+                },
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+            let assets = [
+                MediaAssetFact {
+                    id: SOURCE_ASSET_ID,
+                    sample_rate_hz: 48_000,
+                    frame_count: 50,
+                },
+                MediaAssetFact {
+                    id: FROZEN_ASSET_ID,
+                    sample_rate_hz: 48_000,
+                    frame_count: 50,
+                },
+            ];
+            let documents = serialize_audio_track_freeze_reactivation(
+                &project,
+                &assets,
+                &track,
+                &clips,
+                &arrangement,
+                freeze_state,
+                TRACK_ID,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+            let asset = package
+                .manifest()
+                .assets()
+                .iter()
+                .find(|asset| asset.id() == FROZEN_ASSET_ID)
+                .unwrap();
+            (
+                *package.manifest_sha256(),
+                documents,
+                asset.sha256().to_owned(),
+                asset.byte_length(),
+            )
         }
     }
 
@@ -4561,6 +5513,200 @@ mod tests {
             .unwrap(),
             fixture.sample
         );
+    }
+
+    #[test]
+    fn reactivates_the_exact_retained_freeze_without_rerendering() {
+        let fixture = Fixture::new();
+        let (freeze_identity, freeze) = fixture.request();
+        publish_audio_track_freeze(
+            &fixture.root,
+            AudioTrackFreezePublicationRequest {
+                expected_project_sha256: freeze_identity,
+                documents: &freeze,
+                rendered_sample: &fixture.sample,
+            },
+        )
+        .unwrap();
+        let (unfreeze_identity, unfreeze) = fixture.unfreeze_request();
+        publish_audio_track_unfreeze(
+            &fixture.root,
+            AudioTrackUnfreezePublicationRequest {
+                expected_project_sha256: unfreeze_identity,
+                documents: &unfreeze,
+            },
+        )
+        .unwrap();
+        let (identity, reactivation, asset_sha256, asset_byte_length) =
+            fixture.reactivation_request(freeze.freeze_state());
+        let outcome = publish_audio_track_freeze_reactivation(
+            &fixture.root,
+            AudioTrackFreezeReactivationPublicationRequest {
+                expected_project_sha256: identity,
+                documents: &reactivation,
+                frozen_asset_sha256: &asset_sha256,
+                frozen_asset_byte_length: asset_byte_length,
+            },
+        )
+        .unwrap();
+        let package = verify_project_package(&fixture.root).unwrap();
+        assert_eq!(package.manifest().revision(), 4);
+        assert_eq!(*package.manifest_sha256(), *outcome.project_identity());
+        assert_eq!(
+            package.read_resource(TRACK_ID).unwrap(),
+            reactivation.track()
+        );
+        assert_eq!(
+            package.read_resource(FROZEN_CLIP_ID).unwrap(),
+            reactivation.clip()
+        );
+        assert_eq!(
+            package.read_resource(FREEZE_STATE_ID).unwrap(),
+            reactivation.freeze_state()
+        );
+        assert!(
+            package
+                .manifest()
+                .resources()
+                .iter()
+                .all(|entry| entry.id() != SOURCE_CLIP_ID)
+        );
+        let asset = package
+            .manifest()
+            .assets()
+            .iter()
+            .find(|asset| asset.id() == FROZEN_ASSET_ID)
+            .unwrap();
+        assert_eq!(asset.sha256(), asset_sha256);
+        assert_eq!(asset.byte_length(), asset_byte_length);
+        assert_eq!(
+            fs::read(
+                fixture
+                    .root
+                    .join(format!("assets/samples/{FROZEN_ASSET_ID}.wav"))
+            )
+            .unwrap(),
+            fixture.sample
+        );
+    }
+
+    #[test]
+    fn reactivation_refuses_a_changed_retained_asset_authority() {
+        let fixture = Fixture::new();
+        let (freeze_identity, freeze) = fixture.request();
+        publish_audio_track_freeze(
+            &fixture.root,
+            AudioTrackFreezePublicationRequest {
+                expected_project_sha256: freeze_identity,
+                documents: &freeze,
+                rendered_sample: &fixture.sample,
+            },
+        )
+        .unwrap();
+        let (unfreeze_identity, unfreeze) = fixture.unfreeze_request();
+        publish_audio_track_unfreeze(
+            &fixture.root,
+            AudioTrackUnfreezePublicationRequest {
+                expected_project_sha256: unfreeze_identity,
+                documents: &unfreeze,
+            },
+        )
+        .unwrap();
+        let (identity, reactivation, _asset_sha256, asset_byte_length) =
+            fixture.reactivation_request(freeze.freeze_state());
+        let error = publish_audio_track_freeze_reactivation(
+            &fixture.root,
+            AudioTrackFreezeReactivationPublicationRequest {
+                expected_project_sha256: identity,
+                documents: &reactivation,
+                frozen_asset_sha256: &"0".repeat(64),
+                frozen_asset_byte_length: asset_byte_length,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::ProjectChanged
+        );
+        let package = verify_project_package(&fixture.root).unwrap();
+        assert_eq!(*package.manifest_sha256(), identity);
+        assert!(package
+            .manifest()
+            .resources()
+            .iter()
+            .all(|resource| resource.id() != FROZEN_CLIP_ID && resource.id() != FREEZE_STATE_ID));
+    }
+
+    #[test]
+    fn crash_recovery_preserves_one_verified_track_freeze_reactivation_side() {
+        for phase in [
+            PublicationPhase::Transaction,
+            PublicationPhase::SourceMoved(0),
+            PublicationPhase::ResourcePublished(0),
+            PublicationPhase::Manifest,
+        ] {
+            let fixture = Fixture::new();
+            let (freeze_identity, freeze) = fixture.request();
+            publish_audio_track_freeze(
+                &fixture.root,
+                AudioTrackFreezePublicationRequest {
+                    expected_project_sha256: freeze_identity,
+                    documents: &freeze,
+                    rendered_sample: &fixture.sample,
+                },
+            )
+            .unwrap();
+            let (unfreeze_identity, unfreeze) = fixture.unfreeze_request();
+            publish_audio_track_unfreeze(
+                &fixture.root,
+                AudioTrackUnfreezePublicationRequest {
+                    expected_project_sha256: unfreeze_identity,
+                    documents: &unfreeze,
+                },
+            )
+            .unwrap();
+            let (identity, documents, asset_sha256, asset_byte_length) =
+                fixture.reactivation_request(freeze.freeze_state());
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_reactivation_observed(
+                    &fixture.root,
+                    AudioTrackFreezeReactivationPublicationRequest {
+                        expected_project_sha256: identity,
+                        documents: &documents,
+                        frozen_asset_sha256: &asset_sha256,
+                        frozen_asset_byte_length: asset_byte_length,
+                    },
+                    |current, _| {
+                        assert_ne!(current, phase, "simulate process termination");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+            let report = recover_project_transactions(&fixture.root).unwrap();
+            assert_eq!(report.audio_track_freezes().len(), 1);
+            let expected = if phase == PublicationPhase::Manifest {
+                AudioTrackFreezePublicationRecoveryDisposition::Committed
+            } else {
+                AudioTrackFreezePublicationRecoveryDisposition::RolledBack
+            };
+            assert_eq!(report.audio_track_freezes()[0].disposition(), expected);
+            let package = verify_project_package(&fixture.root).unwrap();
+            if expected == AudioTrackFreezePublicationRecoveryDisposition::Committed {
+                assert_eq!(
+                    package.read_resource(FROZEN_CLIP_ID).unwrap(),
+                    documents.clip()
+                );
+                assert_eq!(
+                    package.read_resource(FREEZE_STATE_ID).unwrap(),
+                    documents.freeze_state()
+                );
+            } else {
+                assert_eq!(*package.manifest_sha256(), identity);
+                assert_eq!(package.read_resource(SOURCE_CLIP_ID).unwrap(), fixture.clip);
+                assert!(!fixture.root.join("freezes").exists());
+            }
+        }
     }
 
     #[test]

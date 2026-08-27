@@ -750,6 +750,23 @@ pub struct AudioTrackUnfreezeDocuments {
     freeze_state_id: String,
 }
 
+/// Complete canonical delta for reactivating the exact rendered artifact
+/// retained by one session-only unfreeze history entry.
+///
+/// The rendered sample is already a manifest-declared, verified asset. This
+/// delta deliberately contains no sample bytes and must never create a new
+/// render or replacement identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioTrackFreezeReactivationDocuments {
+    track: Vec<u8>,
+    clip: Vec<u8>,
+    arrangement: Vec<u8>,
+    freeze_state: Vec<u8>,
+    frozen_clip_id: String,
+    frozen_asset_id: String,
+    freeze_state_id: String,
+}
+
 impl AudioTrackUnfreezeDocuments {
     #[must_use]
     pub fn track(&self) -> &[u8] {
@@ -764,6 +781,43 @@ impl AudioTrackUnfreezeDocuments {
     #[must_use]
     pub fn arrangement(&self) -> &[u8] {
         &self.arrangement
+    }
+
+    #[must_use]
+    pub fn frozen_clip_id(&self) -> &str {
+        &self.frozen_clip_id
+    }
+
+    #[must_use]
+    pub fn frozen_asset_id(&self) -> &str {
+        &self.frozen_asset_id
+    }
+
+    #[must_use]
+    pub fn freeze_state_id(&self) -> &str {
+        &self.freeze_state_id
+    }
+}
+
+impl AudioTrackFreezeReactivationDocuments {
+    #[must_use]
+    pub fn track(&self) -> &[u8] {
+        &self.track
+    }
+
+    #[must_use]
+    pub fn clip(&self) -> &[u8] {
+        &self.clip
+    }
+
+    #[must_use]
+    pub fn arrangement(&self) -> &[u8] {
+        &self.arrangement
+    }
+
+    #[must_use]
+    pub fn freeze_state(&self) -> &[u8] {
+        &self.freeze_state
     }
 
     #[must_use]
@@ -847,6 +901,24 @@ pub enum AudioTrackUnfreezeSerializationError {
     ProjectCompilation(AdapterCompileError),
 }
 
+/// Reasons an exact retained rendered artifact cannot safely be reactivated
+/// after an unfreeze history restore.
+#[derive(Debug)]
+pub enum AudioTrackFreezeReactivationSerializationError {
+    TrackNotAudio,
+    ScenesUnsupported,
+    ArrangementMissing,
+    SourceTrackMismatch,
+    SourceClipMismatch,
+    SourceArrangementMismatch,
+    SourceFreezeStateMismatch,
+    FrozenStateMismatch,
+    State(TrackFreezeStateError),
+    Source(LoadError),
+    Serialization(serde_json::Error),
+    ProjectCompilation(AdapterCompileError),
+}
+
 impl fmt::Display for AudioTrackUnfreezeSerializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -894,6 +966,67 @@ impl Error for AudioTrackUnfreezeSerializationError {
             | Self::ScenesUnsupported
             | Self::ArrangementMissing
             | Self::SourceTrackMismatch
+            | Self::SourceArrangementMismatch
+            | Self::SourceFreezeStateMismatch
+            | Self::FrozenStateMismatch => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioTrackFreezeReactivationSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TrackNotAudio => {
+                formatter.write_str("track-freeze reactivation supports audio tracks only")
+            }
+            Self::ScenesUnsupported => {
+                formatter.write_str("track-freeze reactivation does not restore interactive scenes")
+            }
+            Self::ArrangementMissing => {
+                formatter.write_str("track-freeze reactivation requires a linear arrangement")
+            }
+            Self::SourceTrackMismatch => formatter.write_str(
+                "track-freeze reactivation source track differs from the loaded project",
+            ),
+            Self::SourceClipMismatch => formatter
+                .write_str("track-freeze reactivation source clips differ from the loaded project"),
+            Self::SourceArrangementMismatch => formatter.write_str(
+                "track-freeze reactivation source arrangement differs from the loaded project",
+            ),
+            Self::SourceFreezeStateMismatch => formatter.write_str(
+                "track-freeze reactivation state is not canonical retained history authority",
+            ),
+            Self::FrozenStateMismatch => formatter.write_str(
+                "track-freeze reactivation source no longer matches its retained freeze state",
+            ),
+            Self::State(source) => source.fmt(formatter),
+            Self::Source(source) => source.fmt(formatter),
+            Self::Serialization(source) => write!(
+                formatter,
+                "track-freeze reactivation cannot serialize a candidate: {source}"
+            ),
+            Self::ProjectCompilation(source) => {
+                write!(
+                    formatter,
+                    "track-freeze reactivation candidate cannot compile: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for AudioTrackFreezeReactivationSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::State(source) => Some(source),
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::TrackNotAudio
+            | Self::ScenesUnsupported
+            | Self::ArrangementMissing
+            | Self::SourceTrackMismatch
+            | Self::SourceClipMismatch
             | Self::SourceArrangementMismatch
             | Self::SourceFreezeStateMismatch
             | Self::FrozenStateMismatch => None,
@@ -4459,6 +4592,237 @@ pub fn serialize_audio_track_unfreeze(
         track,
         clips: restored_clips,
         arrangement: arrangement_bytes,
+        frozen_clip_id: state.frozen_clip_id().to_owned(),
+        frozen_asset_id: state.frozen_asset_id().to_owned(),
+        freeze_state_id: state.id().to_owned(),
+    })
+}
+
+/// Recreates a frozen track from the exact rendered artifact retained by an
+/// unfreeze history entry.
+///
+/// Unlike [`serialize_audio_track_freeze`], this operation never renders or
+/// allocates identities. It requires the current unfrozen source clips and
+/// placements to remain exactly those held in the retained freeze state, then
+/// reapplies only the frozen clip references and placement while preserving
+/// safe live metadata on the track and arrangement.
+///
+/// # Errors
+///
+/// Returns a classified refusal if the retained authority is noncanonical,
+/// the active source has changed, or the exact artifact cannot compile with
+/// the supplied manifest-derived media facts.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "reactivation validates retained authority, live source, and the complete candidate before one structural publication"
+)]
+pub fn serialize_audio_track_freeze_reactivation(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_track: &[u8],
+    source_clips: &[&[u8]],
+    source_arrangement: &[u8],
+    source_freeze_state: &[u8],
+    track_id: &str,
+    limits: LoaderLimits,
+) -> Result<AudioTrackFreezeReactivationDocuments, AudioTrackFreezeReactivationSerializationError> {
+    if !project.is_audio_track(track_id) {
+        return Err(AudioTrackFreezeReactivationSerializationError::TrackNotAudio);
+    }
+    if project.scene_count() != 0 {
+        return Err(AudioTrackFreezeReactivationSerializationError::ScenesUnsupported);
+    }
+    let track_index = project
+        .track_index(track_id)
+        .ok_or(AudioTrackFreezeReactivationSerializationError::TrackNotAudio)?;
+    let arrangement = project
+        .arrangement
+        .as_ref()
+        .ok_or(AudioTrackFreezeReactivationSerializationError::ArrangementMissing)?;
+    if arrangement.canonical_source.as_ref() != source_arrangement {
+        return Err(AudioTrackFreezeReactivationSerializationError::SourceArrangementMismatch);
+    }
+    let source = load_track(
+        source_track,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(AudioTrackFreezeReactivationSerializationError::Source)?;
+    if source.id != project.tracks[track_index].id
+        || source.clip_ids != project.tracks[track_index].clip_ids
+    {
+        return Err(AudioTrackFreezeReactivationSerializationError::SourceTrackMismatch);
+    }
+    if source_clips.len() != source.clip_ids.len() {
+        return Err(AudioTrackFreezeReactivationSerializationError::SourceClipMismatch);
+    }
+    let freeze_state_value: Value = serde_json::from_slice(source_freeze_state)
+        .map_err(AudioTrackFreezeReactivationSerializationError::Serialization)?;
+    let freeze_state = serde_json_canonicalizer::to_vec(&freeze_state_value)
+        .map_err(AudioTrackFreezeReactivationSerializationError::Serialization)?;
+    if freeze_state != source_freeze_state {
+        return Err(AudioTrackFreezeReactivationSerializationError::SourceFreezeStateMismatch);
+    }
+    let state = TrackFreezeState::parse(&freeze_state)
+        .map_err(AudioTrackFreezeReactivationSerializationError::State)?;
+    if !state.has_complete_rendered_authority()
+        || state.project_id() != project.project_id()
+        || state.track_id() != track_id
+        || state.arrangement_id() != arrangement.id
+        || state.original_clips().len() != source.clip_ids.len()
+        || state
+            .original_clips()
+            .iter()
+            .map(FrozenClipState::id)
+            .ne(source.clip_ids.iter().map(String::as_str))
+    {
+        return Err(AudioTrackFreezeReactivationSerializationError::FrozenStateMismatch);
+    }
+    for ((clip_id, source_clip), retained) in source
+        .clip_ids
+        .iter()
+        .zip(source_clips)
+        .zip(state.original_clips())
+    {
+        let source_value: Value = serde_json::from_slice(source_clip)
+            .map_err(AudioTrackFreezeReactivationSerializationError::Serialization)?;
+        let canonical_source = serde_json_canonicalizer::to_vec(&source_value)
+            .map_err(AudioTrackFreezeReactivationSerializationError::Serialization)?;
+        let retained_source = serde_json_canonicalizer::to_vec(retained.document())
+            .map_err(AudioTrackFreezeReactivationSerializationError::Serialization)?;
+        let project_clip_index = project
+            .clips
+            .iter()
+            .position(|clip| &clip.id == clip_id)
+            .ok_or(AudioTrackFreezeReactivationSerializationError::SourceClipMismatch)?;
+        let parsed = load_clip(
+            &canonical_source,
+            project_clip_index,
+            project.project_id(),
+            limits.max_document_bytes,
+            limits.max_warp_markers,
+        )
+        .map_err(AudioTrackFreezeReactivationSerializationError::Source)?;
+        if canonical_source != *source_clip
+            || retained_source != canonical_source
+            || parsed != project.clips[project_clip_index]
+            || retained.id() != clip_id
+            || parsed.track_id != track_id
+        {
+            return Err(AudioTrackFreezeReactivationSerializationError::FrozenStateMismatch);
+        }
+    }
+    let frozen_clip_bytes = serde_json_canonicalizer::to_vec(state.frozen_clip().document())
+        .map_err(AudioTrackFreezeReactivationSerializationError::Serialization)?;
+    let frozen_clip = load_clip(
+        &frozen_clip_bytes,
+        project.clips.len(),
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_warp_markers,
+    )
+    .map_err(AudioTrackFreezeReactivationSerializationError::Source)?;
+    if frozen_clip.id != state.frozen_clip_id()
+        || frozen_clip.track_id != track_id
+        || frozen_clip.asset_id != state.frozen_asset_id()
+        || project
+            .clips
+            .iter()
+            .any(|clip| clip.id == state.frozen_clip_id())
+        || !assets
+            .iter()
+            .any(|asset| asset.id == state.frozen_asset_id())
+    {
+        return Err(AudioTrackFreezeReactivationSerializationError::FrozenStateMismatch);
+    }
+    let mut arrangement_value: Value = serde_json::from_slice(source_arrangement)
+        .map_err(AudioTrackFreezeReactivationSerializationError::Serialization)?;
+    let placements = arrangement_value
+        .get_mut("placements")
+        .and_then(Value::as_array_mut)
+        .ok_or(AudioTrackFreezeReactivationSerializationError::SourceArrangementMismatch)?;
+    let current_placements = placements
+        .iter()
+        .filter(|placement| placement.get("track_id").and_then(Value::as_str) == Some(track_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let retained_placements = state
+        .original_placements()
+        .iter()
+        .map(|placement| placement.document().clone())
+        .collect::<Vec<_>>();
+    let frozen_placement = state
+        .frozen_placement()
+        .ok_or(AudioTrackFreezeReactivationSerializationError::FrozenStateMismatch)?;
+    if current_placements != retained_placements
+        || placements.iter().any(|placement| {
+            placement.get("id").and_then(Value::as_str) == Some(state.frozen_placement_id())
+        })
+        || frozen_placement
+            .document()
+            .get("track_id")
+            .and_then(Value::as_str)
+            != Some(track_id)
+        || frozen_placement
+            .document()
+            .get("clip_id")
+            .and_then(Value::as_str)
+            != Some(state.frozen_clip_id())
+    {
+        return Err(AudioTrackFreezeReactivationSerializationError::FrozenStateMismatch);
+    }
+    let mut track_value: Value = serde_json::from_slice(source_track)
+        .map_err(AudioTrackFreezeReactivationSerializationError::Serialization)?;
+    *track_value
+        .get_mut("clip_ids")
+        .and_then(Value::as_array_mut)
+        .ok_or(AudioTrackFreezeReactivationSerializationError::SourceTrackMismatch)? =
+        vec![Value::String(state.frozen_clip_id().to_owned())];
+    let track = serde_json_canonicalizer::to_vec(&track_value)
+        .map_err(AudioTrackFreezeReactivationSerializationError::Serialization)?;
+    let frozen_track = load_track(
+        &track,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(AudioTrackFreezeReactivationSerializationError::Source)?;
+    placements
+        .retain(|placement| placement.get("track_id").and_then(Value::as_str) != Some(track_id));
+    placements.push(frozen_placement.document().clone());
+    placements
+        .sort_unstable_by(|left, right| placement_sort_key(left).cmp(&placement_sort_key(right)));
+    let arrangement_bytes = serde_json_canonicalizer::to_vec(&arrangement_value)
+        .map_err(AudioTrackFreezeReactivationSerializationError::Serialization)?;
+    let frozen_arrangement = load_arrangement(
+        &arrangement_bytes,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_placements,
+        limits.max_scene_launches,
+    )
+    .map_err(AudioTrackFreezeReactivationSerializationError::Source)?;
+    let mut candidate = project.clone();
+    candidate.tracks[track_index] = frozen_track;
+    candidate
+        .clips
+        .retain(|clip| !source.clip_ids.iter().any(|id| id == &clip.id));
+    candidate.clips.push(frozen_clip);
+    candidate.arrangement = Some(frozen_arrangement);
+    validate_loaded_identities(&candidate)
+        .map_err(AudioTrackFreezeReactivationSerializationError::Source)?;
+    candidate
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(AudioTrackFreezeReactivationSerializationError::ProjectCompilation)?;
+    Ok(AudioTrackFreezeReactivationDocuments {
+        track,
+        clip: frozen_clip_bytes,
+        arrangement: arrangement_bytes,
+        freeze_state,
         frozen_clip_id: state.frozen_clip_id().to_owned(),
         frozen_asset_id: state.frozen_asset_id().to_owned(),
         freeze_state_id: state.id().to_owned(),
@@ -19750,6 +20114,228 @@ mod tests {
         assert_eq!(restored.frozen_clip_id(), frozen.frozen_clip_id());
         assert_eq!(restored.frozen_asset_id(), frozen.frozen_asset_id());
         assert_eq!(restored.freeze_state_id(), frozen.freeze_state_id());
+    }
+
+    #[test]
+    fn audio_track_unfreeze_preserves_live_frozen_track_metadata() {
+        let track =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(TRACK).unwrap())
+                .unwrap();
+        let clip =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(CLIP).unwrap())
+                .unwrap();
+        let arrangement = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
+        )
+        .unwrap();
+        let tracks = [track.as_slice()];
+        let clips = [clip.as_slice()];
+        let project = load(
+            input(TIMELINE, &tracks, &clips, Some(&arrangement)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let frozen = serialize_audio_track_freeze(
+            &project,
+            &asset_facts(),
+            &track,
+            &clips,
+            &arrangement,
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            "018f47a2-6b2d-7c11-8a44-001122334470",
+            100,
+            "018f47a2-6b2d-7c11-8a44-001122334471",
+            "018f47a2-6b2d-7c11-8a44-001122334472",
+            "018f47a2-6b2d-7c11-8a44-001122334473",
+            "Frozen",
+            None,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut live_track: Value = serde_json::from_slice(frozen.track()).unwrap();
+        live_track["name"] = json!("Renamed while frozen");
+        live_track["active"] = false.into();
+        live_track["extensions"]["org.example.freeze-note"] = json!({"keep": true});
+        let live_track = serde_json_canonicalizer::to_vec(&live_track).unwrap();
+        let mut live_arrangement: Value = serde_json::from_slice(frozen.arrangement()).unwrap();
+        live_arrangement["extensions"]["org.example.freeze-note"] = json!({"keep": true});
+        let live_arrangement = serde_json_canonicalizer::to_vec(&live_arrangement).unwrap();
+        let frozen_tracks = [live_track.as_slice()];
+        let frozen_clips = [frozen.clip()];
+        let frozen_project = load(
+            input(
+                TIMELINE,
+                &frozen_tracks,
+                &frozen_clips,
+                Some(&live_arrangement),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let restored = serialize_audio_track_unfreeze(
+            &frozen_project,
+            &asset_facts(),
+            &live_track,
+            &live_arrangement,
+            frozen.freeze_state(),
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let restored_track: Value = serde_json::from_slice(restored.track()).unwrap();
+        assert_eq!(restored_track["name"], "Renamed while frozen");
+        assert_eq!(restored_track["active"], false);
+        assert_eq!(
+            restored_track["extensions"]["org.example.freeze-note"],
+            json!({"keep": true})
+        );
+        assert_eq!(
+            restored_track["clip_ids"],
+            json!(["018f47a2-6b2d-7c11-8a44-001122334460"])
+        );
+        let restored_arrangement: Value = serde_json::from_slice(restored.arrangement()).unwrap();
+        assert_eq!(
+            restored_arrangement["extensions"]["org.example.freeze-note"],
+            json!({"keep": true})
+        );
+    }
+
+    fn frozen_track_reactivation_documents() -> AudioTrackFreezeDocuments {
+        let track =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(TRACK).unwrap())
+                .unwrap();
+        let clip =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(CLIP).unwrap())
+                .unwrap();
+        let arrangement = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
+        )
+        .unwrap();
+        let tracks = [track.as_slice()];
+        let clips = [clip.as_slice()];
+        let project = load(
+            input(TIMELINE, &tracks, &clips, Some(&arrangement)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        serialize_audio_track_freeze(
+            &project,
+            &asset_facts(),
+            &track,
+            &clips,
+            &arrangement,
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            "018f47a2-6b2d-7c11-8a44-001122334470",
+            100,
+            "018f47a2-6b2d-7c11-8a44-001122334471",
+            "018f47a2-6b2d-7c11-8a44-001122334472",
+            "018f47a2-6b2d-7c11-8a44-001122334473",
+            "Frozen",
+            None,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn audio_track_freeze_reactivation_reuses_exact_artifact_and_preserves_live_metadata() {
+        let frozen = frozen_track_reactivation_documents();
+        let frozen_tracks = [frozen.track()];
+        let frozen_clips = [frozen.clip()];
+        let frozen_project = load(
+            input(
+                TIMELINE,
+                &frozen_tracks,
+                &frozen_clips,
+                Some(frozen.arrangement()),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let assets = [
+            MediaAssetFact {
+                id: "018f47a2-6b2d-7c11-8a44-001122334457",
+                sample_rate_hz: 48_000,
+                frame_count: 100,
+            },
+            MediaAssetFact {
+                id: "018f47a2-6b2d-7c11-8a44-001122334470",
+                sample_rate_hz: 48_000,
+                frame_count: 100,
+            },
+        ];
+        let restored = serialize_audio_track_unfreeze(
+            &frozen_project,
+            &assets,
+            frozen.track(),
+            frozen.arrangement(),
+            frozen.freeze_state(),
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut live_track: Value = serde_json::from_slice(restored.track()).unwrap();
+        live_track["name"] = json!("Renamed after unfreeze");
+        live_track["active"] = false.into();
+        live_track["extensions"]["org.example.history"] = json!({"keep": true});
+        let live_track = serde_json_canonicalizer::to_vec(&live_track).unwrap();
+        let mut live_arrangement: Value = serde_json::from_slice(restored.arrangement()).unwrap();
+        live_arrangement["extensions"]["org.example.history"] = json!({"keep": true});
+        let live_arrangement = serde_json_canonicalizer::to_vec(&live_arrangement).unwrap();
+        let restored_clips = restored
+            .clips()
+            .iter()
+            .map(AudioTrackUnfreezeClipDocument::bytes)
+            .collect::<Vec<_>>();
+        let reactivation_tracks = [live_track.as_slice()];
+        let reactivation_project = load(
+            input(
+                TIMELINE,
+                &reactivation_tracks,
+                &restored_clips,
+                Some(&live_arrangement),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let reactivated = serialize_audio_track_freeze_reactivation(
+            &reactivation_project,
+            &assets,
+            &live_track,
+            &restored_clips,
+            &live_arrangement,
+            frozen.freeze_state(),
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reactivated.clip(), frozen.clip());
+        assert_eq!(reactivated.freeze_state(), frozen.freeze_state());
+        assert_eq!(reactivated.frozen_clip_id(), frozen.frozen_clip_id());
+        assert_eq!(reactivated.frozen_asset_id(), frozen.frozen_asset_id());
+        assert_eq!(reactivated.freeze_state_id(), frozen.freeze_state_id());
+        let reactivated_track: Value = serde_json::from_slice(reactivated.track()).unwrap();
+        assert_eq!(reactivated_track["name"], "Renamed after unfreeze");
+        assert_eq!(reactivated_track["active"], false);
+        assert_eq!(
+            reactivated_track["extensions"]["org.example.history"],
+            json!({"keep": true})
+        );
+        assert_eq!(
+            reactivated_track["clip_ids"],
+            json!(["018f47a2-6b2d-7c11-8a44-001122334471"])
+        );
+        let reactivated_arrangement: Value =
+            serde_json::from_slice(reactivated.arrangement()).unwrap();
+        assert_eq!(
+            reactivated_arrangement["extensions"]["org.example.history"],
+            json!({"keep": true})
+        );
+        assert_eq!(
+            reactivated_arrangement["placements"][0]["id"],
+            "018f47a2-6b2d-7c11-8a44-001122334472"
+        );
     }
 
     #[test]

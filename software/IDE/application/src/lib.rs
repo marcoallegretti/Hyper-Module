@@ -104,10 +104,10 @@ use hyper_playback_json::{
     AudioTrackContentRemovalDocuments, AudioTrackContentRemovalSerializationError,
     AudioTrackContentRemovalSource, AudioTrackDocumentSerializationError,
     AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
-    AudioTrackFreezeDeviceChain, AudioTrackFreezeDocuments, AudioTrackFreezeSerializationError,
-    AudioTrackRemovalBlockers, AudioTrackRemovalSerializationError,
-    AudioTrackRenameSerializationError, AudioTrackUnfreezeDocuments,
-    AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
+    AudioTrackFreezeDeviceChain, AudioTrackFreezeDocuments, AudioTrackFreezeReactivationDocuments,
+    AudioTrackFreezeSerializationError, AudioTrackRemovalBlockers,
+    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
+    AudioTrackUnfreezeDocuments, AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
     AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
     AutomationTargetSelection, CompiledMixerDestination, CompiledMixerGraph, CompiledMixerTap,
     CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact,
@@ -132,9 +132,10 @@ use hyper_playback_json::{
     serialize_audio_clip_source_view, serialize_audio_primary_route_change,
     serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_content_removal, serialize_audio_track_duplication,
-    serialize_audio_track_freeze, serialize_audio_track_removal, serialize_audio_track_rename,
-    serialize_audio_track_unfreeze, serialize_automation_take_activation,
-    serialize_automation_take_addition, serialize_mixer_base_state, serialize_mixer_strip_reorder,
+    serialize_audio_track_freeze, serialize_audio_track_freeze_reactivation,
+    serialize_audio_track_removal, serialize_audio_track_rename, serialize_audio_track_unfreeze,
+    serialize_automation_take_activation, serialize_automation_take_addition,
+    serialize_mixer_base_state, serialize_mixer_strip_reorder,
     serialize_recording_audio_clip_addition, serialize_recording_audio_clip_placement,
     serialize_return_send_addition, serialize_return_send_removal, serialize_routing_bus_creation,
     serialize_routing_bus_duplication, serialize_routing_bus_removal, serialize_routing_bus_rename,
@@ -162,14 +163,15 @@ pub use hyper_project_history::{
     RecentProject,
 };
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackError, ProjectPlaybackLimits};
-use hyper_project_model::ResourceRole;
+use hyper_project_model::{ResourceRole, is_valid_entity_id};
 use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
     AudioClipRemovalOutcome, AudioClipRemovalRequest, AudioTrackContentRemovalPublicationOutcome,
     AudioTrackContentRemovalPublicationRequest, AudioTrackDuplicationPublicationOutcome,
     AudioTrackDuplicationPublicationRequest, AudioTrackFreezePublicationOutcome,
-    AudioTrackFreezePublicationRequest, AudioTrackPublicationOutcome, AudioTrackPublicationRequest,
-    AudioTrackRemovalOutcome, AudioTrackRemovalRequest, AudioTrackUnfreezePublicationOutcome,
+    AudioTrackFreezePublicationRequest, AudioTrackFreezeReactivationPublicationRequest,
+    AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
+    AudioTrackRemovalRequest, AudioTrackUnfreezePublicationOutcome,
     AudioTrackUnfreezePublicationRequest, AutomationTakePublicationRequest,
     AutomationTakeRemovalRequest, ControlMappingPublicationRequest, DeviceChainPublicationRequest,
     DeviceChainRemovalRequest, ImportedAudioClipPublicationRequest, MixerRecoverySnapshotError,
@@ -182,12 +184,15 @@ use hyper_storage_engine::{
     StorageError, TrackOrderPublicationOutcome, TrackOrderPublicationRequest, clean_unused_samples,
     discard_recording_take, publish_arrangement, publish_audio_clip, publish_audio_track,
     publish_audio_track_content_removal, publish_audio_track_duplication,
-    publish_audio_track_freeze, publish_audio_track_unfreeze, publish_automation_take,
-    publish_control_mapping, publish_device_chain, publish_imported_audio_clip,
-    publish_project_resource, publish_recorded_take_placement, publish_routing_bus, publish_scene,
-    publish_track_order, remove_audio_clip, remove_audio_track, remove_automation_take,
-    remove_device_chain, remove_routing_bus, remove_scene, store_mixer_recovery_snapshot,
+    publish_audio_track_freeze, publish_audio_track_freeze_reactivation,
+    publish_audio_track_unfreeze, publish_automation_take, publish_control_mapping,
+    publish_device_chain, publish_imported_audio_clip, publish_project_resource,
+    publish_recorded_take_placement, publish_routing_bus, publish_scene, publish_track_order,
+    remove_audio_clip, remove_audio_track, remove_automation_take, remove_device_chain,
+    remove_routing_bus, remove_scene, store_mixer_recovery_snapshot,
 };
+use hyper_track_freeze::TrackFreezeState;
+use sha2::{Digest, Sha256};
 
 mod recording;
 mod worker;
@@ -3096,6 +3101,7 @@ pub enum IdeAudioTrackFreezeError {
     Render(Box<OfflineExportError>),
     Sample(DecodeError),
     Serialization(AudioTrackFreezeSerializationError),
+    HistoryAuthority(Box<dyn Error + Send + Sync>),
     Publication(Box<ProjectResourcePublicationError>),
     NativeClose(IdeNativeCloseFailure),
     NativeCloseAndReopen {
@@ -3168,6 +3174,10 @@ impl fmt::Display for IdeAudioTrackFreezeError {
             Self::Render(source) => source.fmt(formatter),
             Self::Sample(source) => source.fmt(formatter),
             Self::Serialization(source) => source.fmt(formatter),
+            Self::HistoryAuthority(source) => write!(
+                formatter,
+                "the exact rendered-freeze history authority could not be retained: {source}"
+            ),
             Self::Publication(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
@@ -3209,6 +3219,7 @@ impl Error for IdeAudioTrackFreezeError {
             Self::Render(source) => Some(source.as_ref()),
             Self::Sample(source) => Some(source),
             Self::Serialization(source) => Some(source),
+            Self::HistoryAuthority(source) => Some(source.as_ref()),
             Self::Publication(source) => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
@@ -3243,6 +3254,7 @@ pub enum IdeAudioTrackUnfreezeError {
     FreezeStateInvalid,
     CapacityUnavailable,
     Serialization(AudioTrackUnfreezeSerializationError),
+    HistoryAuthority(Box<dyn Error + Send + Sync>),
     Publication(Box<ProjectResourcePublicationError>),
     NativeClose(IdeNativeCloseFailure),
     NativeCloseAndReopen {
@@ -3269,6 +3281,25 @@ impl IdeAudioTrackUnfreezeError {
         matches!(self, Self::Publication(source) if source.published())
             || matches!(self, Self::ReopenAfterPublication { .. })
             || matches!(self, Self::ReopenAfterPreparation { preparation, .. } if preparation.publication_committed())
+    }
+
+    /// Whether the retained authority cannot become valid without a new
+    /// explicit project edit, so a session-history entry must not block older
+    /// undo entries forever.
+    #[must_use]
+    pub fn is_permanent_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidTrackIdentity
+                | Self::TrackResourceMissing
+                | Self::TrackResourceRoleMismatch
+                | Self::ArrangementResourceMissing
+                | Self::ArrangementResourceAmbiguous
+                | Self::FreezeStateMissing
+                | Self::FreezeStateInvalid
+                | Self::Serialization(_)
+                | Self::HistoryAuthority(_)
+        )
     }
 }
 
@@ -3305,6 +3336,10 @@ impl fmt::Display for IdeAudioTrackUnfreezeError {
                 formatter.write_str("audio-track unfreeze capacity is unavailable")
             }
             Self::Serialization(source) => source.fmt(formatter),
+            Self::HistoryAuthority(source) => write!(
+                formatter,
+                "the exact rendered-freeze history authority could not be retained: {source}"
+            ),
             Self::Publication(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
@@ -3344,6 +3379,7 @@ impl Error for IdeAudioTrackUnfreezeError {
             Self::MixerSave(source) => Some(source.as_ref()),
             Self::Storage(source) => Some(source),
             Self::Serialization(source) => Some(source),
+            Self::HistoryAuthority(source) => Some(source.as_ref()),
             Self::Publication(source) => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
@@ -5831,6 +5867,7 @@ pub enum IdeResourceRestoreError {
     Storage(StorageError),
     CapacityUnavailable,
     CandidateInvalid(Box<dyn Error + Send + Sync>),
+    AudioTrackUnfreeze(Box<IdeAudioTrackUnfreezeError>),
     MixerPublication(Box<ProjectResourcePublicationError>),
     Publication(Box<ProjectResourcePublicationError>),
     NativeClose(IdeNativeCloseFailure),
@@ -5846,6 +5883,10 @@ pub enum IdeResourceRestoreError {
         outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
+    ReopenAfterStructuralPublication {
+        project_revision: u64,
+        source: Box<IdeProjectOpenError>,
+    },
 }
 
 impl IdeResourceRestoreError {
@@ -5855,7 +5896,9 @@ impl IdeResourceRestoreError {
     #[must_use]
     pub fn publication_committed(&self) -> bool {
         match self {
-            Self::ReopenAfterPublication { .. } => true,
+            Self::ReopenAfterPublication { .. } | Self::ReopenAfterStructuralPublication { .. } => {
+                true
+            }
             Self::Publication(source) => source.published(),
             Self::ReopenAfterPreparation { preparation, .. } => preparation.publication_committed(),
             Self::MixerPublication(_)
@@ -5866,14 +5909,16 @@ impl IdeResourceRestoreError {
             | Self::CandidateInvalid(_)
             | Self::NativeClose(_)
             | Self::NativeCloseAndReopen { .. } => false,
+            Self::AudioTrackUnfreeze(source) => source.publication_committed(),
         }
     }
 
     /// A refusal that cannot succeed on a later attempt, so retaining the
     /// entry would wedge every older entry behind it.
     #[must_use]
-    pub const fn is_permanent_refusal(&self) -> bool {
+    pub fn is_permanent_refusal(&self) -> bool {
         matches!(self, Self::ResourceMissing | Self::CandidateInvalid(_))
+            || matches!(self, Self::AudioTrackUnfreeze(source) if source.is_permanent_refusal())
     }
 }
 
@@ -5899,6 +5944,10 @@ impl fmt::Display for IdeResourceRestoreError {
                 formatter,
                 "undoing this edit would leave a project that cannot open: {source}"
             ),
+            Self::AudioTrackUnfreeze(source) => write!(
+                formatter,
+                "the retained frozen track cannot be restored for this undo: {source}"
+            ),
             Self::Publication(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
@@ -5921,6 +5970,13 @@ impl fmt::Display for IdeResourceRestoreError {
                 outcome.resource_id(),
                 outcome.project_revision()
             ),
+            Self::ReopenAfterStructuralPublication {
+                project_revision,
+                source,
+            } => write!(
+                formatter,
+                "the structural undo was restored in project revision {project_revision} but the project could not be reopened: {source}"
+            ),
         }
     }
 }
@@ -5931,10 +5987,12 @@ impl Error for IdeResourceRestoreError {
             Self::MixerSave(source) => Some(source.as_ref()),
             Self::Storage(source) => Some(source),
             Self::CandidateInvalid(source) => Some(source.as_ref()),
+            Self::AudioTrackUnfreeze(source) => Some(source.as_ref()),
             Self::MixerPublication(source) | Self::Publication(source) => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
-            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::ReopenAfterPublication { source, .. }
+            | Self::ReopenAfterStructuralPublication { source, .. } => Some(source.as_ref()),
             Self::ResourceMissing | Self::CapacityUnavailable | Self::NativeClose(_) => None,
         }
     }
@@ -7934,12 +7992,22 @@ struct IdeAudioTrackFreezePlan {
     mixer: IdeMixerSavePlan,
     documents: AudioTrackFreezeDocuments,
     rendered_sample: Vec<u8>,
+    history_authority: IdeTrackFreezeHistoryAuthority,
 }
 
 #[derive(Debug)]
 struct IdeAudioTrackUnfreezePlan {
     mixer: IdeMixerSavePlan,
     documents: AudioTrackUnfreezeDocuments,
+    history_authority: IdeTrackFreezeHistoryAuthority,
+}
+
+#[derive(Debug)]
+struct IdeAudioTrackFreezeReactivationPlan {
+    mixer: IdeMixerSavePlan,
+    documents: AudioTrackFreezeReactivationDocuments,
+    frozen_asset_sha256: String,
+    frozen_asset_byte_length: u64,
 }
 
 #[derive(Debug)]
@@ -8084,6 +8152,10 @@ impl IdeAudioTrackContentRemovalPlan {
 }
 
 impl IdeAudioTrackFreezePlan {
+    fn history_authority(&self) -> &IdeTrackFreezeHistoryAuthority {
+        &self.history_authority
+    }
+
     fn publish(&self) -> Result<AudioTrackFreezePublicationOutcome, IdeAudioTrackFreezeError> {
         let mixer = self.mixer.publish().map_err(|source| {
             IdeAudioTrackFreezeError::MixerSave(Box::new(IdeProjectSaveError::Publication(
@@ -8103,6 +8175,10 @@ impl IdeAudioTrackFreezePlan {
 }
 
 impl IdeAudioTrackUnfreezePlan {
+    fn history_authority(&self) -> &IdeTrackFreezeHistoryAuthority {
+        &self.history_authority
+    }
+
     fn publish(&self) -> Result<AudioTrackUnfreezePublicationOutcome, IdeAudioTrackUnfreezeError> {
         let mixer = self.mixer.publish().map_err(|source| {
             IdeAudioTrackUnfreezeError::MixerSave(Box::new(IdeProjectSaveError::Publication(
@@ -8117,6 +8193,42 @@ impl IdeAudioTrackUnfreezePlan {
             },
         )
         .map_err(|source| IdeAudioTrackUnfreezeError::Publication(Box::new(source)))
+    }
+
+    fn publish_for_history(
+        &self,
+    ) -> Result<AudioTrackUnfreezePublicationOutcome, IdeResourceRestoreError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeResourceRestoreError::MixerPublication(Box::new(source)))?;
+        publish_audio_track_unfreeze(
+            &self.mixer.project_path,
+            AudioTrackUnfreezePublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                documents: &self.documents,
+            },
+        )
+        .map_err(|source| IdeResourceRestoreError::Publication(Box::new(source)))
+    }
+}
+
+impl IdeAudioTrackFreezeReactivationPlan {
+    fn publish(&self) -> Result<AudioTrackFreezePublicationOutcome, IdeResourceRestoreError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeResourceRestoreError::MixerPublication(Box::new(source)))?;
+        publish_audio_track_freeze_reactivation(
+            &self.mixer.project_path,
+            AudioTrackFreezeReactivationPublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                documents: &self.documents,
+                frozen_asset_sha256: &self.frozen_asset_sha256,
+                frozen_asset_byte_length: self.frozen_asset_byte_length,
+            },
+        )
+        .map_err(|source| IdeResourceRestoreError::Publication(Box::new(source)))
     }
 }
 
@@ -8474,6 +8586,136 @@ enum IdeNativeFilterPublication {
     Removal,
 }
 
+/// The bounded, session-only authority required to replay one already rendered
+/// freeze without carrying audio bytes in undo/redo memory.
+///
+/// A freeze-state resource is independently limited to one MiB by
+/// `hyper-track-freeze`; retaining at most `MAX_UNDO_DEPTH` history entries in
+/// the worker consequently bounds this authority class to twenty MiB. The WAV
+/// remains a verified project asset and is checked again at reactivation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IdeTrackFreezeHistoryAuthority {
+    track_id: String,
+    freeze_state: Vec<u8>,
+    frozen_asset_sha256: String,
+    frozen_asset_byte_length: u64,
+}
+
+impl IdeTrackFreezeHistoryAuthority {
+    fn try_new(
+        track_id: &str,
+        freeze_state: &[u8],
+        frozen_asset_sha256: &str,
+        frozen_asset_byte_length: u64,
+    ) -> Result<Self, IdeTrackFreezeHistoryAuthorityError> {
+        if !is_valid_entity_id(track_id) {
+            return Err(IdeTrackFreezeHistoryAuthorityError::InvalidTrackIdentity);
+        }
+        let state = TrackFreezeState::parse(freeze_state)
+            .map_err(IdeTrackFreezeHistoryAuthorityError::FreezeState)?;
+        let canonical_state = state
+            .to_canonical_bytes()
+            .map_err(IdeTrackFreezeHistoryAuthorityError::Canonicalization)?;
+        if canonical_state != freeze_state {
+            return Err(IdeTrackFreezeHistoryAuthorityError::StateNotCanonical);
+        }
+        if !state.has_complete_rendered_authority() || state.track_id() != track_id {
+            return Err(IdeTrackFreezeHistoryAuthorityError::StateMismatch);
+        }
+        if !is_canonical_sha256(frozen_asset_sha256) {
+            return Err(IdeTrackFreezeHistoryAuthorityError::InvalidAssetDigest);
+        }
+        if frozen_asset_byte_length == 0 {
+            return Err(IdeTrackFreezeHistoryAuthorityError::InvalidAssetLength);
+        }
+        Ok(Self {
+            track_id: track_id.to_owned(),
+            freeze_state: freeze_state.to_vec(),
+            frozen_asset_sha256: frozen_asset_sha256.to_owned(),
+            frozen_asset_byte_length,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn track_id(&self) -> &str {
+        &self.track_id
+    }
+
+    #[must_use]
+    pub(crate) fn freeze_state(&self) -> &[u8] {
+        &self.freeze_state
+    }
+
+    #[must_use]
+    pub(crate) fn frozen_asset_sha256(&self) -> &str {
+        &self.frozen_asset_sha256
+    }
+
+    #[must_use]
+    pub(crate) const fn frozen_asset_byte_length(&self) -> u64 {
+        self.frozen_asset_byte_length
+    }
+}
+
+#[derive(Debug)]
+enum IdeTrackFreezeHistoryAuthorityError {
+    InvalidTrackIdentity,
+    FreezeState(hyper_track_freeze::TrackFreezeStateError),
+    Canonicalization(serde_json::Error),
+    StateNotCanonical,
+    StateMismatch,
+    InvalidAssetDigest,
+    InvalidAssetLength,
+}
+
+impl fmt::Display for IdeTrackFreezeHistoryAuthorityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTrackIdentity => {
+                formatter.write_str("track-freeze history requires a valid track identity")
+            }
+            Self::FreezeState(source) => source.fmt(formatter),
+            Self::Canonicalization(source) => write!(
+                formatter,
+                "track-freeze history cannot canonicalize its retained state: {source}"
+            ),
+            Self::StateNotCanonical => {
+                formatter.write_str("track-freeze history state is not canonical")
+            }
+            Self::StateMismatch => formatter.write_str(
+                "track-freeze history state does not name a complete rendered freeze for its track",
+            ),
+            Self::InvalidAssetDigest => {
+                formatter.write_str("track-freeze history has an invalid rendered-asset digest")
+            }
+            Self::InvalidAssetLength => {
+                formatter.write_str("track-freeze history has an empty rendered asset")
+            }
+        }
+    }
+}
+
+impl Error for IdeTrackFreezeHistoryAuthorityError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::FreezeState(source) => Some(source),
+            Self::Canonicalization(source) => Some(source),
+            Self::InvalidTrackIdentity
+            | Self::StateNotCanonical
+            | Self::StateMismatch
+            | Self::InvalidAssetDigest
+            | Self::InvalidAssetLength => None,
+        }
+    }
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum IdeHistoryOperation {
     ResourceReplacement {
@@ -8495,6 +8737,12 @@ pub(crate) enum IdeHistoryOperation {
     AutomationTakeRemoval {
         take_id: String,
         expected_bytes: Vec<u8>,
+    },
+    AudioTrackUnfreeze {
+        authority: Box<IdeTrackFreezeHistoryAuthority>,
+    },
+    AudioTrackFreezeReactivation {
+        authority: Box<IdeTrackFreezeHistoryAuthority>,
     },
 }
 
@@ -10301,10 +10549,21 @@ impl RunningDesktopIdeApplication {
             application.config.project_limits.session.documents,
         )
         .map_err(IdeAudioTrackFreezeError::Serialization)?;
+        let rendered_sample_byte_length = u64::try_from(rendered_sample.len())
+            .map_err(|_| IdeAudioTrackFreezeError::CapacityUnavailable)?;
+        let rendered_sample_sha256 = format!("{:x}", Sha256::digest(&rendered_sample));
+        let history_authority = IdeTrackFreezeHistoryAuthority::try_new(
+            track_id,
+            documents.freeze_state(),
+            &rendered_sample_sha256,
+            rendered_sample_byte_length,
+        )
+        .map_err(|source| IdeAudioTrackFreezeError::HistoryAuthority(Box::new(source)))?;
         Ok(IdeAudioTrackFreezePlan {
             mixer,
             documents,
             rendered_sample,
+            history_authority,
         })
     }
 
@@ -10391,7 +10650,158 @@ impl RunningDesktopIdeApplication {
             application.config.project_limits.session.documents,
         )
         .map_err(IdeAudioTrackUnfreezeError::Serialization)?;
-        Ok(IdeAudioTrackUnfreezePlan { mixer, documents })
+        let frozen_asset = package
+            .manifest()
+            .assets()
+            .iter()
+            .find(|asset| asset.id() == documents.frozen_asset_id())
+            .ok_or(IdeAudioTrackUnfreezeError::FreezeStateInvalid)?;
+        let history_authority = IdeTrackFreezeHistoryAuthority::try_new(
+            track_id,
+            &freeze_states[0],
+            frozen_asset.sha256(),
+            frozen_asset.byte_length(),
+        )
+        .map_err(|source| IdeAudioTrackUnfreezeError::HistoryAuthority(Box::new(source)))?;
+        Ok(IdeAudioTrackUnfreezePlan {
+            mixer,
+            documents,
+            history_authority,
+        })
+    }
+
+    fn prepare_audio_track_unfreeze_history(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        authority: &IdeTrackFreezeHistoryAuthority,
+    ) -> Result<IdeAudioTrackUnfreezePlan, IdeResourceRestoreError> {
+        let plan = Self::prepare_audio_track_unfreeze(application, recovery, authority.track_id())
+            .map_err(|source| IdeResourceRestoreError::AudioTrackUnfreeze(Box::new(source)))?;
+        if plan.history_authority() != authority {
+            return Err(IdeResourceRestoreError::CandidateInvalid(Box::new(
+                IdeTrackFreezeHistoryAuthorityError::StateMismatch,
+            )));
+        }
+        Ok(plan)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "reactivation authenticates the live source, retained authority, and durable asset before one atomic structural publication"
+    )]
+    fn prepare_audio_track_freeze_reactivation(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        authority: &IdeTrackFreezeHistoryAuthority,
+    ) -> Result<IdeAudioTrackFreezeReactivationPlan, IdeResourceRestoreError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeResourceRestoreError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeResourceRestoreError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == authority.track_id())
+            .ok_or(IdeResourceRestoreError::ResourceMissing)?;
+        if descriptor.role() != ResourceRole::Track {
+            return Err(IdeResourceRestoreError::CandidateInvalid(Box::new(
+                IdeTrackFreezeHistoryAuthorityError::StateMismatch,
+            )));
+        }
+        let source_track = package
+            .read_resource(authority.track_id())
+            .map_err(IdeResourceRestoreError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        let clip_ids = project
+            .audio_track_clip_ids(authority.track_id())
+            .ok_or_else(|| {
+                IdeResourceRestoreError::CandidateInvalid(Box::new(
+                    IdeTrackFreezeHistoryAuthorityError::StateMismatch,
+                ))
+            })?;
+        let mut source_clips = Vec::new();
+        source_clips
+            .try_reserve_exact(clip_ids.len())
+            .map_err(|_| IdeResourceRestoreError::CapacityUnavailable)?;
+        for clip_id in clip_ids {
+            let descriptor = package
+                .manifest()
+                .resources()
+                .iter()
+                .find(|descriptor| descriptor.id() == clip_id)
+                .ok_or(IdeResourceRestoreError::ResourceMissing)?;
+            if descriptor.role() != ResourceRole::Clip {
+                return Err(IdeResourceRestoreError::CandidateInvalid(Box::new(
+                    IdeTrackFreezeHistoryAuthorityError::StateMismatch,
+                )));
+            }
+            source_clips.push(
+                package
+                    .read_resource(clip_id)
+                    .map_err(IdeResourceRestoreError::Storage)?,
+            );
+        }
+        let mut arrangements = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Arrangement);
+        let arrangement_descriptor = arrangements
+            .next()
+            .ok_or(IdeResourceRestoreError::ResourceMissing)?;
+        if arrangements.next().is_some() {
+            return Err(IdeResourceRestoreError::CandidateInvalid(Box::new(
+                IdeTrackFreezeHistoryAuthorityError::StateMismatch,
+            )));
+        }
+        let source_arrangement = package
+            .read_resource(arrangement_descriptor.id())
+            .map_err(IdeResourceRestoreError::Storage)?;
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeResourceRestoreError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let source_clip_bytes = source_clips.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let documents = serialize_audio_track_freeze_reactivation(
+            project,
+            &assets,
+            &source_track,
+            &source_clip_bytes,
+            &source_arrangement,
+            authority.freeze_state(),
+            authority.track_id(),
+            application.config.project_limits.session.documents,
+        )
+        .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
+        let frozen_asset = package
+            .manifest()
+            .assets()
+            .iter()
+            .find(|asset| asset.id() == documents.frozen_asset_id())
+            .ok_or_else(|| {
+                IdeResourceRestoreError::CandidateInvalid(Box::new(
+                    IdeTrackFreezeHistoryAuthorityError::StateMismatch,
+                ))
+            })?;
+        if frozen_asset.sha256() != authority.frozen_asset_sha256()
+            || frozen_asset.byte_length() != authority.frozen_asset_byte_length()
+        {
+            return Err(IdeResourceRestoreError::CandidateInvalid(Box::new(
+                IdeTrackFreezeHistoryAuthorityError::StateMismatch,
+            )));
+        }
+        Ok(IdeAudioTrackFreezeReactivationPlan {
+            mixer,
+            documents,
+            frozen_asset_sha256: authority.frozen_asset_sha256().to_owned(),
+            frozen_asset_byte_length: authority.frozen_asset_byte_length(),
+        })
     }
 
     #[allow(
@@ -12779,7 +13189,9 @@ impl RunningDesktopIdeApplication {
             }
             IdeHistoryOperation::ResourceReplacement { .. }
             | IdeHistoryOperation::AutomationTakeAddition { .. }
-            | IdeHistoryOperation::AutomationTakeRemoval { .. } => Err(invalid(
+            | IdeHistoryOperation::AutomationTakeRemoval { .. }
+            | IdeHistoryOperation::AudioTrackUnfreeze { .. }
+            | IdeHistoryOperation::AudioTrackFreezeReactivation { .. } => Err(invalid(
                 "non-device-chain operation was sent to structural device-chain undo",
             )),
         }
@@ -12879,7 +13291,9 @@ impl RunningDesktopIdeApplication {
             }
             IdeHistoryOperation::ResourceReplacement { .. }
             | IdeHistoryOperation::DeviceChainAddition { .. }
-            | IdeHistoryOperation::DeviceChainRemoval { .. } => Err(invalid(
+            | IdeHistoryOperation::DeviceChainRemoval { .. }
+            | IdeHistoryOperation::AudioTrackUnfreeze { .. }
+            | IdeHistoryOperation::AudioTrackFreezeReactivation { .. } => Err(invalid(
                 "non-automation operation was sent to structural automation undo",
             )),
         }
