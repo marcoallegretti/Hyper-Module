@@ -46,6 +46,9 @@ const ADDED_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334466";
 const DEVICE_CHAIN_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334467";
 const NATIVE_DEVICE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334468";
 const SECOND_DEVICE_CHAIN_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334469";
+const FROZEN_CLIP_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233446a";
+const FROZEN_PLACEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233446b";
+const FREEZE_STATE_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233446c";
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -710,6 +713,54 @@ fn binds_one_native_device_chain_to_its_compiled_mixer_route() {
     assert_eq!(chain.id(), DEVICE_CHAIN_ID);
     assert_eq!(chain.track_id(), TRACK_ID);
     assert_eq!(chain.devices()[0].id(), NATIVE_DEVICE_ID);
+}
+
+#[test]
+fn freeze_state_bypasses_the_rendered_tracks_native_device_chain() {
+    let fixture = Fixture::new();
+    fixture.add_sample_asset();
+    fixture.add_resource(
+        DEVICE_CHAIN_ID,
+        "device-chain",
+        "devices/audio.json",
+        &device_chain(DEVICE_CHAIN_ID, TRACK_ID, NATIVE_DEVICE_ID),
+    );
+    let original_clip: Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("clips/clip.json")).unwrap()).unwrap();
+    fixture.replace_resource(
+        "tracks/audio.json",
+        &json!({"format":"hyper-track","format_version":1,"id":TRACK_ID,"project_id":PROJECT_ID,"name":"Audio","kind":"audio","order":0,"active":true,"clip_ids":[FROZEN_CLIP_ID],"extensions":{}}),
+    );
+    fs::remove_file(fixture.root.join("clips/clip.json")).unwrap();
+    let mut manifest = fixture.manifest();
+    manifest["resources"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|resource| resource["id"] != CLIP_ID);
+    fixture.write_manifest(&manifest);
+    fixture.add_resource(
+        FROZEN_CLIP_ID,
+        "clip",
+        "clips/frozen.json",
+        &json!({"format":"hyper-audio-clip","format_version":1,"id":FROZEN_CLIP_ID,"project_id":PROJECT_ID,"track_id":TRACK_ID,"name":"Frozen","enabled":true,"duration_ticks":4,"source":{"asset_id":SECOND_ASSET_ID,"start_frame":0,"frame_count":100},"loop":{"enabled":false,"start_tick":0,"end_tick":4},"playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},"fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},"warp_markers":[{"tick":0,"source_frame_offset":0},{"tick":4,"source_frame_offset":100}],"extensions":{}}),
+    );
+    fixture.replace_resource(
+        "arrangement/main.json",
+        &json!({"format":"hyper-arrangement","format_version":1,"id":ARRANGEMENT_ID,"project_id":PROJECT_ID,"name":"Main","enabled":true,"placements":[{"id":FROZEN_PLACEMENT_ID,"track_id":TRACK_ID,"clip_id":FROZEN_CLIP_ID,"start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}],"scene_launches":[],"extensions":{}}),
+    );
+    fixture.add_resource(
+        FREEZE_STATE_ID,
+        "freeze-state",
+        "freezes/audio.json",
+        &json!({"format":"hyper-track-freeze-state","format_version":2,"id":FREEZE_STATE_ID,"project_id":PROJECT_ID,"track_id":TRACK_ID,"frozen_clip_id":FROZEN_CLIP_ID,"frozen_asset_id":SECOND_ASSET_ID,"arrangement_id":ARRANGEMENT_ID,"frozen_placement_id":FROZEN_PLACEMENT_ID,"original_clips":[{"document":original_clip}],"original_placements":[{"document":{"id":PLACEMENT_ID,"track_id":TRACK_ID,"clip_id":CLIP_ID,"start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":DEVICE_CHAIN_ID,"extensions":{}}),
+    );
+
+    let mut project_limits = limits();
+    project_limits.session.media_cache.max_assets = 2;
+    project_limits.session.media_cache.max_decoded_sample_bytes = 800;
+    let prepared = prepare_project_playback(&fixture.root, project_limits).unwrap();
+    assert!(prepared.device_chains().is_empty());
+    assert_eq!(prepared.freeze_states().len(), 1);
 }
 
 #[test]
