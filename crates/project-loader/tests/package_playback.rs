@@ -738,12 +738,8 @@ fn freeze_state_bypasses_the_rendered_tracks_native_device_chain() {
         .unwrap()
         .retain(|resource| resource["id"] != CLIP_ID);
     fixture.write_manifest(&manifest);
-    fixture.add_resource(
-        FROZEN_CLIP_ID,
-        "clip",
-        "clips/frozen.json",
-        &json!({"format":"hyper-audio-clip","format_version":1,"id":FROZEN_CLIP_ID,"project_id":PROJECT_ID,"track_id":TRACK_ID,"name":"Frozen","enabled":true,"duration_ticks":4,"source":{"asset_id":SECOND_ASSET_ID,"start_frame":0,"frame_count":100},"loop":{"enabled":false,"start_tick":0,"end_tick":4},"playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},"fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},"warp_markers":[{"tick":0,"source_frame_offset":0},{"tick":4,"source_frame_offset":100}],"extensions":{}}),
-    );
+    let frozen_clip = json!({"format":"hyper-audio-clip","format_version":1,"id":FROZEN_CLIP_ID,"project_id":PROJECT_ID,"track_id":TRACK_ID,"name":"Frozen","enabled":true,"duration_ticks":4,"source":{"asset_id":SECOND_ASSET_ID,"start_frame":0,"frame_count":100},"loop":{"enabled":false,"start_tick":0,"end_tick":4},"playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},"fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},"warp_markers":[{"tick":0,"source_frame_offset":0},{"tick":4,"source_frame_offset":100}],"extensions":{}});
+    fixture.add_resource(FROZEN_CLIP_ID, "clip", "clips/frozen.json", &frozen_clip);
     fixture.replace_resource(
         "arrangement/main.json",
         &json!({"format":"hyper-arrangement","format_version":1,"id":ARRANGEMENT_ID,"project_id":PROJECT_ID,"name":"Main","enabled":true,"placements":[{"id":FROZEN_PLACEMENT_ID,"track_id":TRACK_ID,"clip_id":FROZEN_CLIP_ID,"start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}],"scene_launches":[],"extensions":{}}),
@@ -752,7 +748,7 @@ fn freeze_state_bypasses_the_rendered_tracks_native_device_chain() {
         FREEZE_STATE_ID,
         "freeze-state",
         "freezes/audio.json",
-        &json!({"format":"hyper-track-freeze-state","format_version":2,"id":FREEZE_STATE_ID,"project_id":PROJECT_ID,"track_id":TRACK_ID,"frozen_clip_id":FROZEN_CLIP_ID,"frozen_asset_id":SECOND_ASSET_ID,"arrangement_id":ARRANGEMENT_ID,"frozen_placement_id":FROZEN_PLACEMENT_ID,"original_clips":[{"document":original_clip}],"original_placements":[{"document":{"id":PLACEMENT_ID,"track_id":TRACK_ID,"clip_id":CLIP_ID,"start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":DEVICE_CHAIN_ID,"extensions":{}}),
+        &json!({"format":"hyper-track-freeze-state","format_version":3,"id":FREEZE_STATE_ID,"project_id":PROJECT_ID,"track_id":TRACK_ID,"frozen_clip_id":FROZEN_CLIP_ID,"frozen_asset_id":SECOND_ASSET_ID,"frozen_clip":{"document":frozen_clip},"arrangement_id":ARRANGEMENT_ID,"frozen_placement_id":FROZEN_PLACEMENT_ID,"original_clips":[{"document":original_clip}],"original_placements":[{"document":{"id":PLACEMENT_ID,"track_id":TRACK_ID,"clip_id":CLIP_ID,"start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":DEVICE_CHAIN_ID,"extensions":{}}),
     );
 
     let mut project_limits = limits();

@@ -9,7 +9,7 @@ use std::error::Error;
 use std::fmt;
 
 const FORMAT: &str = "hyper-track-freeze-state";
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 3;
 const MAX_DOCUMENT_BYTES: usize = 1_048_576;
 
 /// One complete arrangement placement displaced by a rendered freeze clip.
@@ -293,6 +293,7 @@ pub struct TrackFreezeState {
     track_id: String,
     frozen_clip_id: String,
     frozen_asset_id: String,
+    frozen_clip: FrozenClipState,
     arrangement_id: String,
     frozen_placement_id: String,
     original_clips: Vec<FrozenClipState>,
@@ -302,7 +303,7 @@ pub struct TrackFreezeState {
 }
 
 impl TrackFreezeState {
-    /// Creates one validated version-2 freeze authority.
+    /// Creates one validated version-3 freeze authority.
     ///
     /// # Errors
     ///
@@ -318,6 +319,7 @@ impl TrackFreezeState {
         track_id: String,
         frozen_clip_id: String,
         frozen_asset_id: String,
+        frozen_clip: FrozenClipState,
         arrangement_id: String,
         frozen_placement_id: String,
         original_clips: Vec<FrozenClipState>,
@@ -332,6 +334,9 @@ impl TrackFreezeState {
             track_id,
             frozen_clip_id,
             frozen_asset_id,
+            frozen_clip: RawFrozenClipState {
+                document: frozen_clip.document,
+            },
             arrangement_id,
             frozen_placement_id,
             original_clips: original_clips
@@ -351,7 +356,7 @@ impl TrackFreezeState {
         })
     }
 
-    /// Parses one complete version-2 freeze-state resource.
+    /// Parses one complete version-3 freeze-state resource.
     ///
     /// # Errors
     ///
@@ -380,6 +385,10 @@ impl TrackFreezeState {
     #[must_use]
     pub fn frozen_asset_id(&self) -> &str {
         &self.frozen_asset_id
+    }
+    #[must_use]
+    pub const fn frozen_clip(&self) -> &FrozenClipState {
+        &self.frozen_clip
     }
     #[must_use]
     pub fn arrangement_id(&self) -> &str {
@@ -420,6 +429,7 @@ impl TrackFreezeState {
             track_id: &self.track_id,
             frozen_clip_id: &self.frozen_clip_id,
             frozen_asset_id: &self.frozen_asset_id,
+            frozen_clip: &self.frozen_clip,
             arrangement_id: &self.arrangement_id,
             frozen_placement_id: &self.frozen_placement_id,
             original_clips: &self.original_clips,
@@ -470,6 +480,7 @@ struct RawTrackFreezeState {
     track_id: String,
     frozen_clip_id: String,
     frozen_asset_id: String,
+    frozen_clip: RawFrozenClipState,
     arrangement_id: String,
     frozen_placement_id: String,
     original_clips: Vec<RawFrozenClipState>,
@@ -500,6 +511,7 @@ struct CanonicalTrackFreezeState<'a> {
     track_id: &'a str,
     frozen_clip_id: &'a str,
     frozen_asset_id: &'a str,
+    frozen_clip: &'a FrozenClipState,
     arrangement_id: &'a str,
     frozen_placement_id: &'a str,
     original_clips: &'a [FrozenClipState],
@@ -547,6 +559,16 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
     {
         return Err(TrackFreezeStateError::InvalidDomain(
             "track freeze state has an invalid device-chain identity",
+        ));
+    }
+    let frozen_clip = FrozenClipState::try_new(raw.frozen_clip.document)?;
+    if frozen_clip.id() != raw.frozen_clip_id
+        || frozen_clip.project_id() != raw.project_id
+        || frozen_clip.track_id() != raw.track_id
+        || frozen_clip.asset_id() != raw.frozen_asset_id
+    {
+        return Err(TrackFreezeStateError::InvalidDomain(
+            "track freeze state has an invalid rendered clip",
         ));
     }
     if raw.original_clips.is_empty() {
@@ -613,6 +635,7 @@ fn validate(raw: RawTrackFreezeState) -> Result<TrackFreezeState, TrackFreezeSta
         track_id: raw.track_id,
         frozen_clip_id: raw.frozen_clip_id,
         frozen_asset_id: raw.frozen_asset_id,
+        frozen_clip,
         arrangement_id: raw.arrangement_id,
         frozen_placement_id: raw.frozen_placement_id,
         original_clips,
@@ -629,9 +652,19 @@ mod tests {
 
     const STATE: &[u8] = br#"{"format":"hyper-track-freeze-state","format_version":2,"id":"018f47a2-6b2d-7c11-8a44-001122337600","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","frozen_clip_id":"018f47a2-6b2d-7c11-8a44-001122337603","frozen_asset_id":"018f47a2-6b2d-7c11-8a44-001122337604","arrangement_id":"018f47a2-6b2d-7c11-8a44-001122337605","frozen_placement_id":"018f47a2-6b2d-7c11-8a44-001122337606","original_clips":[{"document":{"format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337607","project_id":"018f47a2-6b2d-7c11-8a44-001122337601","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","name":"Lead","enabled":true,"duration_ticks":4,"source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337610","start_frame":0,"frame_count":100},"loop":{"enabled":false,"start_tick":0,"end_tick":4},"playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},"fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},"warp_markers":[],"extensions":{}}}],"original_placements":[{"document":{"id":"018f47a2-6b2d-7c11-8a44-001122337608","track_id":"018f47a2-6b2d-7c11-8a44-001122337602","clip_id":"018f47a2-6b2d-7c11-8a44-001122337607","start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":"018f47a2-6b2d-7c11-8a44-001122337609","extensions":{}}"#;
 
+    fn state_bytes() -> Vec<u8> {
+        let mut state: Value = serde_json::from_slice(STATE).unwrap();
+        state["format_version"] = 3.into();
+        let mut frozen = state["original_clips"][0]["document"].clone();
+        frozen["id"] = "018f47a2-6b2d-7c11-8a44-001122337603".into();
+        frozen["source"]["asset_id"] = "018f47a2-6b2d-7c11-8a44-001122337604".into();
+        state["frozen_clip"] = serde_json::json!({"document": frozen});
+        serde_json_canonicalizer::to_vec(&state).unwrap()
+    }
+
     #[test]
     fn parses_complete_reversible_authority() {
-        let state = TrackFreezeState::parse(STATE).unwrap();
+        let state = TrackFreezeState::parse(&state_bytes()).unwrap();
         assert_eq!(state.track_id(), "018f47a2-6b2d-7c11-8a44-001122337602");
         assert_eq!(state.original_clips().len(), 1);
         assert_eq!(
@@ -645,7 +678,7 @@ mod tests {
 
     #[test]
     fn refuses_a_duplicate_original_clip_identity() {
-        let mut duplicated: Value = serde_json::from_slice(STATE).unwrap();
+        let mut duplicated: Value = serde_json::from_slice(&state_bytes()).unwrap();
         let clips = duplicated["original_clips"].as_array_mut().unwrap();
         clips.push(clips[0].clone());
         let duplicated = serde_json_canonicalizer::to_vec(&duplicated).unwrap();
@@ -657,9 +690,8 @@ mod tests {
 
     #[test]
     fn refuses_the_nonreversible_version_one_schema() {
-        let legacy = std::str::from_utf8(STATE)
-            .unwrap()
-            .replace("\"format_version\":2", "\"format_version\":1");
+        let state = String::from_utf8(state_bytes()).unwrap();
+        let legacy = state.replace("\"format_version\":3", "\"format_version\":1");
         assert!(matches!(
             TrackFreezeState::parse(legacy.as_bytes()),
             Err(TrackFreezeStateError::InvalidDomain(_))

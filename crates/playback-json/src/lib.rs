@@ -4142,12 +4142,18 @@ pub fn serialize_audio_track_freeze(
         .map(FrozenClipState::try_new)
         .collect::<Result<Vec<_>, _>>()
         .map_err(AudioTrackFreezeSerializationError::State)?;
+    let frozen_clip_state = FrozenClipState::try_new(
+        serde_json::from_slice(&added.clip)
+            .map_err(AudioTrackFreezeSerializationError::Serialization)?,
+    )
+    .map_err(AudioTrackFreezeSerializationError::State)?;
     let state = TrackFreezeState::try_new(
         freeze_state_id.to_owned(),
         project.project_id().to_owned(),
         track_id.to_owned(),
         frozen_clip_id.to_owned(),
         frozen_asset_id.to_owned(),
+        frozen_clip_state,
         arrangement.id.clone(),
         frozen_placement_id.to_owned(),
         original_clips,
@@ -4256,13 +4262,25 @@ pub fn serialize_audio_track_unfreeze(
     {
         return Err(AudioTrackUnfreezeSerializationError::FrozenStateMismatch);
     }
-    let frozen_clip = project
+    let (frozen_clip_index, frozen_clip) = project
         .clips
         .iter()
-        .find(|clip| clip.id == state.frozen_clip_id())
+        .enumerate()
+        .find(|(_, clip)| clip.id == state.frozen_clip_id())
         .ok_or(AudioTrackUnfreezeSerializationError::FrozenStateMismatch)?;
+    let frozen_clip_bytes = serde_json_canonicalizer::to_vec(state.frozen_clip().document())
+        .map_err(AudioTrackUnfreezeSerializationError::Serialization)?;
+    let expected_frozen_clip = load_clip(
+        &frozen_clip_bytes,
+        frozen_clip_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_warp_markers,
+    )
+    .map_err(AudioTrackUnfreezeSerializationError::Source)?;
     if frozen_clip.track_id != track_id
         || frozen_clip.asset_id != state.frozen_asset_id()
+        || *frozen_clip != expected_frozen_clip
         || source.clip_ids.as_slice() != [state.frozen_clip_id()]
     {
         return Err(AudioTrackUnfreezeSerializationError::FrozenStateMismatch);
