@@ -1286,6 +1286,21 @@ fn validate_freeze_state_inventory(
                 return Err(fail("freeze-state references a missing resource"));
             }
         }
+        let frozen_clip = package.read_resource(document.frozen_clip_id())?;
+        let retained_frozen_clip =
+            serde_json_canonicalizer::to_vec(document.frozen_clip().document()).map_err(|_| {
+                ProjectPlaybackError::FreezeState {
+                    resource_id: state.descriptor_id.clone(),
+                    source: TrackFreezeStateError::InvalidDomain(
+                        "freeze-state rendered clip cannot be canonicalized",
+                    ),
+                }
+            })?;
+        if frozen_clip != retained_frozen_clip {
+            return Err(fail(
+                "freeze-state rendered clip authority differs from the active clip",
+            ));
+        }
         if !package.manifest().assets().iter().any(|asset| {
             asset.id() == document.frozen_asset_id() && asset.role() == AssetRole::Sample
         }) {

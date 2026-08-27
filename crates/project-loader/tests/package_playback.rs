@@ -748,7 +748,7 @@ fn freeze_state_bypasses_the_rendered_tracks_native_device_chain() {
         FREEZE_STATE_ID,
         "freeze-state",
         "freezes/audio.json",
-        &json!({"format":"hyper-track-freeze-state","format_version":3,"id":FREEZE_STATE_ID,"project_id":PROJECT_ID,"track_id":TRACK_ID,"frozen_clip_id":FROZEN_CLIP_ID,"frozen_asset_id":SECOND_ASSET_ID,"frozen_clip":{"document":frozen_clip},"arrangement_id":ARRANGEMENT_ID,"frozen_placement_id":FROZEN_PLACEMENT_ID,"original_clips":[{"document":original_clip}],"original_placements":[{"document":{"id":PLACEMENT_ID,"track_id":TRACK_ID,"clip_id":CLIP_ID,"start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":DEVICE_CHAIN_ID,"extensions":{}}),
+        &json!({"format":"hyper-track-freeze-state","format_version":3,"id":FREEZE_STATE_ID,"project_id":PROJECT_ID,"track_id":TRACK_ID,"frozen_clip_id":FROZEN_CLIP_ID,"frozen_asset_id":SECOND_ASSET_ID,"frozen_clip":{"document":frozen_clip.clone()},"arrangement_id":ARRANGEMENT_ID,"frozen_placement_id":FROZEN_PLACEMENT_ID,"original_clips":[{"document":original_clip}],"original_placements":[{"document":{"id":PLACEMENT_ID,"track_id":TRACK_ID,"clip_id":CLIP_ID,"start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}}],"device_chain_id":DEVICE_CHAIN_ID,"extensions":{}}),
     );
 
     let mut project_limits = limits();
@@ -757,6 +757,15 @@ fn freeze_state_bypasses_the_rendered_tracks_native_device_chain() {
     let prepared = prepare_project_playback(&fixture.root, project_limits).unwrap();
     assert!(prepared.device_chains().is_empty());
     assert_eq!(prepared.freeze_states().len(), 1);
+    let mut altered_state: Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("freezes/audio.json")).unwrap())
+            .unwrap();
+    altered_state["frozen_clip"]["document"]["name"] = json!("Wrong");
+    fixture.replace_resource("freezes/audio.json", &altered_state);
+    assert!(matches!(
+        prepare_project_playback(&fixture.root, project_limits),
+        Err(ProjectPlaybackError::FreezeState { .. })
+    ));
 }
 
 #[test]
