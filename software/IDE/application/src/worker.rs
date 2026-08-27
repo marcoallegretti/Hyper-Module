@@ -17776,6 +17776,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one worker flow verifies multi-file import, one commit, and one reopen together"
+    )]
     fn running_worker_imports_each_audio_file_and_reopens_once_with_the_committed_batch() {
         let fixture = std::env::temp_dir().join(format!(
             "hyper-desktop-ide-audio-import-success-{}",
@@ -18060,6 +18064,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one worker flow verifies compressor publication, reopen, and undo authority together"
+    )]
     fn native_compressor_edits_reopen_and_undo_through_the_real_worker() {
         let fixture = std::env::temp_dir().join(format!(
             "hyper-desktop-ide-native-compressor-history-{}",
