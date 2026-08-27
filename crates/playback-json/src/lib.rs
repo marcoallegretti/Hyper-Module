@@ -12122,6 +12122,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one complete reorder fixture proves project and mixer ordering agree"
+    )]
     fn reorders_a_complete_flat_audio_project_and_matching_mixer() {
         let first_id = "018f47a2-6b2d-7c11-8a44-001122334456";
         let second_id = "018f47a2-6b2d-7c11-8a44-001122334469";
@@ -12229,6 +12233,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one complete routing fixture proves reorder preserves group and return routes"
+    )]
     fn reorders_flat_audio_group_and_return_strips_without_changing_routes() {
         let audio_track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
         let group_track_id = "018f47a2-6b2d-7c11-8a44-001122334469";
@@ -18061,6 +18069,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one marker-edit matrix keeps ordering, identity, and origin invariants together"
+    )]
     fn timeline_marker_edits_preserve_order_identity_and_the_origin_invariant() {
         let tracks: [&[u8]; 0] = [];
         let clips: [&[u8]; 0] = [];
@@ -18339,6 +18351,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one loop persistence flow proves write, reload, and clear semantics together"
+    )]
     fn writing_a_loop_range_survives_a_reload_and_clearing_removes_the_field() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];

@@ -871,7 +871,7 @@ mod tests {
     #[cfg(windows)]
     const ABSOLUTE_PREFIX: &str = "C:\\";
 
-    fn recording_metadata_with_extensions(extensions: serde_json::Value) -> Vec<u8> {
+    fn recording_metadata_with_extensions(extensions: &serde_json::Value) -> Vec<u8> {
         serde_json_canonicalizer::to_vec(&serde_json::json!({
             "format": FORMAT,
             "format_version": FORMAT_VERSION,
@@ -893,10 +893,11 @@ mod tests {
 
     #[test]
     fn take_label_rewrite_is_canonical_and_preserves_extensions() {
-        let source = recording_metadata_with_extensions(serde_json::json!({
+        let source_extensions = serde_json::json!({
             "org.example.fixture": { "retained": true },
             TAKE_LABEL_EXTENSION: { "label": "Original", "future": 7 },
-        }));
+        });
+        let source = recording_metadata_with_extensions(&source_extensions);
         let parsed = RecordingMetadataDocument::parse(&source).unwrap();
         assert_eq!(parsed.take_label(), Some("Original"));
 
@@ -936,14 +937,16 @@ mod tests {
             serde_json::json!({ "label": " leading" }),
             serde_json::json!({ "label": "x".repeat(121) }),
         ] {
-            let source = recording_metadata_with_extensions(serde_json::json!({
+            let extensions = serde_json::json!({
                 TAKE_LABEL_EXTENSION: extension,
-            }));
+            });
+            let source = recording_metadata_with_extensions(&extensions);
             assert!(RecordingMetadataDocument::parse(&source).is_err());
         }
 
+        let empty_extensions = serde_json::json!({});
         let parsed = RecordingMetadataDocument::parse(&recording_metadata_with_extensions(
-            serde_json::json!({}),
+            &empty_extensions,
         ))
         .unwrap();
         for label in ["", " ", " label", "label "] {
