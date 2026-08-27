@@ -32,6 +32,7 @@ hyper-recording-worker = { path = "../../../crates/recording-worker" }
 hyper-runtime-bundle-builder = { path = "../runtime-bundle-builder" }
 hyper-storage-engine = { path = "../../../crates/storage-engine" }
 hyper-thread-supervisor = { path = "../../../crates/thread-supervisor" }
+serde_json = "=1.0.151"
 uuid = { version = "=1.24.0", features = ["v4"] }
 
 [features]
@@ -40,7 +41,6 @@ ui-test-support = []
 [dev-dependencies]
 hyper-clip-engine = { path = "../../../crates/clip-engine" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime", features = ["test-support"] }
-serde_json = "=1.0.151"
 serde_json_canonicalizer = "=0.3.2"
 sha2 = "=0.10.9"
 
