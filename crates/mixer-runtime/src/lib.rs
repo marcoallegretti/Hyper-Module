@@ -184,6 +184,9 @@ pub enum RuntimeProcessError {
     DuplicateChannelTap {
         channel_index: usize,
     },
+    PreFaderChannelTapRequiresAudio {
+        channel_index: usize,
+    },
     BlockLimit {
         actual: usize,
         maximum: usize,
@@ -199,6 +202,12 @@ pub enum RuntimeProcessError {
     PlaybackRender(PlaybackRenderError),
     Mixer(ProcessError),
     NativeDevice(NativeDeviceProcessError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChannelTapPosition {
+    PostDevicePreFader,
+    PostFader,
 }
 
 impl fmt::Display for RuntimeProcessError {
@@ -231,6 +240,10 @@ impl fmt::Display for RuntimeProcessError {
                     "runtime channel tap {channel_index} was requested more than once"
                 )
             }
+            Self::PreFaderChannelTapRequiresAudio { channel_index } => write!(
+                formatter,
+                "runtime pre-fader channel tap {channel_index} does not target an audio channel"
+            ),
             Self::BlockLimit { actual, maximum } => write!(
                 formatter,
                 "runtime block has {actual} frames; configured maximum is {maximum}"
@@ -272,6 +285,7 @@ impl Error for RuntimeProcessError {
             | Self::ChannelTapOutputLengthMismatch { .. }
             | Self::ChannelTapUnavailable { .. }
             | Self::DuplicateChannelTap { .. }
+            | Self::PreFaderChannelTapRequiresAudio { .. }
             | Self::BlockLimit { .. }
             | Self::FrameRangeOverflow
             | Self::AutomationValueMismatch => None,
@@ -3529,11 +3543,12 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
         scratch: &mut [RenderScratchSlot<'_>],
         output: StereoOutput<'_>,
     ) -> Result<RenderedWindow, RuntimeProcessError> {
-        self.process_window_with_channel_tap_sink(
+        self.process_window_with_channel_tap_sink_at(
             arrangement_start_frame,
             scratch,
             output,
             &[],
+            ChannelTapPosition::PostFader,
             |_, _, _| {},
         )
     }
@@ -3572,11 +3587,12 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 right: channel_output.right.len(),
             });
         }
-        self.process_window_with_channel_tap_sink(
+        self.process_window_with_channel_tap_sink_at(
             arrangement_start_frame,
             scratch,
             output,
             &[channel_index],
+            ChannelTapPosition::PostFader,
             |_, left, right| {
                 channel_output.left[..left.len()].copy_from_slice(left);
                 channel_output.right[..right.len()].copy_from_slice(right);
@@ -3602,6 +3618,58 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
         scratch: &mut [RenderScratchSlot<'_>],
         output: StereoOutput<'_>,
         channel_indices: &[usize],
+        channel_tap: impl FnMut(usize, &[f32], &[f32]),
+    ) -> Result<RenderedWindow, RuntimeProcessError> {
+        self.process_window_with_channel_tap_sink_at(
+            arrangement_start_frame,
+            scratch,
+            output,
+            channel_indices,
+            ChannelTapPosition::PostFader,
+            channel_tap,
+        )
+    }
+
+    /// Renders the normal main output while copying selected audio channels
+    /// directly after their native device chains and before channel mute,
+    /// fader, pan, sends, routing, and main processing.
+    ///
+    /// A channel without a native device chain is copied from its rendered
+    /// clip input, with mono material promoted identically to both planes.
+    /// This is the only channel tap that can replace an audio track's source
+    /// while retaining its persisted channel controls and routing semantics.
+    /// Group and return channels are refused because their inputs already
+    /// contain routing contributions from other channels.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified refusal before rendering when a requested channel
+    /// is not an audio channel, is unavailable, or is repeated.
+    pub fn process_window_with_audio_pre_fader_tap_sink(
+        &mut self,
+        arrangement_start_frame: usize,
+        scratch: &mut [RenderScratchSlot<'_>],
+        output: StereoOutput<'_>,
+        channel_indices: &[usize],
+        channel_tap: impl FnMut(usize, &[f32], &[f32]),
+    ) -> Result<RenderedWindow, RuntimeProcessError> {
+        self.process_window_with_channel_tap_sink_at(
+            arrangement_start_frame,
+            scratch,
+            output,
+            channel_indices,
+            ChannelTapPosition::PostDevicePreFader,
+            channel_tap,
+        )
+    }
+
+    fn process_window_with_channel_tap_sink_at(
+        &mut self,
+        arrangement_start_frame: usize,
+        scratch: &mut [RenderScratchSlot<'_>],
+        output: StereoOutput<'_>,
+        channel_indices: &[usize],
+        tap_position: ChannelTapPosition,
         mut channel_tap: impl FnMut(usize, &[f32], &[f32]),
     ) -> Result<RenderedWindow, RuntimeProcessError> {
         let frame_count = output.left.len();
@@ -3617,17 +3685,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 maximum: self.max_block_frames,
             });
         }
-        for (tap_index, &channel_index) in channel_indices.iter().enumerate() {
-            if channel_index >= self.slots.len() {
-                return Err(RuntimeProcessError::ChannelTapUnavailable {
-                    channel_index,
-                    channel_count: self.slots.len(),
-                });
-            }
-            if channel_indices[..tap_index].contains(&channel_index) {
-                return Err(RuntimeProcessError::DuplicateChannelTap { channel_index });
-            }
-        }
+        self.validate_channel_taps(channel_indices, tap_position)?;
         let rendered =
             self.renderer
                 .render_track_window(arrangement_start_frame, frame_count, scratch)?;
@@ -3647,9 +3705,21 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
             for order_index in 0..self.processing_order.len() {
                 let slot_index = self.processing_order[order_index];
                 self.process_devices(slot_index, frame_count, scratch)?;
+                if tap_position == ChannelTapPosition::PostDevicePreFader
+                    && channel_indices.contains(&slot_index)
+                {
+                    self.copy_audio_pre_fader_output(slot_index, frame_count, scratch);
+                    channel_tap(
+                        slot_index,
+                        &self.channel_output.left[..frame_count],
+                        &self.channel_output.right[..frame_count],
+                    );
+                }
                 self.process_sends(slot_index, CompiledMixerTap::PreFader, frame_count, scratch)?;
                 self.process_channel(slot_index, frame_count, scratch)?;
-                if channel_indices.contains(&slot_index) {
+                if tap_position == ChannelTapPosition::PostFader
+                    && channel_indices.contains(&slot_index)
+                {
                     channel_tap(
                         slot_index,
                         &self.channel_output.left[..frame_count],
@@ -3691,6 +3761,30 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
         result
     }
 
+    fn validate_channel_taps(
+        &self,
+        channel_indices: &[usize],
+        tap_position: ChannelTapPosition,
+    ) -> Result<(), RuntimeProcessError> {
+        for (tap_index, &channel_index) in channel_indices.iter().enumerate() {
+            let Some(slot) = self.slots.get(channel_index) else {
+                return Err(RuntimeProcessError::ChannelTapUnavailable {
+                    channel_index,
+                    channel_count: self.slots.len(),
+                });
+            };
+            if channel_indices[..tap_index].contains(&channel_index) {
+                return Err(RuntimeProcessError::DuplicateChannelTap { channel_index });
+            }
+            if tap_position == ChannelTapPosition::PostDevicePreFader
+                && slot.kind != CompiledMixerTrackKind::Audio
+            {
+                return Err(RuntimeProcessError::PreFaderChannelTapRequiresAudio { channel_index });
+            }
+        }
+        Ok(())
+    }
+
     fn process_devices(
         &mut self,
         slot_index: usize,
@@ -3727,6 +3821,32 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 &mut device.output.right[..frame_count],
             )
             .map_err(RuntimeProcessError::NativeDevice)
+    }
+
+    fn copy_audio_pre_fader_output(
+        &mut self,
+        slot_index: usize,
+        frame_count: usize,
+        scratch: &[RenderScratchSlot<'_>],
+    ) {
+        let slot = &self.slots[slot_index];
+        if let Some(device) = &slot.device {
+            self.channel_output.left[..frame_count]
+                .copy_from_slice(&device.output.left[..frame_count]);
+            self.channel_output.right[..frame_count]
+                .copy_from_slice(&device.output.right[..frame_count]);
+            return;
+        }
+        match scratch[slot_index].input_block() {
+            InputBlock::Mono(samples) => {
+                self.channel_output.left[..frame_count].copy_from_slice(samples);
+                self.channel_output.right[..frame_count].copy_from_slice(samples);
+            }
+            InputBlock::Stereo { left, right } => {
+                self.channel_output.left[..frame_count].copy_from_slice(left);
+                self.channel_output.right[..frame_count].copy_from_slice(right);
+            }
+        }
     }
 
     fn prepare_controls(

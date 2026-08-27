@@ -264,6 +264,132 @@ fn prepared_playback_channel_tap_captures_post_fader_audio_before_main_processin
 }
 
 #[test]
+fn audio_pre_fader_tap_preserves_device_output_without_channel_controls() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let chains = [native_filter_chain(true)];
+    let mut runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        &chains,
+        64,
+    )
+    .unwrap();
+    let mut arrangement_left = [9.0_f32; 64];
+    let mut arrangement_right = [9.0_f32; 64];
+    let mut scene_left = [9.0_f32; 64];
+    let mut scene_right = [9.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut main_left = [9.0_f32; 64];
+    let mut main_right = [9.0_f32; 64];
+    let mut tap_left = [9.0_f32; 64];
+    let mut tap_right = [9.0_f32; 64];
+
+    runtime
+        .process_window_with_audio_pre_fader_tap_sink(
+            0,
+            &mut scratch,
+            StereoOutput {
+                left: &mut main_left,
+                right: &mut main_right,
+            },
+            &[0],
+            |channel_index, left, right| {
+                assert_eq!(channel_index, 0);
+                tap_left.copy_from_slice(left);
+                tap_right.copy_from_slice(right);
+            },
+        )
+        .unwrap();
+
+    assert!(
+        tap_left
+            .iter()
+            .zip(&fixture.arrangement_samples[..64])
+            .any(|(filtered, source)| filtered.to_bits() != source.to_bits())
+    );
+    assert!(tap_right.iter().any(|sample| sample.abs() > f32::EPSILON));
+
+    let mut post_fader_runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+            &prepared,
+            &fixture.mixer,
+            &chains,
+            64,
+        )
+        .unwrap();
+    let mut post_arrangement_left = [9.0_f32; 64];
+    let mut post_arrangement_right = [9.0_f32; 64];
+    let mut post_scene_left = [9.0_f32; 64];
+    let mut post_scene_right = [9.0_f32; 64];
+    let mut post_scratch = [
+        RenderScratchSlot::new(&mut post_arrangement_left, &mut post_arrangement_right),
+        RenderScratchSlot::new(&mut post_scene_left, &mut post_scene_right),
+    ];
+    let mut post_main_left = [9.0_f32; 64];
+    let mut post_main_right = [9.0_f32; 64];
+    let mut post_tap_left = [9.0_f32; 64];
+    let mut post_tap_right = [9.0_f32; 64];
+    post_fader_runtime
+        .process_window_with_channel_tap_sink(
+            0,
+            &mut post_scratch,
+            StereoOutput {
+                left: &mut post_main_left,
+                right: &mut post_main_right,
+            },
+            &[0],
+            |channel_index, left, right| {
+                assert_eq!(channel_index, 0);
+                post_tap_left.copy_from_slice(left);
+                post_tap_right.copy_from_slice(right);
+            },
+        )
+        .unwrap();
+
+    assert_eq!(tap_left.map(f32::to_bits), post_tap_left.map(f32::to_bits));
+    assert_constant(&post_tap_right, 0.0);
+}
+
+#[test]
+fn audio_pre_fader_tap_refuses_a_group_before_rendering() {
+    let fixture = graph_fixture();
+    let group_index = fixture
+        .mixer
+        .slots()
+        .iter()
+        .position(|slot| slot.track_id() == GRAPH_GROUP_TRACK_ID)
+        .unwrap();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let mut runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 64).unwrap();
+    let mut scratch: Vec<RenderScratchSlot<'_>> = Vec::new();
+    let mut output_left = [9.0_f32; 64];
+    let mut output_right = [9.0_f32; 64];
+
+    assert_eq!(
+        runtime.process_window_with_audio_pre_fader_tap_sink(
+            0,
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+            &[group_index],
+            |_, _, _| unreachable!("the group tap must be refused before rendering"),
+        ),
+        Err(RuntimeProcessError::PreFaderChannelTapRequiresAudio {
+            channel_index: group_index,
+        })
+    );
+    assert_constant(&output_left, 9.0);
+    assert_constant(&output_right, 9.0);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "one refusal test proves every channel-tap preflight leaves the render boundary untouched"
