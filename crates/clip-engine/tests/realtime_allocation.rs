@@ -30,6 +30,8 @@ fn clip_block_rendering_performs_zero_heap_allocations() {
         .place(PlacementSpec {
             clip_start_frame: 0,
             frame_count: 256,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
         })
         .unwrap();
     let mut left = [0.0_f32; 128];

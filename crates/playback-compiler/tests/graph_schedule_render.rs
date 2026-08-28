@@ -65,6 +65,8 @@ fn resolved_graph_entry_prepares_and_renders_its_declared_asset() {
         duration_ticks: 4,
         enabled: true,
         gain_decibels: 0.0,
+        fade_in_ticks: 0,
+        fade_out_ticks: 0,
     }];
     let schedule = compile_arrangement(
         timeline,

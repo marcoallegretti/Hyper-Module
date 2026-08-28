@@ -417,6 +417,8 @@ struct LoadedPlacement {
     duration_ticks: u64,
     enabled: bool,
     gain_decibels: f64,
+    fade_in_ticks: u64,
+    fade_out_ticks: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1676,6 +1678,7 @@ pub enum ArrangementPlacementDocumentSerializationError {
     SceneLaunchTickOccupied,
     SceneLaunchMissing,
     PlacementMissing,
+    PlacementFadeBoundaryConflict,
     InvalidDocumentShape,
     Serialization(serde_json::Error),
 }
@@ -1690,6 +1693,12 @@ pub type ArrangementPlacementDurationSerializationError =
 pub enum ArrangementPlacementGainSerializationError {
     NonFiniteGain,
     UnsupportedEffectiveGain,
+    Document(ArrangementPlacementDocumentSerializationError),
+}
+
+#[derive(Debug)]
+pub enum ArrangementPlacementFadeSerializationError {
+    CombinedDurationExceedsPlacement,
     Document(ArrangementPlacementDocumentSerializationError),
 }
 
@@ -2222,6 +2231,9 @@ impl fmt::Display for ArrangementPlacementDocumentSerializationError {
             Self::PlacementMissing => {
                 formatter.write_str("the selected arrangement placement is not present")
             }
+            Self::PlacementFadeBoundaryConflict => formatter.write_str(
+                "the requested placement boundary would change an active local fade; clear or edit the fade first",
+            ),
             Self::InvalidDocumentShape => {
                 formatter.write_str("source arrangement shape changed after typed validation")
             }
@@ -2251,6 +2263,7 @@ impl Error for ArrangementPlacementDocumentSerializationError {
             | Self::SceneLaunchTickOccupied
             | Self::SceneLaunchMissing
             | Self::PlacementMissing
+            | Self::PlacementFadeBoundaryConflict
             | Self::InvalidDocumentShape => None,
         }
     }
@@ -2273,6 +2286,25 @@ impl Error for ArrangementPlacementGainSerializationError {
         match self {
             Self::Document(source) => Some(source),
             Self::NonFiniteGain | Self::UnsupportedEffectiveGain => None,
+        }
+    }
+}
+
+impl fmt::Display for ArrangementPlacementFadeSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CombinedDurationExceedsPlacement => formatter
+                .write_str("combined placement fades may not exceed the placement duration"),
+            Self::Document(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ArrangementPlacementFadeSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::CombinedDurationExceedsPlacement => None,
         }
     }
 }
@@ -4379,7 +4411,7 @@ pub fn serialize_audio_track_freeze(
             true
         }
     });
-    let frozen_placement_document = json!({"id": frozen_placement_id, "track_id": track_id, "clip_id": frozen_clip_id, "start_tick": 0, "clip_start_tick": 0, "duration_ticks": added.duration_ticks, "enabled": true, "gain_decibels": 0});
+    let frozen_placement_document = json!({"id": frozen_placement_id, "track_id": track_id, "clip_id": frozen_clip_id, "start_tick": 0, "clip_start_tick": 0, "duration_ticks": added.duration_ticks, "enabled": true, "gain_decibels": 0, "fade_in_ticks": 0, "fade_out_ticks": 0});
     placements.push(frozen_placement_document.clone());
     placements
         .sort_unstable_by(|left, right| placement_sort_key(left).cmp(&placement_sort_key(right)));
@@ -6104,7 +6136,9 @@ pub fn serialize_arrangement_placement_addition(
         "clip_start_tick": 0,
         "duration_ticks": clip.duration_ticks,
         "enabled": true,
-        "gain_decibels": 0
+        "gain_decibels": 0,
+        "fade_in_ticks": 0,
+        "fade_out_ticks": 0
     });
     let mut value = prepare_arrangement_placement_addition_document(
         project,
@@ -7395,7 +7429,9 @@ pub fn serialize_arrangement_placement_duplication(
         "clip_start_tick": source.clip_start_tick,
         "duration_ticks": source.duration_ticks,
         "enabled": source.enabled,
-        "gain_decibels": source.gain_decibels
+        "gain_decibels": source.gain_decibels,
+        "fade_in_ticks": source.fade_in_ticks,
+        "fade_out_ticks": source.fade_out_ticks
     });
     let mut value = prepare_arrangement_placement_addition_document(
         project,
@@ -7475,6 +7511,9 @@ pub fn serialize_arrangement_placement_split(
         ),
     )?;
     let right_duration = end_tick - split_tick;
+    if source.fade_in_ticks > left_duration || source.fade_out_ticks > right_duration {
+        return Err(ArrangementPlacementDocumentSerializationError::PlacementFadeBoundaryConflict);
+    }
 
     let mut value = prepare_arrangement_placement_addition_document(
         project,
@@ -7493,6 +7532,8 @@ pub fn serialize_arrangement_placement_split(
         .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
     left.insert("duration_ticks".to_owned(), left_duration.into());
     left.insert("gain_decibels".to_owned(), source.gain_decibels.into());
+    left.insert("fade_in_ticks".to_owned(), source.fade_in_ticks.into());
+    left.insert("fade_out_ticks".to_owned(), 0.into());
     placements.push(json!({
         "id": right_placement_id,
         "track_id": source.track_id,
@@ -7501,7 +7542,9 @@ pub fn serialize_arrangement_placement_split(
         "clip_start_tick": right_clip_start,
         "duration_ticks": right_duration,
         "enabled": source.enabled,
-        "gain_decibels": source.gain_decibels
+        "gain_decibels": source.gain_decibels,
+        "fade_in_ticks": 0,
+        "fade_out_ticks": source.fade_out_ticks
     }));
 
     if placements
@@ -7699,9 +7742,12 @@ pub fn serialize_arrangement_placement_move(
 /// activation, and namespaced extensions.
 ///
 /// This is a right-edge resize: it does not change the placement start or the
-/// clip-local start. The strict arrangement boundary rejects zero duration,
-/// a third concurrent same-track placement, safe-range overflow, and
-/// non-looping source overrun.
+/// clip-local start. An existing local fade-out may not be moved to a new edge
+/// because that would silently reshape already-rendered audio. Shortening
+/// before that fade clears the removed fade-out; extension requires no existing
+/// local fade-out. The strict arrangement boundary rejects zero duration, a
+/// third concurrent same-track placement, safe-range overflow, and non-looping
+/// source overrun.
 ///
 /// # Errors
 ///
@@ -7720,7 +7766,28 @@ pub fn serialize_arrangement_placement_duration(
         source_arrangement,
         placement_id,
         limits,
-        |_, document| {
+        |placement, document| {
+            if duration_ticks == placement.duration_ticks {
+                return Ok(());
+            }
+            if duration_ticks > placement.duration_ticks {
+                if placement.fade_out_ticks != 0 {
+                    return Err(
+                        ArrangementPlacementDocumentSerializationError::PlacementFadeBoundaryConflict,
+                    );
+                }
+            } else {
+                if duration_ticks < placement.fade_in_ticks
+                    || duration_ticks > placement.duration_ticks - placement.fade_out_ticks
+                {
+                    return Err(
+                        ArrangementPlacementDocumentSerializationError::PlacementFadeBoundaryConflict,
+                    );
+                }
+                if placement.fade_out_ticks != 0 {
+                    document.insert("fade_out_ticks".to_owned(), 0.into());
+                }
+            }
             document.insert("duration_ticks".to_owned(), duration_ticks.into());
             Ok(())
         },
@@ -7784,6 +7851,58 @@ pub fn serialize_arrangement_placement_gain(
     .map_err(ArrangementPlacementGainSerializationError::Document)
 }
 
+/// Replaces the exact linear-amplitude fade durations of one arrangement
+/// placement without changing its reusable clip or any other placement.
+///
+/// The combined placement fades may equal, but never exceed, the placement
+/// duration. Candidate compilation remains authoritative for native execution,
+/// including the sample-locked placement boundary.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the requested durations do not fit the
+/// placement, the placement is absent, the supplied bytes are stale, or the
+/// complete candidate cannot execute.
+pub fn serialize_arrangement_placement_fades(
+    project: &LoadedPlaybackProject,
+    source_arrangement: &[u8],
+    placement_id: &str,
+    fade_in_ticks: u64,
+    fade_out_ticks: u64,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ArrangementPlacementFadeSerializationError> {
+    let arrangement = project
+        .arrangement
+        .as_ref()
+        .ok_or(ArrangementPlacementDocumentSerializationError::ArrangementMissing)
+        .map_err(ArrangementPlacementFadeSerializationError::Document)?;
+    let placement = arrangement
+        .placements
+        .iter()
+        .find(|placement| placement.id == placement_id)
+        .ok_or(ArrangementPlacementDocumentSerializationError::PlacementMissing)
+        .map_err(ArrangementPlacementFadeSerializationError::Document)?;
+    if fade_out_ticks > placement.duration_ticks
+        || fade_in_ticks > placement.duration_ticks - fade_out_ticks
+    {
+        return Err(ArrangementPlacementFadeSerializationError::CombinedDurationExceedsPlacement);
+    }
+
+    serialize_arrangement_placement_document_edit(
+        project,
+        source_arrangement,
+        placement_id,
+        limits,
+        |_, document| {
+            document.insert("fade_in_ticks".to_owned(), fade_in_ticks.into());
+            document.insert("fade_out_ticks".to_owned(), fade_out_ticks.into());
+            Ok(())
+        },
+        |edited_project| validate_arrangement_placement_execution(edited_project, placement_id),
+    )
+    .map_err(ArrangementPlacementFadeSerializationError::Document)
+}
+
 /// Trims or extends the front of one validated arrangement placement to an
 /// exact project tick while preserving its right edge and playback content.
 ///
@@ -7796,8 +7915,9 @@ pub fn serialize_arrangement_placement_gain(
 ///
 /// Returns a classified rejection when the project has no arrangement, the
 /// placement is absent, the supplied bytes disagree with the loaded project,
-/// the requested start reaches or crosses the fixed right edge, or the edited
-/// placement cannot execute through the version-1 compiler.
+/// the requested start reaches or crosses the fixed right edge, crosses an
+/// active local fade boundary, or the edited placement cannot execute through
+/// the version-1 compiler.
 pub fn serialize_arrangement_placement_front_trim(
     project: &LoadedPlaybackProject,
     source_arrangement: &[u8],
@@ -7811,6 +7931,9 @@ pub fn serialize_arrangement_placement_front_trim(
         placement_id,
         limits,
         |placement, document| {
+            if start_tick == placement.start_tick {
+                return Ok(());
+            }
             let end_tick = placement
                 .start_tick
                 .checked_add(placement.duration_ticks)
@@ -7823,13 +7946,25 @@ pub fn serialize_arrangement_placement_front_trim(
                 ));
             }
             let clip_start_tick = if start_tick >= placement.start_tick {
-                placement
-                    .clip_start_tick
-                    .checked_add(start_tick - placement.start_tick)
-                    .ok_or(ArrangementPlacementDocumentSerializationError::Compilation(
+                let removed_ticks = start_tick - placement.start_tick;
+                if removed_ticks < placement.fade_in_ticks
+                    || removed_ticks > placement.duration_ticks - placement.fade_out_ticks
+                {
+                    return Err(
+                        ArrangementPlacementDocumentSerializationError::PlacementFadeBoundaryConflict,
+                    );
+                }
+                placement.clip_start_tick.checked_add(removed_ticks).ok_or(
+                    ArrangementPlacementDocumentSerializationError::Compilation(
                         CompileError::ArithmeticOverflow,
-                    ))?
+                    ),
+                )?
             } else {
+                if placement.fade_in_ticks != 0 {
+                    return Err(
+                        ArrangementPlacementDocumentSerializationError::PlacementFadeBoundaryConflict,
+                    );
+                }
                 placement
                     .clip_start_tick
                     .checked_sub(placement.start_tick - start_tick)
@@ -7840,6 +7975,9 @@ pub fn serialize_arrangement_placement_front_trim(
             document.insert("start_tick".to_owned(), start_tick.into());
             document.insert("clip_start_tick".to_owned(), clip_start_tick.into());
             document.insert("duration_ticks".to_owned(), (end_tick - start_tick).into());
+            if start_tick > placement.start_tick && placement.fade_in_ticks != 0 {
+                document.insert("fade_in_ticks".to_owned(), 0.into());
+            }
             Ok(())
         },
         |edited_project| validate_arrangement_placement_execution(edited_project, placement_id),
@@ -7977,6 +8115,8 @@ fn validate_arrangement_placement_execution(
             clip_start_tick: placement.clip_start_tick,
             duration_ticks: placement.duration_ticks,
             gain_decibels: placement.gain_decibels,
+            fade_in_ticks: placement.fade_in_ticks,
+            fade_out_ticks: placement.fade_out_ticks,
         },
     )
     .map(|_| ())
@@ -9508,6 +9648,8 @@ pub struct OwnedScheduleEntry {
     pub placement_duration_ticks: u64,
     pub placement_enabled: bool,
     pub placement_gain_decibels: f64,
+    pub placement_fade_in_ticks: u64,
+    pub placement_fade_out_ticks: u64,
     pub track_id: String,
     pub track_index: usize,
     pub clip_id: String,
@@ -10155,6 +10297,8 @@ fn load_arrangement(
             duration_ticks: placement.duration_ticks,
             enabled: placement.enabled,
             gain_decibels: placement.gain_decibels,
+            fade_in_ticks: placement.fade_in_ticks,
+            fade_out_ticks: placement.fade_out_ticks,
         })
         .collect();
     let scene_launches = document
@@ -10863,6 +11007,14 @@ fn validate_arrangement_document(
         if !placement.gain_decibels.is_finite() {
             return domain_error(location, "placement gain must be finite");
         }
+        if placement.fade_out_ticks > placement.duration_ticks
+            || placement.fade_in_ticks > placement.duration_ticks - placement.fade_out_ticks
+        {
+            return domain_error(
+                location,
+                "combined placement fades exceed placement duration",
+            );
+        }
         if placement.start_tick > MAX_SAFE_INTEGER - placement.duration_ticks
             || placement.clip_start_tick > MAX_SAFE_INTEGER - placement.duration_ticks
         {
@@ -11155,6 +11307,8 @@ fn build_placement_resources(
         duration_ticks: placement.duration_ticks,
         enabled: placement.enabled,
         gain_decibels: placement.gain_decibels,
+        fade_in_ticks: placement.fade_in_ticks,
+        fade_out_ticks: placement.fade_out_ticks,
     }));
     Ok(output)
 }
@@ -11472,6 +11626,8 @@ struct SchedulePlacementMetadata {
     duration_ticks: u64,
     enabled: bool,
     gain_decibels: f64,
+    fade_in_ticks: u64,
+    fade_out_ticks: u64,
 }
 
 fn build_schedule_placement_metadata_index(
@@ -11495,6 +11651,8 @@ fn build_schedule_placement_metadata_index(
                     duration_ticks: placement.duration_ticks,
                     enabled: placement.enabled,
                     gain_decibels: placement.gain_decibels,
+                    fade_in_ticks: placement.fade_in_ticks,
+                    fade_out_ticks: placement.fade_out_ticks,
                 },
             )
             .is_some()
@@ -11538,6 +11696,8 @@ fn own_schedule(
             placement_duration_ticks: placement.duration_ticks,
             placement_enabled: placement.enabled,
             placement_gain_decibels: placement.gain_decibels,
+            placement_fade_in_ticks: placement.fade_in_ticks,
+            placement_fade_out_ticks: placement.fade_out_ticks,
             track_id: try_owned(entry.track_id)?,
             track_index,
             clip_id: try_owned(entry.clip_id)?,
@@ -11819,6 +11979,10 @@ struct PlacementDocument {
     enabled: bool,
     #[serde(default)]
     gain_decibels: f64,
+    #[serde(default)]
+    fade_in_ticks: u64,
+    #[serde(default)]
+    fade_out_ticks: u64,
 }
 
 #[derive(Deserialize)]
@@ -15738,6 +15902,241 @@ mod tests {
     }
 
     #[test]
+    fn arrangement_placement_fades_are_local_legacy_safe_and_effective() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["extensions"]["org.example.arrangement"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+
+        let edited = serialize_arrangement_placement_fades(
+            &loaded,
+            &source,
+            placement_id,
+            1,
+            2,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["placements"][0]["fade_in_ticks"] = 1.into();
+        expected["placements"][0]["fade_out_ticks"] = 2.into();
+        assert_eq!(edited, serde_json_canonicalizer::to_vec(&expected).unwrap());
+        assert_eq!(
+            expected["extensions"]["org.example.arrangement"],
+            json!({"opaque": [1, 2, 3]})
+        );
+
+        let reopened = load(
+            input(TIMELINE, &tracks, &clips, Some(&edited)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let compiled = reopened
+            .compile_playback(
+                &asset_facts(),
+                GraphLimits::VERSION_1,
+                SceneLimits::VERSION_1,
+            )
+            .unwrap();
+        let entry = &compiled.arrangement().entries()[0];
+        assert_eq!(entry.placement_fade_in_ticks, 1);
+        assert_eq!(entry.placement_fade_out_ticks, 2);
+        assert_eq!(entry.compiled.clip_spec().fade_in_frames, 0);
+        assert_eq!(entry.compiled.clip_spec().fade_out_frames, 0);
+        assert_eq!(entry.compiled.placement_spec().fade_in_frames, 25);
+        assert_eq!(entry.compiled.placement_spec().fade_out_frames, 50);
+    }
+
+    #[test]
+    fn arrangement_placement_fades_refuse_invalid_or_untrusted_requests() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let source = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
+        )
+        .unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+
+        assert!(matches!(
+            serialize_arrangement_placement_fades(
+                &loaded,
+                &source,
+                placement_id,
+                3,
+                2,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementFadeSerializationError::CombinedDurationExceedsPlacement)
+        ));
+        assert!(matches!(
+            serialize_arrangement_placement_fades(
+                &loaded,
+                &source,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                0,
+                0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementFadeSerializationError::Document(
+                ArrangementPlacementDocumentSerializationError::PlacementMissing
+            ))
+        ));
+
+        let mut stale: Value = serde_json::from_slice(&source).unwrap();
+        stale["name"] = "Stale arrangement".into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_fades(
+                &loaded,
+                &stale,
+                placement_id,
+                0,
+                0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementFadeSerializationError::Document(
+                ArrangementPlacementDocumentSerializationError::SourceArrangementMismatch
+            ))
+        ));
+
+        let mut sample_locked_clip: Value = serde_json::from_slice(CLIP).unwrap();
+        sample_locked_clip["format_version"] = 2.into();
+        sample_locked_clip["timebase"] = "sample-locked".into();
+        let sample_locked_clip = serde_json_canonicalizer::to_vec(&sample_locked_clip).unwrap();
+        let sample_locked_clips: [&[u8]; 1] = [&sample_locked_clip];
+        let sample_locked = load(
+            input(TIMELINE, &tracks, &sample_locked_clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_fades(
+                &sample_locked,
+                &source,
+                placement_id,
+                1,
+                0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementFadeSerializationError::Document(
+                ArrangementPlacementDocumentSerializationError::Compilation(
+                    CompileError::InvalidPlacementFades
+                )
+            ))
+        ));
+    }
+
+    #[test]
+    fn arrangement_placement_fades_preserve_or_refuse_active_edge_boundaries() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["placements"][0]["fade_in_ticks"] = 1.into();
+        source["placements"][0]["fade_out_ticks"] = 1.into();
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let shortened = serialize_arrangement_placement_duration(
+            &loaded,
+            &source,
+            placement_id,
+            3,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let shortened: Value = serde_json::from_slice(&shortened).unwrap();
+        assert_eq!(shortened["placements"][0]["fade_in_ticks"], 1);
+        assert_eq!(shortened["placements"][0]["fade_out_ticks"], 0);
+        assert!(matches!(
+            serialize_arrangement_placement_duration(
+                &loaded,
+                &source,
+                placement_id,
+                5,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementDurationSerializationError::PlacementFadeBoundaryConflict)
+        ));
+
+        let trimmed = serialize_arrangement_placement_front_trim(
+            &loaded,
+            &source,
+            placement_id,
+            1,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let trimmed: Value = serde_json::from_slice(&trimmed).unwrap();
+        assert_eq!(trimmed["placements"][0]["fade_in_ticks"], 0);
+        assert_eq!(trimmed["placements"][0]["fade_out_ticks"], 1);
+
+        let mut fade_in_value: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        fade_in_value["placements"][0]["fade_in_ticks"] = 3.into();
+        let fade_in_source = serde_json_canonicalizer::to_vec(&fade_in_value).unwrap();
+        let fade_in_loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&fade_in_source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_front_trim(
+                &fade_in_loaded,
+                &fade_in_source,
+                placement_id,
+                1,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementFrontTrimSerializationError::PlacementFadeBoundaryConflict)
+        ));
+
+        let right_placement_id = "018f47a2-6b2d-7c11-8a44-001122334466";
+        let split = serialize_arrangement_placement_split(
+            &loaded,
+            &asset_facts(),
+            &source,
+            placement_id,
+            right_placement_id,
+            1,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let split: Value = serde_json::from_slice(&split).unwrap();
+        assert_eq!(split["placements"][0]["fade_in_ticks"], 1);
+        assert_eq!(split["placements"][0]["fade_out_ticks"], 0);
+        assert_eq!(split["placements"][1]["fade_in_ticks"], 0);
+        assert_eq!(split["placements"][1]["fade_out_ticks"], 1);
+        assert!(matches!(
+            serialize_arrangement_placement_split(
+                &fade_in_loaded,
+                &asset_facts(),
+                &fade_in_source,
+                placement_id,
+                right_placement_id,
+                2,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementSplitSerializationError::PlacementFadeBoundaryConflict)
+        ));
+    }
+
+    #[test]
     fn arrangement_placement_front_trim_preserves_right_edge_and_is_reversible() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];
@@ -16024,7 +16423,9 @@ mod tests {
                 "clip_start_tick": 0,
                 "duration_ticks": 4,
                 "enabled": true,
-                "gain_decibels": 0
+                "gain_decibels": 0,
+                "fade_in_ticks": 0,
+                "fade_out_ticks": 0
             })
         );
         assert_eq!(
@@ -16774,7 +17175,9 @@ mod tests {
                 "clip_start_tick": 0,
                 "duration_ticks": 4,
                 "enabled": true,
-                "gain_decibels": 0
+                "gain_decibels": 0,
+                "fade_in_ticks": 0,
+                "fade_out_ticks": 0
             }])
         );
         assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), added);
@@ -16986,7 +17389,9 @@ mod tests {
                 "clip_start_tick": 1,
                 "duration_ticks": 2,
                 "enabled": false,
-                "gain_decibels": 0
+                "gain_decibels": 0,
+                "fade_in_ticks": 0,
+                "fade_out_ticks": 0
             })
         );
         assert_eq!(
@@ -17190,7 +17595,9 @@ mod tests {
                     "clip_start_tick": 6,
                     "duration_ticks": 3,
                     "enabled": true,
-                    "gain_decibels": 0
+                    "gain_decibels": 0,
+                    "fade_in_ticks": 0,
+                    "fade_out_ticks": 0
                 },
                 {
                     "id": right_placement_id,
@@ -17200,7 +17607,9 @@ mod tests {
                     "clip_start_tick": 9,
                     "duration_ticks": 5,
                     "enabled": true,
-                    "gain_decibels": 0
+                    "gain_decibels": 0,
+                    "fade_in_ticks": 0,
+                    "fade_out_ticks": 0
                 }
             ])
         );

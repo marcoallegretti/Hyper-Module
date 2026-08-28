@@ -862,6 +862,73 @@ fn bind_arrangement_gain_callback(
     });
 }
 
+fn bind_arrangement_fades_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_fades = Rc::clone(worker);
+    let project_state_for_fades = Rc::clone(project_state);
+    actions.on_set_arrangement_placement_fades(move |placement_id, fade_in, fade_out| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text(
+                "Arrangement placement fades are not available in the current state".into(),
+            );
+            return;
+        }
+        let state = project_state_for_fades.arrangement.borrow();
+        let Some(binding) = state.as_ref() else {
+            ui.set_error_text("Arrangement placement authority is no longer available".into());
+            return;
+        };
+        let Some(placement) = binding
+            .owner
+            .placements()
+            .iter()
+            .find(|placement| placement.id() == placement_id.as_str())
+        else {
+            ui.set_error_text("The selected arrangement placement is no longer available".into());
+            return;
+        };
+        let (fade_in_ticks, fade_out_ticks) = match parse_arrangement_placement_fades(
+            fade_in.as_str(),
+            fade_out.as_str(),
+            placement.duration_ticks(),
+        ) {
+            Ok(fades) => fades,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        if fade_in_ticks == placement.fade_in_ticks()
+            && fade_out_ticks == placement.fade_out_ticks()
+        {
+            ui.set_status_text(
+                "Arrangement placement fades already match the committed values".into(),
+            );
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        let owned_placement_id = placement.id().to_owned();
+        drop(state);
+        submit_to_ui(
+            &ui,
+            &worker_for_fades,
+            IdeWorkerCommand::SetArrangementPlacementFades {
+                placement_id: owned_placement_id,
+                fade_in_ticks,
+                fade_out_ticks,
+            },
+        );
+    });
+}
+
 fn bind_project_open_callback(ui: &MainWindow, worker: &WorkerCell) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -3314,6 +3381,7 @@ fn bind_arrangement_callback(
     bind_arrangement_split_callback(ui, worker, project_state);
     bind_arrangement_duration_callback(ui, worker, project_state);
     bind_arrangement_gain_callback(ui, worker, project_state);
+    bind_arrangement_fades_callback(ui, worker, project_state);
     bind_arrangement_front_trim_callback(ui, worker, project_state);
     bind_arrangement_removal_callback(ui, worker, project_state);
 }
@@ -4735,6 +4803,29 @@ fn parse_arrangement_placement_gain(value: &str) -> Result<f64, &'static str> {
     Ok(gain_decibels)
 }
 
+fn parse_arrangement_placement_fades(
+    fade_in: &str,
+    fade_out: &str,
+    duration_ticks: u64,
+) -> Result<(u64, u64), &'static str> {
+    let fade_in_ticks = parse_exact_arrangement_tick(
+        fade_in,
+        "Placement fade-in duration must be a non-negative whole number of ticks",
+        "Placement fade-in duration is outside the supported range",
+        "Placement fade-in duration exceeds the exact project range",
+    )?;
+    let fade_out_ticks = parse_exact_arrangement_tick(
+        fade_out,
+        "Placement fade-out duration must be a non-negative whole number of ticks",
+        "Placement fade-out duration is outside the supported range",
+        "Placement fade-out duration exceeds the exact project range",
+    )?;
+    if fade_out_ticks > duration_ticks || fade_in_ticks > duration_ticks - fade_out_ticks {
+        return Err("Combined placement fades may not exceed the placement duration");
+    }
+    Ok((fade_in_ticks, fade_out_ticks))
+}
+
 fn parse_audio_clip_fades(
     fade_in: &str,
     fade_out: &str,
@@ -5028,19 +5119,18 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         }
         IdeWorkerCommandKind::SetAudioTrackActive => AppMode::ChangingTrackActivation,
         IdeWorkerCommandKind::ImportAudio => AppMode::ImportingAudio,
-        IdeWorkerCommandKind::SetArrangementPlacementActive => {
-            AppMode::ChangingArrangementActivation
+        IdeWorkerCommandKind::SetArrangementPlacementActive
+        | IdeWorkerCommandKind::MoveArrangementPlacement
+        | IdeWorkerCommandKind::SetArrangementPlacementDuration
+        | IdeWorkerCommandKind::SetArrangementPlacementGain
+        | IdeWorkerCommandKind::SetArrangementPlacementFades
+        | IdeWorkerCommandKind::TrimArrangementPlacementFront
+        | IdeWorkerCommandKind::RemoveArrangementPlacement
+        | IdeWorkerCommandKind::AddArrangementPlacement
+        | IdeWorkerCommandKind::DuplicateArrangementPlacement
+        | IdeWorkerCommandKind::SplitArrangementPlacement => {
+            arrangement_placement_submission_mode(command)
         }
-        IdeWorkerCommandKind::MoveArrangementPlacement => AppMode::MovingArrangementPlacement,
-        IdeWorkerCommandKind::SetArrangementPlacementDuration
-        | IdeWorkerCommandKind::TrimArrangementPlacementFront => {
-            AppMode::TrimmingArrangementPlacement
-        }
-        IdeWorkerCommandKind::SetArrangementPlacementGain => {
-            AppMode::ChangingArrangementPlacementGain
-        }
-        IdeWorkerCommandKind::RemoveArrangementPlacement => AppMode::RemovingArrangementPlacement,
-        IdeWorkerCommandKind::AddArrangementPlacement => AppMode::AddingArrangementPlacement,
         IdeWorkerCommandKind::AddArrangementSceneLaunch => AppMode::AddingArrangementSceneLaunch,
         IdeWorkerCommandKind::AddAutomationTake => AppMode::AddingAutomationTake,
         IdeWorkerCommandKind::SetAutomationTakeActive => AppMode::ChangingAutomationTakeActivation,
@@ -5059,10 +5149,6 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::RemoveArrangementSceneLaunch => {
             AppMode::RemovingArrangementSceneLaunch
         }
-        IdeWorkerCommandKind::DuplicateArrangementPlacement => {
-            AppMode::DuplicatingArrangementPlacement
-        }
-        IdeWorkerCommandKind::SplitArrangementPlacement => AppMode::SplittingArrangementPlacement,
         IdeWorkerCommandKind::RenameAudioClip => AppMode::RenamingClip,
         IdeWorkerCommandKind::DuplicateAudioClip => AppMode::DuplicatingClip,
         IdeWorkerCommandKind::RemoveAudioClip => AppMode::RemovingClip,
@@ -5091,6 +5177,32 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
             AppMode::PreparingPreview
         }
         _ => current,
+    }
+}
+
+fn arrangement_placement_submission_mode(command: IdeWorkerCommandKind) -> AppMode {
+    match command {
+        IdeWorkerCommandKind::SetArrangementPlacementActive => {
+            AppMode::ChangingArrangementActivation
+        }
+        IdeWorkerCommandKind::MoveArrangementPlacement => AppMode::MovingArrangementPlacement,
+        IdeWorkerCommandKind::SetArrangementPlacementDuration
+        | IdeWorkerCommandKind::TrimArrangementPlacementFront => {
+            AppMode::TrimmingArrangementPlacement
+        }
+        IdeWorkerCommandKind::SetArrangementPlacementGain => {
+            AppMode::ChangingArrangementPlacementGain
+        }
+        IdeWorkerCommandKind::SetArrangementPlacementFades => {
+            AppMode::ChangingArrangementPlacementFades
+        }
+        IdeWorkerCommandKind::RemoveArrangementPlacement => AppMode::RemovingArrangementPlacement,
+        IdeWorkerCommandKind::AddArrangementPlacement => AppMode::AddingArrangementPlacement,
+        IdeWorkerCommandKind::DuplicateArrangementPlacement => {
+            AppMode::DuplicatingArrangementPlacement
+        }
+        IdeWorkerCommandKind::SplitArrangementPlacement => AppMode::SplittingArrangementPlacement,
+        _ => unreachable!("only arrangement placement commands reach this mode mapper"),
     }
 }
 
@@ -5227,6 +5339,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetArrangementPlacementGain => {
             "Preserving mixer state, updating arrangement placement gain, and reopening project…"
+        }
+        IdeWorkerCommandKind::SetArrangementPlacementFades => {
+            "Preserving mixer state, updating arrangement placement fades, and reopening project…"
         }
         IdeWorkerCommandKind::TrimArrangementPlacementFront => {
             "Preserving mixer state, trimming the arrangement front, and reopening project…"
@@ -5629,6 +5744,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementGainChanged { .. }
         | IdeWorkerEvent::ArrangementPlacementGainChanging { .. }) => {
             apply_arrangement_placement_gain_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementPlacementFadesChanged { .. }
+        | IdeWorkerEvent::ArrangementPlacementFadesChanging { .. }) => {
+            apply_arrangement_placement_fades_event(ui, &event);
         }
         event @ (IdeWorkerEvent::ArrangementPlacementFrontTrimmed { .. }
         | IdeWorkerEvent::ArrangementPlacementFrontTrimming { .. }) => {
@@ -6495,6 +6614,44 @@ fn apply_arrangement_placement_gain_event(ui: &MainWindow, event: &IdeWorkerEven
     }
 }
 
+fn apply_arrangement_placement_fades_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementPlacementFadesChanged {
+            revision,
+            changed,
+            fade_in_ticks,
+            fade_out_ticks,
+        } => {
+            ui.set_status_text(
+                if *changed {
+                    format!(
+                        "Arrangement placement fades set to {fade_in_ticks} in / {fade_out_ticks} out ticks in project revision {revision}"
+                    )
+                } else {
+                    format!(
+                        "Arrangement placement fades already matched {fade_in_ticks} in / {fade_out_ticks} out ticks in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementPlacementFadesChanging {
+            fade_in_ticks,
+            fade_out_ticks,
+        } => {
+            ui.set_app_mode(AppMode::ChangingArrangementPlacementFades);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before setting arrangement placement fades to {fade_in_ticks} in / {fade_out_ticks} out ticks…"
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("arrangement placement fades event dispatcher received another event"),
+    }
+}
+
 fn apply_arrangement_placement_front_trim_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::ArrangementPlacementFrontTrimmed {
@@ -6794,6 +6951,9 @@ fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWor
         }
         IdeWorkerCommandKind::SetArrangementPlacementGain => {
             "Arrangement placement gain".to_owned()
+        }
+        IdeWorkerCommandKind::SetArrangementPlacementFades => {
+            "Arrangement placement fades".to_owned()
         }
         _ => "Arrangement placement edit".to_owned(),
     };
@@ -8412,6 +8572,8 @@ impl Model for ArrangementListModel {
             clip_start_tick: placement.clip_start_tick().to_string().into(),
             duration_ticks: placement.duration_ticks().to_string().into(),
             gain_edit: format_gain_decibels(placement.gain_decibels()).into(),
+            fade_in_edit: placement.fade_in_ticks().to_string().into(),
+            fade_out_edit: placement.fade_out_ticks().to_string().into(),
             start_clock: format_frame_clock(placement.start_frame(), self.sample_rate_hz).into(),
             end_clock: format_frame_clock(placement.end_frame(), self.sample_rate_hz).into(),
             start_percent,
@@ -9521,6 +9683,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::SetArrangementPlacementGain
             if current == AppMode::ChangingArrangementPlacementGain =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::SetArrangementPlacementFades
+            if current == AppMode::ChangingArrangementPlacementFades =>
         {
             AppMode::Running
         }
@@ -13364,6 +13531,8 @@ mod tests {
                 clip_start_tick: "0".into(),
                 duration_ticks: "960".into(),
                 gain_edit: "0".into(),
+                fade_in_edit: "0".into(),
+                fade_out_edit: "0".into(),
                 start_clock: "00:00.250".into(),
                 end_clock: "00:00.750".into(),
                 start_percent: 0.0,
@@ -13403,6 +13572,72 @@ mod tests {
             }] if placement_id == "placement-a"
         ));
         assert!(ui.get_error_text().is_empty());
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn generated_arrangement_fade_controls_expose_the_local_transaction_callback() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_arrangement_visible(true);
+        ui.set_arrangement_placements(ModelRc::from(Rc::new(VecModel::from(vec![
+            ArrangementRow {
+                index: 0,
+                id: "placement-a".into(),
+                track_name: "Audio".into(),
+                clip_name: "Lead".into(),
+                start_tick: "480".into(),
+                clip_start_tick: "0".into(),
+                duration_ticks: "960".into(),
+                gain_edit: "0".into(),
+                fade_in_edit: "12".into(),
+                fade_out_edit: "24".into(),
+                start_clock: "00:00.250".into(),
+                end_clock: "00:00.750".into(),
+                start_percent: 0.0,
+                width_percent: 100.0,
+                enabled: true,
+                active: true,
+            },
+        ]))));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        ui.global::<IdeActions>()
+            .on_set_arrangement_placement_fades(move |placement_id, fade_in, fade_out| {
+                submitted_by_callback.borrow_mut().push((
+                    placement_id.to_string(),
+                    fade_in.to_string(),
+                    fade_out.to_string(),
+                ));
+            });
+
+        ui.show().unwrap();
+        assert!(
+            ElementHandle::find_by_accessible_label(
+                &ui,
+                "Placement fade-in duration in ticks for Lead on Audio",
+            )
+            .next()
+            .is_some(),
+            "the generated arrangement row exposes a placement-local fade-in field"
+        );
+        assert!(
+            ElementHandle::find_by_accessible_label(
+                &ui,
+                "Placement fade-out duration in ticks for Lead on Audio",
+            )
+            .next()
+            .is_some(),
+            "the generated arrangement row exposes a placement-local fade-out field"
+        );
+        ui.global::<IdeActions>()
+            .invoke_set_arrangement_placement_fades("placement-a".into(), "16".into(), "32".into());
+        assert_eq!(
+            submitted.borrow().as_slice(),
+            [("placement-a".to_owned(), "16".to_owned(), "32".to_owned())]
+        );
         ui.hide().unwrap();
     }
 
@@ -17629,6 +17864,31 @@ mod tests {
             mode_after_failure(
                 AppMode::ChangingArrangementPlacementGain,
                 IdeWorkerCommandKind::SetArrangementPlacementGain,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn arrangement_placement_fade_input_and_submission_stay_in_the_exact_local_domain() {
+        assert_eq!(parse_arrangement_placement_fades(" 1 ", "3", 4), Ok((1, 3)));
+        assert_eq!(parse_arrangement_placement_fades("0", "0", 4), Ok((0, 0)));
+        assert!(parse_arrangement_placement_fades("", "0", 4).is_err());
+        assert!(parse_arrangement_placement_fades("1.5", "0", 4).is_err());
+        assert!(parse_arrangement_placement_fades("0", "5", 4).is_err());
+        assert!(parse_arrangement_placement_fades("3", "2", 4).is_err());
+        assert!(parse_arrangement_placement_fades("9007199254740992", "0", u64::MAX).is_err());
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::SetArrangementPlacementFades,
+            ),
+            AppMode::ChangingArrangementPlacementFades
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingArrangementPlacementFades,
+                IdeWorkerCommandKind::SetArrangementPlacementFades,
             ),
             AppMode::Running
         );

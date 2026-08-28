@@ -27,6 +27,8 @@ fn rendered_looping_clip_reaches_the_shared_mixer() {
         .place(PlacementSpec {
             clip_start_frame: 0,
             frame_count: 7,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
         })
         .unwrap();
     let clip_audio = plan.render_offline(placement).unwrap();

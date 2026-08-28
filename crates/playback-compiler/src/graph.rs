@@ -73,6 +73,8 @@ pub struct PlacementResource<'a> {
     pub duration_ticks: u64,
     pub enabled: bool,
     pub gain_decibels: f64,
+    pub fade_in_ticks: u64,
+    pub fade_out_ticks: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -608,6 +610,8 @@ fn resolve_placement<'a>(
             clip_start_tick: placement.clip_start_tick,
             duration_ticks: placement.duration_ticks,
             gain_decibels: placement.gain_decibels,
+            fade_in_ticks: placement.fade_in_ticks,
+            fade_out_ticks: placement.fade_out_ticks,
         },
     )
     .map_err(|error| GraphError::PlacementCompilation {
@@ -820,6 +824,8 @@ mod tests {
         duration_ticks: 4,
         enabled: true,
         gain_decibels: 0.0,
+        fade_in_ticks: 0,
+        fade_out_ticks: 0,
     }];
     const TEMPOS: [TempoEvent; 1] = [TempoEvent {
         tick: 0,

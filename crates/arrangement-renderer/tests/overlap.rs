@@ -15,6 +15,7 @@ use realtime_allocator::HeapMeasurement;
 
 const PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122339000";
 const TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122339001";
+const EPSILON: f32 = 1.0e-6;
 
 static REALTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -31,7 +32,7 @@ enum FixtureAudioLayout {
 
 #[test]
 fn fixed_track_renderer_sums_a_bounded_overlap_without_losing_a_longer_placement() {
-    let fixture = overlap_fixture(FixtureAudioLayout::Mono);
+    let fixture = overlap_fixture(FixtureAudioLayout::Mono, false);
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
     let arrangement_renderer =
         ArrangementRenderer::try_new_for_tracks(&prepared, &[TRACK_ID]).unwrap();
@@ -65,7 +66,7 @@ fn fixed_track_renderer_sums_a_bounded_overlap_without_losing_a_longer_placement
 
 #[test]
 fn general_renderer_keeps_each_active_overlap_in_its_own_schedule_slot() {
-    let fixture = overlap_fixture(FixtureAudioLayout::Mono);
+    let fixture = overlap_fixture(FixtureAudioLayout::Mono, false);
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
     let arrangement_renderer = ArrangementRenderer::try_new(&prepared).unwrap();
     let mut first_left = [9.0_f32; 100];
@@ -92,7 +93,7 @@ fn general_renderer_keeps_each_active_overlap_in_its_own_schedule_slot() {
 
 #[test]
 fn fixed_track_renderer_sums_a_bounded_stereo_overlap() {
-    let fixture = overlap_fixture(FixtureAudioLayout::Stereo);
+    let fixture = overlap_fixture(FixtureAudioLayout::Stereo, false);
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
     let arrangement_renderer =
         ArrangementRenderer::try_new_for_tracks(&prepared, &[TRACK_ID]).unwrap();
@@ -112,9 +113,43 @@ fn fixed_track_renderer_sums_a_bounded_stereo_overlap() {
 }
 
 #[test]
+fn fixed_track_renderer_applies_local_fades_before_adding_overlap() {
+    let fixture = overlap_fixture(FixtureAudioLayout::Mono, true);
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let arrangement_renderer =
+        ArrangementRenderer::try_new_for_tracks(&prepared, &[TRACK_ID]).unwrap();
+    let mut left = [9.0_f32; 200];
+    let mut right = [9.0_f32; 200];
+    let mut scratch = [RenderScratchSlot::new(&mut left, &mut right)];
+
+    let window = arrangement_renderer
+        .render_track_window(0, 200, &mut scratch)
+        .unwrap();
+
+    assert_eq!(window.active_slot_count, 1);
+    assert_eq!(scratch[0].entry_index(), Some(0));
+    assert_eq!(scratch[0].channels(), 1);
+    for (frame, expected) in [
+        (49, 1.0),
+        (50, 1.0),
+        (51, 1.01),
+        (74, 1.24),
+        (75, 1.25),
+        (124, 1.25),
+        (125, 1.25),
+        (126, 1.24),
+        (149, 1.01),
+        (150, 1.0),
+    ] {
+        assert_sample(scratch[0].left()[frame], expected, frame);
+    }
+    assert_eq!(scratch[0].right(), &[0.0; 200]);
+}
+
+#[test]
 fn fixed_track_two_voice_overlap_rendering_performs_zero_heap_allocations() {
     let _guard = REALTIME_TEST_LOCK.lock().unwrap();
-    let fixture = overlap_fixture(FixtureAudioLayout::Mono);
+    let fixture = overlap_fixture(FixtureAudioLayout::Mono, false);
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
     let arrangement_renderer =
         ArrangementRenderer::try_new_for_tracks(&prepared, &[TRACK_ID]).unwrap();
@@ -134,7 +169,7 @@ fn fixed_track_two_voice_overlap_rendering_performs_zero_heap_allocations() {
     clippy::too_many_lines,
     reason = "the explicit fixture keeps the two-voice documents, schedule, and decoded media reviewable together"
 )]
-fn overlap_fixture(layout: FixtureAudioLayout) -> OverlapFixture {
+fn overlap_fixture(layout: FixtureAudioLayout, with_local_fades: bool) -> OverlapFixture {
     let timeline = br#"{
         "format":"hyper-timeline","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339010",
         "project_id":"018f47a2-6b2d-7c11-8a44-001122339000","ticks_per_quarter":1920,
@@ -166,7 +201,18 @@ fn overlap_fixture(layout: FixtureAudioLayout) -> OverlapFixture {
             100,
         ),
     ];
-    let arrangement = br#"{
+    let arrangement: &[u8] = if with_local_fades {
+        br#"{
+        "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339040",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122339000","name":"Layered","enabled":true,
+        "placements":[
+            {"id":"018f47a2-6b2d-7c11-8a44-001122339050","track_id":"018f47a2-6b2d-7c11-8a44-001122339001","clip_id":"018f47a2-6b2d-7c11-8a44-001122339020","start_tick":0,"clip_start_tick":0,"duration_ticks":24,"enabled":true},
+            {"id":"018f47a2-6b2d-7c11-8a44-001122339051","track_id":"018f47a2-6b2d-7c11-8a44-001122339001","clip_id":"018f47a2-6b2d-7c11-8a44-001122339021","start_tick":2,"clip_start_tick":0,"duration_ticks":4,"enabled":true,"fade_in_ticks":1,"fade_out_ticks":1},
+            {"id":"018f47a2-6b2d-7c11-8a44-001122339052","track_id":"018f47a2-6b2d-7c11-8a44-001122339001","clip_id":"018f47a2-6b2d-7c11-8a44-001122339022","start_tick":10,"clip_start_tick":0,"duration_ticks":4,"enabled":true}
+        ],"scene_launches":[],"extensions":{}
+    }"#
+    } else {
+        br#"{
         "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339040",
         "project_id":"018f47a2-6b2d-7c11-8a44-001122339000","name":"Layered","enabled":true,
         "placements":[
@@ -174,7 +220,8 @@ fn overlap_fixture(layout: FixtureAudioLayout) -> OverlapFixture {
             {"id":"018f47a2-6b2d-7c11-8a44-001122339051","track_id":"018f47a2-6b2d-7c11-8a44-001122339001","clip_id":"018f47a2-6b2d-7c11-8a44-001122339021","start_tick":2,"clip_start_tick":0,"duration_ticks":4,"enabled":true},
             {"id":"018f47a2-6b2d-7c11-8a44-001122339052","track_id":"018f47a2-6b2d-7c11-8a44-001122339001","clip_id":"018f47a2-6b2d-7c11-8a44-001122339022","start_tick":10,"clip_start_tick":0,"duration_ticks":4,"enabled":true}
         ],"scene_launches":[],"extensions":{}
-    }"#;
+    }"#
+    };
     let tracks = [track.as_slice()];
     let clip_bytes = [
         clips[0].as_slice(),
@@ -243,6 +290,13 @@ fn overlap_fixture(layout: FixtureAudioLayout) -> OverlapFixture {
         cache: cache.seal(),
         schedule,
     }
+}
+
+fn assert_sample(actual: f32, expected: f32, frame: usize) {
+    assert!(
+        (actual - expected).abs() <= EPSILON,
+        "frame {frame}: actual={actual}, expected={expected}"
+    );
 }
 
 fn decoded_audio(layout: FixtureAudioLayout, left: Vec<f32>) -> DecodedAudio {

@@ -58,12 +58,18 @@ pub struct NativeClipSpec {
 pub struct PlacementSpec {
     pub clip_start_frame: usize,
     pub frame_count: usize,
+    /// Linear-amplitude fade-in measured from this placement's start edge.
+    pub fade_in_frames: usize,
+    /// Linear-amplitude fade-out measured from this placement's end edge.
+    pub fade_out_frames: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClipPlacement {
     clip_start_frame: usize,
     frame_count: usize,
+    fade_in_frames: usize,
+    fade_out_frames: usize,
 }
 
 impl ClipPlacement {
@@ -75,6 +81,32 @@ impl ClipPlacement {
     #[must_use]
     pub const fn frame_count(self) -> usize {
         self.frame_count
+    }
+
+    #[must_use]
+    pub const fn fade_in_frames(self) -> usize {
+        self.fade_in_frames
+    }
+
+    #[must_use]
+    pub const fn fade_out_frames(self) -> usize {
+        self.fade_out_frames
+    }
+
+    fn fade_gain(self, local_frame: usize) -> f32 {
+        let mut gain = 1.0_f32;
+        if self.fade_in_frames > 0 && local_frame < self.fade_in_frames {
+            #[allow(clippy::cast_precision_loss)]
+            let fade = local_frame as f32 / self.fade_in_frames as f32;
+            gain *= fade;
+        }
+        let fade_out_start = self.frame_count - self.fade_out_frames;
+        if self.fade_out_frames > 0 && local_frame >= fade_out_start {
+            #[allow(clippy::cast_precision_loss)]
+            let fade = (self.frame_count - local_frame) as f32 / self.fade_out_frames as f32;
+            gain *= fade;
+        }
+        gain
     }
 }
 
@@ -100,6 +132,7 @@ pub enum ClipPlanError {
     SampleGainOverflow,
     RenderedAudioInvalid,
     InvalidPlacement,
+    InvalidPlacementFades,
     ArithmeticOverflow,
     OutputChannelMismatch { expected: usize, actual: usize },
     OutputLengthMismatch { left: usize, right: usize },
@@ -176,6 +209,9 @@ impl fmt::Display for ClipPlanError {
                 formatter.write_str("rendered clip audio failed validation")
             }
             Self::InvalidPlacement => formatter.write_str("clip placement is invalid"),
+            Self::InvalidPlacementFades => {
+                formatter.write_str("clip placement fade ranges are invalid")
+            }
             Self::ArithmeticOverflow => formatter.write_str("clip frame arithmetic overflowed"),
             Self::OutputChannelMismatch { expected, actual } => write!(
                 formatter,
@@ -320,6 +356,11 @@ impl<'a> ClipRenderPlan<'a> {
         if spec.frame_count == 0 {
             return Err(ClipPlanError::InvalidPlacement);
         }
+        if spec.fade_out_frames > spec.frame_count
+            || spec.fade_in_frames > spec.frame_count - spec.fade_out_frames
+        {
+            return Err(ClipPlanError::InvalidPlacementFades);
+        }
         let requested_end = spec
             .clip_start_frame
             .checked_add(spec.frame_count)
@@ -330,6 +371,8 @@ impl<'a> ClipRenderPlan<'a> {
         Ok(ClipPlacement {
             clip_start_frame: spec.clip_start_frame,
             frame_count: spec.frame_count,
+            fade_in_frames: spec.fade_in_frames,
+            fade_out_frames: spec.fade_out_frames,
         })
     }
 
@@ -422,7 +465,12 @@ impl<'a> ClipRenderPlan<'a> {
                 .ok_or(ClipPlanError::ArithmeticOverflow)?;
             let local_frame = self.fold_loop(unfolded_local);
             let source_frame = self.source_frame(local_frame);
-            let amplitude = self.linear_gain * self.fade_gain(local_frame);
+            let placement_local_frame = placement_frame_offset
+                .checked_add(output_frame)
+                .ok_or(ClipPlanError::ArithmeticOverflow)?;
+            let amplitude = self.linear_gain
+                * self.fade_gain(local_frame)
+                * placement.fade_gain(placement_local_frame);
             let left = left_plane[source_frame] * amplitude;
             let right = right_plane.map(|plane| plane[source_frame] * amplitude);
             output.write::<ADDITIVE>(output_frame, left, right);
@@ -580,6 +628,8 @@ mod tests {
             .place(PlacementSpec {
                 clip_start_frame: 1,
                 frame_count: 3,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
             })
             .unwrap();
 
@@ -597,6 +647,8 @@ mod tests {
             .place(PlacementSpec {
                 clip_start_frame: 0,
                 frame_count: 4,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
             })
             .unwrap();
 
@@ -613,6 +665,8 @@ mod tests {
             .place(PlacementSpec {
                 clip_start_frame: 0,
                 frame_count: 10,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
             })
             .unwrap();
         assert_samples(
@@ -624,6 +678,8 @@ mod tests {
             .place(PlacementSpec {
                 clip_start_frame: 4,
                 frame_count: 5,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
             })
             .unwrap();
         assert_samples(&render(&plan, offset), &[4.0, 2.0, 3.0, 4.0, 2.0]);
@@ -632,6 +688,8 @@ mod tests {
             .place(PlacementSpec {
                 clip_start_frame: 8,
                 frame_count: 5,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
             })
             .unwrap();
         assert_samples(&render(&plan, unfolded_offset), &[2.0, 3.0, 4.0, 2.0, 3.0]);
@@ -649,6 +707,8 @@ mod tests {
             .place(PlacementSpec {
                 clip_start_frame: 0,
                 frame_count: 6,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
             })
             .unwrap();
         assert_samples(&render(&plan, placement), &[0.0, 0.25, 0.5, 0.5, 0.5, 0.25]);
@@ -698,6 +758,30 @@ mod tests {
     }
 
     #[test]
+    fn placement_fades_multiply_reusable_clip_fades() {
+        let source = mono(&[1.0; 6]);
+        let mut clip = spec(6);
+        clip.fade_in_frames = 2;
+        clip.fade_out_frames = 2;
+        let plan = ClipRenderPlan::try_new(&source, clip).unwrap();
+        let placement = plan
+            .place(PlacementSpec {
+                clip_start_frame: 0,
+                frame_count: 6,
+                fade_in_frames: 3,
+                fade_out_frames: 2,
+            })
+            .unwrap();
+
+        assert_eq!(placement.fade_in_frames(), 3);
+        assert_eq!(placement.fade_out_frames(), 2);
+        assert_samples(
+            &render(&plan, placement),
+            &[0.0, 1.0 / 6.0, 2.0 / 3.0, 1.0, 1.0, 0.25],
+        );
+    }
+
+    #[test]
     fn rejects_invalid_source_loop_fade_placement_and_sample_product() {
         let source = mono(&[0.0; 4]);
         let mut clip = spec(4);
@@ -733,16 +817,29 @@ mod tests {
         assert!(matches!(
             plan.place(PlacementSpec {
                 clip_start_frame: 3,
-                frame_count: 2
+                frame_count: 2,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
             }),
             Err(ClipPlanError::InvalidPlacement)
         ));
         assert!(matches!(
             plan.place(PlacementSpec {
                 clip_start_frame: 0,
-                frame_count: 0
+                frame_count: 0,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
             }),
             Err(ClipPlanError::InvalidPlacement)
+        ));
+        assert!(matches!(
+            plan.place(PlacementSpec {
+                clip_start_frame: 0,
+                frame_count: 4,
+                fade_in_frames: 3,
+                fade_out_frames: 2,
+            }),
+            Err(ClipPlanError::InvalidPlacementFades)
         ));
 
         let loud_source = mono(&[f32::MAX]);
@@ -762,6 +859,8 @@ mod tests {
             .place(PlacementSpec {
                 clip_start_frame: 0,
                 frame_count: 2,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
             })
             .unwrap();
         let mut mono_output = [7.0; 2];
@@ -815,6 +914,8 @@ mod tests {
             .place(PlacementSpec {
                 clip_start_frame: 0,
                 frame_count: 2,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
             })
             .unwrap();
         let mut left = [1.0_f32, -1.0];

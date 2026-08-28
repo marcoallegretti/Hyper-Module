@@ -101,21 +101,22 @@ pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_cli
 #[cfg(test)]
 use hyper_playback_json::serialize_arrangement_scene_launch_addition;
 use hyper_playback_json::{
-    ArrangementPlacementDocumentSerializationError, ArrangementPlacementGainSerializationError,
-    ArrangementSceneLaunchAddition, AudioClipAdditionSerializationError,
-    AudioClipDocumentSerializationError, AudioClipDuplicationSerializationError,
-    AudioClipFadeSerializationError, AudioClipGainSerializationError,
-    AudioClipLoopSerializationError, AudioClipRemovalSerializationError,
-    AudioClipRenameSerializationError, AudioClipSourceStartSerializationError,
-    AudioClipSourceViewSerializationError, AudioPrimaryRouteSerializationError,
-    AudioPrimaryRouteTarget, AudioTrackAdditionSerializationError,
-    AudioTrackContentRemovalDocuments, AudioTrackContentRemovalSerializationError,
-    AudioTrackContentRemovalSource, AudioTrackDocumentSerializationError,
-    AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
-    AudioTrackFreezeDeviceChain, AudioTrackFreezeDocuments, AudioTrackFreezeReactivationDocuments,
-    AudioTrackFreezeSerializationError, AudioTrackRemovalBlockers,
-    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
-    AudioTrackUnfreezeDocuments, AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
+    ArrangementPlacementDocumentSerializationError, ArrangementPlacementFadeSerializationError,
+    ArrangementPlacementGainSerializationError, ArrangementSceneLaunchAddition,
+    AudioClipAdditionSerializationError, AudioClipDocumentSerializationError,
+    AudioClipDuplicationSerializationError, AudioClipFadeSerializationError,
+    AudioClipGainSerializationError, AudioClipLoopSerializationError,
+    AudioClipRemovalSerializationError, AudioClipRenameSerializationError,
+    AudioClipSourceStartSerializationError, AudioClipSourceViewSerializationError,
+    AudioPrimaryRouteSerializationError, AudioPrimaryRouteTarget,
+    AudioTrackAdditionSerializationError, AudioTrackContentRemovalDocuments,
+    AudioTrackContentRemovalSerializationError, AudioTrackContentRemovalSource,
+    AudioTrackDocumentSerializationError, AudioTrackDuplicationSerializationError,
+    AudioTrackDuplicationSource, AudioTrackFreezeDeviceChain, AudioTrackFreezeDocuments,
+    AudioTrackFreezeReactivationDocuments, AudioTrackFreezeSerializationError,
+    AudioTrackRemovalBlockers, AudioTrackRemovalSerializationError,
+    AudioTrackRenameSerializationError, AudioTrackUnfreezeDocuments,
+    AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
     AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
     AutomationTargetSelection, CompiledMixerDestination, CompiledMixerGraph, CompiledMixerTap,
     CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact,
@@ -131,14 +132,15 @@ use hyper_playback_json::{
     TimelineMarkerEdit as PlaybackTimelineMarkerEdit, TimelineMarkerSerializationError,
     serialize_arrangement_loop_range, serialize_arrangement_placement_activation,
     serialize_arrangement_placement_addition, serialize_arrangement_placement_duplication,
-    serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
-    serialize_arrangement_placement_gain, serialize_arrangement_placement_move,
-    serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
-    serialize_arrangement_scene_launch_additions, serialize_arrangement_scene_launch_move,
-    serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
-    serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
-    serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_removal,
-    serialize_audio_clip_rename, serialize_audio_clip_reverse, serialize_audio_clip_source_start,
+    serialize_arrangement_placement_duration, serialize_arrangement_placement_fades,
+    serialize_arrangement_placement_front_trim, serialize_arrangement_placement_gain,
+    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
+    serialize_arrangement_placement_split, serialize_arrangement_scene_launch_additions,
+    serialize_arrangement_scene_launch_move, serialize_arrangement_scene_launch_removal,
+    serialize_arrangement_scene_launch_scene_edit, serialize_audio_clip_activation,
+    serialize_audio_clip_duplication, serialize_audio_clip_fades, serialize_audio_clip_gain,
+    serialize_audio_clip_loop, serialize_audio_clip_removal, serialize_audio_clip_rename,
+    serialize_audio_clip_reverse, serialize_audio_clip_source_start,
     serialize_audio_clip_source_view, serialize_audio_primary_route_change,
     serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_content_removal, serialize_audio_track_duplication,
@@ -5023,6 +5025,7 @@ pub enum IdeArrangementPlacementEditError {
     Serialization(ArrangementPlacementDocumentSerializationError),
     GainSerialization(ArrangementPlacementGainSerializationError),
     GainNativeValidation(ArrangementPlacementGainValidationError),
+    FadeSerialization(ArrangementPlacementFadeSerializationError),
     CapacityUnavailable,
     Publication {
         created_placement_id: Option<Box<str>>,
@@ -5112,6 +5115,7 @@ impl fmt::Display for IdeArrangementPlacementEditError {
             Self::Serialization(source) => source.fmt(formatter),
             Self::GainSerialization(source) => source.fmt(formatter),
             Self::GainNativeValidation(source) => source.fmt(formatter),
+            Self::FadeSerialization(source) => source.fmt(formatter),
             Self::CapacityUnavailable => {
                 formatter.write_str("arrangement edit capacity is unavailable")
             }
@@ -5219,6 +5223,7 @@ impl Error for IdeArrangementPlacementEditError {
             Self::Serialization(source) => Some(source),
             Self::GainSerialization(source) => Some(source),
             Self::GainNativeValidation(source) => Some(source),
+            Self::FadeSerialization(source) => Some(source),
             Self::Publication { source, .. } => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
@@ -13249,6 +13254,31 @@ impl RunningDesktopIdeApplication {
                     .validate_arrangement_placement_gain(placement_id, gain_decibels)
                     .map_err(IdeArrangementPlacementEditError::GainNativeValidation)?;
                 Ok(arrangement_bytes)
+            },
+        )
+    }
+
+    fn prepare_arrangement_placement_fades(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        placement_id: &str,
+        fade_in_ticks: u64,
+        fade_out_ticks: u64,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        Self::prepare_arrangement_placement_edit(
+            application,
+            recovery,
+            |prepared, source, limits| {
+                let (project, _, _, _) = prepared.session().parts();
+                serialize_arrangement_placement_fades(
+                    project,
+                    source,
+                    placement_id,
+                    fade_in_ticks,
+                    fade_out_ticks,
+                    limits,
+                )
+                .map_err(IdeArrangementPlacementEditError::FadeSerialization)
             },
         )
     }

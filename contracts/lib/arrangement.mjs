@@ -61,6 +61,15 @@ export function assertArrangementInvariants(arrangement) {
       "placement duration",
     );
     assert(placement.duration_ticks > 0, "placement duration must be positive");
+    const fadeInTicks = placement.fade_in_ticks ?? 0;
+    const fadeOutTicks = placement.fade_out_ticks ?? 0;
+    assertSafeNonnegativeInteger(fadeInTicks, "placement fade-in duration");
+    assertSafeNonnegativeInteger(fadeOutTicks, "placement fade-out duration");
+    assert(
+      fadeOutTicks <= placement.duration_ticks &&
+        fadeInTicks <= placement.duration_ticks - fadeOutTicks,
+      "combined placement fades may not exceed placement duration",
+    );
     assert(
       placement.start_tick <= MAX_SAFE_INTEGER - placement.duration_ticks,
       "placement end exceeds the safe-integer domain",

@@ -67,6 +67,32 @@ assert.throws(
     }),
   /safe-integer domain/,
 );
+assertArrangementInvariants({
+  ...arrangement,
+  placements: [
+    {
+      ...arrangement.placements[0],
+      fade_in_ticks: 1920,
+      fade_out_ticks: 1920,
+    },
+  ],
+  scene_launches: [],
+});
+assert.throws(
+  () =>
+    assertArrangementInvariants({
+      ...arrangement,
+      placements: [
+        {
+          ...arrangement.placements[0],
+          fade_in_ticks: 4000,
+          fade_out_ticks: 4000,
+        },
+      ],
+      scene_launches: [],
+    }),
+  /combined placement fades/,
+);
 assert.throws(
   () =>
     assertArrangementInvariants({
@@ -118,4 +144,4 @@ assert.throws(
   /inside the placement/,
 );
 
-console.log("Arrangement invariants passed: 11 deterministic cases");
+console.log("Arrangement invariants passed: 13 deterministic cases");

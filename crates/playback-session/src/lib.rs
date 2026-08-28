@@ -260,6 +260,8 @@ pub struct PlaybackArrangementPlacement {
     clip_start_tick: u64,
     duration_ticks: u64,
     gain_decibels: f64,
+    fade_in_ticks: u64,
+    fade_out_ticks: u64,
     start_frame: usize,
     end_frame: usize,
     enabled: bool,
@@ -337,6 +339,18 @@ impl PlaybackArrangementPlacement {
     #[must_use]
     pub const fn gain_decibels(&self) -> f64 {
         self.gain_decibels
+    }
+
+    /// Exact persisted local fade-in duration in project ticks.
+    #[must_use]
+    pub const fn fade_in_ticks(&self) -> u64 {
+        self.fade_in_ticks
+    }
+
+    /// Exact persisted local fade-out duration in project ticks.
+    #[must_use]
+    pub const fn fade_out_ticks(&self) -> u64 {
+        self.fade_out_ticks
     }
 
     #[must_use]
@@ -1100,6 +1114,8 @@ fn build_playback_arrangement(
             clip_start_tick: entry.placement_clip_start_tick,
             duration_ticks: entry.placement_duration_ticks,
             gain_decibels: entry.placement_gain_decibels,
+            fade_in_ticks: entry.placement_fade_in_ticks,
+            fade_out_ticks: entry.placement_fade_out_ticks,
             start_frame,
             end_frame: placement_end_frame,
             enabled: entry.placement_enabled,
@@ -1475,6 +1491,8 @@ mod tests {
                 clip_start_tick: 0,
                 duration_ticks: 4,
                 gain_decibels: 0.0,
+                fade_in_ticks: 0,
+                fade_out_ticks: 0,
                 start_frame: 0,
                 end_frame: 100,
                 enabled: true,

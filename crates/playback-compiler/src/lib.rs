@@ -626,6 +626,10 @@ pub struct PlacementCompileSpec {
     /// The compiler combines it with the reusable clip gain before building
     /// the one existing native clip-render plan.
     pub gain_decibels: f64,
+    /// Linear-amplitude fade-in from this arrangement placement's start edge.
+    pub fade_in_ticks: u64,
+    /// Linear-amplitude fade-out from this arrangement placement's end edge.
+    pub fade_out_ticks: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -637,6 +641,7 @@ pub enum CompileError {
     InvalidFades,
     InvalidGain,
     InvalidPlacementGain,
+    InvalidPlacementFades,
     InvalidWarpMap,
     InvalidPlacement,
     NonIntegralFrameBoundary,
@@ -655,6 +660,7 @@ impl fmt::Display for CompileError {
             Self::InvalidFades => formatter.write_str("clip fade ranges are invalid"),
             Self::InvalidGain => formatter.write_str("effective clip gain must be finite"),
             Self::InvalidPlacementGain => formatter.write_str("placement gain must be finite"),
+            Self::InvalidPlacementFades => formatter.write_str("placement fade ranges are invalid"),
             Self::InvalidWarpMap => formatter.write_str("clip warp map is invalid"),
             Self::InvalidPlacement => formatter.write_str("clip placement is invalid"),
             Self::NonIntegralFrameBoundary => {
@@ -916,16 +922,17 @@ pub fn compile_placement(
         ));
     }
 
-    let loop_range = if clip.loop_enabled {
-        Some(FrameRange {
-            start: clip_tick_to_frame(clip, clip.loop_range.start)?,
-            end: clip_tick_to_frame(clip, clip.loop_range.end)?,
-        })
-    } else {
-        None
-    };
+    let loop_range = compiled_loop_range(clip)?;
     let fade_in_frames = clip_tick_span_to_frames(clip, clip.fade_in_ticks)?;
     let fade_out_frames = clip_tick_span_to_frames(clip, clip.fade_out_ticks)?;
+    let (placement_fade_in_frames, placement_fade_out_frames) =
+        placement_fade_tick_spans_to_frames(
+            timeline,
+            placement,
+            placement_end_tick,
+            arrangement_start_frame,
+            arrangement_end_frame,
+        )?;
 
     Ok(CompiledPlacement {
         arrangement_start_frame,
@@ -949,8 +956,44 @@ pub fn compile_placement(
         placement_spec: PlacementSpec {
             clip_start_frame,
             frame_count,
+            fade_in_frames: placement_fade_in_frames,
+            fade_out_frames: placement_fade_out_frames,
         },
     })
+}
+
+fn placement_fade_tick_spans_to_frames(
+    timeline: Timeline<'_>,
+    placement: PlacementCompileSpec,
+    placement_end_tick: u64,
+    arrangement_start_frame: usize,
+    arrangement_end_frame: usize,
+) -> Result<(usize, usize), CompileError> {
+    let fade_in_end_tick = placement
+        .start_tick
+        .checked_add(placement.fade_in_ticks)
+        .ok_or(CompileError::ArithmeticOverflow)?;
+    let fade_in_frames = timeline
+        .tick_to_frame(fade_in_end_tick)?
+        .checked_sub(arrangement_start_frame)
+        .ok_or(CompileError::ArithmeticOverflow)?;
+    let fade_out_start_tick = placement_end_tick
+        .checked_sub(placement.fade_out_ticks)
+        .ok_or(CompileError::ArithmeticOverflow)?;
+    let fade_out_frames = arrangement_end_frame
+        .checked_sub(timeline.tick_to_frame(fade_out_start_tick)?)
+        .ok_or(CompileError::ArithmeticOverflow)?;
+    Ok((fade_in_frames, fade_out_frames))
+}
+
+fn compiled_loop_range(clip: ClipCompileSpec<'_>) -> Result<Option<FrameRange>, CompileError> {
+    if !clip.loop_enabled {
+        return Ok(None);
+    }
+    Ok(Some(FrameRange {
+        start: clip_tick_to_frame(clip, clip.loop_range.start)?,
+        end: clip_tick_to_frame(clip, clip.loop_range.end)?,
+    }))
 }
 
 /// Compiles one clip for playback from a recorded scene launch.
@@ -1008,14 +1051,7 @@ pub fn compile_scene_audio_clip(
         .source_start_frame
         .checked_add(clip.source_frame_count)
         .ok_or(CompileError::ArithmeticOverflow)?;
-    let loop_range = if clip.loop_enabled {
-        Some(FrameRange {
-            start: clip_tick_to_frame(clip, clip.loop_range.start)?,
-            end: clip_tick_to_frame(clip, clip.loop_range.end)?,
-        })
-    } else {
-        None
-    };
+    let loop_range = compiled_loop_range(clip)?;
     let placement_frame_count = if clip.loop_enabled {
         usize::MAX
     } else {
@@ -1042,6 +1078,8 @@ pub fn compile_scene_audio_clip(
         placement_spec: PlacementSpec {
             clip_start_frame: 0,
             frame_count: placement_frame_count,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
         },
     })
 }
@@ -1153,6 +1191,11 @@ fn validate_placement(
     if placement.duration_ticks == 0 {
         return Err(CompileError::InvalidPlacement);
     }
+    if placement.fade_out_ticks > placement.duration_ticks
+        || placement.fade_in_ticks > placement.duration_ticks - placement.fade_out_ticks
+    {
+        return Err(CompileError::InvalidPlacementFades);
+    }
     placement
         .start_tick
         .checked_add(placement.duration_ticks)
@@ -1168,6 +1211,11 @@ fn validate_placement(
         && (placement.clip_start_tick != 0 || placement.duration_ticks != clip.duration_ticks)
     {
         return Err(CompileError::InvalidPlacement);
+    }
+    if clip.timebase == ClipTimebase::SampleLocked
+        && (placement.fade_in_ticks != 0 || placement.fade_out_ticks != 0)
+    {
+        return Err(CompileError::InvalidPlacementFades);
     }
     Ok(())
 }
@@ -1207,6 +1255,8 @@ fn compile_sample_locked_placement(
         placement_spec: PlacementSpec {
             clip_start_frame: 0,
             frame_count: clip.source_frame_count,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
         },
     })
 }
@@ -1241,6 +1291,8 @@ fn compile_sample_locked_scene_audio_clip(
         placement_spec: PlacementSpec {
             clip_start_frame: 0,
             frame_count: clip.source_frame_count,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
         },
     })
 }
@@ -1531,6 +1583,8 @@ mod tests {
             clip_start_tick: 0,
             duration_ticks: 10,
             gain_decibels: 0.0,
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
         }
     }
 
@@ -1701,6 +1755,8 @@ mod tests {
             clip_start_tick: 2,
             duration_ticks: 10,
             gain_decibels: 0.0,
+            fade_in_ticks: 2,
+            fade_out_ticks: 4,
         };
         let compiled = compile_placement(timeline(&tempos), clip, offset_placement).unwrap();
         assert_eq!(compiled.arrangement_start_frame(), 200);
@@ -1726,7 +1782,9 @@ mod tests {
             compiled.placement_spec(),
             PlacementSpec {
                 clip_start_frame: 50,
-                frame_count: 250
+                frame_count: 250,
+                fade_in_frames: 50,
+                fade_out_frames: 100,
             }
         );
 
@@ -1743,7 +1801,9 @@ mod tests {
             unfolded.placement_spec(),
             PlacementSpec {
                 clip_start_frame: 250,
-                frame_count: 250
+                frame_count: 250,
+                fade_in_frames: 50,
+                fade_out_frames: 100,
             }
         );
     }
@@ -1929,6 +1989,8 @@ mod tests {
             clip_start_tick: 1,
             duration_ticks: 1,
             gain_decibels: 0.0,
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
         };
         assert_eq!(
             compile_placement(timeline(&tempos), clip, nonintegral),
@@ -1994,6 +2056,29 @@ mod tests {
         assert_eq!(
             compile_placement(timeline(&tempos), clip, placement()),
             Err(CompileError::InvalidFades)
+        );
+
+        let mut invalid_placement = placement();
+        invalid_placement.fade_in_ticks = 7;
+        invalid_placement.fade_out_ticks = 4;
+        assert_eq!(
+            compile_placement(timeline(&tempos), valid_clip, invalid_placement),
+            Err(CompileError::InvalidPlacementFades)
+        );
+
+        let mut sample_locked_clip = valid_clip;
+        sample_locked_clip.timebase = ClipTimebase::SampleLocked;
+        sample_locked_clip.loop_enabled = false;
+        let mut sample_locked_placement = placement();
+        sample_locked_placement.duration_ticks = sample_locked_clip.duration_ticks;
+        sample_locked_placement.fade_in_ticks = 1;
+        assert_eq!(
+            compile_placement(
+                timeline(&tempos),
+                sample_locked_clip,
+                sample_locked_placement,
+            ),
+            Err(CompileError::InvalidPlacementFades)
         );
 
         clip = valid_clip;
