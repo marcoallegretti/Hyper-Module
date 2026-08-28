@@ -616,12 +616,16 @@ pub struct ClipCompileSpec<'a> {
     pub warp_markers: &'a [WarpMarker],
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlacementCompileSpec {
     pub enabled: bool,
     pub start_tick: u64,
     pub clip_start_tick: u64,
     pub duration_ticks: u64,
+    /// Constant decibel offset applied only by this arrangement placement.
+    /// The compiler combines it with the reusable clip gain before building
+    /// the one existing native clip-render plan.
+    pub gain_decibels: f64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -632,6 +636,7 @@ pub enum CompileError {
     InvalidLoopRange,
     InvalidFades,
     InvalidGain,
+    InvalidPlacementGain,
     InvalidWarpMap,
     InvalidPlacement,
     NonIntegralFrameBoundary,
@@ -648,7 +653,8 @@ impl fmt::Display for CompileError {
             Self::InvalidSourceRange => formatter.write_str("clip source range is invalid"),
             Self::InvalidLoopRange => formatter.write_str("clip loop range is invalid"),
             Self::InvalidFades => formatter.write_str("clip fade ranges are invalid"),
-            Self::InvalidGain => formatter.write_str("clip gain must be finite"),
+            Self::InvalidGain => formatter.write_str("effective clip gain must be finite"),
+            Self::InvalidPlacementGain => formatter.write_str("placement gain must be finite"),
             Self::InvalidWarpMap => formatter.write_str("clip warp map is invalid"),
             Self::InvalidPlacement => formatter.write_str("clip placement is invalid"),
             Self::NonIntegralFrameBoundary => {
@@ -850,6 +856,14 @@ pub fn compile_placement(
 ) -> Result<CompiledPlacement, CompileError> {
     validate_clip(clip)?;
     validate_placement(clip, placement)?;
+    let effective_gain_decibels = clip.gain_decibels + placement.gain_decibels;
+    if !effective_gain_decibels.is_finite() {
+        return Err(CompileError::InvalidGain);
+    }
+    let clip = ClipCompileSpec {
+        gain_decibels: effective_gain_decibels,
+        ..clip
+    };
 
     if clip.transpose_cents != 0 {
         return Err(CompileError::ConsolidationRequired(
@@ -1133,6 +1147,9 @@ fn validate_placement(
     clip: ClipCompileSpec<'_>,
     placement: PlacementCompileSpec,
 ) -> Result<(), CompileError> {
+    if !placement.gain_decibels.is_finite() {
+        return Err(CompileError::InvalidPlacementGain);
+    }
     if placement.duration_ticks == 0 {
         return Err(CompileError::InvalidPlacement);
     }
@@ -1513,6 +1530,7 @@ mod tests {
             start_tick: 0,
             clip_start_tick: 0,
             duration_ticks: 10,
+            gain_decibels: 0.0,
         }
     }
 
@@ -1682,6 +1700,7 @@ mod tests {
             start_tick: 8,
             clip_start_tick: 2,
             duration_ticks: 10,
+            gain_decibels: 0.0,
         };
         let compiled = compile_placement(timeline(&tempos), clip, offset_placement).unwrap();
         assert_eq!(compiled.arrangement_start_frame(), 200);
@@ -1843,6 +1862,44 @@ mod tests {
     }
 
     #[test]
+    fn arrangement_placement_gain_combines_with_the_reusable_clip_gain_once() {
+        let tempos = [TempoEvent {
+            tick: 0,
+            microseconds_per_quarter: 1_000_000,
+        }];
+        let markers = [
+            WarpMarker {
+                tick: 0,
+                source_frame_offset: 0,
+            },
+            WarpMarker {
+                tick: 8,
+                source_frame_offset: 200,
+            },
+        ];
+        let mut clip = native_clip(&markers);
+        clip.gain_decibels = -3.0;
+        let mut placement = placement();
+        placement.gain_decibels = 6.0;
+
+        let compiled = compile_placement(timeline(&tempos), clip, placement).unwrap();
+        assert!((compiled.clip_spec().gain_decibels - 3.0).abs() < f64::EPSILON);
+
+        placement.gain_decibels = f64::NAN;
+        assert_eq!(
+            compile_placement(timeline(&tempos), clip, placement),
+            Err(CompileError::InvalidPlacementGain)
+        );
+
+        clip.gain_decibels = f64::MAX;
+        placement.gain_decibels = f64::MAX;
+        assert_eq!(
+            compile_placement(timeline(&tempos), clip, placement),
+            Err(CompileError::InvalidGain)
+        );
+    }
+
+    #[test]
     fn rejects_nonintegral_and_invalid_boundaries() {
         let tempos = [TempoEvent {
             tick: 0,
@@ -1871,6 +1928,7 @@ mod tests {
             start_tick: 0,
             clip_start_tick: 1,
             duration_ticks: 1,
+            gain_decibels: 0.0,
         };
         assert_eq!(
             compile_placement(timeline(&tempos), clip, nonintegral),

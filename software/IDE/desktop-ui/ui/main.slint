@@ -38,6 +38,7 @@ export enum AppMode {
     changing-arrangement-activation,
     moving-arrangement-placement,
     trimming-arrangement-placement,
+    changing-arrangement-placement-gain,
     removing-arrangement-placement,
     renaming-clip,
     duplicating-clip,
@@ -203,6 +204,7 @@ export struct ArrangementRow {
     start-tick: string,
     clip-start-tick: string,
     duration-ticks: string,
+    gain-edit: string,
     start-clock: string,
     end-clock: string,
     start-percent: float,
@@ -323,6 +325,7 @@ export global IdeActions {
     callback set-arrangement-placement-active(int, bool);
     callback move-arrangement-placement(string, string);
     callback set-arrangement-placement-duration(string, string);
+    callback set-arrangement-placement-gain(string, string);
     callback trim-arrangement-placement-front(string, string);
     callback remove-arrangement-placement(string);
     callback add-arrangement-placement(string, string);
@@ -1150,6 +1153,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.changing-arrangement-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.moving-arrangement-placement ? "◌  MOVING CLIP"
                         : root.app-mode == AppMode.trimming-arrangement-placement ? "◌  TRIMMING CLIP"
+                        : root.app-mode == AppMode.changing-arrangement-placement-gain ? "◌  UPDATING PLACEMENT GAIN"
                         : root.app-mode == AppMode.removing-arrangement-placement ? "◌  REMOVING CLIP"
                         : root.app-mode == AppMode.changing-clip-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.changing-clip-gain ? "◌  UPDATING GAIN"
@@ -4517,7 +4521,7 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     VerticalLayout {
-                                        width: 244px;
+                                        width: 282px;
                                         spacing: 4px;
                                         HorizontalLayout {
                                             height: 44px;
@@ -4585,6 +4589,29 @@ export component MainWindow inherits Window {
                                                 accessible-label: "Set the right edge of " + placement.clip-name + " on " + placement.track-name + " from its entered duration";
                                                 enabled: root.app-mode == AppMode.running && duration-tick-input.text != placement.duration-ticks;
                                                 clicked => { IdeActions.set-arrangement-placement-duration(placement.id, duration-tick-input.text); }
+                                            }
+                                            VerticalLayout {
+                                                width: 86px;
+                                                spacing: 2px;
+                                                Text {
+                                                    text: "PLACEMENT GAIN dB";
+                                                    color: #6f8197;
+                                                    font-size: 8px;
+                                                }
+                                                placement-gain-input := IdeLineEdit {
+                                                    width: 86px;
+                                                    horizontal-stretch: 0;
+                                                    text: placement.gain-edit;
+                                                    accessible-label: "Placement gain offset in dB for " + placement.clip-name + " on " + placement.track-name;
+                                                    accepted => { IdeActions.set-arrangement-placement-gain(placement.id, self.text); }
+                                                }
+                                            }
+                                            Button {
+                                                width: 50px;
+                                                text: "Apply";
+                                                accessible-label: "Apply the entered local placement gain offset to " + placement.clip-name + " on " + placement.track-name;
+                                                enabled: root.app-mode == AppMode.running && placement-gain-input.text != "" && placement-gain-input.text != placement.gain-edit;
+                                                clicked => { IdeActions.set-arrangement-placement-gain(placement.id, placement-gain-input.text); }
                                             }
                                         }
                                     }

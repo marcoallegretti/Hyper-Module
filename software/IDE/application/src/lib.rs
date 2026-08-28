@@ -95,20 +95,21 @@ pub use hyper_playback_compiler::{
 };
 pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_clip_gain_is_supported;
 use hyper_playback_json::{
-    ArrangementPlacementDocumentSerializationError, AudioClipAdditionSerializationError,
-    AudioClipDocumentSerializationError, AudioClipDuplicationSerializationError,
-    AudioClipFadeSerializationError, AudioClipGainSerializationError,
-    AudioClipLoopSerializationError, AudioClipRemovalSerializationError,
-    AudioClipRenameSerializationError, AudioClipSourceStartSerializationError,
-    AudioClipSourceViewSerializationError, AudioPrimaryRouteSerializationError,
-    AudioPrimaryRouteTarget, AudioTrackAdditionSerializationError,
-    AudioTrackContentRemovalDocuments, AudioTrackContentRemovalSerializationError,
-    AudioTrackContentRemovalSource, AudioTrackDocumentSerializationError,
-    AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
-    AudioTrackFreezeDeviceChain, AudioTrackFreezeDocuments, AudioTrackFreezeReactivationDocuments,
-    AudioTrackFreezeSerializationError, AudioTrackRemovalBlockers,
-    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
-    AudioTrackUnfreezeDocuments, AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
+    ArrangementPlacementDocumentSerializationError, ArrangementPlacementGainSerializationError,
+    AudioClipAdditionSerializationError, AudioClipDocumentSerializationError,
+    AudioClipDuplicationSerializationError, AudioClipFadeSerializationError,
+    AudioClipGainSerializationError, AudioClipLoopSerializationError,
+    AudioClipRemovalSerializationError, AudioClipRenameSerializationError,
+    AudioClipSourceStartSerializationError, AudioClipSourceViewSerializationError,
+    AudioPrimaryRouteSerializationError, AudioPrimaryRouteTarget,
+    AudioTrackAdditionSerializationError, AudioTrackContentRemovalDocuments,
+    AudioTrackContentRemovalSerializationError, AudioTrackContentRemovalSource,
+    AudioTrackDocumentSerializationError, AudioTrackDuplicationSerializationError,
+    AudioTrackDuplicationSource, AudioTrackFreezeDeviceChain, AudioTrackFreezeDocuments,
+    AudioTrackFreezeReactivationDocuments, AudioTrackFreezeSerializationError,
+    AudioTrackRemovalBlockers, AudioTrackRemovalSerializationError,
+    AudioTrackRenameSerializationError, AudioTrackUnfreezeDocuments,
+    AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
     AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
     AutomationTargetSelection, CompiledMixerDestination, CompiledMixerGraph, CompiledMixerTap,
     CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact,
@@ -125,13 +126,13 @@ use hyper_playback_json::{
     serialize_arrangement_loop_range, serialize_arrangement_placement_activation,
     serialize_arrangement_placement_addition, serialize_arrangement_placement_duplication,
     serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
-    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
-    serialize_arrangement_placement_split, serialize_arrangement_scene_launch_addition,
-    serialize_arrangement_scene_launch_move, serialize_arrangement_scene_launch_removal,
-    serialize_arrangement_scene_launch_scene_edit, serialize_audio_clip_activation,
-    serialize_audio_clip_duplication, serialize_audio_clip_fades, serialize_audio_clip_gain,
-    serialize_audio_clip_loop, serialize_audio_clip_removal, serialize_audio_clip_rename,
-    serialize_audio_clip_reverse, serialize_audio_clip_source_start,
+    serialize_arrangement_placement_gain, serialize_arrangement_placement_move,
+    serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
+    serialize_arrangement_scene_launch_addition, serialize_arrangement_scene_launch_move,
+    serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
+    serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
+    serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_removal,
+    serialize_audio_clip_rename, serialize_audio_clip_reverse, serialize_audio_clip_source_start,
     serialize_audio_clip_source_view, serialize_audio_primary_route_change,
     serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_content_removal, serialize_audio_track_duplication,
@@ -156,7 +157,8 @@ pub use hyper_playback_json::{
     microseconds_per_quarter_for_bpm,
 };
 use hyper_playback_session::{
-    AudioClipGainValidationError, AudioClipSourceSlipValidationError, PlaybackSessionAssemblyLimits,
+    ArrangementPlacementGainValidationError, AudioClipGainValidationError,
+    AudioClipSourceSlipValidationError, PlaybackSessionAssemblyLimits,
 };
 pub use hyper_playback_session::{
     PlaybackArrangement as IdePlaybackArrangement, PlaybackAutomation as IdePlaybackAutomation,
@@ -5013,6 +5015,8 @@ pub enum IdeArrangementPlacementEditError {
     LoopMark(LoopMarkFailure),
     Storage(StorageError),
     Serialization(ArrangementPlacementDocumentSerializationError),
+    GainSerialization(ArrangementPlacementGainSerializationError),
+    GainNativeValidation(ArrangementPlacementGainValidationError),
     CapacityUnavailable,
     Publication {
         created_placement_id: Option<Box<str>>,
@@ -5100,6 +5104,8 @@ impl fmt::Display for IdeArrangementPlacementEditError {
             }
             Self::Storage(source) => source.fmt(formatter),
             Self::Serialization(source) => source.fmt(formatter),
+            Self::GainSerialization(source) => source.fmt(formatter),
+            Self::GainNativeValidation(source) => source.fmt(formatter),
             Self::CapacityUnavailable => {
                 formatter.write_str("arrangement edit capacity is unavailable")
             }
@@ -5205,6 +5211,8 @@ impl Error for IdeArrangementPlacementEditError {
             Self::MixerSave(source) => Some(source.as_ref()),
             Self::Storage(source) => Some(source),
             Self::Serialization(source) => Some(source),
+            Self::GainSerialization(source) => Some(source),
+            Self::GainNativeValidation(source) => Some(source),
             Self::Publication { source, .. } => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
@@ -11802,6 +11810,7 @@ impl RunningDesktopIdeApplication {
                     active,
                     limits,
                 )
+                .map_err(IdeArrangementPlacementEditError::Serialization)
             },
         )
     }
@@ -13097,6 +13106,7 @@ impl RunningDesktopIdeApplication {
                     start_tick,
                     limits,
                 )
+                .map_err(IdeArrangementPlacementEditError::Serialization)
             },
         )
     }
@@ -13178,6 +13188,35 @@ impl RunningDesktopIdeApplication {
                     duration_ticks,
                     limits,
                 )
+                .map_err(IdeArrangementPlacementEditError::Serialization)
+            },
+        )
+    }
+
+    fn prepare_arrangement_placement_gain(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        placement_id: &str,
+        gain_decibels: f64,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        Self::prepare_arrangement_placement_edit(
+            application,
+            recovery,
+            |prepared, source, limits| {
+                let (project, _, _, _) = prepared.session().parts();
+                let arrangement_bytes = serialize_arrangement_placement_gain(
+                    project,
+                    source,
+                    placement_id,
+                    gain_decibels,
+                    limits,
+                )
+                .map_err(IdeArrangementPlacementEditError::GainSerialization)?;
+                prepared
+                    .session()
+                    .validate_arrangement_placement_gain(placement_id, gain_decibels)
+                    .map_err(IdeArrangementPlacementEditError::GainNativeValidation)?;
+                Ok(arrangement_bytes)
             },
         )
     }
@@ -13200,6 +13239,7 @@ impl RunningDesktopIdeApplication {
                     start_tick,
                     limits,
                 )
+                .map_err(IdeArrangementPlacementEditError::Serialization)
             },
         )
     }
@@ -13215,6 +13255,7 @@ impl RunningDesktopIdeApplication {
             |prepared, source, limits| {
                 let (project, _, _, _) = prepared.session().parts();
                 serialize_arrangement_placement_removal(project, source, placement_id, limits)
+                    .map_err(IdeArrangementPlacementEditError::Serialization)
             },
         )
     }
@@ -13226,8 +13267,7 @@ impl RunningDesktopIdeApplication {
             &PreparedProjectPlayback,
             &[u8],
             LoaderLimits,
-        )
-            -> Result<Vec<u8>, ArrangementPlacementDocumentSerializationError>,
+        ) -> Result<Vec<u8>, IdeArrangementPlacementEditError>,
     ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
         let mixer = Self::prepare_mixer_save(application, recovery)
             .map_err(|source| IdeArrangementPlacementEditError::MixerSave(Box::new(source)))?;
@@ -13255,8 +13295,7 @@ impl RunningDesktopIdeApplication {
             prepared,
             &source,
             application.config.project_limits.session.documents,
-        )
-        .map_err(IdeArrangementPlacementEditError::Serialization)?;
+        )?;
         let mut arrangement_id = String::new();
         arrangement_id
             .try_reserve_exact(descriptor.id().len())
@@ -18412,6 +18451,79 @@ mod tests {
             reopened.package().read_resource(&arrangement_id).unwrap(),
             removed_arrangement
         );
+    }
+
+    #[test]
+    fn arrangement_placement_gain_publishes_a_local_offset_and_reopens() {
+        let fixture = ArrangementProjectFixture::new();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let arrangement = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Arrangement)
+            .unwrap();
+        let arrangement_id = arrangement.id().to_owned();
+        let source_arrangement = package.read_resource(&arrangement_id).unwrap();
+        let (project, _, _, _) = prepared.session().parts();
+        let arrangement_bytes = serialize_arrangement_placement_gain(
+            project,
+            &source_arrangement,
+            ARRANGEMENT_TEST_PLACEMENT_ID,
+            -12.5,
+            limits.session.documents,
+        )
+        .unwrap();
+        let plan = IdeArrangementPlacementEditPlan {
+            mixer: fixture_mixer_save_plan(&prepared),
+            arrangement_id: arrangement_id.clone(),
+            arrangement_bytes: arrangement_bytes.clone(),
+            addition: false,
+            created_placement_id: None,
+        };
+        drop(prepared);
+
+        let outcome = plan.publish().unwrap();
+        assert!(outcome.changed());
+        assert_eq!(outcome.project_revision(), 2);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let placement = &reopened.session().arrangement().placements()[0];
+        assert!((placement.gain_decibels() + 12.5).abs() < f64::EPSILON);
+        assert_eq!(
+            reopened.session().parts().0.clip_gain_decibels_at(0),
+            Some(0.0)
+        );
+        assert_eq!(
+            reopened.package().read_resource(&arrangement_id).unwrap(),
+            arrangement_bytes
+        );
+        let persisted: serde_json::Value = serde_json::from_slice(
+            reopened
+                .package()
+                .read_resource(&arrangement_id)
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(persisted["placements"][0]["gain_decibels"], -12.5);
+
+        let unchanged = IdeArrangementPlacementEditPlan {
+            mixer: fixture_mixer_save_plan(&reopened),
+            arrangement_id,
+            arrangement_bytes,
+            addition: false,
+            created_placement_id: None,
+        };
+        drop(reopened);
+        let unchanged = unchanged.publish().unwrap();
+        assert!(!unchanged.changed());
+        assert_eq!(unchanged.project_revision(), 2);
     }
 
     #[test]

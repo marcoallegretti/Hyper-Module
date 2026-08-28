@@ -199,6 +199,7 @@ pub enum IdeWorkerCommandKind {
     SetArrangementPlacementActive,
     MoveArrangementPlacement,
     SetArrangementPlacementDuration,
+    SetArrangementPlacementGain,
     TrimArrangementPlacementFront,
     RemoveArrangementPlacement,
     RenameAudioClip,
@@ -436,6 +437,10 @@ pub enum IdeWorkerCommand {
         placement_id: String,
         duration_ticks: u64,
     },
+    SetArrangementPlacementGain {
+        placement_id: String,
+        gain_decibels: f64,
+    },
     TrimArrangementPlacementFront {
         placement_id: String,
         start_tick: u64,
@@ -646,6 +651,9 @@ impl IdeWorkerCommand {
             Self::MoveArrangementPlacement { .. } => IdeWorkerCommandKind::MoveArrangementPlacement,
             Self::SetArrangementPlacementDuration { .. } => {
                 IdeWorkerCommandKind::SetArrangementPlacementDuration
+            }
+            Self::SetArrangementPlacementGain { .. } => {
+                IdeWorkerCommandKind::SetArrangementPlacementGain
             }
             Self::TrimArrangementPlacementFront { .. } => {
                 IdeWorkerCommandKind::TrimArrangementPlacementFront
@@ -2173,6 +2181,7 @@ pub enum IdeWorkerCommandFailure {
     ArrangementPlacementActivation(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementMove(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementDuration(Box<IdeArrangementPlacementEditError>),
+    ArrangementPlacementGain(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementFrontTrim(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementRemoval(Box<IdeArrangementPlacementEditError>),
     AudioClipRename(Box<IdeAudioClipRenameEditError>),
@@ -2336,6 +2345,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             | Self::ArrangementPlacementActivation(source)
             | Self::ArrangementPlacementMove(source)
             | Self::ArrangementPlacementDuration(source)
+            | Self::ArrangementPlacementGain(source)
             | Self::ArrangementPlacementFrontTrim(source)
             | Self::ArrangementPlacementRemoval(source) => source.fmt(formatter),
             Self::AudioClipRename(source) => source.fmt(formatter),
@@ -2434,6 +2444,7 @@ impl Error for IdeWorkerCommandFailure {
             | Self::ArrangementPlacementActivation(source)
             | Self::ArrangementPlacementMove(source)
             | Self::ArrangementPlacementDuration(source)
+            | Self::ArrangementPlacementGain(source)
             | Self::ArrangementPlacementFrontTrim(source)
             | Self::ArrangementPlacementRemoval(source) => Some(source),
             Self::AudioClipRename(source) => Some(source),
@@ -2740,6 +2751,11 @@ pub enum IdeWorkerEvent {
         changed: bool,
         duration_ticks: u64,
     },
+    ArrangementPlacementGainChanged {
+        revision: u64,
+        changed: bool,
+        gain_decibels: f64,
+    },
     ArrangementPlacementFrontTrimmed {
         revision: u64,
         changed: bool,
@@ -3015,6 +3031,9 @@ pub enum IdeWorkerEvent {
     },
     ArrangementPlacementDurationChanging {
         duration_ticks: u64,
+    },
+    ArrangementPlacementGainChanging {
+        gain_decibels: f64,
     },
     ArrangementPlacementFrontTrimming {
         start_tick: u64,
@@ -3591,6 +3610,10 @@ enum ProjectMutation {
         placement_id: String,
         duration_ticks: u64,
     },
+    SetArrangementPlacementGain {
+        placement_id: String,
+        gain_decibels: f64,
+    },
     TrimArrangementPlacementFront {
         placement_id: String,
         start_tick: u64,
@@ -3744,6 +3767,9 @@ impl ProjectMutation {
             Self::SetArrangementPlacementDuration { .. } => {
                 IdeWorkerCommandKind::SetArrangementPlacementDuration
             }
+            Self::SetArrangementPlacementGain { .. } => {
+                IdeWorkerCommandKind::SetArrangementPlacementGain
+            }
             Self::TrimArrangementPlacementFront { .. } => {
                 IdeWorkerCommandKind::TrimArrangementPlacementFront
             }
@@ -3862,6 +3888,11 @@ impl ProjectMutation {
             Self::SetArrangementPlacementDuration { duration_ticks, .. } => {
                 IdeWorkerEvent::ArrangementPlacementDurationChanging {
                     duration_ticks: *duration_ticks,
+                }
+            }
+            Self::SetArrangementPlacementGain { gain_decibels, .. } => {
+                IdeWorkerEvent::ArrangementPlacementGainChanging {
+                    gain_decibels: *gain_decibels,
                 }
             }
             Self::TrimArrangementPlacementFront { start_tick, .. } => {
@@ -4078,6 +4109,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::FlattenAudioTrack => "track flatten",
         IdeWorkerCommandKind::MoveArrangementPlacement => "placement move",
         IdeWorkerCommandKind::SetArrangementPlacementDuration => "placement duration",
+        IdeWorkerCommandKind::SetArrangementPlacementGain => "placement gain",
         IdeWorkerCommandKind::TrimArrangementPlacementFront => "placement trim",
         IdeWorkerCommandKind::RemoveArrangementPlacement => "placement removal",
         IdeWorkerCommandKind::SetArrangementPlacementActive => "placement activation",
@@ -4513,6 +4545,7 @@ fn process_command(
         | IdeWorkerCommand::SetArrangementPlacementActive { .. }
         | IdeWorkerCommand::MoveArrangementPlacement { .. }
         | IdeWorkerCommand::SetArrangementPlacementDuration { .. }
+        | IdeWorkerCommand::SetArrangementPlacementGain { .. }
         | IdeWorkerCommand::TrimArrangementPlacementFront { .. }
         | IdeWorkerCommand::RemoveArrangementPlacement { .. }
         | IdeWorkerCommand::RenameAudioClip { .. }
@@ -4765,6 +4798,7 @@ fn process_project_mutation_command(
         | IdeWorkerCommand::SetArrangementPlacementActive { .. }
         | IdeWorkerCommand::MoveArrangementPlacement { .. }
         | IdeWorkerCommand::SetArrangementPlacementDuration { .. }
+        | IdeWorkerCommand::SetArrangementPlacementGain { .. }
         | IdeWorkerCommand::TrimArrangementPlacementFront { .. }
         | IdeWorkerCommand::RemoveArrangementPlacement { .. }) => {
             process_arrangement_mutation_command(state, command, events)
@@ -4953,6 +4987,10 @@ fn process_arrangement_mutation_command(
             placement_id,
             duration_ticks,
         } => set_arrangement_placement_duration(state, events, &placement_id, duration_ticks),
+        IdeWorkerCommand::SetArrangementPlacementGain {
+            placement_id,
+            gain_decibels,
+        } => set_arrangement_placement_gain(state, events, &placement_id, gain_decibels),
         IdeWorkerCommand::TrimArrangementPlacementFront {
             placement_id,
             start_tick,
@@ -7473,6 +7511,45 @@ fn set_arrangement_placement_duration(
     )
 }
 
+fn set_arrangement_placement_gain(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    placement_id: &str,
+    gain_decibels: f64,
+) -> bool {
+    if placement_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SetArrangementPlacementGain,
+            IdeWorkerCommandFailure::ArrangementPlacementGain(Box::new(
+                IdeArrangementPlacementEditError::InvalidPlacementIdentity,
+            )),
+        );
+    }
+    let mut owned_placement_id = String::new();
+    if owned_placement_id
+        .try_reserve_exact(placement_id.len())
+        .is_err()
+    {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SetArrangementPlacementGain,
+            IdeWorkerCommandFailure::ArrangementPlacementGain(Box::new(
+                IdeArrangementPlacementEditError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_placement_id.push_str(placement_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::SetArrangementPlacementGain {
+            placement_id: owned_placement_id,
+            gain_decibels,
+        },
+    )
+}
+
 fn trim_arrangement_placement_front(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -8180,6 +8257,10 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             result: Ok(outcome),
             ..
         }
+        | ProjectMutationAttempt::SetArrangementPlacementGain {
+            result: Ok(outcome),
+            ..
+        }
         | ProjectMutationAttempt::TrimArrangementPlacementFront {
             result: Ok(outcome),
             ..
@@ -8367,6 +8448,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::SetSceneSlot { result: Err(_), .. }
         | ProjectMutationAttempt::MoveArrangementPlacement { result: Err(_), .. }
         | ProjectMutationAttempt::SetArrangementPlacementDuration { result: Err(_), .. }
+        | ProjectMutationAttempt::SetArrangementPlacementGain { result: Err(_), .. }
         | ProjectMutationAttempt::TrimArrangementPlacementFront { result: Err(_), .. }
         | ProjectMutationAttempt::RenameAudioClip { result: Err(_), .. }
         | ProjectMutationAttempt::RenameRecordingTake { result: Err(_), .. }
@@ -9223,6 +9305,11 @@ fn project_mutation_save_failure(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::SetArrangementPlacementGain { .. } => {
+            IdeWorkerCommandFailure::ArrangementPlacementGain(Box::new(
+                IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
+            ))
+        }
         ProjectMutation::TrimArrangementPlacementFront { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementFrontTrim(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -9537,6 +9624,11 @@ fn project_mutation_native_close_failure(
         }
         ProjectMutation::SetArrangementPlacementDuration { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementDuration(Box::new(
+                IdeArrangementPlacementEditError::NativeClose(failure),
+            ))
+        }
+        ProjectMutation::SetArrangementPlacementGain { .. } => {
+            IdeWorkerCommandFailure::ArrangementPlacementGain(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
             ))
         }
@@ -9884,6 +9976,13 @@ enum ProjectMutationAttempt {
     },
     SetArrangementPlacementDuration {
         duration_ticks: u64,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeArrangementPlacementEditError,
+        >,
+    },
+    SetArrangementPlacementGain {
+        gain_decibels: f64,
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeArrangementPlacementEditError,
@@ -11107,6 +11206,26 @@ fn complete_project_mutation(
                     IdeWorkerCommandKind::SetArrangementPlacementDuration,
                     reason,
                     IdeWorkerCommandFailure::ArrangementPlacementDuration,
+                ),
+                ProjectMutationAttempt::SetArrangementPlacementGain {
+                    gain_decibels,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::ArrangementPlacementGainChanged {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                        gain_decibels,
+                    },
+                ),
+                ProjectMutationAttempt::SetArrangementPlacementGain {
+                    result: Err(reason),
+                    ..
+                } => publish_arrangement_edit_failure(
+                    events,
+                    IdeWorkerCommandKind::SetArrangementPlacementGain,
+                    reason,
+                    IdeWorkerCommandFailure::ArrangementPlacementGain,
                 ),
                 ProjectMutationAttempt::TrimArrangementPlacementFront {
                     start_tick,
@@ -12426,6 +12545,19 @@ fn attempt_project_mutation(
                 native_failure,
             ),
         },
+        ProjectMutation::SetArrangementPlacementGain {
+            placement_id,
+            gain_decibels,
+        } => ProjectMutationAttempt::SetArrangementPlacementGain {
+            gain_decibels,
+            result: attempt_arrangement_placement_gain(
+                application,
+                recovery,
+                &placement_id,
+                gain_decibels,
+                native_failure,
+            ),
+        },
         ProjectMutation::TrimArrangementPlacementFront {
             placement_id,
             start_tick,
@@ -13128,6 +13260,26 @@ fn attempt_arrangement_placement_duration(
         recovery,
         placement_id,
         duration_ticks,
+    )
+    .and_then(publish_arrangement_placement_edit_plan)
+}
+
+fn attempt_arrangement_placement_gain(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    placement_id: &str,
+    gain_decibels: f64,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeArrangementPlacementEditError>
+{
+    if let Some(failure) = native_failure {
+        return Err(IdeArrangementPlacementEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_arrangement_placement_gain(
+        application,
+        recovery,
+        placement_id,
+        gain_decibels,
     )
     .and_then(publish_arrangement_placement_edit_plan)
 }
@@ -13998,6 +14150,13 @@ fn project_mutation_reopen_failure(
                 result,
                 reopen,
                 IdeWorkerCommandFailure::ArrangementPlacementDuration,
+            )
+        }
+        ProjectMutationAttempt::SetArrangementPlacementGain { result, .. } => {
+            arrangement_placement_edit_reopen_failure(
+                result,
+                reopen,
+                IdeWorkerCommandFailure::ArrangementPlacementGain,
             )
         }
         ProjectMutationAttempt::TrimArrangementPlacementFront { result, .. } => {
@@ -24212,6 +24371,66 @@ mod tests {
     }
 
     #[test]
+    fn arrangement_gain_validates_identity_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetArrangementPlacementGain {
+                placement_id: String::new(),
+                gain_decibels: -3.0,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetArrangementPlacementGain,
+                reason: IdeWorkerCommandFailure::ArrangementPlacementGain(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeArrangementPlacementEditError::InvalidPlacementIdentity
+            )
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetArrangementPlacementGain {
+                placement_id: "018f47a2-6b2d-7c11-8a44-001122334464".to_owned(),
+                gain_decibels: -3.0,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ArrangementPlacementGainChanging {
+                gain_decibels: -3.0
+            }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetArrangementPlacementGain,
+                reason: IdeWorkerCommandFailure::ArrangementPlacementGain(reason),
+            } if matches!(reason.as_ref(), IdeArrangementPlacementEditError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
     fn arrangement_front_trim_validates_identity_and_waits_for_the_mixer_fence() {
         let running = RunningDesktopIdeApplication {
             application: closed_application(),
@@ -25183,11 +25402,10 @@ mod tests {
     }
 
     /// A change no stored document can express must drop the history rather
-    /// than leave entries that would silently revert it.
-    /// Exhaustiveness proves every mutation is listed, not that it is classified
-    /// correctly. These three were listed and never checked.
+    /// than leave entries that would silently revert it. Exhaustiveness proves
+    /// every mutation is listed, not that its undo classification is correct.
     #[test]
-    fn the_timeline_and_loop_edits_are_classified_as_undoable_replacements() {
+    fn document_replacement_edits_are_classified_as_undoable() {
         let edit = captured_mixer_edit("classified");
         let outcome = edit.outcome.clone();
         for (attempt, label, kind) in [
@@ -25229,6 +25447,14 @@ mod tests {
                 "loop range",
                 IdeWorkerCommandKind::SetArrangementLoopRange,
             ),
+            (
+                ProjectMutationAttempt::SetArrangementPlacementGain {
+                    gain_decibels: -12.5,
+                    result: Ok(outcome.clone()),
+                },
+                "placement gain",
+                IdeWorkerCommandKind::SetArrangementPlacementGain,
+            ),
         ] {
             assert!(
                 matches!(history_effect(&attempt), HistoryEffect::Replacement(_)),
@@ -25264,6 +25490,10 @@ mod tests {
                 result: Err(IdeTempoEditError::TimelineResourceMissing),
             },
             ProjectMutationAttempt::SetArrangementLoopRange {
+                result: Err(IdeArrangementPlacementEditError::ArrangementResourceMissing),
+            },
+            ProjectMutationAttempt::SetArrangementPlacementGain {
+                gain_decibels: -12.5,
                 result: Err(IdeArrangementPlacementEditError::ArrangementResourceMissing),
             },
         ] {
@@ -25884,6 +26114,10 @@ mod tests {
             (
                 IdeWorkerCommandKind::SetArrangementPlacementDuration,
                 "placement duration",
+            ),
+            (
+                IdeWorkerCommandKind::SetArrangementPlacementGain,
+                "placement gain",
             ),
             (
                 IdeWorkerCommandKind::TrimArrangementPlacementFront,

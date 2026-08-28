@@ -342,6 +342,38 @@ impl AudioClipGainValidationView<'_> {
     }
 }
 
+/// Immutable media metadata required to validate one arrangement placement's
+/// candidate gain against the reusable clip that it references.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArrangementPlacementGainValidationView<'a> {
+    asset_id: &'a str,
+    source_start_frame: usize,
+    source_frame_count: usize,
+    clip_gain_decibels: f64,
+}
+
+impl ArrangementPlacementGainValidationView<'_> {
+    #[must_use]
+    pub const fn asset_id(&self) -> &str {
+        self.asset_id
+    }
+
+    #[must_use]
+    pub const fn source_start_frame(&self) -> usize {
+        self.source_start_frame
+    }
+
+    #[must_use]
+    pub const fn source_frame_count(&self) -> usize {
+        self.source_frame_count
+    }
+
+    #[must_use]
+    pub const fn clip_gain_decibels(&self) -> f64 {
+        self.clip_gain_decibels
+    }
+}
+
 #[derive(Clone, Debug)]
 struct LoadedTrack {
     id: String,
@@ -374,7 +406,7 @@ struct LoadedClip {
     warp_markers: Vec<WarpMarker>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct LoadedPlacement {
     id: String,
     track_id: String,
@@ -383,6 +415,7 @@ struct LoadedPlacement {
     clip_start_tick: u64,
     duration_ticks: u64,
     enabled: bool,
+    gain_decibels: f64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -422,7 +455,7 @@ struct LoadedSceneLaunch {
     scene_id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct LoadedArrangement {
     id: String,
     enabled: bool,
@@ -1651,6 +1684,13 @@ pub type ArrangementPlacementMoveSerializationError =
     ArrangementPlacementDocumentSerializationError;
 pub type ArrangementPlacementDurationSerializationError =
     ArrangementPlacementDocumentSerializationError;
+#[derive(Debug)]
+pub enum ArrangementPlacementGainSerializationError {
+    NonFiniteGain,
+    UnsupportedEffectiveGain,
+    Document(ArrangementPlacementDocumentSerializationError),
+}
+
 pub type ArrangementPlacementFrontTrimSerializationError =
     ArrangementPlacementDocumentSerializationError;
 pub type ArrangementPlacementRemovalSerializationError =
@@ -2204,6 +2244,27 @@ impl Error for ArrangementPlacementDocumentSerializationError {
             | Self::SceneLaunchMissing
             | Self::PlacementMissing
             | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+impl fmt::Display for ArrangementPlacementGainSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonFiniteGain => formatter.write_str("arrangement-placement gain must be finite"),
+            Self::UnsupportedEffectiveGain => formatter.write_str(
+                "combined reusable-clip and arrangement-placement gain is outside the native range",
+            ),
+            Self::Document(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ArrangementPlacementGainSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::NonFiniteGain | Self::UnsupportedEffectiveGain => None,
         }
     }
 }
@@ -4310,7 +4371,7 @@ pub fn serialize_audio_track_freeze(
             true
         }
     });
-    let frozen_placement_document = json!({"id": frozen_placement_id, "track_id": track_id, "clip_id": frozen_clip_id, "start_tick": 0, "clip_start_tick": 0, "duration_ticks": added.duration_ticks, "enabled": true});
+    let frozen_placement_document = json!({"id": frozen_placement_id, "track_id": track_id, "clip_id": frozen_clip_id, "start_tick": 0, "clip_start_tick": 0, "duration_ticks": added.duration_ticks, "enabled": true, "gain_decibels": 0});
     placements.push(frozen_placement_document.clone());
     placements
         .sort_unstable_by(|left, right| placement_sort_key(left).cmp(&placement_sort_key(right)));
@@ -6034,7 +6095,8 @@ pub fn serialize_arrangement_placement_addition(
         "start_tick": start_tick,
         "clip_start_tick": 0,
         "duration_ticks": clip.duration_ticks,
-        "enabled": true
+        "enabled": true,
+        "gain_decibels": 0
     });
     let mut value = prepare_arrangement_placement_addition_document(
         project,
@@ -7241,7 +7303,8 @@ pub fn serialize_arrangement_placement_duplication(
         "start_tick": start_tick,
         "clip_start_tick": source.clip_start_tick,
         "duration_ticks": source.duration_ticks,
-        "enabled": source.enabled
+        "enabled": source.enabled,
+        "gain_decibels": source.gain_decibels
     });
     let mut value = prepare_arrangement_placement_addition_document(
         project,
@@ -7338,6 +7401,7 @@ pub fn serialize_arrangement_placement_split(
         .and_then(Value::as_object_mut)
         .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
     left.insert("duration_ticks".to_owned(), left_duration.into());
+    left.insert("gain_decibels".to_owned(), source.gain_decibels.into());
     placements.push(json!({
         "id": right_placement_id,
         "track_id": source.track_id,
@@ -7345,7 +7409,8 @@ pub fn serialize_arrangement_placement_split(
         "start_tick": split_tick,
         "clip_start_tick": right_clip_start,
         "duration_ticks": right_duration,
-        "enabled": source.enabled
+        "enabled": source.enabled,
+        "gain_decibels": source.gain_decibels
     }));
 
     if placements
@@ -7570,6 +7635,62 @@ pub fn serialize_arrangement_placement_duration(
     )
 }
 
+/// Replaces only the constant decibel offset of one arrangement placement.
+///
+/// The offset belongs to this placement rather than its reusable clip. It is
+/// added to the clip gain before the existing native clip plan is built, so
+/// every other placement of the same clip keeps its own gain unchanged.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the requested gain is non-finite, the
+/// resulting effective gain cannot execute natively, the placement is absent,
+/// the supplied bytes are stale, or the candidate arrangement is invalid.
+pub fn serialize_arrangement_placement_gain(
+    project: &LoadedPlaybackProject,
+    source_arrangement: &[u8],
+    placement_id: &str,
+    gain_decibels: f64,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ArrangementPlacementGainSerializationError> {
+    if !gain_decibels.is_finite() {
+        return Err(ArrangementPlacementGainSerializationError::NonFiniteGain);
+    }
+    let arrangement = project
+        .arrangement
+        .as_ref()
+        .ok_or(ArrangementPlacementDocumentSerializationError::ArrangementMissing)
+        .map_err(ArrangementPlacementGainSerializationError::Document)?;
+    let placement = arrangement
+        .placements
+        .iter()
+        .find(|placement| placement.id == placement_id)
+        .ok_or(ArrangementPlacementDocumentSerializationError::PlacementMissing)
+        .map_err(ArrangementPlacementGainSerializationError::Document)?;
+    let clip = project
+        .clips
+        .iter()
+        .find(|clip| clip.id == placement.clip_id)
+        .ok_or(ArrangementPlacementDocumentSerializationError::ClipMissing)
+        .map_err(ArrangementPlacementGainSerializationError::Document)?;
+    if !is_native_audio_clip_gain_decibels(clip.gain_decibels + gain_decibels) {
+        return Err(ArrangementPlacementGainSerializationError::UnsupportedEffectiveGain);
+    }
+
+    serialize_arrangement_placement_document_edit(
+        project,
+        source_arrangement,
+        placement_id,
+        limits,
+        |_, document| {
+            document.insert("gain_decibels".to_owned(), gain_decibels.into());
+            Ok(())
+        },
+        |edited_project| validate_arrangement_placement_execution(edited_project, placement_id),
+    )
+    .map_err(ArrangementPlacementGainSerializationError::Document)
+}
+
 /// Trims or extends the front of one validated arrangement placement to an
 /// exact project tick while preserving its right edge and playback content.
 ///
@@ -7762,6 +7883,7 @@ fn validate_arrangement_placement_execution(
             start_tick: placement.start_tick,
             clip_start_tick: placement.clip_start_tick,
             duration_ticks: placement.duration_ticks,
+            gain_decibels: placement.gain_decibels,
         },
     )
     .map(|_| ())
@@ -9054,6 +9176,31 @@ impl LoadedPlaybackProject {
             })
     }
 
+    /// Returns the immutable decoded-media view and reusable-clip gain needed
+    /// to validate a candidate gain for one arrangement placement.
+    #[must_use]
+    pub fn arrangement_placement_gain_validation_view(
+        &self,
+        placement_id: &str,
+    ) -> Option<ArrangementPlacementGainValidationView<'_>> {
+        let placement = self
+            .arrangement
+            .as_ref()?
+            .placements
+            .iter()
+            .find(|placement| placement.id == placement_id)?;
+        let clip = self
+            .clips
+            .iter()
+            .find(|clip| clip.id == placement.clip_id)?;
+        Some(ArrangementPlacementGainValidationView {
+            asset_id: &clip.asset_id,
+            source_start_frame: clip.source_start_frame,
+            source_frame_count: clip.source_frame_count,
+            clip_gain_decibels: clip.gain_decibels,
+        })
+    }
+
     /// Returns a validated structural-track name by canonical project order.
     #[must_use]
     pub fn track_name_at(&self, track_index: usize) -> Option<&str> {
@@ -9259,6 +9406,7 @@ pub struct OwnedScheduleEntry {
     pub placement_clip_start_tick: u64,
     pub placement_duration_ticks: u64,
     pub placement_enabled: bool,
+    pub placement_gain_decibels: f64,
     pub track_id: String,
     pub track_index: usize,
     pub clip_id: String,
@@ -9905,6 +10053,7 @@ fn load_arrangement(
             clip_start_tick: placement.clip_start_tick,
             duration_ticks: placement.duration_ticks,
             enabled: placement.enabled,
+            gain_decibels: placement.gain_decibels,
         })
         .collect();
     let scene_launches = document
@@ -10610,6 +10759,9 @@ fn validate_arrangement_document(
         if placement.duration_ticks == 0 {
             return domain_error(location, "placement duration must be positive");
         }
+        if !placement.gain_decibels.is_finite() {
+            return domain_error(location, "placement gain must be finite");
+        }
         if placement.start_tick > MAX_SAFE_INTEGER - placement.duration_ticks
             || placement.clip_start_tick > MAX_SAFE_INTEGER - placement.duration_ticks
         {
@@ -10879,6 +11031,7 @@ fn build_placement_resources(
         clip_start_tick: placement.clip_start_tick,
         duration_ticks: placement.duration_ticks,
         enabled: placement.enabled,
+        gain_decibels: placement.gain_decibels,
     }));
     Ok(output)
 }
@@ -11195,6 +11348,7 @@ struct SchedulePlacementMetadata {
     clip_start_tick: u64,
     duration_ticks: u64,
     enabled: bool,
+    gain_decibels: f64,
 }
 
 fn build_schedule_placement_metadata_index(
@@ -11217,6 +11371,7 @@ fn build_schedule_placement_metadata_index(
                     clip_start_tick: placement.clip_start_tick,
                     duration_ticks: placement.duration_ticks,
                     enabled: placement.enabled,
+                    gain_decibels: placement.gain_decibels,
                 },
             )
             .is_some()
@@ -11259,6 +11414,7 @@ fn own_schedule(
             placement_clip_start_tick: placement.clip_start_tick,
             placement_duration_ticks: placement.duration_ticks,
             placement_enabled: placement.enabled,
+            placement_gain_decibels: placement.gain_decibels,
             track_id: try_owned(entry.track_id)?,
             track_index,
             clip_id: try_owned(entry.clip_id)?,
@@ -11538,6 +11694,8 @@ struct PlacementDocument {
     clip_start_tick: u64,
     duration_ticks: u64,
     enabled: bool,
+    #[serde(default)]
+    gain_decibels: f64,
 }
 
 #[derive(Deserialize)]
@@ -15292,6 +15450,139 @@ mod tests {
     }
 
     #[test]
+    fn arrangement_placement_gain_is_local_legacy_safe_and_effective() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let mut clip_value: Value = serde_json::from_slice(CLIP).unwrap();
+        clip_value["playback"]["gain_decibels"] = 3.0.into();
+        let clip = serde_json_canonicalizer::to_vec(&clip_value).unwrap();
+        let clips: [&[u8]; 1] = [&clip];
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["extensions"]["org.example.arrangement"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+
+        let edited = serialize_arrangement_placement_gain(
+            &loaded,
+            &source,
+            placement_id,
+            -6.0,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["placements"][0]["gain_decibels"] = (-6.0).into();
+        assert_eq!(edited, serde_json_canonicalizer::to_vec(&expected).unwrap());
+        assert_eq!(
+            expected["extensions"]["org.example.arrangement"],
+            json!({"opaque": [1, 2, 3]})
+        );
+
+        let reopened = load(
+            input(TIMELINE, &tracks, &clips, Some(&edited)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let compiled = reopened
+            .compile_playback(
+                &asset_facts(),
+                GraphLimits::VERSION_1,
+                SceneLimits::VERSION_1,
+            )
+            .unwrap();
+        let entry = &compiled.arrangement().entries()[0];
+        assert!((entry.placement_gain_decibels + 6.0).abs() < f64::EPSILON);
+        assert!((entry.compiled.clip_spec().gain_decibels + 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn arrangement_placement_gain_refuses_unsafe_or_untrusted_requests() {
+        let source = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
+        )
+        .unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+
+        assert!(matches!(
+            serialize_arrangement_placement_gain(
+                &loaded,
+                &source,
+                placement_id,
+                f64::NAN,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementGainSerializationError::NonFiniteGain)
+        ));
+        assert!(matches!(
+            serialize_arrangement_placement_gain(
+                &loaded,
+                &source,
+                placement_id,
+                12.0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementGainSerializationError::UnsupportedEffectiveGain)
+        ));
+        assert!(matches!(
+            serialize_arrangement_placement_gain(
+                &loaded,
+                &source,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                0.0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementGainSerializationError::Document(
+                ArrangementPlacementDocumentSerializationError::PlacementMissing
+            ))
+        ));
+
+        let mut stale: Value = serde_json::from_slice(&source).unwrap();
+        stale["name"] = "Stale arrangement".into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_gain(
+                &loaded,
+                &stale,
+                placement_id,
+                0.0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementGainSerializationError::Document(
+                ArrangementPlacementDocumentSerializationError::SourceArrangementMismatch
+            ))
+        ));
+
+        let without_arrangement = load(
+            input(TIMELINE, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_gain(
+                &without_arrangement,
+                &source,
+                placement_id,
+                0.0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementGainSerializationError::Document(
+                ArrangementPlacementDocumentSerializationError::ArrangementMissing
+            ))
+        ));
+    }
+
+    #[test]
     fn arrangement_placement_front_trim_preserves_right_edge_and_is_reversible() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];
@@ -15565,7 +15856,8 @@ mod tests {
                 "start_tick": 4,
                 "clip_start_tick": 0,
                 "duration_ticks": 4,
-                "enabled": true
+                "enabled": true,
+                "gain_decibels": 0
             })
         );
         assert_eq!(
@@ -16179,7 +16471,8 @@ mod tests {
                 "start_tick": 7,
                 "clip_start_tick": 0,
                 "duration_ticks": 4,
-                "enabled": true
+                "enabled": true,
+                "gain_decibels": 0
             }])
         );
         assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), added);
@@ -16393,7 +16686,8 @@ mod tests {
                 "start_tick": 4,
                 "clip_start_tick": 1,
                 "duration_ticks": 2,
-                "enabled": false
+                "enabled": false,
+                "gain_decibels": 0
             })
         );
         assert_eq!(
@@ -16599,7 +16893,8 @@ mod tests {
                     "start_tick": 10,
                     "clip_start_tick": 6,
                     "duration_ticks": 3,
-                    "enabled": true
+                    "enabled": true,
+                    "gain_decibels": 0
                 },
                 {
                     "id": right_placement_id,
@@ -16608,7 +16903,8 @@ mod tests {
                     "start_tick": 13,
                     "clip_start_tick": 9,
                     "duration_ticks": 5,
-                    "enabled": true
+                    "enabled": true,
+                    "gain_decibels": 0
                 }
             ])
         );

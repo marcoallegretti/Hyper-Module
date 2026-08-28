@@ -801,6 +801,66 @@ fn bind_arrangement_front_trim_callback(
     });
 }
 
+fn bind_arrangement_gain_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_gain = Rc::clone(worker);
+    let project_state_for_gain = Rc::clone(project_state);
+    actions.on_set_arrangement_placement_gain(move |placement_id, value| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text(
+                "Arrangement placement gain is not available in the current state".into(),
+            );
+            return;
+        }
+        let gain_decibels = match parse_arrangement_placement_gain(value.as_str()) {
+            Ok(gain_decibels) => gain_decibels,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let state = project_state_for_gain.arrangement.borrow();
+        let Some(binding) = state.as_ref() else {
+            ui.set_error_text("Arrangement placement authority is no longer available".into());
+            return;
+        };
+        let Some(placement) = binding
+            .owner
+            .placements()
+            .iter()
+            .find(|placement| placement.id() == placement_id.as_str())
+        else {
+            ui.set_error_text("The selected arrangement placement is no longer available".into());
+            return;
+        };
+        if gain_decibels.to_bits() == placement.gain_decibels().to_bits() {
+            ui.set_status_text(
+                "Arrangement placement gain already matches the committed value".into(),
+            );
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        let owned_placement_id = placement.id().to_owned();
+        drop(state);
+        submit_to_ui(
+            &ui,
+            &worker_for_gain,
+            IdeWorkerCommand::SetArrangementPlacementGain {
+                placement_id: owned_placement_id,
+                gain_decibels,
+            },
+        );
+    });
+}
+
 fn bind_project_open_callback(ui: &MainWindow, worker: &WorkerCell) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -3214,6 +3274,7 @@ fn bind_arrangement_callback(
     bind_arrangement_duplication_callback(ui, worker, project_state);
     bind_arrangement_split_callback(ui, worker, project_state);
     bind_arrangement_duration_callback(ui, worker, project_state);
+    bind_arrangement_gain_callback(ui, worker, project_state);
     bind_arrangement_front_trim_callback(ui, worker, project_state);
     bind_arrangement_removal_callback(ui, worker, project_state);
 }
@@ -4616,6 +4677,17 @@ fn parse_audio_clip_gain(value: &str) -> Result<f64, &'static str> {
     Ok(gain_decibels)
 }
 
+fn parse_arrangement_placement_gain(value: &str) -> Result<f64, &'static str> {
+    let gain_decibels = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| "Arrangement placement gain must be a decimal value in dB")?;
+    if !gain_decibels.is_finite() {
+        return Err("Arrangement placement gain must be finite");
+    }
+    Ok(gain_decibels)
+}
+
 fn parse_audio_clip_fades(
     fade_in: &str,
     fade_out: &str,
@@ -4910,6 +4982,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         | IdeWorkerCommandKind::TrimArrangementPlacementFront => {
             AppMode::TrimmingArrangementPlacement
         }
+        IdeWorkerCommandKind::SetArrangementPlacementGain => {
+            AppMode::ChangingArrangementPlacementGain
+        }
         IdeWorkerCommandKind::RemoveArrangementPlacement => AppMode::RemovingArrangementPlacement,
         IdeWorkerCommandKind::AddArrangementPlacement => AppMode::AddingArrangementPlacement,
         IdeWorkerCommandKind::AddArrangementSceneLaunch => AppMode::AddingArrangementSceneLaunch,
@@ -5081,6 +5156,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetArrangementPlacementDuration => {
             "Preserving mixer state, trimming the arrangement placement, and reopening project…"
+        }
+        IdeWorkerCommandKind::SetArrangementPlacementGain => {
+            "Preserving mixer state, updating arrangement placement gain, and reopening project…"
         }
         IdeWorkerCommandKind::TrimArrangementPlacementFront => {
             "Preserving mixer state, trimming the arrangement front, and reopening project…"
@@ -5476,6 +5554,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementDurationChanged { .. }
         | IdeWorkerEvent::ArrangementPlacementDurationChanging { .. }) => {
             apply_arrangement_placement_duration_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementPlacementGainChanged { .. }
+        | IdeWorkerEvent::ArrangementPlacementGainChanging { .. }) => {
+            apply_arrangement_placement_gain_event(ui, &event);
         }
         event @ (IdeWorkerEvent::ArrangementPlacementFrontTrimmed { .. }
         | IdeWorkerEvent::ArrangementPlacementFrontTrimming { .. }) => {
@@ -6301,6 +6383,40 @@ fn apply_arrangement_placement_duration_event(ui: &MainWindow, event: &IdeWorker
     }
 }
 
+fn apply_arrangement_placement_gain_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementPlacementGainChanged {
+            revision,
+            changed,
+            gain_decibels,
+        } => {
+            ui.set_status_text(
+                if *changed {
+                    format!(
+                        "Arrangement placement gain set to {gain_decibels:.4} dB in project revision {revision}"
+                    )
+                } else {
+                    format!(
+                        "Arrangement placement gain already matched {gain_decibels:.4} dB in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementPlacementGainChanging { gain_decibels } => {
+            ui.set_app_mode(AppMode::ChangingArrangementPlacementGain);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before setting arrangement placement gain to {gain_decibels:.4} dB…"
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("arrangement placement gain event dispatcher received another event"),
+    }
+}
+
 fn apply_arrangement_placement_front_trim_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::ArrangementPlacementFrontTrimmed {
@@ -6596,6 +6712,9 @@ fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWor
         IdeWorkerCommandKind::RemoveArrangementPlacement => {
             reset_arrangement_placement_removal_confirmation(ui);
             "Arrangement placement removal".to_owned()
+        }
+        IdeWorkerCommandKind::SetArrangementPlacementGain => {
+            "Arrangement placement gain".to_owned()
         }
         _ => "Arrangement placement edit".to_owned(),
     };
@@ -8213,6 +8332,7 @@ impl Model for ArrangementListModel {
             start_tick: placement.start_tick().to_string().into(),
             clip_start_tick: placement.clip_start_tick().to_string().into(),
             duration_ticks: placement.duration_ticks().to_string().into(),
+            gain_edit: format_gain_decibels(placement.gain_decibels()).into(),
             start_clock: format_frame_clock(placement.start_frame(), self.sample_rate_hz).into(),
             end_clock: format_frame_clock(placement.end_frame(), self.sample_rate_hz).into(),
             start_percent,
@@ -8289,7 +8409,7 @@ fn set_audio_clips(
             track_name: clip.track_name().into(),
             active: clip.active(),
             gain_label: format!("{:+.2} dB", clip.gain_decibels()).into(),
-            gain_edit: format_audio_clip_gain(clip.gain_decibels()).into(),
+            gain_edit: format_gain_decibels(clip.gain_decibels()).into(),
             loop_enabled: clip.loop_enabled(),
             loop_label: format!(
                 "{} {}–{}",
@@ -8320,7 +8440,7 @@ fn set_audio_clips(
     true
 }
 
-fn format_audio_clip_gain(gain_decibels: f64) -> String {
+fn format_gain_decibels(gain_decibels: f64) -> String {
     if gain_decibels == 0.0 {
         "0".to_owned()
     } else {
@@ -9237,6 +9357,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::SetArrangementPlacementDuration
         | IdeWorkerCommandKind::TrimArrangementPlacementFront
             if current == AppMode::TrimmingArrangementPlacement =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::SetArrangementPlacementGain
+            if current == AppMode::ChangingArrangementPlacementGain =>
         {
             AppMode::Running
         }
@@ -17170,6 +17295,38 @@ mod tests {
             mode_after_failure(
                 AppMode::TrimmingArrangementPlacement,
                 IdeWorkerCommandKind::SetArrangementPlacementDuration,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn arrangement_placement_gain_input_accepts_finite_offsets_only() {
+        assert_eq!(parse_arrangement_placement_gain(" -12.5 "), Ok(-12.5));
+        assert_eq!(parse_arrangement_placement_gain("0"), Ok(0.0));
+        assert_eq!(
+            parse_arrangement_placement_gain("6.020599913279624"),
+            Ok(6.020_599_913_279_624)
+        );
+        assert!(parse_arrangement_placement_gain("NaN").is_err());
+        assert!(parse_arrangement_placement_gain("inf").is_err());
+        assert!(parse_arrangement_placement_gain("").is_err());
+        assert!(parse_arrangement_placement_gain("not gain").is_err());
+    }
+
+    #[test]
+    fn arrangement_placement_gain_submission_and_failure_use_a_dedicated_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::SetArrangementPlacementGain,
+            ),
+            AppMode::ChangingArrangementPlacementGain
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingArrangementPlacementGain,
+                IdeWorkerCommandKind::SetArrangementPlacementGain,
             ),
             AppMode::Running
         );

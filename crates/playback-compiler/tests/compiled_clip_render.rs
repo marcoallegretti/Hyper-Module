@@ -43,6 +43,7 @@ fn compiled_tick_placement_renders_through_the_clip_engine() {
         start_tick: 0,
         clip_start_tick: 0,
         duration_ticks: 6,
+        gain_decibels: 0.0,
     };
     let compiled = compile_placement(timeline, clip, placement).unwrap();
 
@@ -66,6 +67,7 @@ fn compiled_tick_placement_renders_through_the_clip_engine() {
             start_tick: 0,
             clip_start_tick: 5,
             duration_ticks: 6,
+            gain_decibels: 0.0,
         },
     )
     .unwrap();
@@ -120,6 +122,7 @@ fn sample_locked_placement_preserves_an_arbitrary_recorded_frame_count() {
             start_tick: 0,
             clip_start_tick: 0,
             duration_ticks: 4,
+            gain_decibels: 0.0,
         },
     )
     .unwrap();

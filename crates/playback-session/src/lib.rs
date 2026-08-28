@@ -136,6 +136,15 @@ pub enum AudioClipGainValidationError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArrangementPlacementGainValidationError {
+    PlacementMissing,
+    MediaMissing,
+    SourceRangeOverflow,
+    EffectiveGainOverflow,
+    Native(ClipPlanError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioClipSourceSlipValidationError {
     ClipMissing,
     MediaMissing,
@@ -166,6 +175,43 @@ impl Error for AudioClipGainValidationError {
         match self {
             Self::Native(source) => Some(source),
             Self::ClipMissing | Self::MediaMissing | Self::SourceRangeOverflow => None,
+        }
+    }
+}
+
+impl fmt::Display for ArrangementPlacementGainValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlacementMissing => {
+                formatter.write_str("arrangement placement is missing from the project")
+            }
+            Self::MediaMissing => {
+                formatter.write_str("arrangement placement references unavailable decoded media")
+            }
+            Self::SourceRangeOverflow => {
+                formatter.write_str("arrangement-placement source range arithmetic overflowed")
+            }
+            Self::EffectiveGainOverflow => {
+                formatter.write_str("combined clip and arrangement-placement gain is not finite")
+            }
+            Self::Native(source) => {
+                write!(
+                    formatter,
+                    "native arrangement-placement gain is invalid: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for ArrangementPlacementGainValidationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Native(source) => Some(source),
+            Self::PlacementMissing
+            | Self::MediaMissing
+            | Self::SourceRangeOverflow
+            | Self::EffectiveGainOverflow => None,
         }
     }
 }
@@ -205,7 +251,7 @@ impl Error for AudioClipSourceSlipValidationError {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct PlaybackArrangementPlacement {
     id: String,
     track_index: usize,
@@ -213,6 +259,7 @@ pub struct PlaybackArrangementPlacement {
     start_tick: u64,
     clip_start_tick: u64,
     duration_ticks: u64,
+    gain_decibels: f64,
     start_frame: usize,
     end_frame: usize,
     enabled: bool,
@@ -284,6 +331,12 @@ impl PlaybackArrangementPlacement {
     #[must_use]
     pub const fn duration_ticks(&self) -> u64 {
         self.duration_ticks
+    }
+
+    /// Exact persisted dB offset local to this arrangement placement.
+    #[must_use]
+    pub const fn gain_decibels(&self) -> f64 {
+        self.gain_decibels
     }
 
     #[must_use]
@@ -679,6 +732,50 @@ impl PreparedPlaybackSession {
         .map_err(AudioClipGainValidationError::Native)
     }
 
+    /// Validates a candidate arrangement-placement gain against the exact
+    /// immutable decoded source view retained by this prepared project.
+    ///
+    /// The candidate is combined with the reusable clip gain once, matching
+    /// the native clip plan constructed for arrangement playback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified rejection when the placement/media binding is
+    /// missing, its source range overflows, the combined gain is non-finite,
+    /// or native `f32` gain would be unsupported or overflow decoded samples.
+    pub fn validate_arrangement_placement_gain(
+        &self,
+        placement_id: &str,
+        gain_decibels: f64,
+    ) -> Result<(), ArrangementPlacementGainValidationError> {
+        let view = self
+            .project
+            .arrangement_placement_gain_validation_view(placement_id)
+            .ok_or(ArrangementPlacementGainValidationError::PlacementMissing)?;
+        let effective_gain_decibels = view.clip_gain_decibels() + gain_decibels;
+        if !effective_gain_decibels.is_finite() {
+            return Err(ArrangementPlacementGainValidationError::EffectiveGainOverflow);
+        }
+        let source_end = view
+            .source_start_frame()
+            .checked_add(view.source_frame_count())
+            .ok_or(ArrangementPlacementGainValidationError::SourceRangeOverflow)?;
+        let source = self
+            .media
+            .decoded_audio(view.asset_id())
+            .ok_or(ArrangementPlacementGainValidationError::MediaMissing)?;
+        validate_native_clip_gain(
+            source,
+            FrameRange {
+                start: view.source_start_frame(),
+                end: source_end,
+            },
+            effective_gain_decibels,
+        )
+        .map(|_| ())
+        .map_err(ArrangementPlacementGainValidationError::Native)
+    }
+
     /// Validates a candidate source-slip start against the exact decoded media
     /// and the clip's persisted native gain.
     ///
@@ -1002,6 +1099,7 @@ fn build_playback_arrangement(
             start_tick: entry.placement_start_tick,
             clip_start_tick: entry.placement_clip_start_tick,
             duration_ticks: entry.placement_duration_ticks,
+            gain_decibels: entry.placement_gain_decibels,
             start_frame,
             end_frame: placement_end_frame,
             enabled: entry.placement_enabled,
@@ -1376,6 +1474,7 @@ mod tests {
                 start_tick: 0,
                 clip_start_tick: 0,
                 duration_ticks: 4,
+                gain_decibels: 0.0,
                 start_frame: 0,
                 end_frame: 100,
                 enabled: true,
@@ -1441,6 +1540,33 @@ mod tests {
             session
                 .validate_audio_clip_gain("018f47a2-6b2d-7c11-8a44-001122337503", -6.0,)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn candidate_arrangement_placement_gain_is_validated_against_exact_samples() {
+        let loud = DecodedPlaybackAsset::new(
+            "018f47a2-6b2d-7c11-8a44-001122337504".to_owned(),
+            DecodedAudio::from_mono(48_000, vec![f32::MAX; 100]).unwrap(),
+        );
+        let session = assemble_playback_session(input(vec![loud])).unwrap();
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122337506";
+
+        assert!(matches!(
+            session.validate_arrangement_placement_gain(placement_id, 20.0 * 2.0_f64.log10(),),
+            Err(ArrangementPlacementGainValidationError::Native(
+                ClipPlanError::SampleGainOverflow
+            ))
+        ));
+        assert!(
+            session
+                .validate_arrangement_placement_gain(placement_id, -6.0)
+                .is_ok()
+        );
+        assert_eq!(
+            session
+                .validate_arrangement_placement_gain("018f47a2-6b2d-7c11-8a44-001122337599", 0.0,),
+            Err(ArrangementPlacementGainValidationError::PlacementMissing)
         );
     }
 

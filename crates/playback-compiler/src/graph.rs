@@ -56,7 +56,7 @@ pub struct ClipResource<'a> {
     pub warp_markers: &'a [WarpMarker],
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlacementResource<'a> {
     pub id: &'a str,
     pub track_id: &'a str,
@@ -65,6 +65,7 @@ pub struct PlacementResource<'a> {
     pub clip_start_tick: u64,
     pub duration_ticks: u64,
     pub enabled: bool,
+    pub gain_decibels: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -570,6 +571,7 @@ fn resolve_placement<'a>(
             start_tick: placement.start_tick,
             clip_start_tick: placement.clip_start_tick,
             duration_ticks: placement.duration_ticks,
+            gain_decibels: placement.gain_decibels,
         },
     )
     .map_err(|error| GraphError::PlacementCompilation {
@@ -781,6 +783,7 @@ mod tests {
         clip_start_tick: 0,
         duration_ticks: 4,
         enabled: true,
+        gain_decibels: 0.0,
     }];
     const TEMPOS: [TempoEvent; 1] = [TempoEvent {
         tick: 0,
