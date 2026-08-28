@@ -3749,10 +3749,34 @@ fn bind_arrangement_duplication_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    let project_state = Rc::clone(project_state);
+    let worker = Rc::clone(worker);
+    bind_arrangement_duplication_callback_with(
+        ui,
+        move |placement_id| {
+            let state = project_state.arrangement.borrow();
+            let binding = state
+                .as_ref()
+                .ok_or("Arrangement placement authority is no longer available")?;
+            binding
+                .owner
+                .placements()
+                .iter()
+                .find(|placement| placement.id() == placement_id)
+                .map(|placement| placement.id().to_owned())
+                .ok_or("The selected arrangement placement is no longer available")
+        },
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_arrangement_duplication_callback_with(
+    ui: &MainWindow,
+    resolve_placement: impl Fn(&str) -> Result<String, &'static str> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker_for_duplication = Rc::clone(worker);
-    let project_state_for_duplication = Rc::clone(project_state);
     actions.on_duplicate_arrangement_placement(move |placement_id, start_tick| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -3770,31 +3794,15 @@ fn bind_arrangement_duplication_callback(
                 return;
             }
         };
-        let state = project_state_for_duplication.arrangement.borrow();
-        let Some(binding) = state.as_ref() else {
-            ui.set_error_text("Arrangement placement authority is no longer available".into());
-            return;
+        let owned_placement_id = match resolve_placement(placement_id.as_str()) {
+            Ok(placement_id) => placement_id,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
         };
-        let Some(placement) = binding
-            .owner
-            .placements()
-            .iter()
-            .find(|placement| placement.id() == placement_id.as_str())
-        else {
-            ui.set_error_text("The selected arrangement placement is no longer available".into());
-            return;
-        };
-        if placement.start_tick() == start_tick {
-            ui.set_error_text(
-                "The copied placement would overlap its source at the same start tick".into(),
-            );
-            return;
-        }
-        let owned_placement_id = placement.id().to_owned();
-        drop(state);
-        submit_to_ui(
+        submit(
             &ui,
-            &worker_for_duplication,
             IdeWorkerCommand::DuplicateArrangementPlacement {
                 placement_id: owned_placement_id,
                 start_tick,
@@ -13337,6 +13345,65 @@ mod tests {
         ui.set_app_mode(AppMode::Previewing);
         ui.global::<IdeActions>().invoke_metronome_toggle();
         assert_eq!(submitted.borrow().len(), 2);
+    }
+
+    #[test]
+    fn generated_arrangement_copy_submits_same_tick_overlap_to_transaction_authority() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_arrangement_visible(true);
+        ui.set_arrangement_placements(ModelRc::from(Rc::new(VecModel::from(vec![
+            ArrangementRow {
+                index: 0,
+                id: "placement-a".into(),
+                track_name: "Audio".into(),
+                clip_name: "Lead".into(),
+                start_tick: "480".into(),
+                clip_start_tick: "0".into(),
+                duration_ticks: "960".into(),
+                gain_edit: "0".into(),
+                start_clock: "00:00.250".into(),
+                end_clock: "00:00.750".into(),
+                start_percent: 0.0,
+                width_percent: 100.0,
+                enabled: true,
+                active: true,
+            },
+        ]))));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_arrangement_duplication_callback_with(
+            &ui,
+            |placement_id| {
+                if placement_id == "placement-a" {
+                    Ok(placement_id.to_owned())
+                } else {
+                    Err("The selected arrangement placement is no longer available")
+                }
+            },
+            move |_, command| submitted_by_callback.borrow_mut().push(command),
+        );
+
+        ui.show().unwrap();
+        let copy = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Copy the exact source view of Lead on Audio to the entered start tick without ripple",
+        )
+        .next()
+        .expect("the generated arrangement row exposes copy");
+        assert_eq!(copy.accessible_enabled(), Some(true));
+        copy.mock_single_click(PointerEventButton::Left);
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::DuplicateArrangementPlacement {
+                placement_id,
+                start_tick: 480,
+            }] if placement_id == "placement-a"
+        ));
+        assert!(ui.get_error_text().is_empty());
+        ui.hide().unwrap();
     }
 
     fn audio_track_mixer_row(index: i32, track_id: &str) -> MixerChannelRow {

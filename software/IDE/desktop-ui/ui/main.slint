@@ -4665,7 +4665,7 @@ export component MainWindow inherits Window {
                                         Button {
                                             text: "Copy";
                                             accessible-label: "Copy the exact source view of " + placement.clip-name + " on " + placement.track-name + " to the entered start tick without ripple";
-                                            enabled: root.app-mode == AppMode.running && start-tick-input.text != placement.start-tick;
+                                            enabled: root.app-mode == AppMode.running;
                                             clicked => { IdeActions.duplicate-arrangement-placement(placement.id, start-tick-input.text); }
                                         }
                                         Button {
@@ -5147,7 +5147,7 @@ export component MainWindow inherits Window {
                             accessible-label: "Arrangement placement start tick";
                         }
                         Text {
-                            text: "The edit is non-ripple: existing placements keep their exact ticks. The reusable clip and immutable source audio are unchanged. Overlap and conflicting scene authority are rejected.";
+                            text: "The edit is non-ripple: existing placements keep their exact ticks. The reusable clip and immutable source audio are unchanged. A track may carry at most two concurrent placements; a third overlap or conflicting scene authority is rejected.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;

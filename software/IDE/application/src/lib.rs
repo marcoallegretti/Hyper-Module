@@ -18625,7 +18625,7 @@ mod tests {
             &source_arrangement,
             ARRANGEMENT_TEST_PLACEMENT_ID,
             DUPLICATED_PLACEMENT_ID,
-            4,
+            0,
             limits.session.documents,
         )
         .unwrap();
@@ -18683,12 +18683,16 @@ mod tests {
 
         let reopened =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
-        assert_eq!(reopened.session().arrangement().placements().len(), 2);
+        let placements = reopened.session().arrangement().placements();
+        assert_eq!(placements.len(), 2);
         assert!(
-            reopened
-                .session()
-                .arrangement()
-                .placements()
+            placements
+                .iter()
+                .all(|placement| placement.start_tick() == 0),
+            "the persisted project retains both same-tick voices"
+        );
+        assert!(
+            placements
                 .iter()
                 .any(|placement| placement.id() == DUPLICATED_PLACEMENT_ID)
         );
