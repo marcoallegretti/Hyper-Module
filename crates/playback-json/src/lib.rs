@@ -9,8 +9,9 @@ pub use automation::{
     AutomationInterpolation, AutomationLane, AutomationMainParameter, AutomationPoint,
     AutomationSendParameter, AutomationTake, AutomationTakeAddition,
     AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
-    AutomationTarget, AutomationTargetSelection, AutomationValue, CompiledAutomation,
-    LoadedAutomationSet, serialize_automation_take_activation, serialize_automation_take_addition,
+    AutomationTakeReplacement, AutomationTarget, AutomationTargetSelection, AutomationValue,
+    CompiledAutomation, LoadedAutomationSet, serialize_automation_take_activation,
+    serialize_automation_take_addition, serialize_automation_take_replacement,
 };
 pub use duplication::{
     AudioTrackContentRemovalDocument, AudioTrackContentRemovalDocuments,
@@ -20167,6 +20168,238 @@ mod tests {
         );
     }
 
+    #[test]
+    fn automation_take_replacement_preserves_unowned_take_authority() {
+        let (loaded, mixer, created) = automation_take_replacement_fixture();
+        let disabled = serialize_automation_take_activation(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&created],
+            "018f47a2-6b2d-7c11-8a44-0011223344a0",
+            false,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut source_value: Value = serde_json::from_slice(&disabled).unwrap();
+        source_value["extensions"] = json!({"org.example.automation": {"retained": true}});
+        let source = serde_json_canonicalizer::to_vec(&source_value).unwrap();
+        let replacement_points = [
+            AutomationPoint::new(8, AutomationValue::Boolean(false)),
+            AutomationPoint::new(12, AutomationValue::Boolean(true)),
+        ];
+        let rewritten = serialize_automation_take_replacement(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&source],
+            "018f47a2-6b2d-7c11-8a44-0011223344a0",
+            AutomationTakeReplacement {
+                name: "Mute correction",
+                start_tick: 8,
+                end_tick: 16,
+                target: AutomationTargetSelection::Main {
+                    parameter: AutomationMainParameter::Mute,
+                },
+                interpolation: AutomationInterpolation::Hold,
+                points: &replacement_points,
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let rewritten_value: Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_automation_take_replacement_preserves_authority(&source_value, &rewritten_value);
+        assert_eq!(rewritten_value["name"].as_str(), Some("Mute correction"));
+        assert_eq!(rewritten_value["start_tick"].as_u64(), Some(8));
+        assert_eq!(rewritten_value["end_tick"].as_u64(), Some(16));
+
+        let reloaded = loaded
+            .load_automation_takes(
+                &mixer,
+                &asset_facts(),
+                &[&rewritten],
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+        let take = &reloaded.takes()[0];
+        assert!(!take.enabled());
+        assert_eq!(take.name(), "Mute correction");
+        assert_eq!((take.start_tick(), take.end_tick()), (8, 16));
+        assert_eq!(take.lanes().len(), 1);
+        assert_eq!(
+            take.lanes()[0].target(),
+            AutomationTarget::Main {
+                parameter: AutomationMainParameter::Mute,
+            }
+        );
+        assert_eq!(
+            take.lanes()[0].interpolation(),
+            AutomationInterpolation::Hold
+        );
+        assert_eq!(take.lanes()[0].points(), replacement_points);
+    }
+
+    #[test]
+    fn automation_take_replacement_classifies_unsupported_sources_and_requests() {
+        let (loaded, mixer, source) = automation_take_replacement_fixture();
+        let points = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(4, AutomationValue::Integer(0)),
+        ];
+        let request = automation_take_replacement(&points);
+        assert!(matches!(
+            serialize_automation_take_replacement(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&source],
+                "018f47a2-6b2d-7c11-8a44-0011223344ff",
+                request,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AutomationTakeEditSerializationError::TakeMissing)
+        ));
+        let pretty =
+            serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(&source).unwrap()).unwrap();
+        assert!(matches!(
+            serialize_automation_take_replacement(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&pretty],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                request,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AutomationTakeEditSerializationError::NonCanonicalSource)
+        ));
+        for (request, expected) in [
+            (
+                AutomationTakeReplacement {
+                    name: " Edited",
+                    ..request
+                },
+                AutomationTakeEditSerializationError::InvalidTakeName,
+            ),
+            (
+                AutomationTakeReplacement {
+                    end_tick: 0,
+                    ..request
+                },
+                AutomationTakeEditSerializationError::InvalidInterval,
+            ),
+            (
+                AutomationTakeReplacement {
+                    points: &[],
+                    ..request
+                },
+                AutomationTakeEditSerializationError::EmptyLane,
+            ),
+        ] {
+            let error = serialize_automation_take_replacement(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&source],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                request,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap_err();
+            assert!(
+                core::mem::discriminant(&error) == core::mem::discriminant(&expected),
+                "{error}"
+            );
+        }
+
+        let mut multi_value: Value = serde_json::from_slice(&source).unwrap();
+        multi_value["lanes"].as_array_mut().unwrap().push(json!({
+            "id": "018f47a2-6b2d-7c11-8a44-0011223344a2",
+            "target": {"kind": "mixer-main", "parameter": "gain"},
+            "interpolation": "hold",
+            "points": [{"tick": 0, "value": 1_000_000}]
+        }));
+        let multi = serde_json_canonicalizer::to_vec(&multi_value).unwrap();
+        assert!(matches!(
+            serialize_automation_take_replacement(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&multi],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                request,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AutomationTakeEditSerializationError::UnsupportedTakeShape)
+        ));
+    }
+
+    #[test]
+    fn automation_take_replacement_revalidates_the_complete_candidate_set() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = loaded
+            .load_mixer(MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+        let first_points = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(4, AutomationValue::Integer(0)),
+        ];
+        let first = serialize_automation_take_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[],
+            automation_take_request(&first_points),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let second_points = [AutomationPoint::new(8, AutomationValue::Integer(0))];
+        let second = serialize_automation_take_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&first],
+            AutomationTakeAddition {
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a2",
+                lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a3",
+                start_tick: 8,
+                end_tick: 16,
+                points: &second_points,
+                ..automation_take_request(&first_points)
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let replacement_points = [
+            AutomationPoint::new(4, AutomationValue::Integer(500_000)),
+            AutomationPoint::new(8, AutomationValue::Integer(0)),
+        ];
+        let result = serialize_automation_take_replacement(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&first, &second],
+            "018f47a2-6b2d-7c11-8a44-0011223344a0",
+            AutomationTakeReplacement {
+                start_tick: 4,
+                end_tick: 12,
+                points: &replacement_points,
+                ..automation_take_replacement(&first_points)
+            },
+            LoaderLimits::VERSION_1,
+        );
+        assert!(
+            matches!(result, Err(AutomationTakeEditSerializationError::Source(_))),
+            "an enabled replacement may not overlap another enabled take on one target"
+        );
+    }
+
     type AutomationRejectionCheck = fn(&AutomationTakeAdditionSerializationError) -> bool;
 
     fn automation_take_request(points: &[AutomationPoint]) -> AutomationTakeAddition<'_> {
@@ -20184,6 +20417,62 @@ mod tests {
             interpolation: AutomationInterpolation::Linear,
             points,
         }
+    }
+
+    fn automation_take_replacement(points: &[AutomationPoint]) -> AutomationTakeReplacement<'_> {
+        AutomationTakeReplacement {
+            name: "Corrected fade",
+            start_tick: 0,
+            end_tick: 8,
+            target: AutomationTargetSelection::Channel {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456",
+                parameter: AutomationChannelParameter::Gain,
+            },
+            interpolation: AutomationInterpolation::Linear,
+            points,
+        }
+    }
+
+    fn automation_take_replacement_fixture() -> (LoadedPlaybackProject, LoadedMixer, Vec<u8>) {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = loaded
+            .load_mixer(MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+        let points = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(4, AutomationValue::Integer(0)),
+        ];
+        let source = serialize_automation_take_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[],
+            automation_take_request(&points),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        (loaded, mixer, source)
+    }
+
+    fn assert_automation_take_replacement_preserves_authority(source: &Value, rewritten: &Value) {
+        for field in [
+            "id",
+            "project_id",
+            "format",
+            "format_version",
+            "enabled",
+            "captured_at_utc",
+            "extensions",
+        ] {
+            assert_eq!(rewritten[field], source[field], "{field} must be retained");
+        }
+        assert_eq!(rewritten["lanes"][0]["id"], source["lanes"][0]["id"]);
     }
 
     fn assert_automation_schema_domain_rejections(

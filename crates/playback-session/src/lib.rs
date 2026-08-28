@@ -13,10 +13,10 @@ use hyper_media_cache::{
 use hyper_playback_compiler::scene::{RecordedSceneExtent, SceneLimits};
 use hyper_playback_compiler::{FrameTimelineError, graph::GraphLimits};
 use hyper_playback_json::{
-    AdapterCompileError, AutomationCompileError, AutomationInterpolation, AutomationTarget,
-    CompiledAutomation, CompiledMixerGraph, CompiledMixerTap, CompiledPlaybackGraph, LoadError,
-    LoadedAutomationSet, LoadedPlaybackProject, LoaderLimits, MediaAssetFact, MixerCompileError,
-    PlaybackJsonInput, load,
+    AdapterCompileError, AutomationCompileError, AutomationInterpolation, AutomationPoint,
+    AutomationTarget, CompiledAutomation, CompiledMixerGraph, CompiledMixerTap,
+    CompiledPlaybackGraph, LoadError, LoadedAutomationSet, LoadedPlaybackProject, LoaderLimits,
+    MediaAssetFact, MixerCompileError, PlaybackJsonInput, load,
 };
 
 /// Canonical resource bytes supplied to playback-session assembly.
@@ -382,7 +382,7 @@ pub struct PlaybackAutomationLane {
     id: String,
     target: AutomationTarget,
     interpolation: AutomationInterpolation,
-    point_count: usize,
+    points: Vec<AutomationPoint>,
 }
 
 impl PlaybackAutomationLane {
@@ -402,8 +402,13 @@ impl PlaybackAutomationLane {
     }
 
     #[must_use]
-    pub const fn point_count(&self) -> usize {
-        self.point_count
+    pub fn points(&self) -> &[AutomationPoint] {
+        &self.points
+    }
+
+    #[must_use]
+    pub fn point_count(&self) -> usize {
+        self.points.len()
     }
 }
 
@@ -480,7 +485,7 @@ fn retain_automation(
                 id: lane.id().to_owned(),
                 target: lane.target(),
                 interpolation: lane.interpolation(),
-                point_count: lane.points().len(),
+                points: lane.points().to_vec(),
             });
         }
         takes.push(PlaybackAutomationTake {
@@ -1472,7 +1477,16 @@ mod tests {
                     parameter: hyper_playback_json::AutomationChannelParameter::Gain,
                 },
                 interpolation: AutomationInterpolation::Linear,
-                point_count: 2,
+                points: vec![
+                    hyper_playback_json::AutomationPoint::new(
+                        0,
+                        hyper_playback_json::AutomationValue::Integer(1_000_000),
+                    ),
+                    hyper_playback_json::AutomationPoint::new(
+                        3,
+                        hyper_playback_json::AutomationValue::Integer(0),
+                    ),
+                ],
             }
         );
         assert_eq!(session.extent(), PlaybackExtent::Bounded { end_frame: 100 });

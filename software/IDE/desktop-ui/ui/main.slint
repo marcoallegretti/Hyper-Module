@@ -53,6 +53,7 @@ export enum AppMode {
     changing-clip-source,
     trimming-clip-source,
     adding-automation-take,
+    editing-automation-take,
     editing-control-mapping,
     editing-native-filter,
     exporting-project,
@@ -232,6 +233,7 @@ export struct AutomationTakeRow {
     id: string,
     name: string,
     enabled: bool,
+    editable: bool,
     range: string,
     target: string,
     interpolation: string,
@@ -393,6 +395,8 @@ export global IdeActions {
     callback paste-native-device(int);
     callback remove-native-filter(int);
     callback add-automation-take(string, int, int, string, string, string);
+    callback begin-edit-automation-take(string);
+    callback save-automation-take-edit();
     callback set-automation-take-active(string, bool);
     callback remove-automation-take(string);
     callback add-control-binding(int, int, bool, string, string);
@@ -804,6 +808,7 @@ export component MainWindow inherits Window {
         || root.native-compressor-edit-visible
         || root.control-create-visible
         || root.automation-create-visible
+        || root.automation-edit-visible
         || root.automation-take-remove-confirming-id != ""
         || root.close-unsaved-mixer-confirming
         || root.unused-sample-cleanup-confirming
@@ -918,6 +923,14 @@ export component MainWindow inherits Window {
     in-out property <string> automation-create-start: "0";
     in-out property <string> automation-create-end: "1920";
     in-out property <string> automation-create-points: "";
+    in-out property <bool> automation-edit-visible: false;
+    in-out property <string> automation-edit-take-id: "";
+    in-out property <string> automation-edit-name: "";
+    in-out property <int> automation-edit-target-index: 0;
+    in-out property <int> automation-edit-interpolation-index: 0;
+    in-out property <string> automation-edit-start: "";
+    in-out property <string> automation-edit-end: "";
+    in-out property <string> automation-edit-points: "";
     in property <bool> mixer-main-state-available: false;
     in property <float> mixer-main-gain-percent: 0;
     in property <bool> mixer-main-muted: false;
@@ -3357,12 +3370,13 @@ export component MainWindow inherits Window {
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         Button {
                             text: "Channels";
-                            clicked => { root.automation-create-visible = false; root.automation-take-remove-confirming-id = ""; root.mixer-automation-visible = false; }
+                            clicked => { root.automation-create-visible = false; root.automation-edit-visible = false; root.automation-take-remove-confirming-id = ""; root.mixer-automation-visible = false; }
                         }
                         Button {
                             text: "Performance";
                             clicked => {
                                 root.automation-create-visible = false;
+                                root.automation-edit-visible = false;
                                 root.automation-take-remove-confirming-id = "";
                                 root.mixer-automation-visible = false;
                                 root.mixer-sends-visible = false;
@@ -3371,7 +3385,7 @@ export component MainWindow inherits Window {
                         }
                             Button {
                                 text: "Add take";
-                            enabled: root.app-mode == AppMode.running && !root.automation-create-visible;
+                            enabled: root.app-mode == AppMode.running && !root.automation-create-visible && !root.automation-edit-visible;
                             clicked => {
                                 root.automation-create-name = "";
                                 root.automation-create-target-index = 0;
@@ -3379,6 +3393,7 @@ export component MainWindow inherits Window {
                                 root.automation-create-start = "0";
                                 root.automation-create-end = "1920";
                                 root.automation-create-points = "";
+                                root.automation-edit-visible = false;
                                 root.automation-take-remove-confirming-id = "";
                                 root.automation-create-visible = true;
                             }
@@ -3493,6 +3508,105 @@ export component MainWindow inherits Window {
                         Rectangle { height: 1px; background: #27313d; }
                     }
 
+                    if root.automation-edit-visible : VerticalLayout {
+                        spacing: 8px;
+                        Text { height: 16px; text: "EDIT AUTOMATION TAKE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { height: 14px; text: "Edits retain this take's identity, activation state, capture time, and extension data."; color: #8fa0b4; font-size: 9px; overflow: elide; }
+                        HorizontalLayout {
+                            height: 48px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text { text: "Name"; color: #8fa0b4; font-size: 9px; }
+                                IdeLineEdit {
+                                    placeholder-text: "Take name";
+                                    text <=> root.automation-edit-name;
+                                    enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 2;
+                                Text { text: "Target"; color: #8fa0b4; font-size: 9px; }
+                                ComboBox {
+                                    model: root.automation-target-names;
+                                    current-index <=> root.automation-edit-target-index;
+                                    enabled: root.app-mode == AppMode.running;
+                                    selected(_) => {
+                                        if (root.automation-target-boolean[self.current-index]) {
+                                            root.automation-edit-interpolation-index = 0;
+                                        }
+                                    }
+                                }
+                            }
+                            VerticalLayout {
+                                width: 120px;
+                                Text { text: "Interpolation"; color: #8fa0b4; font-size: 9px; }
+                                ComboBox {
+                                    model: ["Hold", "Linear"];
+                                    current-index <=> root.automation-edit-interpolation-index;
+                                    enabled: root.app-mode == AppMode.running
+                                        && !root.automation-target-boolean[root.automation-edit-target-index];
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 48px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                width: 120px;
+                                Text { text: "Start tick"; color: #8fa0b4; font-size: 9px; }
+                                IdeLineEdit {
+                                    text <=> root.automation-edit-start;
+                                    input-type: number;
+                                    enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                            VerticalLayout {
+                                width: 120px;
+                                Text { text: "End tick"; color: #8fa0b4; font-size: 9px; }
+                                IdeLineEdit {
+                                    text <=> root.automation-edit-end;
+                                    input-type: number;
+                                    enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: "Points  " + root.automation-target-domain[root.automation-edit-target-index];
+                                    color: #8fa0b4;
+                                    font-size: 9px;
+                                }
+                                IdeLineEdit {
+                                    placeholder-text: "tick=value, tick=value";
+                                    text <=> root.automation-edit-points;
+                                    enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 34px;
+                            spacing: 8px;
+                            Button {
+                                text: "Cancel";
+                                enabled: root.app-mode == AppMode.running;
+                                clicked => { root.automation-edit-visible = false; }
+                            }
+                            Button {
+                                horizontal-stretch: 1;
+                                text: root.app-mode == AppMode.editing-automation-take ? "Saving take..." : "Save automation take";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.automation-edit-take-id != ""
+                                    && root.automation-edit-name != ""
+                                    && root.automation-edit-start != ""
+                                    && root.automation-edit-end != ""
+                                    && root.automation-edit-points != "";
+                                clicked => { IdeActions.save-automation-take-edit(); }
+                            }
+                        }
+                        Rectangle { height: 1px; background: #27313d; }
+                    }
+
                     if root.automation-takes.length == 0 : Text {
                         text: "This project has no automation takes.";
                         color: #8fa0b4;
@@ -3505,7 +3619,7 @@ export component MainWindow inherits Window {
                     if root.automation-takes.length > 0 : ListView {
                         vertical-stretch: 1;
                         for take in root.automation-takes : Rectangle {
-                            height: 52px;
+                            height: 60px;
                             width: parent.width;
                             background: #101820;
                             border-color: #27313d;
@@ -3537,11 +3651,24 @@ export component MainWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 VerticalLayout {
-                                    width: 154px;
+                                    width: 202px;
                                     padding-top: 9px;
                                     padding-bottom: 9px;
                                     HorizontalLayout {
                                         spacing: 6px;
+                                        Button {
+                                            width: 54px;
+                                            text: take.editable ? "Edit" : "Locked";
+                                            accessible-label: take.editable
+                                                ? "Edit " + take.name + " automation take"
+                                                : "Editing is unavailable because " + take.name + " has multiple automation lanes";
+                                            enabled: root.app-mode == AppMode.running && take.editable;
+                                            clicked => {
+                                                root.automation-create-visible = false;
+                                                root.automation-take-remove-confirming-id = "";
+                                                IdeActions.begin-edit-automation-take(take.id);
+                                            }
+                                        }
                                         Button {
                                             text: take.enabled ? "Disable" : "Enable";
                                             accessible-label: (take.enabled ? "Disable " : "Enable ") + take.name + " automation take";

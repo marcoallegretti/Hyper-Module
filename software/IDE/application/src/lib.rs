@@ -118,9 +118,10 @@ use hyper_playback_json::{
     AudioTrackRenameSerializationError, AudioTrackUnfreezeDocuments,
     AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
     AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
-    AutomationTargetSelection, CompiledMixerDestination, CompiledMixerGraph, CompiledMixerTap,
-    CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact,
-    MixerBaseState, MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
+    AutomationTakeReplacement, AutomationTargetSelection, CompiledMixerDestination,
+    CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
+    LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact, MixerBaseState,
+    MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
     MixerStripReorderSerializationError, RecordedTakePlacementSerializationError,
     ReturnSendSerializationError, RoutingBusCreationSerializationError,
     RoutingBusDuplicationSerializationError, RoutingBusDuplicationSource,
@@ -147,9 +148,10 @@ use hyper_playback_json::{
     serialize_audio_track_freeze, serialize_audio_track_freeze_reactivation,
     serialize_audio_track_removal, serialize_audio_track_rename, serialize_audio_track_unfreeze,
     serialize_automation_take_activation, serialize_automation_take_addition,
-    serialize_mixer_base_state, serialize_mixer_strip_reorder,
-    serialize_recording_audio_clip_addition, serialize_recording_audio_clip_placement,
-    serialize_return_send_addition, serialize_return_send_removal, serialize_routing_bus_creation,
+    serialize_automation_take_replacement, serialize_mixer_base_state,
+    serialize_mixer_strip_reorder, serialize_recording_audio_clip_addition,
+    serialize_recording_audio_clip_placement, serialize_return_send_addition,
+    serialize_return_send_removal, serialize_routing_bus_creation,
     serialize_routing_bus_duplication, serialize_routing_bus_removal, serialize_routing_bus_rename,
     serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
     serialize_scene_removal, serialize_scene_rename, serialize_scene_slot_edit,
@@ -5856,6 +5858,8 @@ impl Error for IdeAutomationTakeCreationError {
 #[derive(Debug)]
 pub enum IdeAutomationTakeEditError {
     InvalidTakeIdentity,
+    InvalidTakeName,
+    InvalidTargetIdentity,
     TakeUnavailable,
     MixerSave(Box<IdeProjectSaveError>),
     Storage(StorageError),
@@ -5899,6 +5903,12 @@ impl fmt::Display for IdeAutomationTakeEditError {
         match self {
             Self::InvalidTakeIdentity => {
                 formatter.write_str("the automation take identity is empty")
+            }
+            Self::InvalidTakeName => {
+                formatter.write_str("automation take name must contain 1 through 120 characters")
+            }
+            Self::InvalidTargetIdentity => {
+                formatter.write_str("the automation target identity is empty")
             }
             Self::TakeUnavailable => formatter.write_str("the automation take is unavailable"),
             Self::MixerSave(source) => {
@@ -5966,6 +5976,8 @@ impl Error for IdeAutomationTakeEditError {
             Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
             Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
             Self::InvalidTakeIdentity
+            | Self::InvalidTakeName
+            | Self::InvalidTargetIdentity
             | Self::TakeUnavailable
             | Self::CapacityUnavailable
             | Self::NativeClose(_) => None,
@@ -14651,6 +14663,128 @@ impl RunningDesktopIdeApplication {
             &references,
             take_id,
             enabled,
+            limits,
+        )
+        .map_err(IdeAutomationTakeEditError::Serialization)?;
+        let mut owned_take_id = String::new();
+        owned_take_id
+            .try_reserve_exact(take_id.len())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        owned_take_id.push_str(take_id);
+        Ok(IdeAutomationTakeEditPlan {
+            mixer,
+            take_id: owned_take_id,
+            take_bytes,
+        })
+    }
+
+    fn prepare_automation_take_replacement(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        take_id: &str,
+        request: &IdeAutomationTakeRequest,
+    ) -> Result<IdeAutomationTakeEditPlan, IdeAutomationTakeEditError> {
+        if take_id.is_empty() {
+            return Err(IdeAutomationTakeEditError::InvalidTakeIdentity);
+        }
+        let name_length = request.name.chars().count();
+        if request.name.trim() != request.name || !(1..=120).contains(&name_length) {
+            return Err(IdeAutomationTakeEditError::InvalidTakeName);
+        }
+        let empty_target = match &request.target {
+            IdeAutomationTarget::Channel { track_id, .. } => track_id.is_empty(),
+            IdeAutomationTarget::Send { send_id, .. } => send_id.is_empty(),
+            IdeAutomationTarget::Main { .. } => false,
+        };
+        if empty_target {
+            return Err(IdeAutomationTakeEditError::InvalidTargetIdentity);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAutomationTakeEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAutomationTakeEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Self::prepare_automation_take_replacement_from_project(
+            application,
+            mixer,
+            prepared,
+            take_id,
+            request,
+        )
+    }
+
+    fn prepare_automation_take_replacement_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        take_id: &str,
+        request: &IdeAutomationTakeRequest,
+    ) -> Result<IdeAutomationTakeEditPlan, IdeAutomationTakeEditError> {
+        if take_id.is_empty() {
+            return Err(IdeAutomationTakeEditError::InvalidTakeIdentity);
+        }
+        let package = prepared.package();
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let limits = application.config.project_limits.session.documents;
+        let loaded_mixer = project
+            .load_mixer(&mixer.resource_bytes, &assets, limits)
+            .map_err(IdeAutomationTakeEditError::MixerDocument)?;
+        let mut existing = Vec::new();
+        for descriptor in package.manifest().resources() {
+            if descriptor.role() != ResourceRole::AutomationTake {
+                continue;
+            }
+            existing
+                .try_reserve(1)
+                .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+            existing.push(
+                package
+                    .read_resource(descriptor.id())
+                    .map_err(IdeAutomationTakeEditError::Storage)?,
+            );
+        }
+        let mut references = Vec::new();
+        references
+            .try_reserve_exact(existing.len())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        references.extend(existing.iter().map(Vec::as_slice));
+        let target = match &request.target {
+            IdeAutomationTarget::Channel {
+                track_id,
+                parameter,
+            } => AutomationTargetSelection::Channel {
+                track_id,
+                parameter: *parameter,
+            },
+            IdeAutomationTarget::Send { send_id, parameter } => AutomationTargetSelection::Send {
+                send_id,
+                parameter: *parameter,
+            },
+            IdeAutomationTarget::Main { parameter } => AutomationTargetSelection::Main {
+                parameter: *parameter,
+            },
+        };
+        let take_bytes = serialize_automation_take_replacement(
+            project,
+            &loaded_mixer,
+            &assets,
+            &references,
+            take_id,
+            AutomationTakeReplacement {
+                name: &request.name,
+                start_tick: request.start_tick,
+                end_tick: request.end_tick,
+                target,
+                interpolation: request.interpolation,
+                points: &request.points,
+            },
             limits,
         )
         .map_err(IdeAutomationTakeEditError::Serialization)?;

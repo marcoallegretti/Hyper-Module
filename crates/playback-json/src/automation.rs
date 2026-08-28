@@ -578,6 +578,83 @@ pub struct AutomationTakeAddition<'a> {
     pub points: &'a [AutomationPoint],
 }
 
+/// The editable fields of one existing desktop-authored automation take.
+///
+/// The replacement deliberately owns neither take nor lane identity, capture
+/// timestamp, enabled state, nor extensions. The serializer preserves those
+/// fields after proving that the selected source has exactly one lane.
+#[derive(Clone, Copy, Debug)]
+pub struct AutomationTakeReplacement<'a> {
+    pub name: &'a str,
+    pub start_tick: u64,
+    pub end_tick: u64,
+    pub target: AutomationTargetSelection<'a>,
+    pub interpolation: AutomationInterpolation,
+    pub points: &'a [AutomationPoint],
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AutomationTakeBodyValidationError {
+    InvalidName,
+    InvalidInterval,
+    EmptyLane,
+}
+
+fn validate_automation_take_body(
+    name: &str,
+    start_tick: u64,
+    end_tick: u64,
+    points: &[AutomationPoint],
+) -> Result<(), AutomationTakeBodyValidationError> {
+    let name_length = name.chars().count();
+    if name.trim() != name || !(1..=super::MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length) {
+        return Err(AutomationTakeBodyValidationError::InvalidName);
+    }
+    if start_tick >= end_tick || end_tick > super::MAX_SAFE_INTEGER {
+        return Err(AutomationTakeBodyValidationError::InvalidInterval);
+    }
+    if points.is_empty() {
+        return Err(AutomationTakeBodyValidationError::EmptyLane);
+    }
+    Ok(())
+}
+
+fn automation_target_value(target: AutomationTargetSelection<'_>) -> Value {
+    match target {
+        AutomationTargetSelection::Channel {
+            track_id,
+            parameter,
+        } => json!({
+            "kind": "mixer-channel",
+            "track_id": track_id,
+            "parameter": channel_parameter_name(parameter),
+        }),
+        AutomationTargetSelection::Send { send_id, parameter } => json!({
+            "kind": "mixer-send",
+            "send_id": send_id,
+            "parameter": send_parameter_name(parameter),
+        }),
+        AutomationTargetSelection::Main { parameter } => json!({
+            "kind": "mixer-main",
+            "parameter": main_parameter_name(parameter),
+        }),
+    }
+}
+
+fn automation_point_values(points: &[AutomationPoint]) -> Result<Vec<Value>, LoadError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(points.len())
+        .map_err(|_| capacity_error())?;
+    for point in points {
+        output.push(match point.value {
+            AutomationValue::Integer(value) => json!({"tick": point.tick, "value": value}),
+            AutomationValue::Boolean(value) => json!({"tick": point.tick, "value": value}),
+        });
+    }
+    Ok(output)
+}
+
 #[derive(Debug)]
 pub enum AutomationTakeAdditionSerializationError {
     TakeCapacity,
@@ -669,47 +746,26 @@ pub fn serialize_automation_take_addition(
     {
         return Err(AutomationTakeAdditionSerializationError::InvalidLaneIdentity);
     }
-    let name_length = request.name.chars().count();
-    if request.name.trim() != request.name
-        || !(1..=super::MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
-    {
-        return Err(AutomationTakeAdditionSerializationError::InvalidTakeName);
+    match validate_automation_take_body(
+        request.name,
+        request.start_tick,
+        request.end_tick,
+        request.points,
+    ) {
+        Ok(()) => {}
+        Err(AutomationTakeBodyValidationError::InvalidName) => {
+            return Err(AutomationTakeAdditionSerializationError::InvalidTakeName);
+        }
+        Err(AutomationTakeBodyValidationError::InvalidInterval) => {
+            return Err(AutomationTakeAdditionSerializationError::InvalidInterval);
+        }
+        Err(AutomationTakeBodyValidationError::EmptyLane) => {
+            return Err(AutomationTakeAdditionSerializationError::EmptyLane);
+        }
     }
-    if request.start_tick >= request.end_tick || request.end_tick > super::MAX_SAFE_INTEGER {
-        return Err(AutomationTakeAdditionSerializationError::InvalidInterval);
-    }
-    if request.points.is_empty() {
-        return Err(AutomationTakeAdditionSerializationError::EmptyLane);
-    }
-    let target = match request.target {
-        AutomationTargetSelection::Channel {
-            track_id,
-            parameter,
-        } => json!({
-            "kind": "mixer-channel",
-            "track_id": track_id,
-            "parameter": channel_parameter_name(parameter),
-        }),
-        AutomationTargetSelection::Send { send_id, parameter } => json!({
-            "kind": "mixer-send",
-            "send_id": send_id,
-            "parameter": send_parameter_name(parameter),
-        }),
-        AutomationTargetSelection::Main { parameter } => json!({
-            "kind": "mixer-main",
-            "parameter": main_parameter_name(parameter),
-        }),
-    };
-    let mut points = Vec::new();
-    points
-        .try_reserve_exact(request.points.len())
-        .map_err(|_| AutomationTakeAdditionSerializationError::Source(capacity_error()))?;
-    for point in request.points {
-        points.push(match point.value {
-            AutomationValue::Integer(value) => json!({"tick": point.tick, "value": value}),
-            AutomationValue::Boolean(value) => json!({"tick": point.tick, "value": value}),
-        });
-    }
+    let target = automation_target_value(request.target);
+    let points = automation_point_values(request.points)
+        .map_err(AutomationTakeAdditionSerializationError::Source)?;
     let output = serde_json_canonicalizer::to_vec(&json!({
         "format": "hyper-automation-take",
         "format_version": 1,
@@ -754,6 +810,11 @@ pub fn serialize_automation_take_addition(
 pub enum AutomationTakeEditSerializationError {
     TakeMissing,
     NonCanonicalSource,
+    InvalidTakeName,
+    InvalidInterval,
+    EmptyLane,
+    UnsupportedTakeShape,
+    InvalidDocumentShape,
     Source(LoadError),
     Serialization(serde_json::Error),
     MixerCompilation(MixerCompileError),
@@ -768,6 +829,19 @@ impl fmt::Display for AutomationTakeEditSerializationError {
             }
             Self::NonCanonicalSource => {
                 formatter.write_str("the source automation take is not canonical")
+            }
+            Self::InvalidTakeName => {
+                formatter.write_str("the automation take name is outside the version-1 domain")
+            }
+            Self::InvalidInterval => {
+                formatter.write_str("the automation interval is empty or exceeds the tick domain")
+            }
+            Self::EmptyLane => formatter.write_str("the automation lane declares no points"),
+            Self::UnsupportedTakeShape => formatter.write_str(
+                "only automation takes with exactly one lane can be edited by this authority",
+            ),
+            Self::InvalidDocumentShape => {
+                formatter.write_str("the source automation take has an invalid document shape")
             }
             Self::Source(source) => source.fmt(formatter),
             Self::Serialization(source) => source.fmt(formatter),
@@ -784,7 +858,13 @@ impl Error for AutomationTakeEditSerializationError {
             Self::Serialization(source) => Some(source),
             Self::MixerCompilation(source) => Some(source),
             Self::AutomationCompilation(source) => Some(source),
-            Self::TakeMissing | Self::NonCanonicalSource => None,
+            Self::TakeMissing
+            | Self::NonCanonicalSource
+            | Self::InvalidTakeName
+            | Self::InvalidInterval
+            | Self::EmptyLane
+            | Self::UnsupportedTakeShape
+            | Self::InvalidDocumentShape => None,
         }
     }
 }
@@ -812,6 +892,122 @@ pub fn serialize_automation_take_activation(
     enabled: bool,
     limits: LoaderLimits,
 ) -> Result<Vec<u8>, AutomationTakeEditSerializationError> {
+    serialize_automation_take_document_edit(
+        project,
+        mixer,
+        assets,
+        takes,
+        take_id,
+        limits,
+        |_, document| {
+            document.insert("enabled".to_owned(), enabled.into());
+            Ok(())
+        },
+    )
+}
+
+/// Replaces the user-editable fields of one existing automation take with
+/// exactly one lane.
+///
+/// The source must be canonical and belong to the selected `take_id`. Take and
+/// lane identity, capture timestamp, enabled state, and extensions are retained
+/// while the complete candidate automation set reloads and recompiles before a
+/// caller may publish the result. Takes with multiple lanes are intentionally
+/// refused because this authority cannot represent every lane without loss.
+///
+/// # Errors
+///
+/// Returns a classified rejection for malformed requested fields, a missing or
+/// noncanonical source, a take shape outside this authority, or a candidate
+/// set that fails the existing loader or main-graph compiler.
+pub fn serialize_automation_take_replacement(
+    project: &LoadedPlaybackProject,
+    mixer: &LoadedMixer,
+    assets: &[MediaAssetFact<'_>],
+    takes: &[&[u8]],
+    take_id: &str,
+    request: AutomationTakeReplacement<'_>,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AutomationTakeEditSerializationError> {
+    match validate_automation_take_body(
+        request.name,
+        request.start_tick,
+        request.end_tick,
+        request.points,
+    ) {
+        Ok(()) => {}
+        Err(AutomationTakeBodyValidationError::InvalidName) => {
+            return Err(AutomationTakeEditSerializationError::InvalidTakeName);
+        }
+        Err(AutomationTakeBodyValidationError::InvalidInterval) => {
+            return Err(AutomationTakeEditSerializationError::InvalidInterval);
+        }
+        Err(AutomationTakeBodyValidationError::EmptyLane) => {
+            return Err(AutomationTakeEditSerializationError::EmptyLane);
+        }
+    }
+    let target = automation_target_value(request.target);
+    let points = automation_point_values(request.points)
+        .map_err(AutomationTakeEditSerializationError::Source)?;
+    serialize_automation_take_document_edit(
+        project,
+        mixer,
+        assets,
+        takes,
+        take_id,
+        limits,
+        move |take, document| {
+            if take.lanes().len() != 1 {
+                return Err(AutomationTakeEditSerializationError::UnsupportedTakeShape);
+            }
+            let source_lane = take
+                .lanes()
+                .first()
+                .ok_or(AutomationTakeEditSerializationError::UnsupportedTakeShape)?;
+            let lanes = document
+                .get_mut("lanes")
+                .and_then(Value::as_array_mut)
+                .ok_or(AutomationTakeEditSerializationError::InvalidDocumentShape)?;
+            if lanes.len() != 1 {
+                return Err(AutomationTakeEditSerializationError::UnsupportedTakeShape);
+            }
+            let lane = lanes
+                .first_mut()
+                .and_then(Value::as_object_mut)
+                .ok_or(AutomationTakeEditSerializationError::InvalidDocumentShape)?;
+            if lane.get("id").and_then(Value::as_str) != Some(source_lane.id()) {
+                return Err(AutomationTakeEditSerializationError::TakeMissing);
+            }
+            lane.insert("target".to_owned(), target);
+            lane.insert(
+                "interpolation".to_owned(),
+                match request.interpolation {
+                    AutomationInterpolation::Hold => "hold",
+                    AutomationInterpolation::Linear => "linear",
+                }
+                .into(),
+            );
+            lane.insert("points".to_owned(), points.into());
+            document.insert("name".to_owned(), request.name.into());
+            document.insert("start_tick".to_owned(), request.start_tick.into());
+            document.insert("end_tick".to_owned(), request.end_tick.into());
+            Ok(())
+        },
+    )
+}
+
+fn serialize_automation_take_document_edit(
+    project: &LoadedPlaybackProject,
+    mixer: &LoadedMixer,
+    assets: &[MediaAssetFact<'_>],
+    takes: &[&[u8]],
+    take_id: &str,
+    limits: LoaderLimits,
+    edit: impl FnOnce(
+        &AutomationTake,
+        &mut serde_json::Map<String, Value>,
+    ) -> Result<(), AutomationTakeEditSerializationError>,
+) -> Result<Vec<u8>, AutomationTakeEditSerializationError> {
     let loaded = project
         .load_automation_takes(mixer, assets, takes, limits)
         .map_err(AutomationTakeEditSerializationError::Source)?;
@@ -820,7 +1016,13 @@ pub fn serialize_automation_take_activation(
         .iter()
         .position(|take| take.id() == take_id)
         .ok_or(AutomationTakeEditSerializationError::TakeMissing)?;
-    let source = takes[index];
+    let source_take = loaded
+        .takes()
+        .get(index)
+        .ok_or(AutomationTakeEditSerializationError::TakeMissing)?;
+    let source = *takes
+        .get(index)
+        .ok_or(AutomationTakeEditSerializationError::TakeMissing)?;
     let mut value: Value = serde_json::from_slice(source)
         .map_err(AutomationTakeEditSerializationError::Serialization)?;
     let canonical_source = serde_json_canonicalizer::to_vec(&value)
@@ -834,7 +1036,7 @@ pub fn serialize_automation_take_activation(
     if document.get("id").and_then(Value::as_str) != Some(take_id) {
         return Err(AutomationTakeEditSerializationError::TakeMissing);
     }
-    document.insert("enabled".to_owned(), enabled.into());
+    edit(source_take, document)?;
     let output = serde_json_canonicalizer::to_vec(&value)
         .map_err(AutomationTakeEditSerializationError::Serialization)?;
     let mut documents = Vec::new();

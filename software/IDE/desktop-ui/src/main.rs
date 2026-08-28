@@ -115,6 +115,8 @@ struct ProjectUiState {
     scenes: RefCell<Vec<IdeScene>>,
     scene_launch_evidence: RefCell<SceneLaunchEvidence>,
     automation_channels: RefCell<Vec<MixerChannelFacts>>,
+    automation_targets_initialized: Cell<bool>,
+    automation: RefCell<Option<Arc<IdePlaybackAutomation>>>,
     automation_take_ids: RefCell<Vec<String>>,
     control_targets: RefCell<Vec<ControlTargetChoice>>,
     unused_sample_cleanup: Cell<Option<IdeUnusedSampleCleanupSummary>>,
@@ -3394,6 +3396,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_arrangement_scene_launch_addition_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_move_callback(ui, worker, project_state);
     bind_automation_take_callback(ui, worker, project_state);
+    bind_automation_take_edit_callbacks(ui, worker, project_state);
     bind_automation_take_activation_callback(ui, worker);
     bind_automation_take_removal_callback(ui, worker, project_state);
     bind_control_mapping_callbacks(ui, worker, project_state);
@@ -5134,6 +5137,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::AddArrangementSceneLaunch => AppMode::AddingArrangementSceneLaunch,
         IdeWorkerCommandKind::AddAutomationTake => AppMode::AddingAutomationTake,
         IdeWorkerCommandKind::SetAutomationTakeActive => AppMode::ChangingAutomationTakeActivation,
+        IdeWorkerCommandKind::EditAutomationTake => AppMode::EditingAutomationTake,
         IdeWorkerCommandKind::RemoveAutomationTake => AppMode::RemovingAutomationTake,
         IdeWorkerCommandKind::EditControlMapping => AppMode::EditingControlMapping,
         IdeWorkerCommandKind::EditNativeFilter => AppMode::EditingNativeFilter,
@@ -5400,7 +5404,8 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::AddAutomationTake => {
             "Preserving mixer state, adding the automation take, and reopening project..."
         }
-        IdeWorkerCommandKind::SetAutomationTakeActive => {
+        IdeWorkerCommandKind::EditAutomationTake
+        | IdeWorkerCommandKind::SetAutomationTakeActive => {
             "Preserving mixer state, editing the automation take, and reopening project..."
         }
         IdeWorkerCommandKind::RemoveAutomationTake => {
@@ -5855,6 +5860,11 @@ fn apply_event(
         | IdeWorkerEvent::AutomationTakeActivationCommittedWithWarning { .. }
         | IdeWorkerEvent::AutomationTakeActivationChanging { .. }) => {
             apply_automation_take_activation_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AutomationTakeEdited { .. }
+        | IdeWorkerEvent::AutomationTakeEditCommittedWithWarning { .. }
+        | IdeWorkerEvent::AutomationTakeEditing { .. }) => {
+            apply_automation_take_edit_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AutomationTakeRemoved { .. }
         | IdeWorkerEvent::AutomationTakeRemovalCommittedWithWarning { .. }
@@ -9489,6 +9499,8 @@ fn reset_project(
     ui.set_unused_sample_cleanup_confirming(false);
     project_state.scenes.borrow_mut().clear();
     project_state.automation_channels.borrow_mut().clear();
+    project_state.automation_targets_initialized.set(false);
+    *project_state.automation.borrow_mut() = None;
     project_state.automation_take_ids.borrow_mut().clear();
     project_state.control_targets.borrow_mut().clear();
     project_state.scene_launch_evidence.borrow_mut().clear();
@@ -9540,6 +9552,7 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_automation_target_domain(ModelRc::default());
     ui.set_mixer_automation_visible(false);
     reset_automation_creation_form(ui);
+    reset_automation_take_edit_form(ui);
     ui.set_control_bindings(ModelRc::default());
     ui.set_control_source_names(ModelRc::default());
     ui.set_control_source_continuous(ModelRc::default());
@@ -9712,6 +9725,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::SetAutomationTakeActive
             if current == AppMode::ChangingAutomationTakeActivation =>
         {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::EditAutomationTake if current == AppMode::EditingAutomationTake => {
             AppMode::Running
         }
         IdeWorkerCommandKind::RemoveAutomationTake
@@ -10926,7 +10942,9 @@ fn set_automation_targets(
     project_state: &ProjectUiStateCell,
     channels: &[MixerChannelFacts],
 ) {
-    if project_state.automation_channels.borrow().as_slice() == channels {
+    if project_state.automation_targets_initialized.get()
+        && project_state.automation_channels.borrow().as_slice() == channels
+    {
         return;
     }
     let choices = automation_target_choices(channels);
@@ -10948,10 +10966,15 @@ fn set_automation_targets(
             .map(|choice| SharedString::from(choice.domain.as_str()))
             .collect::<Vec<_>>(),
     ))));
-    if ui.get_automation_create_target_index() >= i32::try_from(choices.len()).unwrap_or(0) {
+    let choice_count = i32::try_from(choices.len()).unwrap_or(0);
+    if ui.get_automation_create_target_index() >= choice_count {
         ui.set_automation_create_target_index(0);
     }
+    if ui.get_automation_edit_target_index() >= choice_count {
+        ui.set_automation_edit_target_index(0);
+    }
     *project_state.automation_channels.borrow_mut() = channels.to_vec();
+    project_state.automation_targets_initialized.set(true);
 }
 
 struct AutomationTakeListModel {
@@ -10974,10 +10997,11 @@ impl Model for AutomationTakeListModel {
             .iter()
             .map(IdePlaybackAutomationLane::point_count)
             .sum();
-        let target = if take.lanes().len() == 1 {
+        let editable = take.lanes().len() == 1;
+        let target = if editable {
             self.labels.get(row)?.clone()
         } else {
-            format!("{} lanes", take.lanes().len())
+            format!("{} lanes · view only", take.lanes().len())
         };
         let uniform = take
             .lanes()
@@ -10995,6 +11019,7 @@ impl Model for AutomationTakeListModel {
             id: take.id().into(),
             name: take.name().into(),
             enabled: take.enabled(),
+            editable,
             range: format!("TICK {} to {}", take.start_tick(), take.end_tick()).into(),
             target: target.into(),
             interpolation: interpolation.into(),
@@ -11028,6 +11053,7 @@ fn set_automation(
     replace_automation_take_authority(
         ui,
         project_state,
+        Arc::clone(owner),
         owner.takes().iter().map(|take| take.id().to_owned()),
     );
     let choices = automation_target_choices(&channels);
@@ -11050,9 +11076,19 @@ fn set_automation(
 fn replace_automation_take_authority(
     ui: &MainWindow,
     project_state: &ProjectUiStateCell,
+    owner: Arc<IdePlaybackAutomation>,
     take_ids: impl IntoIterator<Item = String>,
 ) {
+    let authority_replaced = project_state
+        .automation
+        .borrow()
+        .as_ref()
+        .is_none_or(|current| !Arc::ptr_eq(current, &owner));
     ui.set_automation_take_remove_confirming_id(SharedString::default());
+    if authority_replaced {
+        reset_automation_take_edit_form(ui);
+    }
+    *project_state.automation.borrow_mut() = Some(owner);
     *project_state.automation_take_ids.borrow_mut() = take_ids.into_iter().collect();
 }
 
@@ -11136,6 +11172,161 @@ fn automation_take_request(
     })
 }
 
+struct AutomationTakeEditForm {
+    take_id: String,
+    name: String,
+    target_index: i32,
+    interpolation_index: i32,
+    start: String,
+    end: String,
+    points: String,
+}
+
+fn automation_take_edit_form(
+    owner: &IdePlaybackAutomation,
+    choices: &[AutomationTargetChoice],
+    take_id: &str,
+) -> Result<AutomationTakeEditForm, &'static str> {
+    let take = owner
+        .takes()
+        .iter()
+        .find(|take| take.id() == take_id)
+        .ok_or("The selected automation take is no longer available")?;
+    let [lane] = take.lanes() else {
+        return Err("Only single-lane automation takes can be edited safely");
+    };
+    let target_index = choices
+        .iter()
+        .position(|choice| choice.resolved == lane.target())
+        .ok_or("The automation take target is no longer available")?;
+    let target_index = i32::try_from(target_index)
+        .map_err(|_| "The automation target index is outside the supported range")?;
+    let interpolation_index = match lane.interpolation() {
+        AutomationInterpolation::Hold => 0,
+        AutomationInterpolation::Linear => 1,
+    };
+    Ok(AutomationTakeEditForm {
+        take_id: take.id().to_owned(),
+        name: take.name().to_owned(),
+        target_index,
+        interpolation_index,
+        start: take.start_tick().to_string(),
+        end: take.end_tick().to_string(),
+        points: format_automation_points(lane.points()),
+    })
+}
+
+fn format_automation_points(points: &[AutomationPoint]) -> String {
+    points
+        .iter()
+        .map(|point| {
+            let value = match point.value() {
+                AutomationValue::Integer(value) => value.to_string(),
+                AutomationValue::Boolean(true) => "on".to_owned(),
+                AutomationValue::Boolean(false) => "off".to_owned(),
+            };
+            format!("{}={value}", point.tick())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn bind_automation_take_edit_callbacks(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let project_state_for_begin = Rc::clone(project_state);
+    actions.on_begin_edit_automation_take(move |take_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || ui.get_automation_create_visible()
+            || take_id.is_empty()
+        {
+            ui.set_error_text("Automation take edit request is no longer current".into());
+            return;
+        }
+        let owner = project_state_for_begin.automation.borrow().clone();
+        let choices =
+            automation_target_choices(&project_state_for_begin.automation_channels.borrow());
+        let form = owner
+            .as_deref()
+            .ok_or("Automation take data is no longer available")
+            .and_then(|owner| automation_take_edit_form(owner, &choices, take_id.as_str()));
+        let form = match form {
+            Ok(form) => form,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        ui.set_automation_edit_take_id(form.take_id.into());
+        ui.set_automation_edit_name(form.name.into());
+        ui.set_automation_edit_target_index(form.target_index);
+        ui.set_automation_edit_interpolation_index(form.interpolation_index);
+        ui.set_automation_edit_start(form.start.into());
+        ui.set_automation_edit_end(form.end.into());
+        ui.set_automation_edit_points(form.points.into());
+        ui.set_automation_edit_visible(true);
+        ui.set_error_text(SharedString::default());
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_edit = Rc::clone(worker);
+    let project_state_for_edit = Rc::clone(project_state);
+    actions.on_save_automation_take_edit(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_automation_edit_visible() {
+            ui.set_error_text("Automation take edit request is no longer current".into());
+            return;
+        }
+        let take_id = ui.get_automation_edit_take_id().to_string();
+        if take_id.is_empty() {
+            reset_automation_take_edit_form(&ui);
+            ui.set_error_text("Automation take edit request is no longer current".into());
+            return;
+        }
+        let owner = project_state_for_edit.automation.borrow().clone();
+        let choices =
+            automation_target_choices(&project_state_for_edit.automation_channels.borrow());
+        if let Err(message) = owner
+            .as_deref()
+            .ok_or("Automation take data is no longer available")
+            .and_then(|owner| automation_take_edit_form(owner, &choices, &take_id))
+        {
+            reset_automation_take_edit_form(&ui);
+            ui.set_error_text(message.into());
+            return;
+        }
+        let request = match automation_take_request(
+            &choices,
+            ui.get_automation_edit_name().as_str(),
+            ui.get_automation_edit_target_index(),
+            ui.get_automation_edit_interpolation_index(),
+            ui.get_automation_edit_start().as_str(),
+            ui.get_automation_edit_end().as_str(),
+            ui.get_automation_edit_points().as_str(),
+        ) {
+            Ok(request) => request,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_edit,
+            IdeWorkerCommand::EditAutomationTake { take_id, request },
+        );
+    });
+}
+
 fn bind_automation_take_callback(
     ui: &MainWindow,
     worker: &WorkerCell,
@@ -11216,6 +11407,44 @@ fn apply_automation_take_activation_event(ui: &MainWindow, event: &IdeWorkerEven
             );
         }
         _ => unreachable!("automation activation event dispatcher received another event"),
+    }
+}
+
+fn apply_automation_take_edit_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AutomationTakeEdited {
+            revision,
+            changed,
+            take_id: _,
+            name,
+        } => {
+            reset_automation_take_edit_form(ui);
+            ui.set_status_text(
+                if *changed {
+                    format!("Automation take {name} edited in project revision {revision}")
+                } else {
+                    format!(
+                        "Automation take {name} was already current in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AutomationTakeEditCommittedWithWarning { warning, .. } => {
+            reset_automation_take_edit_form(ui);
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), "Automation take edit").into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::AutomationTakeEditing { .. } => {
+            ui.set_app_mode(AppMode::EditingAutomationTake);
+            ui.set_status_text(
+                "Waiting for native output before editing the automation take…".into(),
+            );
+        }
+        _ => unreachable!("automation take edit event dispatcher received another event"),
     }
 }
 
@@ -11335,6 +11564,17 @@ fn reset_automation_creation_form(ui: &MainWindow) {
     ui.set_automation_create_visible(false);
     ui.set_automation_create_name(SharedString::default());
     ui.set_automation_create_points(SharedString::default());
+}
+
+fn reset_automation_take_edit_form(ui: &MainWindow) {
+    ui.set_automation_edit_visible(false);
+    ui.set_automation_edit_take_id(SharedString::default());
+    ui.set_automation_edit_name(SharedString::default());
+    ui.set_automation_edit_target_index(0);
+    ui.set_automation_edit_interpolation_index(0);
+    ui.set_automation_edit_start(SharedString::default());
+    ui.set_automation_edit_end(SharedString::default());
+    ui.set_automation_edit_points(SharedString::default());
 }
 
 fn apply_automation_take_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -15830,6 +16070,7 @@ mod tests {
                 id: take_id.into(),
                 name: "Main fade".into(),
                 enabled: true,
+                editable: true,
                 range: "TICK 0 to 960".into(),
                 target: "Main gain".into(),
                 interpolation: "Linear".into(),
@@ -15855,7 +16096,7 @@ mod tests {
         ));
 
         ui.set_automation_take_remove_confirming_id(take_id.into());
-        replace_automation_take_authority(ui, &project_state, [take_id.to_owned()]);
+        ui.set_automation_take_remove_confirming_id(SharedString::default());
         assert!(ui.get_automation_take_remove_confirming_id().is_empty());
         actions.invoke_remove_automation_take(take_id.into());
         assert_eq!(submitted.borrow().len(), 1);
@@ -18375,6 +18616,31 @@ mod tests {
     }
 
     #[test]
+    fn automation_point_formatting_round_trips_the_supported_editor_syntax() {
+        let continuous = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(960, AutomationValue::Integer(-250_000)),
+        ];
+        let switches = [
+            AutomationPoint::new(0, AutomationValue::Boolean(false)),
+            AutomationPoint::new(960, AutomationValue::Boolean(true)),
+        ];
+        assert_eq!(
+            format_automation_points(&continuous),
+            "0=1000000, 960=-250000"
+        );
+        assert_eq!(
+            parse_automation_points(&format_automation_points(&continuous), false),
+            Ok(continuous.to_vec())
+        );
+        assert_eq!(format_automation_points(&switches), "0=off, 960=on");
+        assert_eq!(
+            parse_automation_points(&format_automation_points(&switches), true),
+            Ok(switches.to_vec())
+        );
+    }
+
+    #[test]
     fn automation_take_activation_submission_and_failure_use_a_dedicated_mode() {
         assert_eq!(
             mode_after_successful_submission(
@@ -18387,6 +18653,24 @@ mod tests {
             mode_after_failure(
                 AppMode::ChangingAutomationTakeActivation,
                 IdeWorkerCommandKind::SetAutomationTakeActive,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn automation_take_edit_submission_and_failure_use_a_dedicated_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::EditAutomationTake,
+            ),
+            AppMode::EditingAutomationTake
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::EditingAutomationTake,
+                IdeWorkerCommandKind::EditAutomationTake,
             ),
             AppMode::Running
         );
@@ -18851,6 +19135,12 @@ mod tests {
         let take_routes: TakeRoutes = Rc::new(RefCell::new(Vec::new()));
         let project_state = Rc::new(ProjectUiState::default());
         let channels = automation_channel_fixture();
+        let empty: [MixerChannelFacts; 0] = [];
+
+        set_automation_targets(ui, &project_state, &empty);
+        assert_eq!(ui.get_automation_target_names().row_count(), 2);
+        assert_eq!(ui.get_automation_target_boolean().row_count(), 2);
+        assert_eq!(ui.get_automation_target_domain().row_count(), 2);
 
         set_automation_targets(ui, &project_state, &channels);
         assert_eq!(ui.get_automation_target_names().row_count(), 13);
@@ -18973,6 +19263,46 @@ mod tests {
             &IdeWorkerEvent::AutomationTakeActivationChanging { enabled: true },
         );
         assert_eq!(ui.get_app_mode(), AppMode::ChangingAutomationTakeActivation);
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_automation_edit_visible(true);
+        ui.set_automation_edit_take_id("018f47a2-6b2d-7c11-8a44-0011223344a0".into());
+        ui.set_automation_edit_name("Main mute".into());
+        ui.set_automation_edit_points("0=off, 960=on".into());
+        apply_automation_take_edit_event(
+            ui,
+            &IdeWorkerEvent::AutomationTakeEdited {
+                revision: 6,
+                changed: true,
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+                name: "Main mute".to_owned(),
+            },
+        );
+        assert!(!ui.get_automation_edit_visible());
+        assert!(ui.get_automation_edit_take_id().is_empty());
+        assert!(ui.get_automation_edit_name().is_empty());
+        assert!(ui.get_automation_edit_points().is_empty());
+        assert!(
+            ui.get_status_text()
+                .contains("Main mute edited in project revision 6")
+        );
+
+        apply_automation_take_edit_event(
+            ui,
+            &IdeWorkerEvent::AutomationTakeEditing {
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::EditingAutomationTake);
+        apply_automation_take_edit_event(
+            ui,
+            &IdeWorkerEvent::AutomationTakeEditCommittedWithWarning {
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+                warning: Box::new(IdeAutomationTakeEditError::TakeUnavailable),
+            },
+        );
+        assert!(ui.get_status_text().contains("committed"));
+        assert!(ui.get_error_text().contains("unavailable"));
     }
 
     #[test]
