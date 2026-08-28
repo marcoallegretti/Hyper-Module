@@ -3789,6 +3789,42 @@ fn interleaved_strip_meters_accumulate_loop_spans_and_clear_when_stopped() {
 }
 
 #[test]
+fn rejected_final_post_mix_never_publishes_a_strip_meter_snapshot() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 2)
+            .unwrap();
+    let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
+    transport.apply_command(TransportCommand::Start).unwrap();
+    let mut callback = InterleavedStereoCallback::try_new(2, 48_000).unwrap();
+    let (mut meter_sender, mut meter_receiver) = output_meter_channel();
+    let mut scratch_left = [[0.0_f32; 2]; 2];
+    let mut scratch_right = [[0.0_f32; 2]; 2];
+    let [left_0, left_1] = &mut scratch_left;
+    let [right_0, right_1] = &mut scratch_right;
+    let mut scratch = [
+        RenderScratchSlot::new(left_0, right_0),
+        RenderScratchSlot::new(left_1, right_1),
+    ];
+    let mut interleaved = [9.0_f32; 4];
+
+    assert!(matches!(
+        transport.process_interleaved_cycle_with_post_mix(
+            &mut callback,
+            &mut scratch,
+            &mut interleaved,
+            &mut meter_sender,
+            |output| output.left[0] = f32::NAN,
+        ),
+        Err(StereoCallbackError::NonFiniteOutput { samples: 1 })
+    ));
+    assert_constant(&interleaved, 0.0);
+    assert_eq!(meter_receiver.read_latest().snapshot(), None);
+}
+
+#[test]
 fn loudness_command_queue_reports_saturation_and_disconnection() {
     let (mut sender, receiver) = loudness_command_channel();
     for _ in 0..MAX_QUEUED_LOUDNESS_COMMANDS {
