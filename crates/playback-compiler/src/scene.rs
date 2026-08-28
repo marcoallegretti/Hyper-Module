@@ -938,14 +938,64 @@ struct PendingSceneLaunch {
     scene_index: usize,
     tick: u64,
     frame: usize,
+    arrangement_tick: Option<u64>,
+}
+
+/// One interactive scene launch accepted by the scene runtime.
+///
+/// This is emitted only after the pending launch reaches its actual callback
+/// boundary. `arrangement_tick` is deliberately absent for immediate launches:
+/// the version-1 arrangement document is tick-addressed and cannot reproduce
+/// arbitrary sub-tick timing without changing its format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InteractiveSceneLaunch {
+    scene_index: u8,
+    tick: u64,
+    frame: usize,
+    arrangement_tick: Option<u64>,
+    sequence: u64,
+}
+
+impl InteractiveSceneLaunch {
+    #[must_use]
+    pub const fn scene_index(self) -> usize {
+        self.scene_index as usize
+    }
+
+    /// Returns the exact timeline tick selected when this launch was queued.
+    #[must_use]
+    pub const fn tick(self) -> u64 {
+        self.tick
+    }
+
+    /// Returns the exact callback frame at which the launch was applied.
+    #[must_use]
+    pub const fn frame(self) -> usize {
+        self.frame
+    }
+
+    /// Returns the tick that can round-trip through a version-1 arrangement.
+    ///
+    /// Immediate scene launches return `None`, even when they happen to be
+    /// near an integer tick, so callers never silently round timing.
+    #[must_use]
+    pub const fn arrangement_tick(self) -> Option<u64> {
+        self.arrangement_tick
+    }
+
+    /// Returns this runtime's monotonic interactive-launch observation sequence.
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
 }
 
 /// Committed interactive scene-launch state at one runtime position.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SceneLaunchState {
     queued_scene_index: u8,
-    last_launched_scene_index: u8,
     queued_launch_frame: usize,
+    last_interactive_launch: Option<InteractiveSceneLaunch>,
 }
 
 impl SceneLaunchState {
@@ -971,11 +1021,16 @@ impl SceneLaunchState {
 
     #[must_use]
     pub const fn last_launched_scene_index(self) -> Option<usize> {
-        if self.last_launched_scene_index == Self::NO_SCENE {
-            None
-        } else {
-            Some(self.last_launched_scene_index as usize)
+        match self.last_interactive_launch {
+            Some(launch) => Some(launch.scene_index()),
+            None => None,
         }
+    }
+
+    /// Returns the most recently accepted interactive launch, if any.
+    #[must_use]
+    pub const fn last_interactive_launch(self) -> Option<InteractiveSceneLaunch> {
+        self.last_interactive_launch
     }
 }
 
@@ -983,8 +1038,8 @@ impl Default for SceneLaunchState {
     fn default() -> Self {
         Self {
             queued_scene_index: Self::NO_SCENE,
-            last_launched_scene_index: Self::NO_SCENE,
             queued_launch_frame: 0,
+            last_interactive_launch: None,
         }
     }
 }
@@ -997,7 +1052,8 @@ pub struct SceneRuntimeCheckpoint<'resource> {
     track_count: usize,
     position: usize,
     pending: Option<PendingSceneLaunch>,
-    last_launched_scene_index: Option<usize>,
+    last_interactive_launch: Option<InteractiveSceneLaunch>,
+    next_interactive_launch_sequence: u64,
 }
 
 #[derive(Debug)]
@@ -1008,7 +1064,8 @@ pub struct SceneRuntime<'plan, 'resource> {
     controlled: Vec<bool>,
     position: usize,
     pending: Option<PendingSceneLaunch>,
-    last_launched_scene_index: Option<usize>,
+    last_interactive_launch: Option<InteractiveSceneLaunch>,
+    next_interactive_launch_sequence: u64,
 }
 
 impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
@@ -1038,7 +1095,8 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
             controlled,
             position: frame,
             pending: None,
-            last_launched_scene_index: None,
+            last_interactive_launch: None,
+            next_interactive_launch_sequence: 0,
         };
         runtime.seek(frame);
         Ok(runtime)
@@ -1083,13 +1141,7 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
         SceneLaunchState {
             queued_scene_index,
             queued_launch_frame,
-            last_launched_scene_index: self.last_launched_scene_index.map_or(
-                SceneLaunchState::NO_SCENE,
-                |scene_index| {
-                    u8::try_from(scene_index)
-                        .expect("compiled scene indices fit the version-1 scene limit")
-                },
-            ),
+            last_interactive_launch: self.last_interactive_launch,
         }
     }
 
@@ -1108,7 +1160,8 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
             track_count: self.states.len(),
             position: self.position,
             pending: self.pending,
-            last_launched_scene_index: self.last_launched_scene_index,
+            last_interactive_launch: self.last_interactive_launch,
+            next_interactive_launch_sequence: self.next_interactive_launch_sequence,
         }
     }
 
@@ -1122,7 +1175,8 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
             .copy_from_slice(&checkpoint.controlled[..checkpoint.track_count]);
         self.position = checkpoint.position;
         self.pending = checkpoint.pending;
-        self.last_launched_scene_index = checkpoint.last_launched_scene_index;
+        self.last_interactive_launch = checkpoint.last_interactive_launch;
+        self.next_interactive_launch_sequence = checkpoint.next_interactive_launch_sequence;
     }
 
     /// Replaces any pending interactive launch with the latest request.
@@ -1165,6 +1219,10 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
                 (tick, frame)
             }
         };
+        let arrangement_tick = match scene.launch_quantization {
+            LaunchQuantization::Immediate => None,
+            LaunchQuantization::Grid { .. } => Some(tick),
+        };
         for slot in &scene.slots {
             if let CompiledTemplateAction::Play {
                 duration_frames,
@@ -1181,6 +1239,7 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
             scene_index,
             tick,
             frame,
+            arrangement_tick,
         });
         Ok(())
     }
@@ -1207,7 +1266,7 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
     pub fn seek(&mut self, frame: usize) {
         self.position = frame;
         self.pending = None;
-        self.last_launched_scene_index = None;
+        self.last_interactive_launch = None;
         for (track_index, track) in self.plan.tracks.iter().enumerate() {
             self.controlled[track_index] = !track.actions.is_empty();
             let cursor = track
@@ -1279,7 +1338,8 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
             .ok_or(SceneProcessError::Runtime(SceneRuntimeError::FrameOverflow))?;
         let saved_position = self.position;
         let saved_pending = self.pending;
-        let saved_last_launched_scene_index = self.last_launched_scene_index;
+        let saved_last_interactive_launch = self.last_interactive_launch;
+        let saved_next_interactive_launch_sequence = self.next_interactive_launch_sequence;
         let track_count = self.states.len();
         let mut saved_states = [None; VERSION_1_MAX_SCENE_TRACKS];
         saved_states[..track_count].copy_from_slice(&self.states);
@@ -1303,7 +1363,8 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
                 self.controlled
                     .copy_from_slice(&saved_controlled[..track_count]);
                 self.pending = saved_pending;
-                self.last_launched_scene_index = saved_last_launched_scene_index;
+                self.last_interactive_launch = saved_last_interactive_launch;
+                self.next_interactive_launch_sequence = saved_next_interactive_launch_sequence;
                 return Err(SceneProcessError::Observer(error));
             }
             segment_count += 1;
@@ -1363,7 +1424,16 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
                     }),
                 };
             }
-            self.last_launched_scene_index = Some(pending.scene_index);
+            self.next_interactive_launch_sequence =
+                self.next_interactive_launch_sequence.wrapping_add(1);
+            self.last_interactive_launch = Some(InteractiveSceneLaunch {
+                scene_index: u8::try_from(pending.scene_index)
+                    .expect("compiled scene indices fit the version-1 scene limit"),
+                tick: pending.tick,
+                frame: pending.frame,
+                arrangement_tick: pending.arrangement_tick,
+                sequence: self.next_interactive_launch_sequence,
+            });
             self.pending = None;
         }
     }

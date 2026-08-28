@@ -8,7 +8,7 @@ use core::cell::Cell;
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
-use hyper_mixer_runtime::PlaybackRecoveryPublisher;
+use hyper_mixer_runtime::{InteractiveSceneLaunchPublisher, PlaybackRecoveryPublisher};
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
@@ -324,6 +324,7 @@ impl PipeWireThreadRunner {
         self,
         mut processor: P,
         mut publisher: PlaybackRecoveryPublisher,
+        mut scene_launch_publisher: InteractiveSceneLaunchPublisher,
     ) -> Result<(), PipeWireStartError>
     where
         P: CheckpointedOutputProcessor,
@@ -348,6 +349,7 @@ impl PipeWireThreadRunner {
                 let (cycle, mixer_parameter_state, native_device_state) = pending_cycle
                     .take()
                     .expect("a rendered PipeWire block has a pending recovery cycle");
+                let _ = scene_launch_publisher.publish_cycle(cycle);
                 publisher.publish_cycle_with_native_device_state(
                     cycle,
                     mixer_parameter_state.as_ref(),

@@ -37,7 +37,8 @@ mod loudness_presentation;
 mod meter_ballistics;
 mod metronome;
 mod recovery;
-pub use hyper_playback_compiler::scene::SceneLaunchState;
+mod scene_capture;
+pub use hyper_playback_compiler::scene::{InteractiveSceneLaunch, SceneLaunchState};
 pub use loudness_presentation::{
     EBU_TARGET_LOUDNESS_LUFS, EbuLoudnessPresentationConfig, EbuLoudnessScale, LoudnessDisplayUnit,
     LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay, ScaledLoudnessValue,
@@ -54,6 +55,11 @@ pub use recovery::{
     playback_recovery_channel_with_initial_loop_and_metronome,
     playback_recovery_channel_with_initial_loop_metronome_and_native_device_state,
 };
+pub use scene_capture::{
+    InteractiveSceneLaunchDrain, InteractiveSceneLaunchObservation,
+    InteractiveSceneLaunchPublication, InteractiveSceneLaunchPublisher,
+    InteractiveSceneLaunchReceiver, interactive_scene_launch_channel,
+};
 
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;
 pub const MAX_MIXER_SENDS_PER_SLOT: usize = 2;
@@ -62,6 +68,8 @@ pub const MAX_QUEUED_MIXER_PARAMETER_COMMANDS: usize = 64;
 pub const MAX_QUEUED_NATIVE_DEVICE_COMMANDS: usize = 64;
 pub const MAX_QUEUED_LOUDNESS_COMMANDS: usize = 32;
 pub const MAX_QUEUED_OUTPUT_METER_SNAPSHOTS: usize = 64;
+/// Bounded, loss-detecting control-thread capture queue for committed scene launches.
+pub const MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES: usize = 256;
 const ALL_MAIN_MIXER_SLOT_INDICES: [usize; MAX_MAIN_MIXER_SLOTS] = [0, 1, 2, 3, 4, 5, 6, 7];
 const MIXER_PARAMETER_LAYOUT_SIGNATURE_VERSION: &[u8] = b"hyper-mixer-parameter-layout-v1";
 const NATIVE_DEVICE_LAYOUT_SIGNATURE_VERSION: &[u8] = b"hyper-native-device-layout-v1";

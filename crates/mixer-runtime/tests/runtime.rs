@@ -8,20 +8,23 @@ use hyper_audio_engine::{
 use hyper_media_cache::PreparedSceneAvailability;
 use hyper_mixer_runtime::{
     EbuLoudnessPresentationConfig, EbuLoudnessScale, FlatMainRuntime, GraphMainRuntime,
-    GraphTransportRuntime, LocateState, LoudnessCommandSendError, LoudnessCommandSender,
-    LoudnessDisplayUnit, MAX_QUEUED_LOUDNESS_COMMANDS, MAX_QUEUED_MIXER_PARAMETER_COMMANDS,
-    MAX_QUEUED_NATIVE_DEVICE_COMMANDS, MAX_QUEUED_OUTPUT_METER_SNAPSHOTS,
-    MAX_QUEUED_TRANSPORT_COMMANDS, MetronomePlan, MixerChannelHandle, MixerParameterCommand,
-    MixerParameterCommandSendError, MixerParameterCommandSender, MixerParameterResolveError,
-    MixerParameterStateRestoreError, MixerParameterTargetError, NativeDeviceCommand,
-    NativeDeviceCommandSendError, NativeDeviceResolveError, NativeDeviceTargetError,
-    OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
-    PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, RuntimeCreationError,
-    RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig, SceneLaunchState,
+    GraphTransportRuntime, InteractiveSceneLaunchPublication, LocateState,
+    LoudnessCommandSendError, LoudnessCommandSender, LoudnessDisplayUnit,
+    MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES, MAX_QUEUED_LOUDNESS_COMMANDS,
+    MAX_QUEUED_MIXER_PARAMETER_COMMANDS, MAX_QUEUED_NATIVE_DEVICE_COMMANDS,
+    MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, MetronomePlan,
+    MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSendError,
+    MixerParameterCommandSender, MixerParameterResolveError, MixerParameterStateRestoreError,
+    MixerParameterTargetError, NativeDeviceCommand, NativeDeviceCommandSendError,
+    NativeDeviceResolveError, NativeDeviceTargetError, OutputMeterPublication, OutputMeterReceiver,
+    OutputMeterSender, OutputMeterSnapshot, PreparedPlaybackMainRuntime,
+    PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError,
+    RuntimeProjectComponent, SamplePeakBallisticsConfig, SceneLaunchState,
     StereoSamplePeakBallistics, TransportCommand, TransportCommandApplyError,
     TransportCommandSendError, TransportCycle, TransportLoopRange, TransportLoopRangeError,
     TransportOutputCreationError, TransportOutputProcessor, TransportState,
-    loudness_command_channel, output_meter_channel, playback_recovery_channel,
+    interactive_scene_launch_channel, loudness_command_channel, output_meter_channel,
+    playback_recovery_channel,
 };
 use hyper_native_device::{
     DeviceChain, NativeCompressorState, NativeDeviceInstance, NativeDeviceState, NativeFilterMode,
@@ -3918,6 +3921,121 @@ fn meter_receiver_reports_an_abandoned_sender_without_a_snapshot() {
     assert_eq!(latest.coalesced_snapshot_count(), 0);
     assert_eq!(latest.dropped_snapshot_count(), 0);
     assert!(latest.sender_disconnected());
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one real scene transport fixture proves the capture queue follows committed callback order"
+)]
+fn interactive_scene_launch_channel_preserves_order_and_reports_overflow() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 50)
+            .unwrap();
+    let (mut sender, mut transport) = PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    let (mut publisher, mut receiver) = interactive_scene_launch_channel();
+    assert_eq!(publisher.capacity(), MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES);
+    assert_eq!(receiver.capacity(), MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES);
+
+    let mut arrangement_left = [0.0_f32; 50];
+    let mut arrangement_right = [0.0_f32; 50];
+    let mut scene_left = [0.0_f32; 50];
+    let mut scene_right = [0.0_f32; 50];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut output_left = [0.0_f32; 50];
+    let mut output_right = [0.0_f32; 50];
+
+    sender.try_send(TransportCommand::Start).unwrap();
+    let mut last_cycle = None;
+    for index in 0..=MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES {
+        sender
+            .try_send(TransportCommand::LaunchScene { scene_index: 0 })
+            .unwrap();
+        let cycle = transport
+            .process_cycle(
+                &mut scratch,
+                StereoOutput {
+                    left: &mut output_left,
+                    right: &mut output_right,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            publisher.publish_cycle(cycle),
+            if index < MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES {
+                InteractiveSceneLaunchPublication::Published
+            } else {
+                InteractiveSceneLaunchPublication::QueueFull
+            }
+        );
+        last_cycle = Some(cycle);
+    }
+    assert_eq!(
+        publisher.publish_cycle(last_cycle.unwrap()),
+        InteractiveSceneLaunchPublication::NoLaunch
+    );
+
+    let mut launches = Vec::new();
+    let drained = receiver.drain(|observation| launches.push(observation));
+    assert_eq!(
+        drained.delivered_event_count(),
+        MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES
+    );
+    assert_eq!(drained.dropped_event_count(), 1);
+    assert!(!drained.sender_disconnected());
+    assert_eq!(launches.len(), MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES);
+    for (index, observation) in launches.iter().copied().enumerate() {
+        let launch = observation.launch();
+        assert_eq!(launch.scene_index(), 0);
+        assert_eq!(launch.arrangement_tick(), None);
+        assert_eq!(launch.sequence(), u64::try_from(index + 1).unwrap());
+        assert!(!observation.loop_enabled());
+    }
+
+    sender
+        .try_send(TransportCommand::LaunchScene { scene_index: 0 })
+        .unwrap();
+    let recovered_cycle = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        publisher.publish_cycle(recovered_cycle),
+        InteractiveSceneLaunchPublication::Published
+    );
+    let mut recovered_launches = Vec::new();
+    let recovered = receiver.drain(|observation| recovered_launches.push(observation));
+    assert_eq!(recovered.delivered_event_count(), 1);
+    assert_eq!(recovered.dropped_event_count(), 0);
+    assert!(!recovered.sender_disconnected());
+    assert_eq!(recovered_launches.len(), 1);
+    assert_eq!(
+        recovered_launches[0].launch().sequence(),
+        u64::try_from(MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES + 2).unwrap()
+    );
+}
+
+#[test]
+fn interactive_scene_launch_receiver_reports_an_abandoned_publisher() {
+    let (publisher, mut receiver) = interactive_scene_launch_channel();
+    drop(publisher);
+
+    let drained = receiver.drain(|_| {});
+
+    assert_eq!(drained.delivered_event_count(), 0);
+    assert_eq!(drained.dropped_event_count(), 0);
+    assert!(drained.sender_disconnected());
 }
 
 #[test]

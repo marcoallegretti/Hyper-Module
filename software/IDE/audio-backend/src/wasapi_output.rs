@@ -8,7 +8,7 @@ use core::cell::Cell;
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use hyper_mixer_runtime::PlaybackRecoveryPublisher;
+use hyper_mixer_runtime::{InteractiveSceneLaunchPublisher, PlaybackRecoveryPublisher};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
@@ -343,6 +343,7 @@ impl WasapiThreadRunner {
         self,
         mut processor: P,
         mut publisher: PlaybackRecoveryPublisher,
+        mut scene_launch_publisher: InteractiveSceneLaunchPublisher,
     ) -> Result<(), WasapiStartError>
     where
         P: CheckpointedOutputProcessor,
@@ -367,6 +368,7 @@ impl WasapiThreadRunner {
                 let (cycle, mixer_parameter_state, native_device_state) = pending_cycle
                     .take()
                     .expect("a rendered WASAPI block has a pending recovery cycle");
+                let _ = scene_launch_publisher.publish_cycle(cycle);
                 publisher.publish_cycle_with_native_device_state(
                     cycle,
                     mixer_parameter_state.as_ref(),

@@ -427,6 +427,7 @@ fn bind_callbacks(
     bind_playback_callbacks(ui, worker, project_state);
     bind_monitoring_callbacks(ui, worker);
     bind_recording_callbacks(ui, worker, &routes.recordings);
+    bind_scene_performance_capture_callbacks(ui, worker);
     bind_audio_preview_callbacks(ui, worker, &routes.takes);
     bind_audio_import_callback(ui, worker, &routes.audio_imports);
 }
@@ -1067,6 +1068,44 @@ fn bind_recording_callbacks(
         };
         if ui.get_app_mode() == AppMode::Recording {
             submit_to_ui(&ui, &worker_for_abort, IdeWorkerCommand::AbortRecording);
+        }
+    });
+}
+
+fn bind_scene_performance_capture_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+
+    let weak = ui.as_weak();
+    let worker_for_start = Rc::clone(worker);
+    actions.on_start_scene_performance_capture(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_transport_start_available()
+            || ui.get_loop_engaged()
+        {
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_start,
+            IdeWorkerCommand::StartScenePerformanceCapture,
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_stop = Rc::clone(worker);
+    actions.on_stop_scene_performance_capture(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() == AppMode::CapturingScenePerformance {
+            submit_to_ui(
+                &ui,
+                &worker_for_stop,
+                IdeWorkerCommand::StopScenePerformanceCapture,
+            );
         }
     });
 }
@@ -4856,7 +4895,12 @@ fn start_event_pump(
         }
         if !matches!(
             ui.get_app_mode(),
-            AppMode::Running | AppMode::Previewing | AppMode::Recording | AppMode::OutputTesting
+            AppMode::Running
+                | AppMode::Previewing
+                | AppMode::Recording
+                | AppMode::CapturingScenePerformance
+                | AppMode::StoppingScenePerformance
+                | AppMode::OutputTesting
         ) {
             observation_pending = false;
         } else if !observation_pending {
@@ -4878,6 +4922,8 @@ fn completes_observation(event: &IdeWorkerEvent) -> bool {
         event,
         IdeWorkerEvent::Running(_)
             | IdeWorkerEvent::Recording(_)
+            | IdeWorkerEvent::ScenePerformanceCaptureProgress { .. }
+            | IdeWorkerEvent::ScenePerformanceCaptureStopping { .. }
             | IdeWorkerEvent::OutputTest(_)
             | IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::Observe,
@@ -5030,10 +5076,24 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
             AppMode::FinalizingRecording
         }
+        IdeWorkerCommandKind::CaptureScenePerformance => {
+            scene_performance_capture_submission_mode(current)
+        }
         IdeWorkerCommandKind::StartAudioPreview | IdeWorkerCommandKind::StartAudioClipPreview => {
             AppMode::PreparingPreview
         }
         _ => current,
+    }
+}
+
+fn scene_performance_capture_submission_mode(current: AppMode) -> AppMode {
+    if matches!(
+        current,
+        AppMode::CapturingScenePerformance | AppMode::StoppingScenePerformance
+    ) {
+        AppMode::StoppingScenePerformance
+    } else {
+        AppMode::CapturingScenePerformance
     }
 }
 
@@ -5266,6 +5326,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::StopRecording => "Verifying and importing the recorded take…",
         IdeWorkerCommandKind::AbortRecording => "Aborting capture and retaining recovery data…",
+        IdeWorkerCommandKind::CaptureScenePerformance => {
+            "Scene-performance capture command queued…"
+        }
         IdeWorkerCommandKind::StartAudioPreview => {
             "Stopping transport and preparing dry take audition…"
         }
@@ -5878,6 +5941,13 @@ fn apply_event(
         }
         IdeWorkerEvent::RecordingImported(outcome) => apply_recording_imported(ui, &outcome),
         IdeWorkerEvent::RecordingAborted(outcome) => apply_recording_aborted(ui, &outcome),
+        event @ (IdeWorkerEvent::ScenePerformanceCaptureStarted { .. }
+        | IdeWorkerEvent::ScenePerformanceCaptureProgress { .. }
+        | IdeWorkerEvent::ScenePerformanceCaptureStopping { .. }
+        | IdeWorkerEvent::ScenePerformanceCaptureSaving { .. }
+        | IdeWorkerEvent::ScenePerformanceCaptureSaved { .. }) => {
+            apply_scene_performance_capture_event(ui, &event);
+        }
         event @ (IdeWorkerEvent::AudioPreviewPreparing
         | IdeWorkerEvent::AudioPreviewStopRequested
         | IdeWorkerEvent::AudioPreviewControlApplied(_)) => apply_audio_preview_event(ui, &event),
@@ -6674,6 +6744,7 @@ fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWor
         unreachable!("arrangement committed-warning dispatcher received another event");
     };
     let action = match command {
+        IdeWorkerCommandKind::CaptureScenePerformance => "Scene-performance capture".to_owned(),
         IdeWorkerCommandKind::AddArrangementSceneLaunch => {
             reset_arrangement_scene_launch_addition_form(ui);
             "Arrangement scene marker".to_owned()
@@ -8565,6 +8636,86 @@ fn apply_recording_event(ui: &MainWindow, state: &hyper_desktop_ide::IdeRecordin
     ui.set_error_text(SharedString::default());
 }
 
+fn apply_scene_performance_capture_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ScenePerformanceCaptureStarted {
+            maximum_launch_count,
+        } => {
+            ui.set_app_mode(AppMode::CapturingScenePerformance);
+            ui.set_scene_performance_capture_launch_count(0);
+            ui.set_status_text(
+                format!(
+                    "Scene capture armed: transport start is queued; committed grid launches will be retained (0 of {maximum_launch_count})"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ScenePerformanceCaptureProgress { launch_count } => {
+            ui.set_app_mode(AppMode::CapturingScenePerformance);
+            ui.set_scene_performance_capture_launch_count(
+                i32::try_from(*launch_count).unwrap_or(i32::MAX),
+            );
+            ui.set_status_text(
+                format!(
+                    "Scene capture active: {launch_count} committed grid {} will be saved as one arrangement edit",
+                    if *launch_count == 1 { "launch" } else { "launches" }
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ScenePerformanceCaptureStopping { launch_count } => {
+            ui.set_app_mode(AppMode::StoppingScenePerformance);
+            ui.set_scene_performance_capture_launch_count(
+                i32::try_from(*launch_count).unwrap_or(i32::MAX),
+            );
+            ui.set_status_text(
+                format!(
+                    "Ending scene capture after {launch_count} committed grid {}; waiting for the stopped audio cycle",
+                    if *launch_count == 1 { "launch" } else { "launches" }
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ScenePerformanceCaptureSaving { launch_count } => {
+            ui.set_app_mode(AppMode::SavingScenePerformance);
+            ui.set_scene_performance_capture_launch_count(
+                i32::try_from(*launch_count).unwrap_or(i32::MAX),
+            );
+            ui.set_status_text(
+                format!(
+                    "Saving {launch_count} committed grid {} as one atomic arrangement edit…",
+                    if *launch_count == 1 {
+                        "launch"
+                    } else {
+                        "launches"
+                    }
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ScenePerformanceCaptureSaved {
+            revision,
+            launch_count,
+        } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_scene_performance_capture_launch_count(0);
+            ui.set_status_text(
+                format!(
+                    "Saved {launch_count} committed grid {} in project revision {revision} as one arrangement edit",
+                    if *launch_count == 1 { "launch" } else { "launches" }
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("scene-performance capture dispatcher received another event"),
+    }
+}
+
 fn set_recording_targets(
     ui: &MainWindow,
     recording_routes: &RecordingRoutes,
@@ -9492,6 +9643,21 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         {
             AppMode::Running
         }
+        IdeWorkerCommandKind::CaptureScenePerformance
+            if current == AppMode::CapturingScenePerformance =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::CaptureScenePerformance
+            if current == AppMode::StoppingScenePerformance =>
+        {
+            AppMode::CapturingScenePerformance
+        }
+        IdeWorkerCommandKind::CaptureScenePerformance
+            if current == AppMode::SavingScenePerformance =>
+        {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::StartAudioPreview | IdeWorkerCommandKind::StartAudioClipPreview
             if current == AppMode::PreparingPreview =>
         {
@@ -9933,7 +10099,7 @@ fn validate_scene_launch(
     if scene.index != index {
         return Err(SceneLaunchFailure::StaleSelection);
     }
-    if mode != AppMode::Running || !scene.launchable {
+    if !matches!(mode, AppMode::Running | AppMode::CapturingScenePerformance) || !scene.launchable {
         return Err(SceneLaunchFailure::NotReady);
     }
     Ok(scene_index)
@@ -15831,6 +15997,10 @@ mod tests {
 
         assert_eq!(validate_scene_launch(AppMode::Running, 0, &scenes), Ok(0));
         assert_eq!(
+            validate_scene_launch(AppMode::CapturingScenePerformance, 0, &scenes),
+            Ok(0)
+        );
+        assert_eq!(
             validate_scene_launch(AppMode::Closed, 0, &scenes),
             Err(SceneLaunchFailure::NotReady)
         );
@@ -15845,6 +16015,71 @@ mod tests {
         assert_eq!(
             validate_scene_launch(AppMode::Running, -1, &scenes),
             Err(SceneLaunchFailure::InvalidSelection)
+        );
+    }
+
+    #[test]
+    fn scene_performance_capture_ui_lifecycle_reports_committed_boundaries() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+
+        apply_scene_performance_capture_event(
+            &ui,
+            &IdeWorkerEvent::ScenePerformanceCaptureStarted {
+                maximum_launch_count: 4,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::CapturingScenePerformance);
+        assert_eq!(ui.get_scene_performance_capture_launch_count(), 0);
+        assert!(ui.get_status_text().contains("transport start is queued"));
+
+        apply_scene_performance_capture_event(
+            &ui,
+            &IdeWorkerEvent::ScenePerformanceCaptureProgress { launch_count: 1 },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::CapturingScenePerformance);
+        assert_eq!(ui.get_scene_performance_capture_launch_count(), 1);
+        assert!(ui.get_status_text().contains("1 committed grid launch"));
+
+        apply_scene_performance_capture_event(
+            &ui,
+            &IdeWorkerEvent::ScenePerformanceCaptureStopping { launch_count: 1 },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::StoppingScenePerformance);
+        assert!(ui.get_status_text().contains("stopped audio cycle"));
+
+        apply_scene_performance_capture_event(
+            &ui,
+            &IdeWorkerEvent::ScenePerformanceCaptureSaving { launch_count: 1 },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::SavingScenePerformance);
+        assert!(ui.get_status_text().contains("one atomic arrangement edit"));
+
+        apply_scene_performance_capture_event(
+            &ui,
+            &IdeWorkerEvent::ScenePerformanceCaptureSaved {
+                revision: 7,
+                launch_count: 1,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(ui.get_scene_performance_capture_launch_count(), 0);
+        assert!(ui.get_status_text().contains("project revision 7"));
+
+        assert_eq!(
+            scene_performance_capture_submission_mode(AppMode::Running),
+            AppMode::CapturingScenePerformance
+        );
+        assert_eq!(
+            scene_performance_capture_submission_mode(AppMode::CapturingScenePerformance),
+            AppMode::StoppingScenePerformance
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::StoppingScenePerformance,
+                IdeWorkerCommandKind::CaptureScenePerformance,
+            ),
+            AppMode::CapturingScenePerformance
         );
     }
 

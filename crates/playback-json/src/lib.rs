@@ -1666,6 +1666,7 @@ pub enum ArrangementPlacementDocumentSerializationError {
     SourceArrangementMismatch,
     PlacementCapacity,
     SceneLaunchCapacity,
+    EmptySceneLaunchBatch,
     ClipMissing,
     SceneMissing,
     InvalidArrangementIdentity,
@@ -1702,6 +1703,8 @@ pub type ArrangementPlacementDuplicationSerializationError =
 pub type ArrangementPlacementSplitSerializationError =
     ArrangementPlacementDocumentSerializationError;
 pub type ArrangementSceneLaunchAdditionSerializationError =
+    ArrangementPlacementDocumentSerializationError;
+pub type ArrangementSceneLaunchBatchAdditionSerializationError =
     ArrangementPlacementDocumentSerializationError;
 pub type ArrangementSceneLaunchMoveSerializationError =
     ArrangementPlacementDocumentSerializationError;
@@ -2193,6 +2196,9 @@ impl fmt::Display for ArrangementPlacementDocumentSerializationError {
             Self::SceneLaunchCapacity => {
                 formatter.write_str("the arrangement scene-launch capacity is exhausted")
             }
+            Self::EmptySceneLaunchBatch => {
+                formatter.write_str("a scene-launch batch must contain at least one launch")
+            }
             Self::ClipMissing => {
                 formatter.write_str("the selected reusable audio clip is not present")
             }
@@ -2235,6 +2241,7 @@ impl Error for ArrangementPlacementDocumentSerializationError {
             | Self::SourceArrangementMismatch
             | Self::PlacementCapacity
             | Self::SceneLaunchCapacity
+            | Self::EmptySceneLaunchBatch
             | Self::ClipMissing
             | Self::SceneMissing
             | Self::InvalidArrangementIdentity
@@ -6107,61 +6114,66 @@ pub fn serialize_arrangement_placement_addition(
     append_arrangement_placement(project, assets, &mut value, placement, limits)
 }
 
-/// Adds one scene launch to the linear arrangement at an exact project tick.
+/// One new scene launch for an atomic arrangement addition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArrangementSceneLaunchAddition<'a> {
+    id: &'a str,
+    scene_id: &'a str,
+    tick: u64,
+}
+
+impl<'a> ArrangementSceneLaunchAddition<'a> {
+    #[must_use]
+    pub const fn new(id: &'a str, scene_id: &'a str, tick: u64) -> Self {
+        Self { id, scene_id, tick }
+    }
+
+    #[must_use]
+    pub const fn id(self) -> &'a str {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn scene_id(self) -> &'a str {
+        self.scene_id
+    }
+
+    #[must_use]
+    pub const fn tick(self) -> u64 {
+        self.tick
+    }
+}
+
+/// Adds scene launches atomically without rewriting unrelated arrangement
+/// content.
 ///
-/// The launch receives a new stable event identity and references an existing
-/// scene. Existing placements, launches, arrangement metadata, and namespaced
-/// extensions are preserved. If the project has no arrangement, this creates
-/// its single version-1 `Main` arrangement.
-///
-/// Version 1 permits at most one scene launch at a tick. The canonical
-/// arrangement is reloaded and the complete playback graph is compiled before
-/// bytes are returned.
+/// The batch has one stable identity per launch and may reference only scenes
+/// already present in the loaded project. Version 1 permits at most one launch
+/// at a tick, including within this batch. The canonical result is reloaded and
+/// the complete playback graph is compiled before bytes are returned.
 ///
 /// # Errors
 ///
-/// Returns a classified rejection for stale or unexpected source bytes, a
-/// missing scene, invalid or colliding identities, an occupied tick, exhausted
-/// capacity, or any non-executable resulting project.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the edit boundary explicitly binds project, assets, source authority, new identities, scene identity, and exact launch time"
-)]
-pub fn serialize_arrangement_scene_launch_addition(
+/// Returns a classified rejection for empty or over-capacity batches, stale or
+/// unexpected source bytes, missing scenes, duplicate/colliding identities or
+/// ticks, or any non-executable resulting project.
+pub fn serialize_arrangement_scene_launch_additions(
     project: &LoadedPlaybackProject,
     assets: &[MediaAssetFact<'_>],
     source_arrangement: Option<&[u8]>,
     arrangement_id: &str,
-    launch_id: &str,
-    scene_id: &str,
-    tick: u64,
+    additions: &[ArrangementSceneLaunchAddition<'_>],
     limits: LoaderLimits,
-) -> Result<Vec<u8>, ArrangementSceneLaunchAdditionSerializationError> {
-    if !project.scenes.iter().any(|scene| scene.id == scene_id) {
-        return Err(ArrangementPlacementDocumentSerializationError::SceneMissing);
+) -> Result<Vec<u8>, ArrangementSceneLaunchBatchAdditionSerializationError> {
+    if additions.is_empty() {
+        return Err(ArrangementPlacementDocumentSerializationError::EmptySceneLaunchBatch);
     }
     let launch_count = project
         .arrangement
         .as_ref()
         .map_or(0, |arrangement| arrangement.scene_launches.len());
-    if launch_count >= limits.max_scene_launches {
+    if additions.len() > limits.max_scene_launches.saturating_sub(launch_count) {
         return Err(ArrangementPlacementDocumentSerializationError::SceneLaunchCapacity);
-    }
-    if project.arrangement.as_ref().is_some_and(|arrangement| {
-        arrangement
-            .scene_launches
-            .iter()
-            .any(|launch| launch.tick == tick)
-    }) {
-        return Err(ArrangementPlacementDocumentSerializationError::SceneLaunchTickOccupied);
-    }
-    if !is_valid_entity_id(launch_id)
-        || launch_id == project.project_id
-        || launch_id == arrangement_id
-        || project_contains_identity(project, launch_id)
-        || assets.iter().any(|asset| asset.id == launch_id)
-    {
-        return Err(ArrangementPlacementDocumentSerializationError::InvalidSceneLaunchIdentity);
     }
     if project.arrangement.is_none()
         && (!is_valid_entity_id(arrangement_id)
@@ -6170,6 +6182,36 @@ pub fn serialize_arrangement_scene_launch_addition(
             || assets.iter().any(|asset| asset.id == arrangement_id))
     {
         return Err(ArrangementPlacementDocumentSerializationError::InvalidArrangementIdentity);
+    }
+
+    let mut launch_ids = BTreeSet::new();
+    let mut launch_ticks = BTreeSet::new();
+    for addition in additions {
+        if !project
+            .scenes
+            .iter()
+            .any(|scene| scene.id == addition.scene_id)
+        {
+            return Err(ArrangementPlacementDocumentSerializationError::SceneMissing);
+        }
+        if !is_valid_entity_id(addition.id)
+            || addition.id == project.project_id
+            || addition.id == arrangement_id
+            || project_contains_identity(project, addition.id)
+            || assets.iter().any(|asset| asset.id == addition.id)
+            || !launch_ids.insert(addition.id)
+        {
+            return Err(ArrangementPlacementDocumentSerializationError::InvalidSceneLaunchIdentity);
+        }
+        if project.arrangement.as_ref().is_some_and(|arrangement| {
+            arrangement
+                .scene_launches
+                .iter()
+                .any(|launch| launch.tick == addition.tick)
+        }) || !launch_ticks.insert(addition.tick)
+        {
+            return Err(ArrangementPlacementDocumentSerializationError::SceneLaunchTickOccupied);
+        }
     }
 
     let mut value = prepare_arrangement_placement_addition_document(
@@ -6182,7 +6224,13 @@ pub fn serialize_arrangement_scene_launch_addition(
         .get_mut("scene_launches")
         .and_then(Value::as_array_mut)
         .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
-    launches.push(json!({"id": launch_id, "tick": tick, "scene_id": scene_id}));
+    launches.extend(additions.iter().map(|addition| {
+        json!({
+            "id": addition.id,
+            "tick": addition.tick,
+            "scene_id": addition.scene_id,
+        })
+    }));
     if launches
         .iter()
         .any(|launch| scene_launch_sort_key(launch).is_none())
@@ -6214,6 +6262,48 @@ pub fn serialize_arrangement_scene_launch_addition(
         .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
         .map_err(ArrangementPlacementDocumentSerializationError::ProjectCompilation)?;
     Ok(output)
+}
+
+/// Adds one scene launch to the linear arrangement at an exact project tick.
+///
+/// The launch receives a new stable event identity and references an existing
+/// scene. Existing placements, launches, arrangement metadata, and namespaced
+/// extensions are preserved. If the project has no arrangement, this creates
+/// its single version-1 `Main` arrangement.
+///
+/// Version 1 permits at most one scene launch at a tick. The canonical
+/// arrangement is reloaded and the complete playback graph is compiled before
+/// bytes are returned.
+///
+/// # Errors
+///
+/// Returns a classified rejection for stale or unexpected source bytes, a
+/// missing scene, invalid or colliding identities, an occupied tick, exhausted
+/// capacity, or any non-executable resulting project.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the edit boundary explicitly binds project, assets, source authority, new identities, scene identity, and exact launch time"
+)]
+pub fn serialize_arrangement_scene_launch_addition(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_arrangement: Option<&[u8]>,
+    arrangement_id: &str,
+    launch_id: &str,
+    scene_id: &str,
+    tick: u64,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ArrangementSceneLaunchAdditionSerializationError> {
+    serialize_arrangement_scene_launch_additions(
+        project,
+        assets,
+        source_arrangement,
+        arrangement_id,
+        &[ArrangementSceneLaunchAddition::new(
+            launch_id, scene_id, tick,
+        )],
+        limits,
+    )
 }
 
 /// Moves one persisted scene launch to an exact project tick while preserving
@@ -9238,6 +9328,14 @@ impl LoadedPlaybackProject {
     #[must_use]
     pub fn scene_enabled(&self, scene_index: usize) -> Option<bool> {
         self.scenes.get(scene_index).map(|scene| scene.enabled)
+    }
+
+    /// Returns the validated interactive launch quantization for one scene.
+    #[must_use]
+    pub fn scene_launch_quantization(&self, scene_index: usize) -> Option<LaunchQuantization> {
+        self.scenes
+            .get(scene_index)
+            .map(|scene| scene.launch_quantization)
     }
 
     /// Returns the persisted action for one validated scene/track pair.
@@ -15937,6 +16035,141 @@ mod tests {
                 SceneLimits::VERSION_1,
             )
             .unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one batch scenario keeps canonical ordering, reopenability, and each atomic refusal boundary together"
+    )]
+    fn arrangement_scene_launch_batch_addition_is_atomic_canonical_and_reopenable() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["placements"] = json!([]);
+        source["extensions"]["org.example.arrangement"] = json!({"opaque": true});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let arrangement_id = "018f47a2-6b2d-7c11-8a44-001122334463";
+        let scene_id = "018f47a2-6b2d-7c11-8a44-001122334461";
+        let additions = [
+            ArrangementSceneLaunchAddition::new(
+                "018f47a2-6b2d-7c11-8a44-001122334468",
+                scene_id,
+                8,
+            ),
+            ArrangementSceneLaunchAddition::new(
+                "018f47a2-6b2d-7c11-8a44-001122334467",
+                scene_id,
+                4,
+            ),
+        ];
+
+        let added = serialize_arrangement_scene_launch_additions(
+            &loaded,
+            &asset_facts(),
+            Some(&source),
+            arrangement_id,
+            &additions,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&added).unwrap();
+        assert_eq!(
+            value["scene_launches"],
+            json!([
+                {
+                    "id": "018f47a2-6b2d-7c11-8a44-001122334467",
+                    "tick": 4,
+                    "scene_id": scene_id,
+                },
+                {
+                    "id": "018f47a2-6b2d-7c11-8a44-001122334468",
+                    "tick": 8,
+                    "scene_id": scene_id,
+                },
+            ])
+        );
+        assert_eq!(
+            value["extensions"]["org.example.arrangement"],
+            json!({"opaque": true})
+        );
+        assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), added);
+        let reopened = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&added)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        reopened
+            .compile_playback(
+                &asset_facts(),
+                GraphLimits::VERSION_1,
+                SceneLimits::VERSION_1,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            serialize_arrangement_scene_launch_additions(
+                &loaded,
+                &asset_facts(),
+                Some(&source),
+                arrangement_id,
+                &[],
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementSceneLaunchBatchAdditionSerializationError::EmptySceneLaunchBatch)
+        ));
+        assert!(matches!(
+            serialize_arrangement_scene_launch_additions(
+                &loaded,
+                &asset_facts(),
+                Some(&source),
+                arrangement_id,
+                &[
+                    additions[0],
+                    ArrangementSceneLaunchAddition::new(additions[0].id(), scene_id, 12),
+                ],
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementSceneLaunchBatchAdditionSerializationError::InvalidSceneLaunchIdentity)
+        ));
+        assert!(matches!(
+            serialize_arrangement_scene_launch_additions(
+                &loaded,
+                &asset_facts(),
+                Some(&source),
+                arrangement_id,
+                &[
+                    additions[0],
+                    ArrangementSceneLaunchAddition::new(
+                        "018f47a2-6b2d-7c11-8a44-001122334469",
+                        scene_id,
+                        additions[0].tick(),
+                    ),
+                ],
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementSceneLaunchBatchAdditionSerializationError::SceneLaunchTickOccupied)
+        ));
+        assert!(matches!(
+            serialize_arrangement_scene_launch_additions(
+                &loaded,
+                &asset_facts(),
+                Some(&source),
+                arrangement_id,
+                &additions,
+                LoaderLimits {
+                    max_scene_launches: 1,
+                    ..LoaderLimits::VERSION_1
+                },
+            ),
+            Err(ArrangementSceneLaunchBatchAdditionSerializationError::SceneLaunchCapacity)
+        ));
     }
 
     #[test]

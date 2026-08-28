@@ -11,7 +11,11 @@ use std::time::{Duration, Instant};
 
 use hyper_desktop_audio::{DesktopAudioPreviewSnapshot, DesktopAudioPreviewState};
 use hyper_fs_authority::path_is_proven_absent;
-use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, TransportCommand};
+use hyper_mixer_runtime::{
+    InteractiveSceneLaunchObservation, LatestOutputMeterSnapshot, PlaybackRecoverySnapshot,
+    PlaybackRecoveryTransportState, TransportCommand,
+};
+use hyper_playback_compiler::scene::LaunchQuantization;
 use hyper_playback_json::SceneTrackAction;
 use hyper_project_history::{ProjectHistory, ProjectHistoryError, RecentProject};
 use hyper_project_model::{ResourceRole, is_valid_interactive_project_name};
@@ -229,6 +233,7 @@ pub enum IdeWorkerCommandKind {
     StartRecording,
     StopRecording,
     AbortRecording,
+    CaptureScenePerformance,
     StartAudioPreview,
     StartAudioClipPreview,
     StopAudioPreview,
@@ -545,6 +550,8 @@ pub enum IdeWorkerCommand {
     },
     StopRecording,
     AbortRecording,
+    StartScenePerformanceCapture,
+    StopScenePerformanceCapture,
     StartAudioPreview {
         asset_id: String,
     },
@@ -688,6 +695,9 @@ impl IdeWorkerCommand {
             Self::StartRecording { .. } => IdeWorkerCommandKind::StartRecording,
             Self::StopRecording => IdeWorkerCommandKind::StopRecording,
             Self::AbortRecording => IdeWorkerCommandKind::AbortRecording,
+            Self::StartScenePerformanceCapture | Self::StopScenePerformanceCapture => {
+                IdeWorkerCommandKind::CaptureScenePerformance
+            }
             Self::StartAudioPreview { .. } => IdeWorkerCommandKind::StartAudioPreview,
             Self::StartAudioClipPreview { .. } => IdeWorkerCommandKind::StartAudioClipPreview,
             Self::StopAudioPreview => IdeWorkerCommandKind::StopAudioPreview,
@@ -2118,6 +2128,149 @@ impl Error for IdeRuntimePreparationError {
     }
 }
 
+/// Why a bounded interactive scene-performance capture could not be saved.
+///
+/// The capture path fails closed: it never writes a partial arrangement when
+/// the committed event stream, transport state, or durable publication cannot
+/// prove the complete performance.
+#[derive(Debug)]
+pub enum IdeScenePerformanceCaptureError {
+    ProjectSnapshotUnavailable,
+    TransportMustBeStopped,
+    LoopEnabled,
+    NoRecordableGridScene,
+    NoRemainingArrangementCapacity,
+    EventSourceDisconnected,
+    EventOverflow {
+        dropped_event_count: usize,
+    },
+    LoopEnabledDuringCapture,
+    ImmediateLaunch {
+        scene_index: usize,
+    },
+    UnknownScene {
+        scene_index: usize,
+    },
+    NonGridScene {
+        scene_index: usize,
+    },
+    SequenceDiscontinuity {
+        expected: u64,
+        actual: u64,
+    },
+    DuplicateTick {
+        tick: u64,
+    },
+    CapacityUnavailable,
+    CaptureCapacityReached {
+        maximum_launch_count: usize,
+    },
+    NoLaunchesCaptured,
+    Transport(super::DesktopDirectControlError),
+    StopUnavailable {
+        capture: Box<Self>,
+        source: super::DesktopDirectControlError,
+    },
+    Arrangement(Box<IdeArrangementPlacementEditError>),
+}
+
+impl fmt::Display for IdeScenePerformanceCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProjectSnapshotUnavailable => {
+                formatter.write_str("running playback exposes no verified project snapshot")
+            }
+            Self::TransportMustBeStopped => {
+                formatter.write_str("scene-performance capture requires stopped transport")
+            }
+            Self::LoopEnabled => {
+                formatter.write_str("scene-performance capture cannot start while looping is enabled")
+            }
+            Self::NoRecordableGridScene => formatter.write_str(
+                "scene-performance capture requires at least one ready, enabled grid-quantized scene",
+            ),
+            Self::NoRemainingArrangementCapacity => formatter.write_str(
+                "the arrangement cannot accept another captured scene launch",
+            ),
+            Self::EventSourceDisconnected => {
+                formatter.write_str("the committed scene-launch event source disconnected")
+            }
+            Self::EventOverflow {
+                dropped_event_count,
+            } => write!(
+                formatter,
+                "{dropped_event_count} committed scene launches could not be captured"
+            ),
+            Self::LoopEnabledDuringCapture => formatter.write_str(
+                "looping was enabled during scene-performance capture, so its timing cannot be written to the arrangement",
+            ),
+            Self::ImmediateLaunch { scene_index } => write!(
+                formatter,
+                "scene {scene_index} launched immediately and has no durable arrangement tick"
+            ),
+            Self::UnknownScene { scene_index } => write!(
+                formatter,
+                "the committed scene launch references unknown scene index {scene_index}"
+            ),
+            Self::NonGridScene { scene_index } => write!(
+                formatter,
+                "scene {scene_index} is not grid-quantized and cannot be captured into the arrangement"
+            ),
+            Self::SequenceDiscontinuity { expected, actual } => write!(
+                formatter,
+                "committed scene-launch sequence is incomplete: expected {expected}, received {actual}"
+            ),
+            Self::DuplicateTick { tick } => write!(
+                formatter,
+                "multiple captured scene launches resolve to arrangement tick {tick}"
+            ),
+            Self::CapacityUnavailable => {
+                formatter.write_str("scene-performance capture capacity is unavailable")
+            }
+            Self::CaptureCapacityReached {
+                maximum_launch_count,
+            } => write!(
+                formatter,
+                "scene-performance capture reached its {maximum_launch_count}-launch arrangement limit"
+            ),
+            Self::NoLaunchesCaptured => {
+                formatter.write_str("scene-performance capture ended without a committed grid launch")
+            }
+            Self::Transport(source) => source.fmt(formatter),
+            Self::StopUnavailable { capture, source } => write!(
+                formatter,
+                "scene-performance capture became invalid ({capture}) and transport stop could not be queued: {source}"
+            ),
+            Self::Arrangement(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeScenePerformanceCaptureError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Transport(source) | Self::StopUnavailable { source, .. } => Some(source),
+            Self::Arrangement(source) => Some(source),
+            Self::ProjectSnapshotUnavailable
+            | Self::TransportMustBeStopped
+            | Self::LoopEnabled
+            | Self::NoRecordableGridScene
+            | Self::NoRemainingArrangementCapacity
+            | Self::EventSourceDisconnected
+            | Self::EventOverflow { .. }
+            | Self::LoopEnabledDuringCapture
+            | Self::ImmediateLaunch { .. }
+            | Self::UnknownScene { .. }
+            | Self::NonGridScene { .. }
+            | Self::SequenceDiscontinuity { .. }
+            | Self::DuplicateTick { .. }
+            | Self::CapacityUnavailable
+            | Self::CaptureCapacityReached { .. }
+            | Self::NoLaunchesCaptured => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum IdeWorkerCommandFailure {
     Discovery(IdeOutputDiscoveryError),
@@ -2208,6 +2361,7 @@ pub enum IdeWorkerCommandFailure {
     SceneRename(Box<IdeSceneRenameError>),
     SceneActivation(Box<IdeSceneEditError>),
     Recording(IdeRecordingError),
+    ScenePerformanceCapture(Box<IdeScenePerformanceCaptureError>),
     AudioPreview(IdeAudioPreviewError),
     InvalidState,
     Publication(OutputInventoryError),
@@ -2372,6 +2526,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::SceneSlotEdit(source) => source.fmt(formatter),
             Self::SceneRename(source) | Self::SceneActivation(source) => source.fmt(formatter),
             Self::Recording(source) => source.fmt(formatter),
+            Self::ScenePerformanceCapture(source) => source.fmt(formatter),
             Self::AudioPreview(source) => source.fmt(formatter),
             Self::InvalidState => {
                 formatter.write_str("command is invalid for the current IDE state")
@@ -2470,6 +2625,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::SceneSlotEdit(source) => Some(source),
             Self::SceneRename(source) | Self::SceneActivation(source) => Some(source),
             Self::Recording(source) => Some(source),
+            Self::ScenePerformanceCapture(source) => Some(source),
             Self::AudioPreview(source) => Some(source),
             Self::Publication(source) => Some(source),
             Self::InputPublication(source) => Some(source),
@@ -2939,6 +3095,22 @@ pub enum IdeWorkerEvent {
     RecordingFinalizing,
     RecordingImported(IdeRecordingImportOutcome),
     RecordingAborted(IdeRecordingAbortOutcome),
+    ScenePerformanceCaptureStarted {
+        maximum_launch_count: usize,
+    },
+    ScenePerformanceCaptureProgress {
+        launch_count: usize,
+    },
+    ScenePerformanceCaptureStopping {
+        launch_count: usize,
+    },
+    ScenePerformanceCaptureSaving {
+        launch_count: usize,
+    },
+    ScenePerformanceCaptureSaved {
+        revision: u64,
+        launch_count: usize,
+    },
     AudioClipWaveform(super::IdeAudioClipWaveform),
     AudioPreviewPreparing,
     AudioPreviewStopRequested,
@@ -3394,6 +3566,169 @@ impl DesktopIdeWorkerPendingShutdown {
     }
 }
 
+#[derive(Debug)]
+struct CapturedScenePerformanceScene {
+    id: String,
+    grid_quantized: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CapturedScenePerformanceLaunch {
+    scene_index: usize,
+    tick: u64,
+}
+
+#[derive(Debug)]
+enum ScenePerformanceCapturePhase {
+    Capturing,
+    Stopping {
+        after_committed_cycle_count: u64,
+        failure: Option<IdeScenePerformanceCaptureError>,
+    },
+}
+
+/// Single-owner, lossless scene-performance capture state.
+///
+/// It deliberately retains scene indexes rather than duplicating scene IDs for
+/// every event. Structural project edits are unavailable while this state owns
+/// the running application, so the snapshot mapping cannot change before its
+/// one atomic arrangement publication.
+#[derive(Debug)]
+struct ScenePerformanceCapture {
+    scenes: Vec<CapturedScenePerformanceScene>,
+    launches: Vec<CapturedScenePerformanceLaunch>,
+    maximum_launch_count: usize,
+    last_sequence: Option<u64>,
+    has_observed_rolling: bool,
+    phase: ScenePerformanceCapturePhase,
+}
+
+impl ScenePerformanceCapture {
+    const fn new(scenes: Vec<CapturedScenePerformanceScene>, maximum_launch_count: usize) -> Self {
+        Self {
+            scenes,
+            launches: Vec::new(),
+            maximum_launch_count,
+            last_sequence: None,
+            has_observed_rolling: false,
+            phase: ScenePerformanceCapturePhase::Capturing,
+        }
+    }
+
+    fn captured_launch_count(&self) -> usize {
+        self.launches.len()
+    }
+
+    const fn is_capturing(&self) -> bool {
+        matches!(self.phase, ScenePerformanceCapturePhase::Capturing)
+    }
+
+    fn stopping_after_committed_cycle_count(&self) -> Option<u64> {
+        match self.phase {
+            ScenePerformanceCapturePhase::Capturing => None,
+            ScenePerformanceCapturePhase::Stopping {
+                after_committed_cycle_count,
+                ..
+            } => Some(after_committed_cycle_count),
+        }
+    }
+
+    fn begin_stopping(
+        &mut self,
+        after_committed_cycle_count: u64,
+        failure: Option<IdeScenePerformanceCaptureError>,
+    ) {
+        self.phase = ScenePerformanceCapturePhase::Stopping {
+            after_committed_cycle_count,
+            failure,
+        };
+    }
+
+    fn remember_failure(&mut self, failure: IdeScenePerformanceCaptureError) {
+        if let ScenePerformanceCapturePhase::Stopping {
+            failure: terminal_failure,
+            ..
+        } = &mut self.phase
+            && terminal_failure.is_none()
+        {
+            *terminal_failure = Some(failure);
+        }
+    }
+
+    fn take_terminal_failure(&mut self) -> Option<IdeScenePerformanceCaptureError> {
+        match &mut self.phase {
+            ScenePerformanceCapturePhase::Capturing => None,
+            ScenePerformanceCapturePhase::Stopping { failure, .. } => failure.take(),
+        }
+    }
+
+    fn observe_transport_state(&mut self, state: PlaybackRecoveryTransportState) {
+        self.has_observed_rolling |= state == PlaybackRecoveryTransportState::Rolling;
+    }
+
+    fn stopped_after_start(&self, state: PlaybackRecoveryTransportState) -> bool {
+        self.has_observed_rolling && state == PlaybackRecoveryTransportState::Stopped
+    }
+
+    fn observe(
+        &mut self,
+        observation: InteractiveSceneLaunchObservation,
+    ) -> Result<(), IdeScenePerformanceCaptureError> {
+        let launch = observation.launch();
+        self.observe_launch(
+            launch.scene_index(),
+            launch.arrangement_tick(),
+            launch.sequence(),
+            observation.loop_enabled(),
+        )
+    }
+
+    fn observe_launch(
+        &mut self,
+        scene_index: usize,
+        arrangement_tick: Option<u64>,
+        sequence: u64,
+        loop_enabled: bool,
+    ) -> Result<(), IdeScenePerformanceCaptureError> {
+        if loop_enabled {
+            return Err(IdeScenePerformanceCaptureError::LoopEnabledDuringCapture);
+        }
+        let Some(scene) = self.scenes.get(scene_index) else {
+            return Err(IdeScenePerformanceCaptureError::UnknownScene { scene_index });
+        };
+        if !scene.grid_quantized {
+            return Err(IdeScenePerformanceCaptureError::NonGridScene { scene_index });
+        }
+        let Some(tick) = arrangement_tick else {
+            return Err(IdeScenePerformanceCaptureError::ImmediateLaunch { scene_index });
+        };
+        if let Some(previous) = self.last_sequence {
+            let expected = previous.wrapping_add(1);
+            if sequence != expected {
+                return Err(IdeScenePerformanceCaptureError::SequenceDiscontinuity {
+                    expected,
+                    actual: sequence,
+                });
+            }
+        }
+        if self.launches.iter().any(|recorded| recorded.tick == tick) {
+            return Err(IdeScenePerformanceCaptureError::DuplicateTick { tick });
+        }
+        if self.launches.len() >= self.maximum_launch_count {
+            return Err(IdeScenePerformanceCaptureError::CaptureCapacityReached {
+                maximum_launch_count: self.maximum_launch_count,
+            });
+        }
+        self.launches
+            .try_reserve(1)
+            .map_err(|_| IdeScenePerformanceCaptureError::CapacityUnavailable)?;
+        self.launches
+            .push(CapturedScenePerformanceLaunch { scene_index, tick });
+        self.last_sequence = Some(sequence);
+        Ok(())
+    }
+}
+
 #[allow(
     clippy::large_enum_variant,
     reason = "state transitions move the sole application owner without allocating after native startup or shutdown"
@@ -3412,6 +3747,10 @@ enum WorkerState {
         command: IdeWorkerCommandKind,
     },
     Running(RunningDesktopIdeApplication),
+    ScenePerformanceCapture {
+        application: RunningDesktopIdeApplication,
+        capture: ScenePerformanceCapture,
+    },
     AutosaveFence {
         application: RunningDesktopIdeApplication,
         sequence: u64,
@@ -3562,6 +3901,10 @@ enum ProjectMutation {
     AddArrangementSceneLaunch {
         scene_id: String,
         tick: u64,
+    },
+    CaptureScenePerformance {
+        scenes: Vec<CapturedScenePerformanceScene>,
+        launches: Vec<CapturedScenePerformanceLaunch>,
     },
     MoveArrangementSceneLaunch {
         launch_id: String,
@@ -3745,6 +4088,7 @@ impl ProjectMutation {
             Self::AddArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::AddArrangementSceneLaunch
             }
+            Self::CaptureScenePerformance { .. } => IdeWorkerCommandKind::CaptureScenePerformance,
             Self::MoveArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::MoveArrangementSceneLaunch
             }
@@ -3852,6 +4196,11 @@ impl ProjectMutation {
             }
             Self::AddArrangementSceneLaunch { tick, .. } => {
                 IdeWorkerEvent::ArrangementSceneLaunchAdding { tick: *tick }
+            }
+            Self::CaptureScenePerformance { launches, .. } => {
+                IdeWorkerEvent::ScenePerformanceCaptureSaving {
+                    launch_count: launches.len(),
+                }
             }
             Self::MoveArrangementSceneLaunch { tick, .. } => {
                 IdeWorkerEvent::ArrangementSceneLaunchMoving { tick: *tick }
@@ -4139,6 +4488,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::EditNativeFilter => "native device",
         IdeWorkerCommandKind::AddArrangementPlacement => "placement",
         IdeWorkerCommandKind::AddArrangementSceneLaunch => "scene marker",
+        IdeWorkerCommandKind::CaptureScenePerformance => "scene performance capture",
         IdeWorkerCommandKind::DuplicateArrangementPlacement => "placement duplication",
         IdeWorkerCommandKind::SplitArrangementPlacement => "placement split",
         IdeWorkerCommandKind::AddScene => "scene",
@@ -4243,6 +4593,7 @@ fn run_worker(
                 | WorkerState::RecordingFence { .. }
                 | WorkerState::AudioPreviewFence { .. }
                 | WorkerState::CloseFence { .. }
+                | WorkerState::ScenePerformanceCapture { .. }
                 | WorkerState::RecordingClosing { .. }
                 | WorkerState::OutputTestStopping { .. }
                 | WorkerState::Closing(_)
@@ -4576,6 +4927,12 @@ fn process_command(
         }
         IdeWorkerCommand::StopRecording => finalize_recording(state, events),
         IdeWorkerCommand::AbortRecording => abort_recording(state, events),
+        IdeWorkerCommand::StartScenePerformanceCapture => {
+            start_scene_performance_capture(state, events)
+        }
+        IdeWorkerCommand::StopScenePerformanceCapture => {
+            stop_scene_performance_capture(state, events)
+        }
         IdeWorkerCommand::InspectAudioClipWaveform { clip_id } => {
             inspect_audio_clip_waveform(state, &clip_id, events)
         }
@@ -5401,6 +5758,31 @@ fn process_transport_command(
                 IdeWorkerCommandFailure::Transport(reason),
             ),
         },
+        WorkerState::ScenePerformanceCapture {
+            application,
+            capture: _,
+        } => match command {
+            TransportCommand::Stop => stop_scene_performance_capture(state, events),
+            TransportCommand::LaunchScene { .. } | TransportCommand::StopInteractiveScenes => {
+                match application.try_send_transport(command) {
+                    Ok(()) => send_event(events, IdeWorkerEvent::TransportQueued(command)),
+                    Err(reason) => publish_failure(
+                        events,
+                        IdeWorkerCommandKind::Transport,
+                        IdeWorkerCommandFailure::Transport(reason),
+                    ),
+                }
+            }
+            TransportCommand::Start
+            | TransportCommand::Locate { .. }
+            | TransportCommand::SetLoopRange(_)
+            | TransportCommand::SetLoopEnabled(_)
+            | TransportCommand::SetMetronomeEnabled(_) => publish_failure(
+                events,
+                IdeWorkerCommandKind::Transport,
+                IdeWorkerCommandFailure::InvalidState,
+            ),
+        },
         _ => publish_failure(
             events,
             IdeWorkerCommandKind::Transport,
@@ -5833,6 +6215,320 @@ fn process_input_command(
         Ok(()) => publish_state(state, events, unpublished_native_failure),
         Err(reason) => publish_failure(events, kind, reason),
     }
+}
+
+fn scene_performance_capture_scenes(
+    snapshot: &RunningIdeSnapshot<'_>,
+) -> Result<(Vec<CapturedScenePerformanceScene>, bool), IdeScenePerformanceCaptureError> {
+    let mut scenes = Vec::new();
+    scenes
+        .try_reserve_exact(snapshot.scene_count)
+        .map_err(|_| IdeScenePerformanceCaptureError::CapacityUnavailable)?;
+    let mut has_recordable_grid_scene = false;
+    for scene_index in 0..snapshot.scene_count {
+        let quantization = snapshot
+            .loaded
+            .scene_launch_quantization(scene_index)
+            .ok_or(IdeScenePerformanceCaptureError::ProjectSnapshotUnavailable)?;
+        let grid_quantized = matches!(quantization, LaunchQuantization::Grid { .. });
+        if grid_quantized
+            && snapshot.scene_active[scene_index]
+            && snapshot.scene_availability[scene_index] == IdeSceneAvailability::Ready
+        {
+            has_recordable_grid_scene = true;
+        }
+        let scene_id = snapshot.scene_ids[scene_index];
+        let mut owned_scene_id = String::new();
+        owned_scene_id
+            .try_reserve_exact(scene_id.len())
+            .map_err(|_| IdeScenePerformanceCaptureError::CapacityUnavailable)?;
+        owned_scene_id.push_str(scene_id);
+        scenes.push(CapturedScenePerformanceScene {
+            id: owned_scene_id,
+            grid_quantized,
+        });
+    }
+    Ok((scenes, has_recordable_grid_scene))
+}
+
+fn publish_scene_performance_capture_failure(
+    events: &SyncSender<IdeWorkerEvent>,
+    reason: IdeScenePerformanceCaptureError,
+) -> bool {
+    publish_failure(
+        events,
+        IdeWorkerCommandKind::CaptureScenePerformance,
+        IdeWorkerCommandFailure::ScenePerformanceCapture(Box::new(reason)),
+    )
+}
+
+fn start_scene_performance_capture(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let WorkerState::Running(application) = state else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CaptureScenePerformance,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    };
+    if application.audio_preview_is_active() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CaptureScenePerformance,
+            IdeWorkerCommandFailure::AudioPreview(IdeAudioPreviewError::Command(
+                hyper_desktop_audio::DesktopAudioPreviewCommandError::PreviewBusy,
+            )),
+        );
+    }
+    let (recovery, scenes, has_recordable_grid_scene) = match application.snapshot() {
+        Some(snapshot) => match scene_performance_capture_scenes(&snapshot) {
+            Ok((scenes, has_recordable_grid_scene)) => {
+                (snapshot.recovery, scenes, has_recordable_grid_scene)
+            }
+            Err(reason) => return publish_scene_performance_capture_failure(events, reason),
+        },
+        None => {
+            return publish_scene_performance_capture_failure(
+                events,
+                IdeScenePerformanceCaptureError::ProjectSnapshotUnavailable,
+            );
+        }
+    };
+    if recovery.state() != PlaybackRecoveryTransportState::Stopped {
+        return publish_scene_performance_capture_failure(
+            events,
+            IdeScenePerformanceCaptureError::TransportMustBeStopped,
+        );
+    }
+    if recovery.loop_enabled() {
+        return publish_scene_performance_capture_failure(
+            events,
+            IdeScenePerformanceCaptureError::LoopEnabled,
+        );
+    }
+    if !has_recordable_grid_scene {
+        return publish_scene_performance_capture_failure(
+            events,
+            IdeScenePerformanceCaptureError::NoRecordableGridScene,
+        );
+    }
+    let Some(maximum_launch_count) = application.remaining_scene_launch_capture_capacity() else {
+        return publish_scene_performance_capture_failure(
+            events,
+            IdeScenePerformanceCaptureError::ProjectSnapshotUnavailable,
+        );
+    };
+    if maximum_launch_count == 0 {
+        return publish_scene_performance_capture_failure(
+            events,
+            IdeScenePerformanceCaptureError::NoRemainingArrangementCapacity,
+        );
+    }
+
+    // Events before the start command belong to no capture. Overflow from that
+    // discarded history cannot make the new, post-start capture incomplete;
+    // a disconnected producer remains terminal evidence.
+    let discarded_history = application.drain_interactive_scene_launches(|_| {});
+    if discarded_history.sender_disconnected() {
+        return publish_scene_performance_capture_failure(
+            events,
+            IdeScenePerformanceCaptureError::EventSourceDisconnected,
+        );
+    }
+    if let Err(source) = application.try_send_transport(TransportCommand::Start) {
+        return publish_scene_performance_capture_failure(
+            events,
+            IdeScenePerformanceCaptureError::Transport(source),
+        );
+    }
+    let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("running state was checked before scene-performance capture transfer");
+    };
+    *state = WorkerState::ScenePerformanceCapture {
+        application,
+        capture: ScenePerformanceCapture::new(scenes, maximum_launch_count),
+    };
+    send_event(
+        events,
+        IdeWorkerEvent::ScenePerformanceCaptureStarted {
+            maximum_launch_count,
+        },
+    )
+}
+
+fn queue_scene_performance_capture_stop(
+    application: &mut RunningDesktopIdeApplication,
+    capture: &mut ScenePerformanceCapture,
+    failure: Option<IdeScenePerformanceCaptureError>,
+) -> Result<(), IdeScenePerformanceCaptureError> {
+    if !capture.is_capturing() {
+        return Ok(());
+    }
+    let recovery = application
+        .snapshot()
+        .map(|snapshot| snapshot.recovery)
+        .ok_or(IdeScenePerformanceCaptureError::ProjectSnapshotUnavailable)?;
+    match application.try_send_transport(TransportCommand::Stop) {
+        Ok(()) => {
+            capture.begin_stopping(recovery.committed_cycle_count(), failure);
+            Ok(())
+        }
+        Err(source) => match failure {
+            Some(capture) => Err(IdeScenePerformanceCaptureError::StopUnavailable {
+                capture: Box::new(capture),
+                source,
+            }),
+            None => Err(IdeScenePerformanceCaptureError::Transport(source)),
+        },
+    }
+}
+
+fn stop_scene_performance_capture(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let WorkerState::ScenePerformanceCapture {
+        application,
+        capture,
+    } = state
+    else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CaptureScenePerformance,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    };
+    if let Err(reason) = queue_scene_performance_capture_stop(application, capture, None) {
+        return publish_scene_performance_capture_failure(events, reason);
+    }
+    send_event(
+        events,
+        IdeWorkerEvent::ScenePerformanceCaptureStopping {
+            launch_count: capture.captured_launch_count(),
+        },
+    )
+}
+
+fn finish_scene_performance_capture_failure(
+    state: &mut WorkerState,
+    application: RunningDesktopIdeApplication,
+    reason: IdeScenePerformanceCaptureError,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    *state = WorkerState::Running(application);
+    let mut no_native_failure = None;
+    if !publish_state(state, events, &mut no_native_failure) {
+        return false;
+    }
+    publish_scene_performance_capture_failure(events, reason)
+}
+
+fn complete_scene_performance_capture(
+    state: &mut WorkerState,
+    application: RunningDesktopIdeApplication,
+    mut capture: ScenePerformanceCapture,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    if let Some(reason) = capture.take_terminal_failure() {
+        return finish_scene_performance_capture_failure(state, application, reason, events);
+    }
+    if capture.launches.is_empty() {
+        return finish_scene_performance_capture_failure(
+            state,
+            application,
+            IdeScenePerformanceCaptureError::NoLaunchesCaptured,
+            events,
+        );
+    }
+    *state = WorkerState::Running(application);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::CaptureScenePerformance {
+            scenes: capture.scenes,
+            launches: capture.launches,
+        },
+    )
+}
+
+fn poll_scene_performance_capture(
+    state: &mut WorkerState,
+    mut application: RunningDesktopIdeApplication,
+    mut capture: ScenePerformanceCapture,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let recovery = match application.snapshot() {
+        Some(snapshot) => snapshot.recovery,
+        None => {
+            return finish_scene_performance_capture_failure(
+                state,
+                application,
+                IdeScenePerformanceCaptureError::ProjectSnapshotUnavailable,
+                events,
+            );
+        }
+    };
+    capture.observe_transport_state(recovery.state());
+    let mut observation_failure = None;
+    let drain = application.drain_interactive_scene_launches(|observation| {
+        if observation_failure.is_none() {
+            observation_failure = capture.observe(observation).err();
+        }
+    });
+    if drain.dropped_event_count() > 0 {
+        observation_failure = Some(IdeScenePerformanceCaptureError::EventOverflow {
+            dropped_event_count: drain.dropped_event_count(),
+        });
+    }
+    if drain.sender_disconnected() {
+        observation_failure = Some(IdeScenePerformanceCaptureError::EventSourceDisconnected);
+    }
+    if capture.is_capturing() && recovery.loop_enabled() {
+        observation_failure = Some(IdeScenePerformanceCaptureError::LoopEnabledDuringCapture);
+    }
+    if let Some(reason) = observation_failure {
+        if capture.is_capturing() {
+            if let Err(reason) =
+                queue_scene_performance_capture_stop(&mut application, &mut capture, Some(reason))
+            {
+                return finish_scene_performance_capture_failure(
+                    state,
+                    application,
+                    reason,
+                    events,
+                );
+            }
+        } else {
+            capture.remember_failure(reason);
+        }
+    }
+
+    if capture.is_capturing() && capture.stopped_after_start(recovery.state()) {
+        // An external control binding may have stopped transport directly. The
+        // stopped recovery snapshot was read before this drain, and the native
+        // publisher enqueues its launch before publishing recovery, so this is
+        // a complete committed stop boundary too.
+        return complete_scene_performance_capture(state, application, capture, events);
+    }
+    if capture
+        .stopping_after_committed_cycle_count()
+        .is_some_and(|after| {
+            recovery.state() == PlaybackRecoveryTransportState::Stopped
+                && recovery.committed_cycle_count() > after
+        })
+    {
+        // The event publisher runs before recovery publication in the native
+        // commit path. Draining after this later stopped snapshot therefore
+        // includes every launch that can belong to the completed capture.
+        return complete_scene_performance_capture(state, application, capture, events);
+    }
+    *state = WorkerState::ScenePerformanceCapture {
+        application,
+        capture,
+    };
+    true
 }
 
 fn start_recording(
@@ -8210,6 +8906,10 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             result: Ok(outcome),
             ..
         }
+        | ProjectMutationAttempt::CaptureScenePerformance {
+            result: Ok(outcome),
+            ..
+        }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch {
             result: Ok(outcome),
             ..
@@ -8434,6 +9134,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::DiscardRecordingTake(Err(_))
         | ProjectMutationAttempt::AddArrangementPlacement { result: Err(_), .. }
         | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Err(_), .. }
+        | ProjectMutationAttempt::CaptureScenePerformance { result: Err(_), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::SetArrangementLoopRange { result: Err(_) }
         | ProjectMutationAttempt::SetTempo { result: Err(_), .. }
@@ -9254,6 +9955,13 @@ fn project_mutation_save_failure(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::CaptureScenePerformance { .. } => {
+            IdeWorkerCommandFailure::ScenePerformanceCapture(Box::new(
+                IdeScenePerformanceCaptureError::Arrangement(Box::new(
+                    IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
+                )),
+            ))
+        }
         ProjectMutation::MoveArrangementSceneLaunch { .. } => {
             IdeWorkerCommandFailure::ArrangementSceneLaunchMove(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -9574,6 +10282,13 @@ fn project_mutation_native_close_failure(
         ProjectMutation::AddArrangementSceneLaunch { .. } => {
             IdeWorkerCommandFailure::ArrangementSceneLaunchAddition(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
+            ))
+        }
+        ProjectMutation::CaptureScenePerformance { .. } => {
+            IdeWorkerCommandFailure::ScenePerformanceCapture(Box::new(
+                IdeScenePerformanceCaptureError::Arrangement(Box::new(
+                    IdeArrangementPlacementEditError::NativeClose(failure),
+                )),
             ))
         }
         ProjectMutation::MoveArrangementSceneLaunch { .. } => {
@@ -9898,6 +10613,13 @@ enum ProjectMutationAttempt {
     AddArrangementSceneLaunch {
         scene_id: String,
         tick: u64,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeArrangementPlacementEditError,
+        >,
+    },
+    CaptureScenePerformance {
+        launch_count: usize,
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeArrangementPlacementEditError,
@@ -10929,6 +11651,29 @@ fn complete_project_mutation(
                     IdeWorkerCommandKind::AddArrangementSceneLaunch,
                     reason,
                     IdeWorkerCommandFailure::ArrangementSceneLaunchAddition,
+                ),
+                ProjectMutationAttempt::CaptureScenePerformance {
+                    launch_count,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::ScenePerformanceCaptureSaved {
+                        revision: outcome.project_revision(),
+                        launch_count,
+                    },
+                ),
+                ProjectMutationAttempt::CaptureScenePerformance {
+                    result: Err(reason),
+                    ..
+                } => publish_arrangement_edit_failure(
+                    events,
+                    IdeWorkerCommandKind::CaptureScenePerformance,
+                    reason,
+                    |reason| {
+                        IdeWorkerCommandFailure::ScenePerformanceCapture(Box::new(
+                            IdeScenePerformanceCaptureError::Arrangement(reason),
+                        ))
+                    },
                 ),
                 ProjectMutationAttempt::SetMeter {
                     numerator,
@@ -12377,6 +13122,18 @@ fn attempt_project_mutation(
                 ),
             }
         }
+        ProjectMutation::CaptureScenePerformance { scenes, launches } => {
+            ProjectMutationAttempt::CaptureScenePerformance {
+                launch_count: launches.len(),
+                result: attempt_scene_performance_capture(
+                    application,
+                    recovery,
+                    &scenes,
+                    &launches,
+                    native_failure,
+                ),
+            }
+        }
         ProjectMutation::SetMeter {
             numerator,
             denominator,
@@ -13110,6 +13867,35 @@ fn attempt_arrangement_scene_launch_addition(
         recovery,
         scene_id,
         tick,
+    )
+    .and_then(publish_arrangement_placement_edit_plan)
+}
+
+fn attempt_scene_performance_capture(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    scenes: &[CapturedScenePerformanceScene],
+    launches: &[CapturedScenePerformanceLaunch],
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeArrangementPlacementEditError>
+{
+    if let Some(failure) = native_failure {
+        return Err(IdeArrangementPlacementEditError::NativeClose(failure));
+    }
+    let mut additions = Vec::new();
+    additions
+        .try_reserve_exact(launches.len())
+        .map_err(|_| IdeArrangementPlacementEditError::CapacityUnavailable)?;
+    for launch in launches {
+        let scene = scenes
+            .get(launch.scene_index)
+            .ok_or(IdeArrangementPlacementEditError::InvalidSceneIdentity)?;
+        additions.push((scene.id.as_str(), launch.tick));
+    }
+    RunningDesktopIdeApplication::prepare_arrangement_scene_launch_additions(
+        application,
+        recovery,
+        &additions,
     )
     .and_then(publish_arrangement_placement_edit_plan)
 }
@@ -14072,6 +14858,13 @@ fn project_mutation_reopen_failure(
                 reopen,
                 IdeWorkerCommandFailure::ArrangementSceneLaunchAddition,
             )
+        }
+        ProjectMutationAttempt::CaptureScenePerformance { result, .. } => {
+            arrangement_placement_edit_reopen_failure(result, reopen, |reason| {
+                IdeWorkerCommandFailure::ScenePerformanceCapture(Box::new(
+                    IdeScenePerformanceCaptureError::Arrangement(reason),
+                ))
+            })
         }
         ProjectMutationAttempt::SetMeter { result, .. }
         | ProjectMutationAttempt::SetTempo { result, .. }
@@ -15243,6 +16036,10 @@ fn poll_pending_state(
             sequence,
             deadline,
         } => poll_audio_preview_fence(state, application, target, sequence, deadline, events),
+        WorkerState::ScenePerformanceCapture {
+            application,
+            capture,
+        } => poll_scene_performance_capture(state, application, capture, events),
         WorkerState::CloseFence {
             application,
             sequence,
@@ -15414,6 +16211,17 @@ fn publish_state(
                 return publish_failure(events, IdeWorkerCommandKind::Observe, reason);
             }
         },
+        WorkerState::ScenePerformanceCapture { capture, .. } => {
+            if capture.is_capturing() {
+                IdeWorkerEvent::ScenePerformanceCaptureProgress {
+                    launch_count: capture.captured_launch_count(),
+                }
+            } else {
+                IdeWorkerEvent::ScenePerformanceCaptureStopping {
+                    launch_count: capture.captured_launch_count(),
+                }
+            }
+        }
         WorkerState::Closing(_) => IdeWorkerEvent::Closing,
         WorkerState::AutosaveFence { application, .. }
         | WorkerState::CloseFence { application, .. }
@@ -15915,6 +16723,10 @@ fn shutdown_state(
                 IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
             },
+            WorkerState::ScenePerformanceCapture { application, .. } => match application.close() {
+                IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
+                IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
+            },
             WorkerState::AutosaveFence { application, .. } => match application.close() {
                 IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
@@ -16031,6 +16843,99 @@ mod tests {
         include_str!("../../../../crates/audio-source/tests/fixtures/mono-8000-id3v23.mp3.b64");
     const AUDIO_IMPORT_AIFF_FIXTURE_BASE64: &str =
         include_str!("../../../../crates/audio-source/tests/fixtures/mono-8000-pcm.aiff.b64");
+
+    fn capture_scene(id: &str, grid_quantized: bool) -> CapturedScenePerformanceScene {
+        CapturedScenePerformanceScene {
+            id: id.to_owned(),
+            grid_quantized,
+        }
+    }
+
+    #[test]
+    fn scene_performance_capture_records_only_contiguous_grid_boundaries() {
+        let mut capture = ScenePerformanceCapture::new(
+            vec![
+                capture_scene("scene-a", true),
+                capture_scene("scene-b", true),
+            ],
+            3,
+        );
+
+        capture.observe_launch(0, Some(960), 41, false).unwrap();
+        capture.observe_launch(1, Some(1_920), 42, false).unwrap();
+
+        assert_eq!(capture.captured_launch_count(), 2);
+        assert_eq!(
+            capture.launches,
+            vec![
+                CapturedScenePerformanceLaunch {
+                    scene_index: 0,
+                    tick: 960,
+                },
+                CapturedScenePerformanceLaunch {
+                    scene_index: 1,
+                    tick: 1_920,
+                },
+            ]
+        );
+        assert!(matches!(
+            capture.observe_launch(0, Some(2_880), 44, false),
+            Err(IdeScenePerformanceCaptureError::SequenceDiscontinuity {
+                expected: 43,
+                actual: 44,
+            })
+        ));
+        assert!(matches!(
+            capture.observe_launch(0, Some(1_920), 43, false),
+            Err(IdeScenePerformanceCaptureError::DuplicateTick { tick: 1_920 })
+        ));
+        assert_eq!(capture.captured_launch_count(), 2);
+    }
+
+    #[test]
+    fn scene_performance_capture_rejects_nonrepresentable_or_incomplete_events() {
+        let mut capture = ScenePerformanceCapture::new(
+            vec![
+                capture_scene("grid", true),
+                capture_scene("immediate", false),
+            ],
+            1,
+        );
+
+        assert!(matches!(
+            capture.observe_launch(0, None, 1, false),
+            Err(IdeScenePerformanceCaptureError::ImmediateLaunch { scene_index: 0 })
+        ));
+        assert!(matches!(
+            capture.observe_launch(1, Some(960), 1, false),
+            Err(IdeScenePerformanceCaptureError::NonGridScene { scene_index: 1 })
+        ));
+        assert!(matches!(
+            capture.observe_launch(2, Some(960), 1, false),
+            Err(IdeScenePerformanceCaptureError::UnknownScene { scene_index: 2 })
+        ));
+        assert!(matches!(
+            capture.observe_launch(0, Some(960), 1, true),
+            Err(IdeScenePerformanceCaptureError::LoopEnabledDuringCapture)
+        ));
+
+        capture.observe_launch(0, Some(960), 1, false).unwrap();
+        assert!(matches!(
+            capture.observe_launch(0, Some(1_920), 2, false),
+            Err(IdeScenePerformanceCaptureError::CaptureCapacityReached {
+                maximum_launch_count: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn scene_performance_capture_accepts_a_directly_observed_stopped_endpoint_only_after_roll() {
+        let mut capture = ScenePerformanceCapture::new(vec![capture_scene("grid", true)], 1);
+
+        assert!(!capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped));
+        capture.observe_transport_state(PlaybackRecoveryTransportState::Rolling);
+        assert!(capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped));
+    }
 
     fn application_config() -> IdeApplicationConfig {
         IdeApplicationConfig::try_new(

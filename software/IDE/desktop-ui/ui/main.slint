@@ -71,6 +71,9 @@ export enum AppMode {
     preparing-recording,
     recording,
     finalizing-recording,
+    capturing-scene-performance,
+    stopping-scene-performance,
+    saving-scene-performance,
     closing,
     unavailable,
 }
@@ -300,6 +303,8 @@ export global IdeActions {
     callback transport-start();
     callback transport-stop();
     callback transport-return-start();
+    callback start-scene-performance-capture();
+    callback stop-scene-performance-capture();
     callback transport-seek(float);
     callback loop-mark-in();
     callback loop-mark-out();
@@ -943,6 +948,7 @@ export component MainWindow inherits Window {
     in property <string> transport-state: "Stopped";
     in property <bool> transport-start-available: false;
     in property <bool> transport-stop-available: false;
+    in property <int> scene-performance-capture-launch-count: 0;
     in property <string> stream-state: "No stream";
     in property <string> frame-position: "0";
     in property <string> musical-position: "";
@@ -1130,6 +1136,9 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.preparing-preview ? "◌  PREPARING"
                         : root.app-mode == AppMode.preparing-recording ? "◌  PREPARING"
                         : root.app-mode == AppMode.finalizing-recording ? "◌  FINALIZING"
+                        : root.app-mode == AppMode.capturing-scene-performance ? "●  CAPTURING SCENES"
+                        : root.app-mode == AppMode.stopping-scene-performance ? "◌  ENDING SCENE CAPTURE"
+                        : root.app-mode == AppMode.saving-scene-performance ? "◌  SAVING SCENE CAPTURE"
                         : root.app-mode == AppMode.starting-output-test ? "◌  STARTING TEST"
                         : root.app-mode == AppMode.output-testing ? "●  OUTPUT TEST"
                         : root.app-mode == AppMode.stopping-output-test ? "◌  STOPPING TEST"
@@ -1170,6 +1179,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.unavailable ? "●  UNAVAILABLE"
                         : "◌  DISCOVERING";
                     color: root.app-mode == AppMode.recording ? #ff8b87
+                        : root.app-mode == AppMode.capturing-scene-performance ? #ffd166
                         : root.app-mode == AppMode.previewing ? #7dcfff
                         : root.app-mode == AppMode.output-testing ? #ffd166
                         : root.app-mode == AppMode.running ? #63e6b5
@@ -1848,6 +1858,33 @@ export component MainWindow inherits Window {
                                     enabled: root.app-mode == AppMode.running;
                                     clicked => { IdeActions.transport-return-start(); }
                                 }
+                                if root.app-mode != AppMode.capturing-scene-performance : Button {
+                                    text: "●  Capture scenes";
+                                    accessible-label: "Start transport and capture committed grid-quantized scene launches as one arrangement edit";
+                                    enabled: root.app-mode == AppMode.running
+                                        && root.transport-start-available
+                                        && !root.loop-engaged;
+                                    clicked => { IdeActions.start-scene-performance-capture(); }
+                                }
+                                if root.app-mode == AppMode.capturing-scene-performance : Button {
+                                    text: "■  End capture";
+                                    accessible-label: "Stop scene-performance capture and atomically save the committed grid launches";
+                                    clicked => { IdeActions.stop-scene-performance-capture(); }
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: root.app-mode == AppMode.capturing-scene-performance
+                                        ? root.scene-performance-capture-launch-count + " committed grid launches"
+                                        : root.app-mode == AppMode.stopping-scene-performance
+                                        ? "Ending after " + root.scene-performance-capture-launch-count + " grid launches"
+                                        : root.app-mode == AppMode.saving-scene-performance
+                                        ? "Saving one arrangement edit"
+                                        : "Grid scenes → one arrangement edit";
+                                    color: root.app-mode == AppMode.capturing-scene-performance ? #ffd166 : #8fa0b4;
+                                    font-size: 9px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
                             }
                             Text { text: root.transport-clock; color: #dce5ef; font-size: 18px; font-weight: 600; horizontal-alignment: center; }
                             Text { text: root.musical-position; color: #7fd6a2; font-size: 12px; font-weight: 600; horizontal-alignment: center; }
@@ -1998,7 +2035,8 @@ export component MainWindow inherits Window {
                                         horizontal-stretch: 2;
                                         text: (scene.queued ? "[Q] " : scene.current ? "[>] " : "") + scene.display-name;
                                         accessible-label: scene.name + ", " + (scene.runtime-state != "" ? scene.runtime-state : scene.availability);
-                                        enabled: root.app-mode == AppMode.running && scene.launchable;
+                                        enabled: (root.app-mode == AppMode.running || root.app-mode == AppMode.capturing-scene-performance)
+                                            && scene.launchable;
                                         clicked => { IdeActions.launch-scene(scene.index); }
                                     }
                                     Button {

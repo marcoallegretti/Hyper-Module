@@ -473,6 +473,10 @@ fn scene_resource_limits_and_references_are_checked() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one interactive launch transaction keeps rollback, committed grid evidence, seek reset, and immediate-launch evidence together"
+)]
 fn interactive_launch_is_quantized_transactional_and_cleared_by_seek() {
     let tracks = [SceneTrackResource {
         id: "track",
@@ -548,6 +552,7 @@ fn interactive_launch_is_quantized_transactional_and_cleared_by_seek() {
     assert_eq!(runtime.checkpoint(), checkpoint);
     assert_eq!(runtime.launch_state().queued_scene_index(), Some(0));
     assert_eq!(runtime.launch_state().last_launched_scene_index(), None);
+    assert_eq!(runtime.launch_state().last_interactive_launch(), None);
 
     let mut rendered_segments = Vec::new();
     runtime
@@ -566,6 +571,12 @@ fn interactive_launch_is_quantized_transactional_and_cleared_by_seek() {
     assert_eq!(runtime.launch_state().queued_scene_index(), None);
     assert_eq!(runtime.launch_state().queued_launch_frame(), None);
     assert_eq!(runtime.launch_state().last_launched_scene_index(), Some(0));
+    let launch = runtime.launch_state().last_interactive_launch().unwrap();
+    assert_eq!(launch.scene_index(), 0);
+    assert_eq!(launch.tick(), 4);
+    assert_eq!(launch.frame(), 50);
+    assert_eq!(launch.arrangement_tick(), Some(4));
+    assert_eq!(launch.sequence(), 1);
 
     runtime.seek(50);
     assert_eq!(runtime.track_states(), [None]);
@@ -576,6 +587,12 @@ fn interactive_launch_is_quantized_transactional_and_cleared_by_seek() {
     runtime.process_window(50, 1, |_| {}).unwrap();
     assert_eq!(runtime.track_states(), [None]);
     assert_eq!(runtime.launch_state().last_launched_scene_index(), Some(1));
+    let launch = runtime.launch_state().last_interactive_launch().unwrap();
+    assert_eq!(launch.scene_index(), 1);
+    assert_eq!(launch.tick(), 4);
+    assert_eq!(launch.frame(), 50);
+    assert_eq!(launch.arrangement_tick(), None);
+    assert_eq!(launch.sequence(), 2);
 }
 
 #[test]

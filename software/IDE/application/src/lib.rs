@@ -71,11 +71,15 @@ pub use hyper_mixer_runtime::{
     TransportCommand, TransportLoopRange, TransportLoopRangeError,
 };
 use hyper_mixer_runtime::{
-    LatestOutputMeterSnapshot, LoudnessCommandSendError, MixerParameterCommand,
-    MixerParameterResolveError, PlaybackRecoverySnapshot,
+    InteractiveSceneLaunchDrain, InteractiveSceneLaunchObservation, LatestOutputMeterSnapshot,
+    LoudnessCommandSendError, MixerParameterCommand, MixerParameterResolveError,
+    PlaybackRecoverySnapshot,
 };
 #[cfg(test)]
-use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
+use hyper_mixer_runtime::{
+    InteractiveSceneLaunchPublisher, InteractiveSceneLaunchReceiver, OutputMeterReceiver,
+    interactive_scene_launch_channel, output_meter_channel,
+};
 use hyper_native_device::{
     DeviceChain, DeviceChainError, NativeCompressorState, NativeDeviceInstance, NativeFilterState,
 };
@@ -94,22 +98,24 @@ pub use hyper_playback_compiler::{
     MeterEvent, MusicalPosition, TempoEvent, musical_position, musical_position_at_frame,
 };
 pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_clip_gain_is_supported;
+#[cfg(test)]
+use hyper_playback_json::serialize_arrangement_scene_launch_addition;
 use hyper_playback_json::{
     ArrangementPlacementDocumentSerializationError, ArrangementPlacementGainSerializationError,
-    AudioClipAdditionSerializationError, AudioClipDocumentSerializationError,
-    AudioClipDuplicationSerializationError, AudioClipFadeSerializationError,
-    AudioClipGainSerializationError, AudioClipLoopSerializationError,
-    AudioClipRemovalSerializationError, AudioClipRenameSerializationError,
-    AudioClipSourceStartSerializationError, AudioClipSourceViewSerializationError,
-    AudioPrimaryRouteSerializationError, AudioPrimaryRouteTarget,
-    AudioTrackAdditionSerializationError, AudioTrackContentRemovalDocuments,
-    AudioTrackContentRemovalSerializationError, AudioTrackContentRemovalSource,
-    AudioTrackDocumentSerializationError, AudioTrackDuplicationSerializationError,
-    AudioTrackDuplicationSource, AudioTrackFreezeDeviceChain, AudioTrackFreezeDocuments,
-    AudioTrackFreezeReactivationDocuments, AudioTrackFreezeSerializationError,
-    AudioTrackRemovalBlockers, AudioTrackRemovalSerializationError,
-    AudioTrackRenameSerializationError, AudioTrackUnfreezeDocuments,
-    AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
+    ArrangementSceneLaunchAddition, AudioClipAdditionSerializationError,
+    AudioClipDocumentSerializationError, AudioClipDuplicationSerializationError,
+    AudioClipFadeSerializationError, AudioClipGainSerializationError,
+    AudioClipLoopSerializationError, AudioClipRemovalSerializationError,
+    AudioClipRenameSerializationError, AudioClipSourceStartSerializationError,
+    AudioClipSourceViewSerializationError, AudioPrimaryRouteSerializationError,
+    AudioPrimaryRouteTarget, AudioTrackAdditionSerializationError,
+    AudioTrackContentRemovalDocuments, AudioTrackContentRemovalSerializationError,
+    AudioTrackContentRemovalSource, AudioTrackDocumentSerializationError,
+    AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
+    AudioTrackFreezeDeviceChain, AudioTrackFreezeDocuments, AudioTrackFreezeReactivationDocuments,
+    AudioTrackFreezeSerializationError, AudioTrackRemovalBlockers,
+    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
+    AudioTrackUnfreezeDocuments, AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
     AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
     AutomationTargetSelection, CompiledMixerDestination, CompiledMixerGraph, CompiledMixerTap,
     CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact,
@@ -128,7 +134,7 @@ use hyper_playback_json::{
     serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
     serialize_arrangement_placement_gain, serialize_arrangement_placement_move,
     serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
-    serialize_arrangement_scene_launch_addition, serialize_arrangement_scene_launch_move,
+    serialize_arrangement_scene_launch_additions, serialize_arrangement_scene_launch_move,
     serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
     serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
     serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_removal,
@@ -216,11 +222,11 @@ pub use worker::{
     IdeMixerChannel, IdeMixerChannelDestination, IdeMixerSend, IdeNativeCompressor,
     IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError, IdeRecordingCaptureKind,
     IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeRuntimePreparationError,
-    IdeScene, IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure,
-    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
-    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
-    IdeWorkerShutdownReport, IdeWorkerStartError, MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS,
-    desktop_ide_worker_supervisor_snapshot,
+    IdeScene, IdeScenePerformanceCaptureError, IdeSceneTrackAction, IdeSceneTrackSlot,
+    IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent,
+    IdeWorkerEventReceiveError, IdeWorkerJoinError, IdeWorkerPendingShutdownWait,
+    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, IdeWorkerStartError,
+    MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS, desktop_ide_worker_supervisor_snapshot,
 };
 
 const DESKTOP_MAXIMUM_BLOCK_FRAMES: usize = 4_096;
@@ -10047,6 +10053,8 @@ struct TestPlaybackSession {
     loudness_commands: Vec<IdeLoudnessCommand>,
     mixer_commands: Vec<IdeMixerCommand>,
     meters: OutputMeterReceiver,
+    scene_launches: InteractiveSceneLaunchReceiver,
+    _scene_launch_publisher: InteractiveSceneLaunchPublisher,
     close_failure: Option<IdeNativeCloseFailure>,
     save_eligible: bool,
     commit_mixer_fences: bool,
@@ -10064,11 +10072,14 @@ struct TestPlaybackSession {
 #[cfg(test)]
 impl Default for TestPlaybackSession {
     fn default() -> Self {
+        let (scene_launch_publisher, scene_launches) = interactive_scene_launch_channel();
         Self {
             commands: Vec::new(),
             loudness_commands: Vec::new(),
             mixer_commands: Vec::new(),
             meters: output_meter_channel().1,
+            scene_launches,
+            _scene_launch_publisher: scene_launch_publisher,
             close_failure: None,
             save_eligible: false,
             commit_mixer_fences: false,
@@ -12635,6 +12646,14 @@ impl RunningDesktopIdeApplication {
         scene_id: &str,
         tick: u64,
     ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        Self::prepare_arrangement_scene_launch_additions(application, recovery, &[(scene_id, tick)])
+    }
+
+    fn prepare_arrangement_scene_launch_additions(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        launches: &[(&str, u64)],
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
         let mixer = Self::prepare_mixer_save(application, recovery)
             .map_err(|source| IdeArrangementPlacementEditError::MixerSave(Box::new(source)))?;
         let prepared = recovery.prepared_project().ok_or_else(|| {
@@ -12667,15 +12686,28 @@ impl RunningDesktopIdeApplication {
             .try_reserve_exact(media.asset_count())
             .map_err(|_| IdeArrangementPlacementEditError::CapacityUnavailable)?;
         assets.extend(media.media_asset_facts());
-        let launch_id = uuid::Uuid::new_v4().to_string();
-        let arrangement_bytes = serialize_arrangement_scene_launch_addition(
+        let mut launch_ids = Vec::new();
+        launch_ids
+            .try_reserve_exact(launches.len())
+            .map_err(|_| IdeArrangementPlacementEditError::CapacityUnavailable)?;
+        for _ in launches {
+            launch_ids.push(uuid::Uuid::new_v4().to_string());
+        }
+        let mut additions = Vec::new();
+        additions
+            .try_reserve_exact(launches.len())
+            .map_err(|_| IdeArrangementPlacementEditError::CapacityUnavailable)?;
+        for (launch_id, (scene_id, tick)) in launch_ids.iter().zip(launches.iter().copied()) {
+            additions.push(ArrangementSceneLaunchAddition::new(
+                launch_id, scene_id, tick,
+            ));
+        }
+        let arrangement_bytes = serialize_arrangement_scene_launch_additions(
             project,
             &assets,
             source.as_deref(),
             &arrangement_id,
-            &launch_id,
-            scene_id,
-            tick,
+            &additions,
             application.config.project_limits.session.documents,
         )
         .map_err(IdeArrangementPlacementEditError::Serialization)?;
@@ -15933,6 +15965,39 @@ impl RunningDesktopIdeApplication {
             #[cfg(test)]
             IdePlaybackSessionOwner::Test(session) => session.meters.read_latest(),
         }
+    }
+
+    /// Drains exact interactive-scene launches from the native commit stream.
+    ///
+    /// Unlike meters, this stream is loss-detecting; callers must treat either
+    /// overflow or disconnection reported by the drain as incomplete capture.
+    #[must_use]
+    pub fn drain_interactive_scene_launches(
+        &mut self,
+        observe: impl FnMut(InteractiveSceneLaunchObservation),
+    ) -> InteractiveSceneLaunchDrain {
+        match &mut self.session {
+            IdePlaybackSessionOwner::Native(session) => {
+                session.scene_launch_receiver().drain(observe)
+            }
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => session.scene_launches.drain(observe),
+        }
+    }
+
+    /// Returns the number of additional version-1 arrangement launches this
+    /// running project's configured document limits can still accept.
+    #[must_use]
+    pub(crate) fn remaining_scene_launch_capture_capacity(&self) -> Option<usize> {
+        let snapshot = self.snapshot()?;
+        let maximum = self
+            .application
+            .config
+            .project_limits
+            .session
+            .documents
+            .max_scene_launches;
+        Some(maximum.saturating_sub(snapshot.loaded.scene_launch_count()))
     }
 
     #[must_use]

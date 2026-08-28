@@ -31,14 +31,14 @@ use hyper_control_runtime::{ControlRuntime, ControlRuntimeBuildErrorReason};
 use hyper_mapping_compiler::{CompiledControlMappingTable, ControlMappingCompileError};
 use hyper_media_cache::{DecodedMediaCache, PreparePlaybackError};
 use hyper_mixer_runtime::{
-    LoudnessCommandSender, MetronomePlan, MetronomePlanError, MixerChannelHandle,
-    MixerParameterCommand, MixerParameterCommandSender, MixerParameterResolveError,
-    MixerParameterStateRestoreError, MixerSendHandle, NativeDeviceCommand,
-    NativeDeviceCommandSender, NativeDeviceHandle, NativeDeviceResolveError, OutputMeterReceiver,
-    RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError, TransportCommand,
-    TransportCommandSendError, TransportCommandSender, TransportLoopRange, TransportLoopRangeError,
-    TransportOutputCreationError, TransportOutputProcessor, loudness_command_channel,
-    output_meter_channel,
+    InteractiveSceneLaunchReceiver, LoudnessCommandSender, MetronomePlan, MetronomePlanError,
+    MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSender,
+    MixerParameterResolveError, MixerParameterStateRestoreError, MixerSendHandle,
+    NativeDeviceCommand, NativeDeviceCommandSender, NativeDeviceHandle, NativeDeviceResolveError,
+    OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError,
+    TransportCommand, TransportCommandSendError, TransportCommandSender, TransportLoopRange,
+    TransportLoopRangeError, TransportOutputCreationError, TransportOutputProcessor,
+    interactive_scene_launch_channel, loudness_command_channel, output_meter_channel,
     playback_recovery_channel_with_initial_loop_metronome_and_native_device_state,
 };
 use hyper_native_device::DeviceChain;
@@ -546,6 +546,7 @@ struct SessionHandles {
     controls: SessionControlHandles,
     loudness_commands: LoudnessCommandSender,
     meters: OutputMeterReceiver,
+    scene_launches: InteractiveSceneLaunchReceiver,
     recovery: PlaybackRecoveryCheckpoint,
     preview: super::DesktopAudioPreviewControl,
 }
@@ -706,6 +707,7 @@ pub struct DesktopPlaybackSession {
     controls: SessionControlHandles,
     loudness_commands: LoudnessCommandSender,
     meters: Option<OutputMeterReceiver>,
+    scene_launches: Option<InteractiveSceneLaunchReceiver>,
     recovery: PlaybackRecoveryCheckpoint,
     preview: super::DesktopAudioPreviewControl,
     config: DesktopOutputConfig,
@@ -1588,6 +1590,7 @@ impl DesktopPlaybackSession {
                     controls: handles.controls,
                     loudness_commands: handles.loudness_commands,
                     meters: Some(handles.meters),
+                    scene_launches: Some(handles.scene_launches),
                     recovery: handles.recovery,
                     preview: handles.preview,
                     config,
@@ -2068,6 +2071,27 @@ impl DesktopPlaybackSession {
         self.meters.take()
     }
 
+    /// Borrows committed interactive-scene launches while this session owns
+    /// their loss-detecting control-thread consumer.
+    ///
+    /// # Panics
+    ///
+    /// Panics after [`Self::take_scene_launch_receiver`] explicitly transferred
+    /// the single consumer to another owner.
+    #[must_use]
+    pub fn scene_launch_receiver(&mut self) -> &mut InteractiveSceneLaunchReceiver {
+        self.scene_launches
+            .as_mut()
+            .expect("the interactive scene launch receiver was explicitly transferred")
+    }
+
+    /// Transfers the committed interactive-scene launch consumer away from the
+    /// session owner without transferring audio or transport authority.
+    #[must_use]
+    pub fn take_scene_launch_receiver(&mut self) -> Option<InteractiveSceneLaunchReceiver> {
+        self.scene_launches.take()
+    }
+
     /// Returns the verified project retained by this session when it was
     /// started through [`Self::open_project`] or [`Self::start_project`].
     #[must_use]
@@ -2149,6 +2173,7 @@ impl DesktopPlaybackSession {
             source,
             monitoring,
             project_open_recovery: _,
+            scene_launches: _,
         } = self;
         let monitoring_config = monitoring
             .as_ref()
@@ -2209,6 +2234,7 @@ impl DesktopPlaybackSession {
             source: _,
             monitoring,
             project_open_recovery: _,
+            scene_launches: _,
         } = self;
         let input = monitoring
             .map(|monitoring| monitoring.input.stop().map_err(DesktopInputStopError::from))
@@ -2351,6 +2377,7 @@ fn initialize_session(
     let initial_metronome_available = transport.metronome_available();
     let initial_metronome_enabled = transport.metronome_enabled();
     let (mut meter_sender, meters) = output_meter_channel();
+    let (scene_launch_publisher, scene_launches) = interactive_scene_launch_channel();
     let (loudness_commands, loudness_command_receiver) = loudness_command_channel();
     let processor = TransportOutputProcessor::try_new(
         &mut transport,
@@ -2390,6 +2417,7 @@ fn initialize_session(
         controls,
         loudness_commands,
         meters,
+        scene_launches,
         recovery.clone(),
         preview_control,
     )?;
@@ -2400,6 +2428,7 @@ fn initialize_session(
             preview,
         },
         publisher,
+        scene_launch_publisher,
     )
 }
 
@@ -2459,6 +2488,7 @@ fn publish_session_handles(
     controls: SessionControlHandles,
     loudness_commands: LoudnessCommandSender,
     meters: OutputMeterReceiver,
+    scene_launches: InteractiveSceneLaunchReceiver,
     recovery: PlaybackRecoveryCheckpoint,
     preview: super::DesktopAudioPreviewControl,
 ) -> Result<(), NativeDesktopOutputStartError> {
@@ -2467,6 +2497,7 @@ fn publish_session_handles(
             controls,
             loudness_commands,
             meters,
+            scene_launches,
             recovery,
             preview,
         }))
