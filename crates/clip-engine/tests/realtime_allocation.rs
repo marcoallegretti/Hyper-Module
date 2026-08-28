@@ -48,4 +48,20 @@ fn clip_block_rendering_performs_zero_heap_allocations() {
 
     assert!(result.is_ok());
     assert_eq!(heap_operations, 0);
+
+    left.fill(0.25);
+    right.fill(-0.25);
+    let measurement = HeapMeasurement::start_verified();
+    let result = plan.render_block_additive(
+        placement,
+        64,
+        ClipOutput::Stereo {
+            left: &mut left,
+            right: &mut right,
+        },
+    );
+    let heap_operations = measurement.finish();
+
+    assert!(result.is_ok());
+    assert_eq!(heap_operations, 0);
 }

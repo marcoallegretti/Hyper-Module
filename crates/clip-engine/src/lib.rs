@@ -225,12 +225,29 @@ impl ClipOutput<'_> {
         }
     }
 
-    fn write(&mut self, frame: usize, left_sample: f32, right_sample: Option<f32>) {
+    fn write<const ADDITIVE: bool>(
+        &mut self,
+        frame: usize,
+        left_sample: f32,
+        right_sample: Option<f32>,
+    ) {
         match self {
-            Self::Mono(samples) => samples[frame] = left_sample,
+            Self::Mono(samples) => {
+                if ADDITIVE {
+                    samples[frame] += left_sample;
+                } else {
+                    samples[frame] = left_sample;
+                }
+            }
             Self::Stereo { left, right } => {
-                left[frame] = left_sample;
-                right[frame] = right_sample.unwrap_or(0.0);
+                let right_sample = right_sample.unwrap_or(0.0);
+                if ADDITIVE {
+                    left[frame] += left_sample;
+                    right[frame] += right_sample;
+                } else {
+                    left[frame] = left_sample;
+                    right[frame] = right_sample;
+                }
             }
         }
     }
@@ -329,6 +346,35 @@ impl<'a> ClipRenderPlan<'a> {
         &self,
         placement: ClipPlacement,
         placement_frame_offset: usize,
+        output: ClipOutput<'_>,
+    ) -> Result<(), ClipPlanError> {
+        self.render_block_inner::<false>(placement, placement_frame_offset, output)
+    }
+
+    /// Adds a block at an offset inside a validated placement to initialized
+    /// output planes.
+    ///
+    /// The caller owns clearing or otherwise initializing the output. The
+    /// call performs no allocation, file I/O, logging, locking, or dynamic
+    /// dispatch. Structural errors are returned before output mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClipPlanError`] when output shape differs from the source or
+    /// the requested block extends outside the placement.
+    pub fn render_block_additive(
+        &self,
+        placement: ClipPlacement,
+        placement_frame_offset: usize,
+        output: ClipOutput<'_>,
+    ) -> Result<(), ClipPlanError> {
+        self.render_block_inner::<true>(placement, placement_frame_offset, output)
+    }
+
+    fn render_block_inner<const ADDITIVE: bool>(
+        &self,
+        placement: ClipPlacement,
+        placement_frame_offset: usize,
         mut output: ClipOutput<'_>,
     ) -> Result<(), ClipPlanError> {
         let output_frames = output.frame_count()?;
@@ -366,7 +412,7 @@ impl<'a> ClipRenderPlan<'a> {
 
         for output_frame in 0..output_frames {
             if !self.enabled {
-                output.write(output_frame, 0.0, Some(0.0));
+                output.write::<ADDITIVE>(output_frame, 0.0, Some(0.0));
                 continue;
             }
             let unfolded_local = placement
@@ -379,7 +425,7 @@ impl<'a> ClipRenderPlan<'a> {
             let amplitude = self.linear_gain * self.fade_gain(local_frame);
             let left = left_plane[source_frame] * amplitude;
             let right = right_plane.map(|plane| plane[source_frame] * amplitude);
-            output.write(output_frame, left, right);
+            output.write::<ADDITIVE>(output_frame, left, right);
         }
         Ok(())
     }
@@ -759,5 +805,32 @@ mod tests {
         ));
         assert_samples(&left, &[7.0; 2]);
         assert_samples(&right, &[8.0; 2]);
+    }
+
+    #[test]
+    fn additive_block_rendering_preserves_initialized_samples() {
+        let source = DecodedAudio::from_stereo(48_000, vec![0.25, 0.5], vec![-0.5, 0.25]).unwrap();
+        let plan = ClipRenderPlan::try_new(&source, spec(2)).unwrap();
+        let placement = plan
+            .place(PlacementSpec {
+                clip_start_frame: 0,
+                frame_count: 2,
+            })
+            .unwrap();
+        let mut left = [1.0_f32, -1.0];
+        let mut right = [0.5_f32, 2.0];
+
+        plan.render_block_additive(
+            placement,
+            0,
+            ClipOutput::Stereo {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+
+        assert_samples(&left, &[1.25, -0.5]);
+        assert_samples(&right, &[0.0, 2.25]);
     }
 }

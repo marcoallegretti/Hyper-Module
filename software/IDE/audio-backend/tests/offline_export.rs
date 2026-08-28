@@ -53,6 +53,21 @@ const ARRANGEMENT: &[u8] = br#"{
     }],
     "scene_launches":[],"extensions":{}
 }"#;
+const OVERLAPPED_ARRANGEMENT: &[u8] = br#"{
+    "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337505",
+    "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Two voices","enabled":true,
+    "placements":[
+        {
+            "id":"018f47a2-6b2d-7c11-8a44-001122337506","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","clip_id":"018f47a2-6b2d-7c11-8a44-001122337503",
+            "start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true
+        },
+        {
+            "id":"018f47a2-6b2d-7c11-8a44-00112233750a","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","clip_id":"018f47a2-6b2d-7c11-8a44-001122337503",
+            "start_tick":2,"clip_start_tick":0,"duration_ticks":4,"enabled":true
+        }
+    ],
+    "scene_launches":[],"extensions":{}
+}"#;
 const MIXER: &[u8] = br#"{
     "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337507",
     "project_id":"018f47a2-6b2d-7c11-8a44-001122337500",
@@ -194,6 +209,50 @@ fn offline_export_matches_the_playback_runtime_sample_for_sample() {
             .any(|(l, r)| (l - r).abs() > f32::EPSILON),
         "the panned fixture distinguishes the two channels"
     );
+}
+
+#[test]
+fn bounded_two_voice_overlap_sums_pre_fader_audio_and_matches_playback() {
+    let session = session(Some(OVERLAPPED_ARRANGEMENT), Vec::new());
+    let exported =
+        render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
+    let expected = render_through_playback(&session, 32);
+
+    assert_eq!(exported.frame_count(), 150);
+    for (index, (expected_left, expected_right)) in expected.iter().take(150).enumerate() {
+        assert!(
+            (exported.plane(0).unwrap()[index] - expected_left).abs() < f32::EPSILON,
+            "left frame {index}: export {} playback {expected_left}",
+            exported.plane(0).unwrap()[index]
+        );
+        assert!(
+            (exported.plane(1).unwrap()[index] - expected_right).abs() < f32::EPSILON,
+            "right frame {index}: export {} playback {expected_right}",
+            exported.plane(1).unwrap()[index]
+        );
+    }
+
+    let frozen = render_audio_track_pre_fader_for_freeze(
+        &session,
+        "018f47a2-6b2d-7c11-8a44-001122337502",
+        OfflineExportSpec { block_frames: 32 },
+    )
+    .unwrap();
+    assert_eq!(frozen.frame_count(), 150);
+    let frozen_left = frozen.plane(0).unwrap();
+    let frozen_right = frozen.plane(1).unwrap();
+    for (frame, (left, right)) in frozen_left.iter().zip(frozen_right).enumerate() {
+        let frame = u16::try_from(frame).unwrap();
+        let expected = if frame < 50 {
+            f32::from(frame) / 200.0
+        } else if frame < 100 {
+            f32::from(frame) / 200.0 + f32::from(frame - 50) / 200.0
+        } else {
+            f32::from(frame - 50) / 200.0
+        };
+        assert!((left - expected).abs() <= 1.0e-6, "left frame {frame}");
+        assert!((right - expected).abs() <= 1.0e-6, "right frame {frame}");
+    }
 }
 
 #[test]

@@ -24,14 +24,15 @@ pub use duplication::{
 
 use core::error::Error;
 use core::fmt;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyper_audio_engine::{ChannelParameters, LinearGain, Pan};
 use hyper_clip_engine::compile_native_clip_gain;
 use hyper_playback_compiler::graph::{
     ArrangementResource, AssetResource, ClipResource, CompiledSchedule, GraphError, GraphInput,
-    GraphLimits, PlacementResource, TrackKind, TrackResource, compile_arrangement,
+    GraphLimits, MAX_CONCURRENT_PLACEMENTS_PER_TRACK, PlacementResource, TrackKind, TrackResource,
+    compile_arrangement,
 };
 use hyper_playback_compiler::scene::{
     CompiledScenePerformance, LaunchQuantization, SceneClipResource, SceneCompileError,
@@ -7665,7 +7666,8 @@ pub fn serialize_arrangement_placement_activation(
 ///
 /// Placements are restored to canonical `(start_tick, track_id, id)` order
 /// before the edited arrangement is reloaded. The strict arrangement boundary
-/// therefore rejects overlap, range overflow, and every other invalid result.
+/// therefore rejects a third concurrent same-track placement, range overflow,
+/// and every other invalid result.
 ///
 /// # Errors
 ///
@@ -7698,7 +7700,8 @@ pub fn serialize_arrangement_placement_move(
 ///
 /// This is a right-edge resize: it does not change the placement start or the
 /// clip-local start. The strict arrangement boundary rejects zero duration,
-/// same-track overlap, safe-range overflow, and non-looping source overrun.
+/// a third concurrent same-track placement, safe-range overflow, and
+/// non-looping source overrun.
 ///
 /// # Errors
 ///
@@ -10883,18 +10886,23 @@ fn validate_arrangement_document(
             );
         }
     }
-    let mut track_ends = std::collections::BTreeMap::new();
+    let mut track_ends = BTreeMap::new();
     for placement in &document.placements {
-        if track_ends
-            .get(placement.track_id.as_str())
-            .is_some_and(|end| placement.start_tick < *end)
-        {
-            return domain_error(location, "placements overlap on one track");
-        }
-        track_ends.insert(
-            placement.track_id.as_str(),
+        let active_ends = track_ends
+            .entry(placement.track_id.as_str())
+            .or_insert([None; MAX_CONCURRENT_PLACEMENTS_PER_TRACK]);
+        if !reserve_arrangement_placement_interval(
+            active_ends,
+            placement.start_tick,
             placement.start_tick + placement.duration_ticks,
-        );
+        ) {
+            return domain_error(
+                location,
+                &format!(
+                    "placements exceed the {MAX_CONCURRENT_PLACEMENTS_PER_TRACK}-voice track overlap limit"
+                ),
+            );
+        }
     }
     let mut previous_launch_tick = None;
     for launch in &document.scene_launches {
@@ -10907,6 +10915,23 @@ fn validate_arrangement_document(
         previous_launch_tick = Some(launch.tick);
     }
     Ok(())
+}
+
+fn reserve_arrangement_placement_interval(
+    active_ends: &mut [Option<u64>; MAX_CONCURRENT_PLACEMENTS_PER_TRACK],
+    start: u64,
+    end: u64,
+) -> bool {
+    for active_end in active_ends.iter_mut() {
+        if active_end.is_some_and(|value| value <= start) {
+            *active_end = None;
+        }
+    }
+    let Some(slot) = active_ends.iter_mut().find(|end| end.is_none()) else {
+        return false;
+    };
+    *slot = Some(end);
+    true
 }
 
 fn validate_track_hierarchy(tracks: &[LoadedTrack]) -> Result<(), LoadError> {
@@ -12023,6 +12048,20 @@ mod tests {
             sample_rate_hz: 48_000,
             frame_count: 100,
         }]
+    }
+
+    fn two_voice_arrangement_source() -> Vec<u8> {
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["placements"].as_array_mut().unwrap().push(json!({
+            "id": "018f47a2-6b2d-7c11-8a44-001122334465",
+            "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+            "clip_id": "018f47a2-6b2d-7c11-8a44-001122334460",
+            "start_tick": 2,
+            "clip_start_tick": 0,
+            "duration_ticks": 4,
+            "enabled": true
+        }));
+        serde_json_canonicalizer::to_vec(&source).unwrap()
     }
 
     fn serialize_test_scene_addition(
@@ -15313,13 +15352,22 @@ mod tests {
     }
 
     #[test]
-    fn arrangement_placement_move_rejects_overlap_and_range_overflow() {
+    fn arrangement_placement_move_rejects_three_voice_overlap_and_range_overflow() {
         let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
         source["placements"].as_array_mut().unwrap().push(json!({
             "id": "018f47a2-6b2d-7c11-8a44-001122334465",
             "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
             "clip_id": "018f47a2-6b2d-7c11-8a44-001122334460",
             "start_tick": 8,
+            "clip_start_tick": 0,
+            "duration_ticks": 4,
+            "enabled": true
+        }));
+        source["placements"].as_array_mut().unwrap().push(json!({
+            "id": "018f47a2-6b2d-7c11-8a44-001122334466",
+            "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+            "clip_id": "018f47a2-6b2d-7c11-8a44-001122334460",
+            "start_tick": 10,
             "clip_start_tick": 0,
             "duration_ticks": 4,
             "enabled": true
@@ -15338,7 +15386,7 @@ mod tests {
             &loaded,
             &source,
             placement_id,
-            6,
+            9,
             LoaderLimits::VERSION_1,
         )
         .unwrap_err();
@@ -15349,7 +15397,7 @@ mod tests {
         assert!(
             overlap
                 .to_string()
-                .contains("placements overlap on one track")
+                .contains("exceed the 2-voice track overlap limit")
         );
 
         let overflow = serialize_arrangement_placement_move(
@@ -15428,7 +15476,7 @@ mod tests {
     }
 
     #[test]
-    fn arrangement_placement_duration_rejects_zero_source_overrun_and_overlap() {
+    fn arrangement_placement_duration_rejects_zero_source_overrun_and_three_voice_overlap() {
         let source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
         let source = serde_json_canonicalizer::to_vec(&source).unwrap();
         let tracks: [&[u8]; 1] = [TRACK];
@@ -15500,6 +15548,15 @@ mod tests {
             "duration_ticks": 4,
             "enabled": false
         }));
+        with_next["placements"].as_array_mut().unwrap().push(json!({
+            "id": "018f47a2-6b2d-7c11-8a44-001122334466",
+            "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+            "clip_id": "018f47a2-6b2d-7c11-8a44-001122334460",
+            "start_tick": 10,
+            "clip_start_tick": 0,
+            "duration_ticks": 4,
+            "enabled": false
+        }));
         let with_next = serde_json_canonicalizer::to_vec(&with_next).unwrap();
         let looping_clips: [&[u8]; 1] = [&looping_clip];
         let loaded = load(
@@ -15511,14 +15568,14 @@ mod tests {
             &loaded,
             &with_next,
             placement_id,
-            9,
+            11,
             LoaderLimits::VERSION_1,
         )
         .unwrap_err();
         assert!(
             overlap
                 .to_string()
-                .contains("placements overlap on one track")
+                .contains("exceed the 2-voice track overlap limit")
         );
     }
 
@@ -15870,7 +15927,7 @@ mod tests {
     }
 
     #[test]
-    fn arrangement_placement_front_trim_rejects_same_track_overlap() {
+    fn arrangement_placement_front_trim_rejects_three_voice_same_track_overlap() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];
         let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
@@ -15886,6 +15943,18 @@ mod tests {
                 "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
                 "clip_id": "018f47a2-6b2d-7c11-8a44-001122334460",
                 "start_tick": 0,
+                "clip_start_tick": 0,
+                "duration_ticks": 3,
+                "enabled": false
+            }),
+        );
+        overlap["placements"].as_array_mut().unwrap().insert(
+            1,
+            json!({
+                "id": "018f47a2-6b2d-7c11-8a44-001122334466",
+                "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+                "clip_id": "018f47a2-6b2d-7c11-8a44-001122334460",
+                "start_tick": 1,
                 "clip_start_tick": 0,
                 "duration_ticks": 3,
                 "enabled": false
@@ -15912,7 +15981,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("placements overlap on one track")
+                .contains("exceed the 2-voice track overlap limit")
         );
     }
 
@@ -16726,13 +16795,10 @@ mod tests {
     }
 
     #[test]
-    fn arrangement_placement_addition_rejects_invalid_inputs_and_overlap() {
+    fn arrangement_placement_addition_rejects_invalid_inputs_and_three_voice_overlap() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];
-        let source = serde_json_canonicalizer::to_vec(
-            &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
-        )
-        .unwrap();
+        let source = two_voice_arrangement_source();
         let loaded = load(
             input(TIMELINE, &tracks, &clips, Some(&source)),
             LoaderLimits::VERSION_1,
@@ -16801,7 +16867,7 @@ mod tests {
         assert!(
             overlap
                 .to_string()
-                .contains("placements overlap on one track")
+                .contains("exceed the 2-voice track overlap limit")
         );
 
         let noncanonical =
@@ -16948,13 +17014,10 @@ mod tests {
     }
 
     #[test]
-    fn arrangement_placement_duplication_rejects_stale_colliding_and_overlapping_requests() {
+    fn arrangement_placement_duplication_rejects_stale_colliding_and_three_voice_requests() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];
-        let source = serde_json_canonicalizer::to_vec(
-            &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
-        )
-        .unwrap();
+        let source = two_voice_arrangement_source();
         let loaded = load(
             input(TIMELINE, &tracks, &clips, Some(&source)),
             LoaderLimits::VERSION_1,
@@ -17036,7 +17099,7 @@ mod tests {
         assert!(
             overlap
                 .to_string()
-                .contains("placements overlap on one track")
+                .contains("exceed the 2-voice track overlap limit")
         );
 
         let noncanonical =

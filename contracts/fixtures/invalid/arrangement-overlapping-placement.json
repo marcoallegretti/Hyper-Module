@@ -23,6 +23,15 @@
       "clip_start_tick": 0,
       "duration_ticks": 7680,
       "enabled": true
+    },
+    {
+      "id": "018f47a2-6b2d-7c11-8a44-001122334467",
+      "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+      "clip_id": "018f47a2-6b2d-7c11-8a44-001122334460",
+      "start_tick": 5760,
+      "clip_start_tick": 0,
+      "duration_ticks": 7680,
+      "enabled": true
     }
   ],
   "scene_launches": [],

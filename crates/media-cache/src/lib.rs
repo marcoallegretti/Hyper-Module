@@ -835,6 +835,24 @@ impl PreparedScheduleEntry<'_, '_> {
         self.plan
             .render_block(self.placement, placement_frame_offset, output)
     }
+
+    /// Adds a block through the pre-bound clip plan without cache mutation.
+    ///
+    /// The caller owns initialized output planes and their accumulation
+    /// semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClipPlanError`] when the requested block or output layout is
+    /// incompatible with the prepared placement.
+    pub fn render_block_additive(
+        &self,
+        placement_frame_offset: usize,
+        output: ClipOutput<'_>,
+    ) -> Result<(), ClipPlanError> {
+        self.plan
+            .render_block_additive(self.placement, placement_frame_offset, output)
+    }
 }
 
 #[cfg(test)]

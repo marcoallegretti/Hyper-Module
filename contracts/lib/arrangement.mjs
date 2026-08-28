@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { assertAudioClipInvariants } from "./audio-clip.mjs";
 
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+const MAX_CONCURRENT_PLACEMENTS_PER_TRACK = 2;
 
 function assertSafeNonnegativeInteger(value, label) {
   assert(
@@ -82,15 +83,15 @@ export function assertArrangementInvariants(arrangement) {
 
   const trackEnds = new Map();
   for (const placement of arrangement.placements) {
-    const previousEnd = trackEnds.get(placement.track_id);
+    const activeEnds = (trackEnds.get(placement.track_id) ?? []).filter(
+      (endTick) => endTick > placement.start_tick,
+    );
     assert(
-      previousEnd === undefined || placement.start_tick >= previousEnd,
-      "enabled and disabled placements must not overlap on one track",
+      activeEnds.length < MAX_CONCURRENT_PLACEMENTS_PER_TRACK,
+      `placements must not exceed the ${MAX_CONCURRENT_PLACEMENTS_PER_TRACK}-voice track overlap limit`,
     );
-    trackEnds.set(
-      placement.track_id,
-      placement.start_tick + placement.duration_ticks,
-    );
+    activeEnds.push(placement.start_tick + placement.duration_ticks);
+    trackEnds.set(placement.track_id, activeEnds);
   }
 
   let previousLaunchTick = -1;

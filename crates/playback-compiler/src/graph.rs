@@ -11,6 +11,13 @@ use crate::{
     TickRange, Timeline, WarpMarker, compile_placement,
 };
 
+/// Maximum number of persisted placement intervals that may overlap on one
+/// Version-1 audio track.
+///
+/// The bound applies before preparation so the native renderer can retain a
+/// fixed source count at each callback boundary.
+pub const MAX_CONCURRENT_PLACEMENTS_PER_TRACK: usize = 2;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrackKind {
     Audio,
@@ -166,8 +173,9 @@ pub enum GraphError {
     PlacementOwnerMismatch {
         placement_index: usize,
     },
-    OverlappingPlacements {
+    ConcurrentPlacementsExceeded {
         placement_index: usize,
+        maximum: usize,
     },
     PlacementCompilation {
         placement_index: usize,
@@ -269,10 +277,13 @@ impl fmt::Display for GraphError {
                 formatter,
                 "placement {placement_index} track differs from its clip owner"
             ),
-            Self::OverlappingPlacements { placement_index } => {
+            Self::ConcurrentPlacementsExceeded {
+                placement_index,
+                maximum,
+            } => {
                 write!(
                     formatter,
-                    "placement {placement_index} overlaps on its track"
+                    "placement {placement_index} exceeds the {maximum}-voice track overlap limit"
                 )
             }
             Self::PlacementCompilation {
@@ -379,8 +390,9 @@ struct ResolvedPlacement<'a> {
 /// # Errors
 ///
 /// Returns [`GraphError`] for exceeded bounds, identity or ownership failures,
-/// scene-launch authority, overlap, invalid asset selection, allocation
-/// failure, or a placement that cannot be compiled natively.
+/// scene-launch authority, excessive concurrent placement intervals, invalid
+/// asset selection, allocation failure, or a placement that cannot be
+/// compiled natively.
 pub fn compile_arrangement<'a>(
     timeline: Timeline<'_>,
     input: GraphInput<'a>,
@@ -493,8 +505,14 @@ fn compile_entries<'a>(
     input: GraphInput<'a>,
     indexes: &ResolvedIndexes<'_>,
 ) -> Result<CompiledSchedule<'a>, GraphError> {
-    let mut track_tick_ends = fallible_filled(input.tracks.len(), None::<u64>)?;
-    let mut track_frame_ends = fallible_filled(input.tracks.len(), None::<usize>)?;
+    let mut track_tick_ends = fallible_filled(
+        input.tracks.len(),
+        [None; MAX_CONCURRENT_PLACEMENTS_PER_TRACK],
+    )?;
+    let mut track_frame_ends = fallible_filled(
+        input.tracks.len(),
+        [None; MAX_CONCURRENT_PLACEMENTS_PER_TRACK],
+    )?;
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(input.arrangement.placements.len())
@@ -502,23 +520,41 @@ fn compile_entries<'a>(
 
     for (placement_index, placement) in input.arrangement.placements.iter().enumerate() {
         let resolved = resolve_placement(timeline, input, indexes, placement_index, *placement)?;
-        if track_tick_ends[resolved.track_index]
-            .is_some_and(|previous_end| placement.start_tick < previous_end)
-        {
-            return Err(GraphError::OverlappingPlacements { placement_index });
+        if !reserve_concurrent_interval(
+            &mut track_tick_ends[resolved.track_index],
+            placement.start_tick,
+            resolved.end_tick,
+        ) || !reserve_concurrent_interval(
+            &mut track_frame_ends[resolved.track_index],
+            resolved.entry.compiled.arrangement_start_frame(),
+            resolved.entry.compiled.arrangement_end_frame(),
+        ) {
+            return Err(GraphError::ConcurrentPlacementsExceeded {
+                placement_index,
+                maximum: MAX_CONCURRENT_PLACEMENTS_PER_TRACK,
+            });
         }
-        track_tick_ends[resolved.track_index] = Some(resolved.end_tick);
-        if track_frame_ends[resolved.track_index].is_some_and(|previous_end| {
-            resolved.entry.compiled.arrangement_start_frame() < previous_end
-        }) {
-            return Err(GraphError::OverlappingPlacements { placement_index });
-        }
-        track_frame_ends[resolved.track_index] =
-            Some(resolved.entry.compiled.arrangement_end_frame());
         entries.push(resolved.entry);
     }
 
     Ok(CompiledSchedule { entries })
+}
+
+fn reserve_concurrent_interval<T: Copy + Ord>(
+    active_ends: &mut [Option<T>; MAX_CONCURRENT_PLACEMENTS_PER_TRACK],
+    start: T,
+    end: T,
+) -> bool {
+    for active_end in active_ends.iter_mut() {
+        if active_end.is_some_and(|value| value <= start) {
+            *active_end = None;
+        }
+    }
+    let Some(slot) = active_ends.iter_mut().find(|end| end.is_none()) else {
+        return false;
+    };
+    *slot = Some(end);
+    true
 }
 
 fn resolve_placement<'a>(
@@ -906,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_noncanonical_order_overlap_and_missing_references() {
+    fn validates_canonical_order_bounded_overlap_and_missing_references() {
         let two = [
             PlacementResource {
                 id: "z",
@@ -924,7 +960,7 @@ mod tests {
             Err(GraphError::PlacementsNotSorted { index: 1 })
         );
 
-        let overlapping = [
+        let overlapping_pair = [
             PLACEMENTS[0],
             PlacementResource {
                 id: "placement-2",
@@ -932,13 +968,33 @@ mod tests {
                 ..PLACEMENTS[0]
             },
         ];
+        let schedule = compile_arrangement(
+            timeline(),
+            input(&TRACKS, &CLIPS, &ASSETS, &overlapping_pair),
+            GraphLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(schedule.entries().len(), 2);
+
+        let overlapping_triple = [
+            overlapping_pair[0],
+            overlapping_pair[1],
+            PlacementResource {
+                id: "placement-3",
+                start_tick: 3,
+                ..PLACEMENTS[0]
+            },
+        ];
         assert_eq!(
             compile_arrangement(
                 timeline(),
-                input(&TRACKS, &CLIPS, &ASSETS, &overlapping),
+                input(&TRACKS, &CLIPS, &ASSETS, &overlapping_triple),
                 GraphLimits::VERSION_1
             ),
-            Err(GraphError::OverlappingPlacements { placement_index: 1 })
+            Err(GraphError::ConcurrentPlacementsExceeded {
+                placement_index: 2,
+                maximum: MAX_CONCURRENT_PLACEMENTS_PER_TRACK,
+            })
         );
 
         let missing = [PlacementResource {
@@ -952,6 +1008,73 @@ mod tests {
                 GraphLimits::VERSION_1
             ),
             Err(GraphError::MissingPlacementClip { placement_index: 0 })
+        );
+    }
+
+    #[test]
+    fn rejects_a_third_native_frame_overlap_even_when_ticks_are_adjacent() {
+        const SAMPLE_LOCKED_MARKERS: [WarpMarker; 2] = [
+            WarpMarker {
+                tick: 0,
+                source_frame_offset: 0,
+            },
+            WarpMarker {
+                tick: 1,
+                source_frame_offset: 100,
+            },
+        ];
+        let clips = [ClipResource {
+            timebase: ClipTimebase::SampleLocked,
+            duration_ticks: 1,
+            source_frame_count: 100,
+            loop_range: TickRange { start: 0, end: 1 },
+            warp_markers: &SAMPLE_LOCKED_MARKERS,
+            ..CLIPS[0]
+        }];
+        let pair = [
+            PlacementResource {
+                duration_ticks: 1,
+                ..PLACEMENTS[0]
+            },
+            PlacementResource {
+                id: "placement-2",
+                start_tick: 1,
+                duration_ticks: 1,
+                ..PLACEMENTS[0]
+            },
+        ];
+        assert_eq!(
+            compile_arrangement(
+                timeline(),
+                input(&TRACKS, &clips, &ASSETS, &pair),
+                GraphLimits::VERSION_1,
+            )
+            .unwrap()
+            .entries()
+            .len(),
+            2
+        );
+
+        let triple = [
+            pair[0],
+            pair[1],
+            PlacementResource {
+                id: "placement-3",
+                start_tick: 2,
+                duration_ticks: 1,
+                ..PLACEMENTS[0]
+            },
+        ];
+        assert_eq!(
+            compile_arrangement(
+                timeline(),
+                input(&TRACKS, &clips, &ASSETS, &triple),
+                GraphLimits::VERSION_1,
+            ),
+            Err(GraphError::ConcurrentPlacementsExceeded {
+                placement_index: 2,
+                maximum: MAX_CONCURRENT_PLACEMENTS_PER_TRACK,
+            })
         );
     }
 

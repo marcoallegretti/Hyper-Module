@@ -10,6 +10,7 @@ use hyper_media_cache::{
     PreparedSceneAudio, PreparedSceneAudioEntry, PreparedSceneAvailability, PreparedSchedule,
     PreparedScheduleEntry,
 };
+use hyper_playback_compiler::graph::MAX_CONCURRENT_PLACEMENTS_PER_TRACK;
 use hyper_playback_compiler::scene::{
     CompiledScenePerformance, PlayingSceneClip, SceneLaunchState, SceneProcessError, SceneRuntime,
     SceneRuntimeCheckpoint, SceneRuntimeError, SceneSegment,
@@ -23,6 +24,8 @@ pub enum RendererCreationError {
     DuplicateTrackId { track_index: usize },
     MissingScheduleTrack { entry_index: usize },
     InconsistentTrackChannels { entry_index: usize },
+    UnorderedTrackPlacements { entry_index: usize },
+    ConcurrentPlacementsExceeded { entry_index: usize, maximum: usize },
 }
 
 impl fmt::Display for RendererCreationError {
@@ -56,6 +59,17 @@ impl fmt::Display for RendererCreationError {
                 formatter,
                 "schedule entry {entry_index} changes its track channel layout"
             ),
+            Self::UnorderedTrackPlacements { entry_index } => write!(
+                formatter,
+                "schedule entry {entry_index} is not ordered by its native start frame"
+            ),
+            Self::ConcurrentPlacementsExceeded {
+                entry_index,
+                maximum,
+            } => write!(
+                formatter,
+                "schedule entry {entry_index} exceeds the {maximum}-voice track overlap limit"
+            ),
         }
     }
 }
@@ -77,7 +91,9 @@ struct TrackLane {
 #[derive(Clone, Copy, Debug)]
 struct IndexedPlacement {
     entry_index: usize,
+    start_frame: usize,
     end_frame: usize,
+    previous_overlap: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -86,13 +102,87 @@ struct LaneBuild {
     placement_count: usize,
 }
 
+impl TrackLane {
+    fn first_candidate_position(&self, window_start: usize) -> Option<usize> {
+        let first_started_in_window = self
+            .placements
+            .partition_point(|placement| placement.start_frame < window_start);
+        let mut candidate = first_started_in_window;
+        for active in self
+            .active_before(first_started_in_window, window_start)
+            .into_iter()
+            .flatten()
+        {
+            candidate = candidate.min(active);
+        }
+        (candidate < self.placements.len()).then_some(candidate)
+    }
+
+    fn active_before(
+        &self,
+        first_started_in_window: usize,
+        window_start: usize,
+    ) -> [Option<usize>; MAX_CONCURRENT_PLACEMENTS_PER_TRACK] {
+        let mut active = [None; MAX_CONCURRENT_PLACEMENTS_PER_TRACK];
+        let Some(previous_index) = first_started_in_window.checked_sub(1) else {
+            return active;
+        };
+        let previous = self.placements[previous_index];
+        if let Some(earlier_index) = previous.previous_overlap
+            && self.placements[earlier_index].end_frame > window_start
+        {
+            active[0] = Some(earlier_index);
+        }
+        if previous.end_frame > window_start {
+            let slot = usize::from(active[0].is_some());
+            active[slot] = Some(previous_index);
+        }
+        active
+    }
+}
+
+fn validate_track_lane(lane: &mut TrackLane) -> Result<(), RendererCreationError> {
+    let mut active: [Option<usize>; MAX_CONCURRENT_PLACEMENTS_PER_TRACK] =
+        [None; MAX_CONCURRENT_PLACEMENTS_PER_TRACK];
+    let mut previous_start = None;
+    for placement_index in 0..lane.placements.len() {
+        let placement = lane.placements[placement_index];
+        if previous_start.is_some_and(|start| placement.start_frame < start) {
+            return Err(RendererCreationError::UnorderedTrackPlacements {
+                entry_index: placement.entry_index,
+            });
+        }
+        previous_start = Some(placement.start_frame);
+        for active_index in &mut active {
+            if active_index
+                .is_some_and(|index| lane.placements[index].end_frame <= placement.start_frame)
+            {
+                *active_index = None;
+            }
+        }
+        if active.iter().all(Option::is_some) {
+            return Err(RendererCreationError::ConcurrentPlacementsExceeded {
+                entry_index: placement.entry_index,
+                maximum: MAX_CONCURRENT_PLACEMENTS_PER_TRACK,
+            });
+        }
+        lane.placements[placement_index].previous_overlap = active.iter().flatten().next().copied();
+        let Some(slot) = active.iter_mut().find(|index| index.is_none()) else {
+            return Err(RendererCreationError::CapacityUnavailable);
+        };
+        *slot = Some(placement_index);
+    }
+    Ok(())
+}
+
 impl<'prepared, 'cache, 'schedule> ArrangementRenderer<'prepared, 'cache, 'schedule> {
     /// Builds a per-track placement index outside the callback path.
     ///
     /// # Errors
     ///
-    /// Returns [`RendererCreationError`] for unavailable index capacity or
-    /// overflowing placement frame ranges.
+    /// Returns [`RendererCreationError`] for unavailable index capacity,
+    /// overflowing placement frame ranges, or a schedule that exceeds the
+    /// bounded per-track overlap topology.
     pub fn try_new(
         schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
     ) -> Result<Self, RendererCreationError> {
@@ -157,8 +247,14 @@ impl<'prepared, 'cache, 'schedule> ArrangementRenderer<'prepared, 'cache, 'sched
             lanes[lane_index].channels = Some(entry.channels());
             lanes[lane_index].placements.push(IndexedPlacement {
                 entry_index,
+                start_frame,
                 end_frame,
+                previous_overlap: None,
             });
+        }
+
+        for lane in &mut lanes {
+            validate_track_lane(lane)?;
         }
 
         Ok(Self { schedule, lanes })
@@ -174,7 +270,8 @@ impl<'prepared, 'cache, 'schedule> ArrangementRenderer<'prepared, 'cache, 'sched
     ///
     /// Returns [`RendererCreationError`] for invalid track identities,
     /// missing schedule tracks, inconsistent source layouts, arithmetic
-    /// overflow, or unavailable capacity.
+    /// overflow, unavailable capacity, or a schedule that exceeds the bounded
+    /// per-track overlap topology.
     pub fn try_new_for_tracks(
         schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
         track_ids: &[&str],
@@ -235,8 +332,13 @@ impl<'prepared, 'cache, 'schedule> ArrangementRenderer<'prepared, 'cache, 'sched
             lanes[lane_index].channels = Some(entry.channels());
             lanes[lane_index].placements.push(IndexedPlacement {
                 entry_index,
+                start_frame,
                 end_frame,
+                previous_overlap: None,
             });
+        }
+        for lane in &mut lanes {
+            validate_track_lane(lane)?;
         }
         Ok(Self { schedule, lanes })
     }
@@ -278,8 +380,9 @@ impl<'prepared, 'cache, 'schedule> ArrangementRenderer<'prepared, 'cache, 'sched
 
     /// Renders one fixed scratch slot per indexed track lane.
     ///
-    /// Sequential placements on one track are written into disjoint window
-    /// regions in the same slot. Inactive and empty tracks remain silent.
+    /// Up to two overlapping placements on one track are summed into the same
+    /// slot in canonical schedule order. Inactive and empty tracks remain
+    /// silent.
     ///
     /// # Errors
     ///
@@ -298,11 +401,8 @@ impl<'prepared, 'cache, 'schedule> ArrangementRenderer<'prepared, 'cache, 'sched
         self.lanes
             .iter()
             .filter_map(|lane| {
-                let position = lane
-                    .placements
-                    .partition_point(|placement| placement.end_frame <= window_start);
-                lane.placements
-                    .get(position)
+                lane.first_candidate_position(window_start)
+                    .and_then(|position| lane.placements.get(position))
                     .map(|placement| placement.entry_index)
             })
             .min()
@@ -633,58 +733,56 @@ fn render_track_window(
     }
 
     let mut active_slot_count = 0_usize;
-    for (lane, slot) in renderer.lanes.iter().zip(scratch.iter_mut()) {
-        let first_candidate = lane
+    for lane_index in 0..renderer.lanes.len() {
+        let lane = &renderer.lanes[lane_index];
+        let first_started_in_window = lane
             .placements
-            .partition_point(|placement| placement.end_frame <= arrangement_start_frame);
+            .partition_point(|placement| placement.start_frame < arrangement_start_frame);
         let mut active = false;
-        for placement in &lane.placements[first_candidate..] {
-            let entry = &renderer.schedule.entries()[placement.entry_index];
-            if entry.schedule_entry().compiled.arrangement_start_frame() >= arrangement_end_frame {
+        for prior_index in lane
+            .active_before(first_started_in_window, arrangement_start_frame)
+            .into_iter()
+            .flatten()
+        {
+            let outcome = {
+                let slot = &mut scratch[lane_index];
+                render_track_placement(
+                    renderer.schedule,
+                    lane.placements[prior_index],
+                    arrangement_start_frame,
+                    arrangement_end_frame,
+                    slot,
+                )
+            };
+            active |= match outcome {
+                Ok(was_rendered) => was_rendered,
+                Err(error) => {
+                    clear_track_scratch(renderer, scratch);
+                    return Err(error);
+                }
+            };
+        }
+        for placement in &lane.placements[first_started_in_window..] {
+            if placement.start_frame >= arrangement_end_frame {
                 break;
             }
-            if !entry.is_enabled() {
-                continue;
-            }
-            let Some(intersection) = intersection(
-                entry,
-                placement.entry_index,
-                arrangement_start_frame,
-                arrangement_end_frame,
-            )?
-            else {
-                continue;
-            };
-            let render_result = if entry.channels() == 1 {
-                entry.render_block(
-                    intersection.placement_offset,
-                    ClipOutput::Mono(
-                        &mut slot.left[intersection.window_offset..intersection.window_end],
-                    ),
-                )
-            } else {
-                entry.render_block(
-                    intersection.placement_offset,
-                    ClipOutput::Stereo {
-                        left: &mut slot.left[intersection.window_offset..intersection.window_end],
-                        right: &mut slot.right[intersection.window_offset..intersection.window_end],
-                    },
+            let outcome = {
+                let slot = &mut scratch[lane_index];
+                render_track_placement(
+                    renderer.schedule,
+                    *placement,
+                    arrangement_start_frame,
+                    arrangement_end_frame,
+                    slot,
                 )
             };
-            if let Err(source) = render_result {
-                for (clear_lane, initialized) in renderer.lanes.iter().zip(scratch.iter_mut()) {
-                    clear_slot(initialized);
-                    initialized.channels = clear_lane.channels.unwrap_or(1);
+            active |= match outcome {
+                Ok(was_rendered) => was_rendered,
+                Err(error) => {
+                    clear_track_scratch(renderer, scratch);
+                    return Err(error);
                 }
-                return Err(RenderWindowError::Clip {
-                    entry_index: placement.entry_index,
-                    source,
-                });
-            }
-            if !active {
-                slot.entry_index = Some(placement.entry_index);
-                active = true;
-            }
+            };
         }
         if active {
             active_slot_count = active_slot_count
@@ -694,6 +792,58 @@ fn render_track_window(
     }
 
     Ok(RenderedWindow { active_slot_count })
+}
+
+fn clear_track_scratch(
+    renderer: &ArrangementRenderer<'_, '_, '_>,
+    scratch: &mut [RenderScratchSlot<'_>],
+) {
+    for (lane, slot) in renderer.lanes.iter().zip(scratch.iter_mut()) {
+        clear_slot(slot);
+        slot.channels = lane.channels.unwrap_or(1);
+    }
+}
+
+fn render_track_placement(
+    schedule: &PreparedSchedule<'_, '_>,
+    placement: IndexedPlacement,
+    arrangement_start_frame: usize,
+    arrangement_end_frame: usize,
+    slot: &mut RenderScratchSlot<'_>,
+) -> Result<bool, RenderWindowError> {
+    let entry = &schedule.entries()[placement.entry_index];
+    if !entry.is_enabled() {
+        return Ok(false);
+    }
+    let Some(intersection) = intersection(
+        entry,
+        placement.entry_index,
+        arrangement_start_frame,
+        arrangement_end_frame,
+    )?
+    else {
+        return Ok(false);
+    };
+    let render_result = if entry.channels() == 1 {
+        entry.render_block_additive(
+            intersection.placement_offset,
+            ClipOutput::Mono(&mut slot.left[intersection.window_offset..intersection.window_end]),
+        )
+    } else {
+        entry.render_block_additive(
+            intersection.placement_offset,
+            ClipOutput::Stereo {
+                left: &mut slot.left[intersection.window_offset..intersection.window_end],
+                right: &mut slot.right[intersection.window_offset..intersection.window_end],
+            },
+        )
+    };
+    render_result.map_err(|source| RenderWindowError::Clip {
+        entry_index: placement.entry_index,
+        source,
+    })?;
+    slot.entry_index.get_or_insert(placement.entry_index);
+    Ok(true)
 }
 
 #[derive(Clone, Copy)]

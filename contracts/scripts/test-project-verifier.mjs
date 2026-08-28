@@ -1656,10 +1656,15 @@ try {
       id: "018f47a2-6b2d-7c11-8a44-001122334466",
       start_tick: 3840,
     });
+    arrangement.placements.push({
+      ...arrangement.placements[0],
+      id: "018f47a2-6b2d-7c11-8a44-001122334467",
+      start_tick: 5760,
+    });
   });
   await assert.rejects(
     verifyProject(overlappingPlacements),
-    /must not overlap/,
+    /exceed the 2-voice/,
   );
 
   const invalidPlacementStart = join(temporaryRoot, "invalid-placement-start");
