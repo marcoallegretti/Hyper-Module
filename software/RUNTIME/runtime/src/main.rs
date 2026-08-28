@@ -27,11 +27,12 @@ use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
     ChannelSamplePeakBallistics, EbuLoudnessPresentationConfig, LocateState,
     LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay, MixerChannelHandle,
-    MixerParameterCommand, MixerParameterStateSnapshot, MixerSendHandle, NativeDeviceCommand,
-    NativeDeviceHandle, NativeDeviceStateSnapshot, OutputMeterReceiver, PlaybackCycleObservation,
-    PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot, PlaybackRecoveryTransportState,
-    SamplePeakBallisticsConfig, ScaledLoudnessValue, StereoSamplePeakBallistics,
-    StereoSamplePeakBallisticsSnapshot, TransportCommand, TransportLoopRange,
+    MixerParameterCommand, MixerParameterStateSnapshot, MixerSendHandle, MixerStripMeterSnapshot,
+    NativeDeviceCommand, NativeDeviceHandle, NativeDeviceStateSnapshot, OutputMeterReceiver,
+    PlaybackCycleObservation, PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
+    PlaybackRecoveryTransportState, SamplePeakBallisticsConfig, ScaledLoudnessValue,
+    StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot, TransportCommand,
+    TransportLoopRange,
 };
 use hyper_native_device::{
     NativeCompressorState, NativeDeviceState, NativeFilterMode, NativeFilterState,
@@ -253,6 +254,7 @@ struct OperatorMeterObserver {
     ballistics: StereoSamplePeakBallistics,
     latest: Option<StereoSamplePeakBallisticsSnapshot>,
     latest_loudness: Option<LoudnessPresentationSnapshot>,
+    latest_strip_meters: Option<MixerStripMeterSnapshot>,
     peak_hold_available: bool,
     coalesced_snapshot_count: u64,
     dropped_snapshot_count: u64,
@@ -266,6 +268,7 @@ impl OperatorMeterObserver {
             ballistics: StereoSamplePeakBallistics::new(config),
             latest: None,
             latest_loudness: None,
+            latest_strip_meters: None,
             peak_hold_available: false,
             coalesced_snapshot_count: 0,
             dropped_snapshot_count: 0,
@@ -273,7 +276,7 @@ impl OperatorMeterObserver {
         }
     }
 
-    fn observe(&mut self) -> OperatorMeterPresentation {
+    fn observe(&mut self) -> OperatorMeterObservation {
         let read = self.receiver.read_ballistics(&mut self.ballistics);
         let latest = read.latest();
         self.coalesced_snapshot_count = self
@@ -286,19 +289,23 @@ impl OperatorMeterObserver {
         if let Some(snapshot) = latest.snapshot() {
             self.latest_loudness =
                 Some(snapshot.present_loudness(EbuLoudnessPresentationConfig::default()));
+            self.latest_strip_meters = Some(snapshot.strip_meters());
         }
         if let Some(snapshot) = read.ballistics() {
             self.latest = Some(snapshot);
             self.peak_hold_available = true;
         }
-        operator_meter_presentation(
-            self.latest,
-            self.peak_hold_available,
-            self.coalesced_snapshot_count,
-            self.dropped_snapshot_count,
-            self.sender_disconnected,
-            self.latest_loudness,
-        )
+        OperatorMeterObservation {
+            presentation: operator_meter_presentation(
+                self.latest,
+                self.peak_hold_available,
+                self.coalesced_snapshot_count,
+                self.dropped_snapshot_count,
+                self.sender_disconnected,
+                self.latest_loudness,
+            ),
+            strip_meters: self.latest_strip_meters,
+        }
     }
 
     fn reset_peak_hold(&mut self) {
@@ -3041,11 +3048,16 @@ fn operator_mixer_rows(channels: &[OperatorMixerChannel]) -> Vec<OperatorMixerRo
     channels
         .iter()
         .map(|channel| OperatorMixerRow {
+            index: i32::try_from(channel.index).unwrap_or(-1),
             name: channel.name.clone().into(),
             gain_percent: 0.0,
             pan_percent: 0.0,
             muted: false,
             soloed: false,
+            meter_left_level: 0.0,
+            meter_right_level: 0.0,
+            meter_left_reading: "— dBFS".into(),
+            meter_right_reading: "— dBFS".into(),
             controls_enabled: false,
             solo_available: channel.solo_available,
         })
@@ -3723,6 +3735,12 @@ struct OperatorMeterPresentation {
     loudness: OperatorLoudnessPresentation,
 }
 
+#[derive(Debug)]
+struct OperatorMeterObservation {
+    presentation: OperatorMeterPresentation,
+    strip_meters: Option<MixerStripMeterSnapshot>,
+}
+
 #[derive(Debug, PartialEq)]
 struct OperatorLoudnessPresentation {
     state: &'static str,
@@ -3907,6 +3925,20 @@ fn operator_meter_level_presentation(measurement_available: bool, dbfs: f32) -> 
     (level, reading)
 }
 
+fn operator_strip_meter_presentation(sample_peak: Option<f32>) -> (f32, String) {
+    let Some(sample_peak) =
+        sample_peak.filter(|sample_peak| sample_peak.is_finite() && *sample_peak >= 0.0)
+    else {
+        return (0.0, "— dBFS".to_owned());
+    };
+    let dbfs = if sample_peak == 0.0 {
+        OUTPUT_METER_FLOOR_DBFS
+    } else {
+        (20.0 * sample_peak.log10()).max(OUTPUT_METER_FLOOR_DBFS)
+    };
+    operator_meter_level_presentation(true, dbfs)
+}
+
 fn operator_peak_hold_presentation(measurement_available: bool, dbfs: f32) -> (String, bool) {
     if !measurement_available || !dbfs.is_finite() {
         return ("hold —".to_owned(), false);
@@ -4014,7 +4046,9 @@ fn apply_operator_meter_observation(
     loudness_authority: &Cell<Option<LoudnessMeasurementState>>,
     terminal_latched: bool,
 ) {
-    let presentation = observer.observe();
+    let observation = observer.observe();
+    let strip_meters = observation.strip_meters;
+    let presentation = observation.presentation;
     ui.set_left_output_level(presentation.left_level);
     ui.set_left_output_reading(presentation.left_reading.into());
     ui.set_left_output_peak_reading(presentation.left_peak_reading.into());
@@ -4024,6 +4058,11 @@ fn apply_operator_meter_observation(
     ui.set_output_overload_latched(presentation.overload_latched);
     ui.set_output_meter_state(presentation.state.into());
     ui.set_output_meter_telemetry(presentation.telemetry.into());
+    apply_operator_strip_meter_observation(
+        ui,
+        strip_meters,
+        terminal_latched || observer.sender_disconnected,
+    );
     ui.set_loudness_state(presentation.loudness.state.into());
     ui.set_loudness_momentary(presentation.loudness.momentary.into());
     ui.set_loudness_short_term(presentation.loudness.short_term.into());
@@ -4043,6 +4082,59 @@ fn apply_operator_meter_observation(
     ui.set_loudness_run_enabled(authority == Some(LoudnessMeasurementState::Standby));
     ui.set_loudness_standby_enabled(authority == Some(LoudnessMeasurementState::Running));
     ui.set_loudness_reset_enabled(authority.is_some());
+}
+
+fn apply_operator_strip_meter_observation(
+    ui: &OperatorWindow,
+    strip_meters: Option<MixerStripMeterSnapshot>,
+    terminal_latched: bool,
+) {
+    let model = ui.get_mixer_channels();
+    let layout_matches = !terminal_latched
+        && strip_meters.is_some_and(|strip_meters| {
+            model.row_count() == strip_meters.slot_count()
+                && (0..strip_meters.slot_count()).all(|slot| {
+                    model.row_data(slot).is_some_and(|row| {
+                        row.index == i32::try_from(slot).unwrap_or(-1)
+                            && strip_meters.slot(slot).is_some()
+                    })
+                })
+        });
+    if !layout_matches {
+        clear_operator_strip_meter_observation(&model);
+        return;
+    }
+    let Some(strip_meters) = strip_meters else {
+        clear_operator_strip_meter_observation(&model);
+        return;
+    };
+    for slot in 0..strip_meters.slot_count() {
+        let (Some(strip), Some(mut row)) = (strip_meters.slot(slot), model.row_data(slot)) else {
+            clear_operator_strip_meter_observation(&model);
+            return;
+        };
+        let (left_level, left_reading) =
+            operator_strip_meter_presentation(strip.left_sample_peak());
+        let (right_level, right_reading) =
+            operator_strip_meter_presentation(strip.right_sample_peak());
+        row.meter_left_level = left_level;
+        row.meter_right_level = right_level;
+        row.meter_left_reading = left_reading.into();
+        row.meter_right_reading = right_reading.into();
+        model.set_row_data(slot, row);
+    }
+}
+
+fn clear_operator_strip_meter_observation(model: &ModelRc<OperatorMixerRow>) {
+    for slot in 0..model.row_count() {
+        if let Some(mut row) = model.row_data(slot) {
+            row.meter_left_level = 0.0;
+            row.meter_right_level = 0.0;
+            row.meter_left_reading = "— dBFS".into();
+            row.meter_right_reading = "— dBFS".into();
+            model.set_row_data(slot, row);
+        }
+    }
 }
 
 /// Enforces the process startup boundary: artifact acceptance and semantic
@@ -6481,6 +6573,21 @@ mod tests {
             &loudness_authority,
             false,
         );
+        let strip_meters = launched.snapshot().strip_meters();
+        assert_eq!(generated_mixer.row_count(), strip_meters.slot_count());
+        for slot in 0..strip_meters.slot_count() {
+            let strip = strip_meters.slot(slot).unwrap();
+            let row = generated_mixer.row_data(slot).unwrap();
+            let (expected_left_level, expected_left_reading) =
+                operator_strip_meter_presentation(strip.left_sample_peak());
+            let (expected_right_level, expected_right_reading) =
+                operator_strip_meter_presentation(strip.right_sample_peak());
+            assert_eq!(row.index, i32::try_from(slot).unwrap());
+            assert_operator_float(row.meter_left_level, expected_left_level);
+            assert_operator_float(row.meter_right_level, expected_right_level);
+            assert_eq!(row.meter_left_reading.as_str(), expected_left_reading);
+            assert_eq!(row.meter_right_reading.as_str(), expected_right_reading);
+        }
         let first_left_peak = interleaved
             .iter()
             .step_by(2)
@@ -7027,6 +7134,13 @@ mod tests {
             &loudness_authority,
             true,
         );
+        for slot in 0..generated_mixer.row_count() {
+            let row = generated_mixer.row_data(slot).unwrap();
+            assert_operator_float(row.meter_left_level, 0.0);
+            assert_operator_float(row.meter_right_level, 0.0);
+            assert_eq!(row.meter_left_reading.as_str(), "— dBFS");
+            assert_eq!(row.meter_right_reading.as_str(), "— dBFS");
+        }
         assert_eq!(
             terminal_peak_measurements,
             (
@@ -7313,6 +7427,26 @@ mod tests {
             saturated_loudness_receiver.try_recv(),
             Err(TryRecvError::Empty)
         );
+
+        let mismatched_model = Rc::new(VecModel::from(operator_mixer_rows(&mixer_channels)));
+        let mut mismatched_row = mismatched_model.row_data(0).unwrap();
+        mismatched_row.index = 99;
+        mismatched_row.controls_enabled = true;
+        mismatched_row.meter_left_level = 0.75;
+        mismatched_row.meter_right_level = 0.5;
+        mismatched_row.meter_left_reading = "-2.5 dBFS".into();
+        mismatched_row.meter_right_reading = "-6.0 dBFS".into();
+        mismatched_model.set_row_data(0, mismatched_row);
+        ui.set_mixer_channels(ModelRc::from(Rc::clone(&mismatched_model)));
+
+        apply_operator_strip_meter_observation(ui, Some(strip_meters), false);
+
+        let cleared = mismatched_model.row_data(0).unwrap();
+        assert!(cleared.controls_enabled);
+        assert_operator_float(cleared.meter_left_level, 0.0);
+        assert_operator_float(cleared.meter_right_level, 0.0);
+        assert_eq!(cleared.meter_left_reading.as_str(), "— dBFS");
+        assert_eq!(cleared.meter_right_reading.as_str(), "— dBFS");
     }
 
     #[test]
@@ -8134,6 +8268,26 @@ mod tests {
             (1.0, "3.0 dBFS".to_owned())
         );
         assert_eq!(
+            operator_strip_meter_presentation(None),
+            (0.0, "— dBFS".to_owned())
+        );
+        assert_eq!(
+            operator_strip_meter_presentation(Some(f32::NAN)),
+            (0.0, "— dBFS".to_owned())
+        );
+        assert_eq!(
+            operator_strip_meter_presentation(Some(-0.1)),
+            (0.0, "— dBFS".to_owned())
+        );
+        assert_eq!(
+            operator_strip_meter_presentation(Some(0.0)),
+            (0.0, "≤ -90.0 dBFS".to_owned())
+        );
+        assert_eq!(
+            operator_strip_meter_presentation(Some(1.0)),
+            (1.0, "0.0 dBFS".to_owned())
+        );
+        assert_eq!(
             operator_peak_hold_presentation(false, 3.0),
             ("hold —".to_owned(), false)
         );
@@ -8169,6 +8323,7 @@ mod tests {
         assert_eq!(observer.dropped_snapshot_count, 11);
         assert!(observer.sender_disconnected);
         assert!(observer.latest.is_none());
+        assert!(observer.latest_strip_meters.is_none());
 
         let unavailable =
             operator_meter_presentation(None, false, u64::MAX, u64::MAX - 1, true, None);

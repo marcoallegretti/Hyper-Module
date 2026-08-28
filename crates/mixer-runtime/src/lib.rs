@@ -62,6 +62,7 @@ pub const MAX_QUEUED_MIXER_PARAMETER_COMMANDS: usize = 64;
 pub const MAX_QUEUED_NATIVE_DEVICE_COMMANDS: usize = 64;
 pub const MAX_QUEUED_LOUDNESS_COMMANDS: usize = 32;
 pub const MAX_QUEUED_OUTPUT_METER_SNAPSHOTS: usize = 64;
+const ALL_MAIN_MIXER_SLOT_INDICES: [usize; MAX_MAIN_MIXER_SLOTS] = [0, 1, 2, 3, 4, 5, 6, 7];
 const MIXER_PARAMETER_LAYOUT_SIGNATURE_VERSION: &[u8] = b"hyper-mixer-parameter-layout-v1";
 const NATIVE_DEVICE_LAYOUT_SIGNATURE_VERSION: &[u8] = b"hyper-native-device-layout-v1";
 static NEXT_OUTPUT_METER_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -1894,11 +1895,126 @@ impl TransportCycle {
     }
 }
 
-/// Final output meter data associated with one successful transport cycle.
+/// Stereo sample-peak data for one compiled mixer strip in a successful
+/// transport callback.
+///
+/// The readings are post-device, post-automation, post-mute, post-fader, and
+/// post-pan. They exclude send and downstream-route contributions and are
+/// copied before routing, post-fader sends, and main processing. Pre-fader
+/// sends have already been dispatched, but they do not alter the measured
+/// channel output. These are sample peaks, not true-peak or loudness
+/// measurements.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MixerStripSamplePeak {
+    left_sample_peak: Option<f32>,
+    right_sample_peak: Option<f32>,
+}
+
+impl MixerStripSamplePeak {
+    const SILENCE: Self = Self {
+        left_sample_peak: Some(0.0),
+        right_sample_peak: Some(0.0),
+    };
+
+    #[must_use]
+    pub const fn left_sample_peak(self) -> Option<f32> {
+        self.left_sample_peak
+    }
+
+    #[must_use]
+    pub const fn right_sample_peak(self) -> Option<f32> {
+        self.right_sample_peak
+    }
+
+    fn observe(&mut self, left: &[f32], right: &[f32]) {
+        observe_strip_sample_peak(&mut self.left_sample_peak, left);
+        observe_strip_sample_peak(&mut self.right_sample_peak, right);
+    }
+}
+
+fn observe_strip_sample_peak(peak: &mut Option<f32>, samples: &[f32]) {
+    let Some(mut observed) = *peak else {
+        return;
+    };
+    for &sample in samples {
+        if !sample.is_finite() {
+            *peak = None;
+            return;
+        }
+        observed = observed.max(sample.abs());
+    }
+    *peak = Some(observed);
+}
+
+/// Fixed-capacity post-fader strip-meter evidence associated with one
+/// successful transport callback.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MixerStripMeterSnapshot {
+    slot_count: usize,
+    strips: [MixerStripSamplePeak; MAX_MAIN_MIXER_SLOTS],
+}
+
+impl MixerStripMeterSnapshot {
+    const fn silence(slot_count: usize) -> Self {
+        Self {
+            slot_count,
+            strips: [MixerStripSamplePeak::SILENCE; MAX_MAIN_MIXER_SLOTS],
+        }
+    }
+
+    #[must_use]
+    pub const fn slot_count(self) -> usize {
+        self.slot_count
+    }
+
+    /// Returns one strip reading only when `slot` belongs to this compiled
+    /// callback layout.
+    #[must_use]
+    pub const fn slot(self, slot: usize) -> Option<MixerStripSamplePeak> {
+        if slot < self.slot_count && slot < MAX_MAIN_MIXER_SLOTS {
+            Some(self.strips[slot])
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MixerStripMeterAccumulator {
+    snapshot: MixerStripMeterSnapshot,
+}
+
+impl MixerStripMeterAccumulator {
+    fn new(slot_count: usize) -> Self {
+        debug_assert!(slot_count <= MAX_MAIN_MIXER_SLOTS);
+        Self {
+            snapshot: MixerStripMeterSnapshot::silence(slot_count),
+        }
+    }
+
+    const fn slot_count(&self) -> usize {
+        self.snapshot.slot_count
+    }
+
+    fn observe(&mut self, slot: usize, left: &[f32], right: &[f32]) {
+        debug_assert!(slot < self.snapshot.slot_count);
+        if let Some(strip) = self.snapshot.strips.get_mut(slot) {
+            strip.observe(left, right);
+        }
+    }
+
+    const fn finish(self) -> MixerStripMeterSnapshot {
+        self.snapshot
+    }
+}
+
+/// Final output and per-strip meter data associated with one successful
+/// transport cycle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OutputMeterSnapshot {
     cycle: TransportCycle,
     meter: StereoBlockMeter,
+    strip_meters: MixerStripMeterSnapshot,
     processed_frame_end: u64,
     dropped_before: usize,
     applied_loudness_command_count: usize,
@@ -1914,6 +2030,13 @@ impl OutputMeterSnapshot {
     #[must_use]
     pub const fn meter(self) -> StereoBlockMeter {
         self.meter
+    }
+
+    /// Returns the fixed post-fader sample peaks for the compiled mixer
+    /// layout that produced this cycle.
+    #[must_use]
+    pub const fn strip_meters(self) -> MixerStripMeterSnapshot {
+        self.strip_meters
     }
 
     /// Converts the persistent loudness measurement into non-visual display
@@ -4452,6 +4575,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         frame_count: usize,
         scratch: &mut [RenderScratchSlot<'_>],
         output: StereoOutput<'_>,
+        mut strip_meters: Option<&mut MixerStripMeterAccumulator>,
     ) -> Result<(usize, RenderedWindow, usize), RuntimeProcessError> {
         let StereoOutput { left, right } = output;
         if start_frame.checked_add(frame_count).is_none() {
@@ -4475,14 +4599,23 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 }
                 _ => remaining,
             };
-            let rendered = self.runtime.process_window(
-                position,
-                scratch,
-                StereoOutput {
-                    left: &mut left[written..written + span],
-                    right: &mut right[written..written + span],
-                },
-            )?;
+            let window_output = StereoOutput {
+                left: &mut left[written..written + span],
+                right: &mut right[written..written + span],
+            };
+            let rendered = if let Some(strip_meters) = &mut strip_meters {
+                let slot_count = strip_meters.slot_count();
+                self.runtime.process_window_with_channel_tap_sink(
+                    position,
+                    scratch,
+                    window_output,
+                    &ALL_MAIN_MIXER_SLOT_INDICES[..slot_count],
+                    |slot, left, right| strip_meters.observe(slot, left, right),
+                )?
+            } else {
+                self.runtime
+                    .process_window(position, scratch, window_output)?
+            };
             if let Some(metronome) = &mut self.metronome {
                 metronome
                     .mix_window(
@@ -4551,6 +4684,19 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         &mut self,
         scratch: &mut [RenderScratchSlot<'_>],
         output: StereoOutput<'_>,
+    ) -> Result<TransportCycle, RuntimeProcessError> {
+        self.process_cycle_with_strip_meters(scratch, output, None)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the transactional transport rollback remains auditable when its state fences are co-located"
+    )]
+    fn process_cycle_with_strip_meters(
+        &mut self,
+        scratch: &mut [RenderScratchSlot<'_>],
+        output: StereoOutput<'_>,
+        strip_meters: Option<&mut MixerStripMeterAccumulator>,
     ) -> Result<TransportCycle, RuntimeProcessError> {
         let frame_count = output.left.len();
         if frame_count != output.right.len() {
@@ -4631,7 +4777,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 native_device_command_sender_disconnected,
             });
         }
-        let rendered = self.render_cycle(start_frame, frame_count, scratch, output);
+        let rendered = self.render_cycle(start_frame, frame_count, scratch, output, strip_meters);
         let (next_frame, rendered, loop_wrap_count) = match rendered {
             Ok(rendered) => rendered,
             Err(source) => {
@@ -4748,18 +4894,21 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     where
         F: FnOnce(StereoOutput<'_>),
     {
+        let mut strip_meters = MixerStripMeterAccumulator::new(self.runtime.slot_count());
         let processed = callback.process(interleaved_output, |output| {
-            let cycle = self.process_cycle(
+            let cycle = self.process_cycle_with_strip_meters(
                 scratch,
                 StereoOutput {
                     left: &mut *output.left,
                     right: &mut *output.right,
                 },
+                Some(&mut strip_meters),
             )?;
             post_mix(output);
             Ok(cycle)
         })?;
         let (cycle, meter) = processed.into_parts();
+        let strip_meters = strip_meters.finish();
         let mixer_parameter_state = (cycle.applied_mixer_parameter_command_count() > 0)
             .then(|| self.runtime.capture_parameter_state());
         let native_device_state = (cycle.applied_native_device_command_count() > 0)
@@ -4767,6 +4916,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         let snapshot = OutputMeterSnapshot {
             cycle,
             meter,
+            strip_meters,
             processed_frame_end: 0,
             dropped_before: 0,
             applied_loudness_command_count: loudness.applied_command_count,

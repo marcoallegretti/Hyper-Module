@@ -144,6 +144,29 @@ fn assert_samples(actual: &[f32], expected: &[f32]) {
     }
 }
 
+fn sample_peak(samples: &[f32]) -> Option<f32> {
+    let mut peak = 0.0_f32;
+    for &sample in samples {
+        if !sample.is_finite() {
+            return None;
+        }
+        peak = peak.max(sample.abs());
+    }
+    Some(peak)
+}
+
+fn assert_sample_peak(actual: Option<f32>, expected: Option<f32>) {
+    match (actual, expected) {
+        (Some(actual), Some(expected)) => {
+            assert!(
+                (actual - expected).abs() <= f32::EPSILON,
+                "expected {expected}, got {actual}"
+            );
+        }
+        (actual, expected) => assert_eq!(actual, expected),
+    }
+}
+
 fn queue_loudness_restart(sender: &mut LoudnessCommandSender) {
     sender
         .try_send(LoudnessMeasurementCommand::SetState(
@@ -3606,6 +3629,163 @@ fn interleaved_callback_executes_the_transport_runtime() {
         meter_receiver,
         &snapshot,
     );
+}
+
+#[test]
+fn interleaved_strip_meters_match_all_post_fader_routed_slots_before_main_processing() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let mut expected_runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 2).unwrap();
+    let mut expected_scratch_left = [[0.0_f32; 2]; 5];
+    let mut expected_scratch_right = [[0.0_f32; 2]; 5];
+    let [
+        expected_left_0,
+        expected_left_1,
+        expected_left_2,
+        expected_left_3,
+        expected_left_4,
+    ] = &mut expected_scratch_left;
+    let [
+        expected_right_0,
+        expected_right_1,
+        expected_right_2,
+        expected_right_3,
+        expected_right_4,
+    ] = &mut expected_scratch_right;
+    let mut expected_scratch = [
+        RenderScratchSlot::new(expected_left_0, expected_right_0),
+        RenderScratchSlot::new(expected_left_1, expected_right_1),
+        RenderScratchSlot::new(expected_left_2, expected_right_2),
+        RenderScratchSlot::new(expected_left_3, expected_right_3),
+        RenderScratchSlot::new(expected_left_4, expected_right_4),
+    ];
+    let mut expected_main_left = [0.0_f32; 2];
+    let mut expected_main_right = [0.0_f32; 2];
+    let mut expected = [(None, None); 5];
+    expected_runtime
+        .process_window_with_channel_tap_sink(
+            0,
+            &mut expected_scratch,
+            StereoOutput {
+                left: &mut expected_main_left,
+                right: &mut expected_main_right,
+            },
+            &[0, 1, 2, 3, 4],
+            |slot, left, right| {
+                expected[slot] = (sample_peak(left), sample_peak(right));
+            },
+        )
+        .unwrap();
+
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 2).unwrap();
+    let (mut transport_sender, mut mixer_sender, mut transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+    transport_sender.try_send(TransportCommand::Start).unwrap();
+    mixer_sender
+        .try_send(MixerParameterCommand::MainMute { muted: true })
+        .unwrap();
+    let mut callback = InterleavedStereoCallback::try_new(2, 48_000).unwrap();
+    let (mut meter_sender, _meter_receiver) = output_meter_channel();
+    let mut scratch_left = [[0.0_f32; 2]; 5];
+    let mut scratch_right = [[0.0_f32; 2]; 5];
+    let [left_0, left_1, left_2, left_3, left_4] = &mut scratch_left;
+    let [right_0, right_1, right_2, right_3, right_4] = &mut scratch_right;
+    let mut scratch = [
+        RenderScratchSlot::new(left_0, right_0),
+        RenderScratchSlot::new(left_1, right_1),
+        RenderScratchSlot::new(left_2, right_2),
+        RenderScratchSlot::new(left_3, right_3),
+        RenderScratchSlot::new(left_4, right_4),
+    ];
+    let mut interleaved = [9.0_f32; 4];
+
+    let reported = transport
+        .process_interleaved_cycle(
+            &mut callback,
+            &mut scratch,
+            &mut interleaved,
+            &mut meter_sender,
+        )
+        .unwrap();
+
+    assert!(reported.mixer_parameter_state().unwrap().main_muted());
+    assert_constant(&interleaved, 0.0);
+    let strips = reported.snapshot().strip_meters();
+    assert_eq!(strips.slot_count(), expected.len());
+    for (slot, (expected_left, expected_right)) in expected.into_iter().enumerate() {
+        let strip = strips.slot(slot).unwrap();
+        assert_sample_peak(strip.left_sample_peak(), expected_left);
+        assert_sample_peak(strip.right_sample_peak(), expected_right);
+    }
+    assert_eq!(strips.slot(expected.len()), None);
+}
+
+#[test]
+fn interleaved_strip_meters_accumulate_loop_spans_and_clear_when_stopped() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 30)
+            .unwrap();
+    let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
+    transport
+        .apply_command(TransportCommand::SetLoopRange(Some(
+            TransportLoopRange::new(20, 50).unwrap(),
+        )))
+        .unwrap();
+    transport
+        .apply_command(TransportCommand::SetLoopEnabled(true))
+        .unwrap();
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 40,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    let mut callback = InterleavedStereoCallback::try_new(30, 48_000).unwrap();
+    let (mut meter_sender, _meter_receiver) = output_meter_channel();
+    let mut scratch_left = [[0.0_f32; 30]; 2];
+    let mut scratch_right = [[0.0_f32; 30]; 2];
+    let [left_0, left_1] = &mut scratch_left;
+    let [right_0, right_1] = &mut scratch_right;
+    let mut scratch = [
+        RenderScratchSlot::new(left_0, right_0),
+        RenderScratchSlot::new(left_1, right_1),
+    ];
+    let mut interleaved = [0.0_f32; 60];
+
+    let rolling = transport
+        .process_interleaved_cycle(
+            &mut callback,
+            &mut scratch,
+            &mut interleaved,
+            &mut meter_sender,
+        )
+        .unwrap();
+    assert_eq!(rolling.snapshot().cycle().loop_wrap_count(), 1);
+    let rolling_strips = rolling.snapshot().strip_meters();
+    assert_eq!(rolling_strips.slot_count(), 2);
+    let arrangement = rolling_strips.slot(0).unwrap();
+    assert_sample_peak(arrangement.left_sample_peak(), Some(0.49));
+    assert_sample_peak(arrangement.right_sample_peak(), Some(0.0));
+
+    transport.apply_command(TransportCommand::Stop).unwrap();
+    let stopped = transport
+        .process_interleaved_cycle(
+            &mut callback,
+            &mut scratch,
+            &mut interleaved,
+            &mut meter_sender,
+        )
+        .unwrap();
+    let stopped_strips = stopped.snapshot().strip_meters();
+    assert_eq!(stopped.snapshot().cycle().state(), TransportState::Stopped);
+    for slot in 0..stopped_strips.slot_count() {
+        let strip = stopped_strips.slot(slot).unwrap();
+        assert_eq!(strip.left_sample_peak(), Some(0.0));
+        assert_eq!(strip.right_sample_peak(), Some(0.0));
+    }
 }
 
 #[test]

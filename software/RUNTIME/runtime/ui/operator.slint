@@ -11,11 +11,16 @@ export struct OperatorSceneRow {
 }
 
 export struct OperatorMixerRow {
+    index: int,
     name: string,
     gain-percent: float,
     pan-percent: float,
     muted: bool,
     soloed: bool,
+    meter-left-level: float,
+    meter-right-level: float,
+    meter-left-reading: string,
+    meter-right-reading: string,
     controls-enabled: bool,
     solo-available: bool,
 }
@@ -92,6 +97,34 @@ component OutputMeterBar inherits Rectangle {
         }
         Text { text: root.reading; color: #edf2f8; font-size: 11px; width: 76px; horizontal-alignment: right; }
         Text { text: root.peak-reading; color: #8d99ad; font-size: 10px; width: 84px; horizontal-alignment: right; }
+    }
+}
+
+component StripPeakBar inherits Rectangle {
+    in property <string> channel;
+    in property <float> level;
+    in property <string> reading;
+    background: #0c1118;
+    border-radius: 3px;
+    min-height: 17px;
+
+    HorizontalLayout {
+        padding: 4px;
+        spacing: 4px;
+        Text { text: root.channel; color: #8d99ad; font-size: 8px; font-weight: 700; width: 8px; }
+        Rectangle {
+            background: #202836;
+            border-radius: 2px;
+            Rectangle {
+                x: 0;
+                y: 0;
+                width: parent.width * root.level;
+                height: parent.height;
+                border-radius: 2px;
+                background: root.level >= 1 ? #ff5a55 : root.level > 0.76 ? #f5b83d : #3ddc97;
+            }
+        }
+        Text { text: root.reading; color: #dce5ef; font-size: 9px; width: 72px; horizontal-alignment: right; }
     }
 }
 
@@ -298,13 +331,17 @@ component MixerChannelRow inherits Rectangle {
     in property <float> pan-percent;
     in property <bool> muted;
     in property <bool> soloed;
+    in property <float> meter-left-level;
+    in property <float> meter-right-level;
+    in property <string> meter-left-reading;
+    in property <string> meter-right-reading;
     in property <bool> controls-enabled;
     in property <bool> solo-available;
     callback mute-requested();
     callback solo-requested();
     callback gain-requested(float);
     callback pan-requested(float);
-    min-height: 74px;
+    min-height: 96px;
     background: #111620;
     border-color: #2c3445;
     border-width: 1px;
@@ -329,6 +366,20 @@ component MixerChannelRow inherits Rectangle {
                     : "Solo unavailable for " + root.name;
                 enabled: root.controls-enabled && root.solo-available;
                 clicked => { root.solo-requested(); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 5px;
+            Text { text: "POST"; color: #69778c; font-size: 8px; font-weight: 700; width: 27px; vertical-alignment: center; }
+            StripPeakBar {
+                channel: "L";
+                level: root.meter-left-level;
+                reading: root.meter-left-reading;
+            }
+            StripPeakBar {
+                channel: "R";
+                level: root.meter-right-level;
+                reading: root.meter-right-reading;
             }
         }
         HorizontalLayout {
@@ -763,7 +814,7 @@ export component OperatorWindow inherits Window {
                 padding: 12px;
                 spacing: 7px;
                 HorizontalLayout {
-                    Text { text: "LIVE MIXER · SESSION ONLY"; color: #8d99ad; font-size: 11px; font-weight: 700; }
+                    Text { text: "LIVE MIXER · SESSION ONLY · POST-FADER PEAK"; color: #8d99ad; font-size: 11px; font-weight: 700; }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
                     Text { text: root.mixer-state; color: #8d99ad; font-size: 10px; overflow: elide; }
                 }
@@ -795,6 +846,10 @@ export component OperatorWindow inherits Window {
                         pan-percent: channel.pan-percent;
                         muted: channel.muted;
                         soloed: channel.soloed;
+                        meter-left-level: channel.meter-left-level;
+                        meter-right-level: channel.meter-right-level;
+                        meter-left-reading: channel.meter-left-reading;
+                        meter-right-reading: channel.meter-right-reading;
                         controls-enabled: channel.controls-enabled;
                         solo-available: channel.solo-available;
                         mute-requested => { root.toggle-mixer-channel-mute-requested(index); }

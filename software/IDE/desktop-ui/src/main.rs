@@ -74,6 +74,7 @@ const MAX_VISIBLE_SCENE_NAME_CHARS: usize = 20;
 const MAX_VISIBLE_MIXER_NAME_CHARS: usize = 10;
 const MAX_VISIBLE_RECENT_PROJECT_NAME_CHARS: usize = 28;
 const MAX_SAFE_TIMELINE_TICK: u64 = 9_007_199_254_740_991;
+const MIXER_STRIP_METER_FLOOR_DBFS: f32 = -60.0;
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
@@ -7876,7 +7877,62 @@ fn apply_output_meter_observation(ui: &MainWindow, observation: &IdeRunningObser
     ui.set_right_meter(right_level);
     ui.set_left_reading(left_reading.into());
     ui.set_right_reading(right_reading.into());
+    apply_mixer_strip_meter_observation(ui, observation);
     apply_loudness_observation(ui, observation);
+}
+
+fn apply_mixer_strip_meter_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
+    let meter = observation.meter();
+    let channels = ui.get_mixer_channels();
+    let Some(snapshot) = meter.snapshot() else {
+        clear_mixer_strip_meter_observation(&channels);
+        return;
+    };
+    if meter.sender_disconnected() {
+        clear_mixer_strip_meter_observation(&channels);
+        return;
+    }
+    let strip_meters = snapshot.strip_meters();
+    let layout_matches = channels.row_count() == strip_meters.slot_count()
+        && (0..strip_meters.slot_count()).all(|slot| {
+            channels.row_data(slot).is_some_and(|row| {
+                row.index == i32::try_from(slot).unwrap_or(-1) && strip_meters.slot(slot).is_some()
+            })
+        });
+    if !layout_matches {
+        clear_mixer_strip_meter_observation(&channels);
+        return;
+    }
+    for slot in 0..strip_meters.slot_count() {
+        let Some(strip) = strip_meters.slot(slot) else {
+            clear_mixer_strip_meter_observation(&channels);
+            return;
+        };
+        let Some(mut row) = channels.row_data(slot) else {
+            clear_mixer_strip_meter_observation(&channels);
+            return;
+        };
+        let (left_level, left_reading) = mixer_strip_meter_presentation(strip.left_sample_peak());
+        let (right_level, right_reading) =
+            mixer_strip_meter_presentation(strip.right_sample_peak());
+        row.meter_left_level = left_level;
+        row.meter_right_level = right_level;
+        row.meter_left_reading = left_reading.into();
+        row.meter_right_reading = right_reading.into();
+        channels.set_row_data(slot, row);
+    }
+}
+
+fn clear_mixer_strip_meter_observation(channels: &ModelRc<MixerChannelRow>) {
+    for slot in 0..channels.row_count() {
+        if let Some(mut row) = channels.row_data(slot) {
+            row.meter_left_level = 0.0;
+            row.meter_right_level = 0.0;
+            row.meter_left_reading = "—".into();
+            row.meter_right_reading = "—".into();
+            channels.set_row_data(slot, row);
+        }
+    }
 }
 
 fn apply_loudness_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
@@ -10118,6 +10174,10 @@ fn mixer_rows(
                 pan_percent: state.map_or(0.0, |state| state.pan * 100.0),
                 muted: state.is_some_and(|state| state.muted),
                 solo: state.is_some_and(|state| state.solo),
+                meter_left_level: 0.0,
+                meter_right_level: 0.0,
+                meter_left_reading: "—".into(),
+                meter_right_reading: "—".into(),
                 solo_available: channel.kind() == IdeMixerChannelKind::Audio,
                 renameable: matches!(
                     channel.kind(),
@@ -12780,6 +12840,26 @@ fn meter_presentation(sample_peak: Option<f32>) -> (f32, String) {
     )
 }
 
+fn mixer_strip_meter_presentation(sample_peak: Option<f32>) -> (f32, String) {
+    let Some(sample_peak) = sample_peak.filter(|value| value.is_finite() && *value >= 0.0) else {
+        return (0.0, "—".to_owned());
+    };
+    let dbfs = if sample_peak == 0.0 {
+        MIXER_STRIP_METER_FLOOR_DBFS
+    } else {
+        (20.0 * sample_peak.log10()).max(MIXER_STRIP_METER_FLOOR_DBFS)
+    };
+    let reading = if dbfs <= MIXER_STRIP_METER_FLOOR_DBFS {
+        format!("≤ {MIXER_STRIP_METER_FLOOR_DBFS:.0}")
+    } else {
+        format!("{dbfs:.1}")
+    };
+    (
+        ((dbfs - MIXER_STRIP_METER_FLOOR_DBFS) / -MIXER_STRIP_METER_FLOOR_DBFS).clamp(0.0, 1.0),
+        reading,
+    )
+}
+
 fn format_transport_clock(frame: u64, sample_rate_hz: u32) -> String {
     if sample_rate_hz == 0 {
         return "—".to_owned();
@@ -12982,6 +13062,10 @@ mod tests {
             pan_percent: 0.0,
             muted: false,
             solo: false,
+            meter_left_level: 0.0,
+            meter_right_level: 0.0,
+            meter_left_reading: "—".into(),
+            meter_right_reading: "—".into(),
             solo_available: true,
             renameable: true,
             removable: true,
@@ -14136,6 +14220,10 @@ mod tests {
             pan_percent: 0.0,
             muted: false,
             solo: false,
+            meter_left_level: 0.0,
+            meter_right_level: 0.0,
+            meter_left_reading: "—".into(),
+            meter_right_reading: "—".into(),
             solo_available: true,
             renameable: true,
             removable: true,
@@ -14221,6 +14309,10 @@ mod tests {
                 pan_percent: 0.0,
                 muted: false,
                 solo: false,
+                meter_left_level: 0.0,
+                meter_right_level: 0.0,
+                meter_left_reading: "—".into(),
+                meter_right_reading: "—".into(),
                 solo_available: true,
                 renameable: true,
                 removable: true,
@@ -15325,6 +15417,61 @@ mod tests {
         assert_eq!(meter_presentation(Some(0.0)), (0.0, "-60.0 dB".to_owned()));
         assert_eq!(meter_presentation(Some(1.0)), (1.0, "0.0 dB".to_owned()));
         assert!((meter_presentation(Some(2.0)).0 - 1.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn mixer_strip_meter_presentation_is_explicitly_sample_peak_only() {
+        assert_eq!(mixer_strip_meter_presentation(None), (0.0, "—".to_owned()));
+        assert_eq!(
+            mixer_strip_meter_presentation(Some(f32::NAN)),
+            (0.0, "—".to_owned())
+        );
+        assert_eq!(
+            mixer_strip_meter_presentation(Some(-0.1)),
+            (0.0, "—".to_owned())
+        );
+        assert_eq!(
+            mixer_strip_meter_presentation(Some(0.0)),
+            (0.0, "≤ -60".to_owned())
+        );
+        assert_eq!(
+            mixer_strip_meter_presentation(Some(1.0)),
+            (1.0, "0.0".to_owned())
+        );
+        assert_eq!(
+            mixer_strip_meter_presentation(Some(2.0)),
+            (1.0, "6.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn missing_strip_meter_snapshot_clears_readings_without_changing_mixer_controls() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let mut row = audio_track_mixer_row(0, "track-a");
+        row.gain_percent = 125.0;
+        row.pan_percent = -25.0;
+        row.meter_left_level = 0.75;
+        row.meter_right_level = 0.5;
+        row.meter_left_reading = "-2.5".into();
+        row.meter_right_reading = "-6.0".into();
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![row]))));
+
+        apply_mixer_strip_meter_observation(
+            &ui,
+            &IdeRunningObservation::for_ui_test(PlaybackRecoverySnapshot::for_test(
+                PlaybackRecoveryTransportState::Stopped,
+                0,
+            )),
+        );
+
+        let row = ui.get_mixer_channels().row_data(0).unwrap();
+        assert_eq!(row.gain_percent.to_bits(), 125.0_f32.to_bits());
+        assert_eq!(row.pan_percent.to_bits(), (-25.0_f32).to_bits());
+        assert_eq!(row.meter_left_level.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(row.meter_right_level.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(row.meter_left_reading.as_str(), "—");
+        assert_eq!(row.meter_right_reading.as_str(), "—");
     }
 
     #[test]
@@ -18716,6 +18863,10 @@ mod tests {
                 pan_percent: 0.0,
                 muted: false,
                 solo: false,
+                meter_left_level: 0.0,
+                meter_right_level: 0.0,
+                meter_left_reading: "—".into(),
+                meter_right_reading: "—".into(),
                 solo_available: true,
                 renameable: true,
                 removable: false,

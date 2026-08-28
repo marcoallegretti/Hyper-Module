@@ -342,7 +342,7 @@ mod tests {
     use hyper_audio_engine::InterleavedStereoCallback;
 
     use super::*;
-    use crate::{SceneLaunchState, TransportCycle, TransportState};
+    use crate::{MixerStripMeterSnapshot, SceneLaunchState, TransportCycle, TransportState};
 
     const EPSILON: f32 = 1.0e-5;
 
@@ -383,6 +383,7 @@ mod tests {
                 native_device_command_sender_disconnected: false,
             },
             meter,
+            strip_meters: MixerStripMeterSnapshot::silence(1),
             processed_frame_end,
             dropped_before: 0,
             applied_loudness_command_count: 0,

@@ -1,4 +1,4 @@
-import { Button, ComboBox, LineEdit, ListView, Slider } from "std-widgets.slint";
+import { Button, ComboBox, LineEdit, ListView, ScrollView, Slider } from "std-widgets.slint";
 
 component IdeLineEdit inherits LineEdit {
     key-pressed(event) => {
@@ -108,6 +108,10 @@ export struct MixerChannelRow {
     pan-percent: float,
     muted: bool,
     solo: bool,
+    meter-left-level: float,
+    meter-right-level: float,
+    meter-left-reading: string,
+    meter-right-reading: string,
     solo-available: bool,
     renameable: bool,
     removable: bool,
@@ -468,6 +472,49 @@ component Meter inherits Rectangle {
         color: #e7edf5;
         font-size: 11px;
         horizontal-alignment: center;
+    }
+}
+
+component StereoStripPeakMeter inherits Rectangle {
+    in property <float> left-level: 0;
+    in property <float> right-level: 0;
+
+    min-width: 18px;
+    max-width: 18px;
+    background: #090d12;
+    border-color: #27313d;
+    border-width: 1px;
+    border-radius: 3px;
+
+    HorizontalLayout {
+        padding: 3px;
+        spacing: 2px;
+        Rectangle {
+            width: 5px;
+            background: #202836;
+            border-radius: 2px;
+            Rectangle {
+                x: 0;
+                y: parent.height * (1 - root.left-level);
+                width: parent.width;
+                height: parent.height * root.left-level;
+                border-radius: 2px;
+                background: root.left-level > 0.92 ? #ff5a55 : root.left-level > 0.72 ? #f5b83d : #3ddc97;
+            }
+        }
+        Rectangle {
+            width: 5px;
+            background: #202836;
+            border-radius: 2px;
+            Rectangle {
+                x: 0;
+                y: parent.height * (1 - root.right-level);
+                width: parent.width;
+                height: parent.height * root.right-level;
+                border-radius: 2px;
+                background: root.right-level > 0.92 ? #ff5a55 : root.right-level > 0.72 ? #f5b83d : #3ddc97;
+            }
+        }
     }
 }
 
@@ -2580,7 +2627,10 @@ export component MainWindow inherits Window {
                 if root.mixer-visible && !root.duplicate-track-visible && !root.rename-track-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.track-freeze-visible && !root.routing-bus-removal-visible && !root.mixer-sends-visible && !root.mixer-automation-visible && !root.mixer-control-visible && !root.mixer-native-filter-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
+                    ScrollView {
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                     VerticalLayout {
+                    min-height: 820px;
                     padding: 16px;
                     spacing: 12px;
 
@@ -2588,8 +2638,10 @@ export component MainWindow inherits Window {
                         height: 48px;
                         spacing: 8px;
                         VerticalLayout {
+                            min-width: 0;
+                            max-width: 248px;
                             Text { text: "BASE MIXER"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                            Text { text: "Automation may override base values"; color: #aebccc; font-size: 12px; }
+                            Text { text: "Base values · post-fader peak L/R dBFS"; color: #aebccc; font-size: 12px; overflow: elide; }
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         Button { text: "Performance"; clicked => { root.mixer-visible = false; } }
@@ -2751,19 +2803,28 @@ export component MainWindow inherits Window {
                                         clicked => { IdeActions.reorder-audio-track(channel.index, false); }
                                     }
                                 }
-                                Slider {
-                                    min-width: 28px;
-                                    max-width: 28px;
+                                HorizontalLayout {
                                     vertical-stretch: 1;
-                                    orientation: Orientation.vertical;
-                                    minimum: 0;
-                                    maximum: 200;
-                                    value: channel.gain-percent;
-                                    enabled: root.app-mode == AppMode.running && channel.state-available;
-                                    accessible-label: channel.name + " base gain";
-                                    released(value) => { IdeActions.mixer-channel-gain(channel.index, value); }
+                                    spacing: 4px;
+                                    StereoStripPeakMeter {
+                                        left-level: channel.meter-left-level;
+                                        right-level: channel.meter-right-level;
+                                    }
+                                    Slider {
+                                        min-width: 28px;
+                                        max-width: 28px;
+                                        vertical-stretch: 1;
+                                        orientation: Orientation.vertical;
+                                        minimum: 0;
+                                        maximum: 200;
+                                        value: channel.gain-percent;
+                                        enabled: root.app-mode == AppMode.running && channel.state-available;
+                                        accessible-label: channel.name + " base gain";
+                                        released(value) => { IdeActions.mixer-channel-gain(channel.index, value); }
+                                    }
                                 }
                                 Text { text: Math.round(channel.gain-percent) + "%"; color: channel.state-available ? #aebccc : #65758a; font-size: 9px; horizontal-alignment: center; }
+                                Text { text: "PF " + channel.meter-left-reading + "/" + channel.meter-right-reading + " dBFS"; color: #8290a2; font-size: 7px; horizontal-alignment: center; overflow: elide; }
                                 Slider {
                                     height: 24px;
                                     minimum: -100;
@@ -2812,6 +2873,7 @@ export component MainWindow inherits Window {
                                 Text { text: root.mixer-main-state-available ? "BASE" : "UNAVAILABLE"; color: root.mixer-main-state-available ? #63e6b5 : #ff9d76; font-size: 7px; horizontal-alignment: center; }
                             }
                         }
+                    }
                     }
                     }
                 }
