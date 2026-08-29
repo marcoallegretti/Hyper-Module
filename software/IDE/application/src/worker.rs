@@ -217,6 +217,7 @@ pub enum IdeWorkerCommandKind {
     SetArrangementPlacementDuration,
     SetArrangementPlacementGain,
     SetArrangementPlacementFades,
+    ApplyArrangementPlacementCrossfade,
     TrimArrangementPlacementFront,
     RemoveArrangementPlacement,
     RenameAudioClip,
@@ -466,6 +467,10 @@ pub enum IdeWorkerCommand {
         fade_in_ticks: u64,
         fade_out_ticks: u64,
     },
+    ApplyArrangementPlacementCrossfade {
+        outgoing_placement_id: String,
+        incoming_placement_id: String,
+    },
     TrimArrangementPlacementFront {
         placement_id: String,
         start_tick: u64,
@@ -693,6 +698,9 @@ impl IdeWorkerCommand {
             }
             Self::SetArrangementPlacementFades { .. } => {
                 IdeWorkerCommandKind::SetArrangementPlacementFades
+            }
+            Self::ApplyArrangementPlacementCrossfade { .. } => {
+                IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade
             }
             Self::TrimArrangementPlacementFront { .. } => {
                 IdeWorkerCommandKind::TrimArrangementPlacementFront
@@ -2518,6 +2526,7 @@ pub enum IdeWorkerCommandFailure {
     ArrangementPlacementDuration(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementGain(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementFades(Box<IdeArrangementPlacementEditError>),
+    ArrangementPlacementCrossfade(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementFrontTrim(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementRemoval(Box<IdeArrangementPlacementEditError>),
     AudioClipRename(Box<IdeAudioClipRenameEditError>),
@@ -2686,6 +2695,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             | Self::ArrangementPlacementDuration(source)
             | Self::ArrangementPlacementGain(source)
             | Self::ArrangementPlacementFades(source)
+            | Self::ArrangementPlacementCrossfade(source)
             | Self::ArrangementPlacementFrontTrim(source)
             | Self::ArrangementPlacementRemoval(source) => source.fmt(formatter),
             Self::AudioClipRename(source) => source.fmt(formatter),
@@ -2788,6 +2798,7 @@ impl Error for IdeWorkerCommandFailure {
             | Self::ArrangementPlacementDuration(source)
             | Self::ArrangementPlacementGain(source)
             | Self::ArrangementPlacementFades(source)
+            | Self::ArrangementPlacementCrossfade(source)
             | Self::ArrangementPlacementFrontTrim(source)
             | Self::ArrangementPlacementRemoval(source) => Some(source),
             Self::AudioClipRename(source) => Some(source),
@@ -3106,6 +3117,10 @@ pub enum IdeWorkerEvent {
         changed: bool,
         fade_in_ticks: u64,
         fade_out_ticks: u64,
+    },
+    ArrangementPlacementCrossfadeApplied {
+        revision: u64,
+        changed: bool,
     },
     ArrangementPlacementFrontTrimmed {
         revision: u64,
@@ -3428,6 +3443,7 @@ pub enum IdeWorkerEvent {
         fade_in_ticks: u64,
         fade_out_ticks: u64,
     },
+    ArrangementPlacementCrossfadeApplying,
     ArrangementPlacementFrontTrimming {
         start_tick: u64,
     },
@@ -4484,6 +4500,10 @@ enum ProjectMutation {
         fade_in_ticks: u64,
         fade_out_ticks: u64,
     },
+    ApplyArrangementPlacementCrossfade {
+        outgoing_placement_id: String,
+        incoming_placement_id: String,
+    },
     TrimArrangementPlacementFront {
         placement_id: String,
         start_tick: u64,
@@ -4578,6 +4598,10 @@ enum ProjectMutation {
 }
 
 impl ProjectMutation {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive mutation-to-command map keeps every durable edit tied to its command identity"
+    )]
     const fn command(&self) -> IdeWorkerCommandKind {
         match self {
             Self::SetArrangementLoopRange { .. } => IdeWorkerCommandKind::SetArrangementLoopRange,
@@ -4647,6 +4671,9 @@ impl ProjectMutation {
             }
             Self::SetArrangementPlacementFades { .. } => {
                 IdeWorkerCommandKind::SetArrangementPlacementFades
+            }
+            Self::ApplyArrangementPlacementCrossfade { .. } => {
+                IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade
             }
             Self::TrimArrangementPlacementFront { .. } => {
                 IdeWorkerCommandKind::TrimArrangementPlacementFront
@@ -4787,6 +4814,9 @@ impl ProjectMutation {
                 fade_in_ticks: *fade_in_ticks,
                 fade_out_ticks: *fade_out_ticks,
             },
+            Self::ApplyArrangementPlacementCrossfade { .. } => {
+                IdeWorkerEvent::ArrangementPlacementCrossfadeApplying
+            }
             Self::TrimArrangementPlacementFront { start_tick, .. } => {
                 IdeWorkerEvent::ArrangementPlacementFrontTrimming {
                     start_tick: *start_tick,
@@ -5006,6 +5036,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetArrangementPlacementDuration => "placement duration",
         IdeWorkerCommandKind::SetArrangementPlacementGain => "placement gain",
         IdeWorkerCommandKind::SetArrangementPlacementFades => "placement fades",
+        IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade => "placement crossfade",
         IdeWorkerCommandKind::TrimArrangementPlacementFront => "placement trim",
         IdeWorkerCommandKind::RemoveArrangementPlacement => "placement removal",
         IdeWorkerCommandKind::SetArrangementPlacementActive => "placement activation",
@@ -5452,6 +5483,7 @@ fn process_command(
         | IdeWorkerCommand::SetArrangementPlacementDuration { .. }
         | IdeWorkerCommand::SetArrangementPlacementGain { .. }
         | IdeWorkerCommand::SetArrangementPlacementFades { .. }
+        | IdeWorkerCommand::ApplyArrangementPlacementCrossfade { .. }
         | IdeWorkerCommand::TrimArrangementPlacementFront { .. }
         | IdeWorkerCommand::RemoveArrangementPlacement { .. }
         | IdeWorkerCommand::RenameAudioClip { .. }
@@ -5719,6 +5751,7 @@ fn process_project_mutation_command(
         | IdeWorkerCommand::SetArrangementPlacementDuration { .. }
         | IdeWorkerCommand::SetArrangementPlacementGain { .. }
         | IdeWorkerCommand::SetArrangementPlacementFades { .. }
+        | IdeWorkerCommand::ApplyArrangementPlacementCrossfade { .. }
         | IdeWorkerCommand::TrimArrangementPlacementFront { .. }
         | IdeWorkerCommand::RemoveArrangementPlacement { .. }) => {
             process_arrangement_mutation_command(state, command, events)
@@ -5834,6 +5867,10 @@ fn import_audio(
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the arrangement command dispatcher keeps every placement mutation at one UI-to-worker boundary"
+)]
 fn process_arrangement_mutation_command(
     state: &mut WorkerState,
     command: IdeWorkerCommand,
@@ -5924,6 +5961,15 @@ fn process_arrangement_mutation_command(
             &placement_id,
             fade_in_ticks,
             fade_out_ticks,
+        ),
+        IdeWorkerCommand::ApplyArrangementPlacementCrossfade {
+            outgoing_placement_id,
+            incoming_placement_id,
+        } => apply_arrangement_placement_crossfade(
+            state,
+            events,
+            &outgoing_placement_id,
+            &incoming_placement_id,
         ),
         IdeWorkerCommand::TrimArrangementPlacementFront {
             placement_id,
@@ -9254,6 +9300,59 @@ fn set_arrangement_placement_fades(
     )
 }
 
+fn apply_arrangement_placement_crossfade(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    outgoing_placement_id: &str,
+    incoming_placement_id: &str,
+) -> bool {
+    if outgoing_placement_id.is_empty() || incoming_placement_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade,
+            IdeWorkerCommandFailure::ArrangementPlacementCrossfade(Box::new(
+                IdeArrangementPlacementEditError::InvalidPlacementIdentity,
+            )),
+        );
+    }
+    let mut owned_outgoing_placement_id = String::new();
+    if owned_outgoing_placement_id
+        .try_reserve_exact(outgoing_placement_id.len())
+        .is_err()
+    {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade,
+            IdeWorkerCommandFailure::ArrangementPlacementCrossfade(Box::new(
+                IdeArrangementPlacementEditError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_outgoing_placement_id.push_str(outgoing_placement_id);
+    let mut owned_incoming_placement_id = String::new();
+    if owned_incoming_placement_id
+        .try_reserve_exact(incoming_placement_id.len())
+        .is_err()
+    {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade,
+            IdeWorkerCommandFailure::ArrangementPlacementCrossfade(Box::new(
+                IdeArrangementPlacementEditError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_incoming_placement_id.push_str(incoming_placement_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::ApplyArrangementPlacementCrossfade {
+            outgoing_placement_id: owned_outgoing_placement_id,
+            incoming_placement_id: owned_incoming_placement_id,
+        },
+    )
+}
+
 fn trim_arrangement_placement_front(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -9973,6 +10072,9 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             result: Ok(outcome),
             ..
         }
+        | ProjectMutationAttempt::ApplyArrangementPlacementCrossfade {
+            result: Ok(outcome),
+        }
         | ProjectMutationAttempt::TrimArrangementPlacementFront {
             result: Ok(outcome),
             ..
@@ -10167,6 +10269,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::SetArrangementPlacementDuration { result: Err(_), .. }
         | ProjectMutationAttempt::SetArrangementPlacementGain { result: Err(_), .. }
         | ProjectMutationAttempt::SetArrangementPlacementFades { result: Err(_), .. }
+        | ProjectMutationAttempt::ApplyArrangementPlacementCrossfade { result: Err(_) }
         | ProjectMutationAttempt::TrimArrangementPlacementFront { result: Err(_), .. }
         | ProjectMutationAttempt::RenameAudioClip { result: Err(_), .. }
         | ProjectMutationAttempt::RenameRecordingTake { result: Err(_), .. }
@@ -11106,6 +11209,11 @@ fn project_mutation_save_failure(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::ApplyArrangementPlacementCrossfade { .. } => {
+            IdeWorkerCommandFailure::ArrangementPlacementCrossfade(Box::new(
+                IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
+            ))
+        }
         ProjectMutation::TrimArrangementPlacementFront { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementFrontTrim(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -11440,6 +11548,11 @@ fn project_mutation_native_close_failure(
         }
         ProjectMutation::SetArrangementPlacementFades { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementFades(Box::new(
+                IdeArrangementPlacementEditError::NativeClose(failure),
+            ))
+        }
+        ProjectMutation::ApplyArrangementPlacementCrossfade { .. } => {
+            IdeWorkerCommandFailure::ArrangementPlacementCrossfade(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
             ))
         }
@@ -11812,6 +11925,12 @@ enum ProjectMutationAttempt {
     SetArrangementPlacementFades {
         fade_in_ticks: u64,
         fade_out_ticks: u64,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeArrangementPlacementEditError,
+        >,
+    },
+    ApplyArrangementPlacementCrossfade {
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeArrangementPlacementEditError,
@@ -13125,6 +13244,23 @@ fn complete_project_mutation(
                     IdeWorkerCommandKind::SetArrangementPlacementFades,
                     reason,
                     IdeWorkerCommandFailure::ArrangementPlacementFades,
+                ),
+                ProjectMutationAttempt::ApplyArrangementPlacementCrossfade {
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::ArrangementPlacementCrossfadeApplied {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                    },
+                ),
+                ProjectMutationAttempt::ApplyArrangementPlacementCrossfade {
+                    result: Err(reason),
+                } => publish_arrangement_edit_failure(
+                    events,
+                    IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade,
+                    reason,
+                    IdeWorkerCommandFailure::ArrangementPlacementCrossfade,
                 ),
                 ProjectMutationAttempt::TrimArrangementPlacementFront {
                     start_tick,
@@ -14503,6 +14639,18 @@ fn attempt_project_mutation(
                 native_failure,
             ),
         },
+        ProjectMutation::ApplyArrangementPlacementCrossfade {
+            outgoing_placement_id,
+            incoming_placement_id,
+        } => ProjectMutationAttempt::ApplyArrangementPlacementCrossfade {
+            result: attempt_arrangement_placement_crossfade(
+                application,
+                recovery,
+                &outgoing_placement_id,
+                &incoming_placement_id,
+                native_failure,
+            ),
+        },
         ProjectMutation::TrimArrangementPlacementFront {
             placement_id,
             start_tick,
@@ -15289,6 +15437,26 @@ fn attempt_arrangement_placement_fades(
         placement_id,
         fade_in_ticks,
         fade_out_ticks,
+    )
+    .and_then(publish_arrangement_placement_edit_plan)
+}
+
+fn attempt_arrangement_placement_crossfade(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    outgoing_placement_id: &str,
+    incoming_placement_id: &str,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeArrangementPlacementEditError>
+{
+    if let Some(failure) = native_failure {
+        return Err(IdeArrangementPlacementEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_arrangement_placement_crossfade(
+        application,
+        recovery,
+        outgoing_placement_id,
+        incoming_placement_id,
     )
     .and_then(publish_arrangement_placement_edit_plan)
 }
@@ -16180,6 +16348,13 @@ fn project_mutation_reopen_failure(
                 result,
                 reopen,
                 IdeWorkerCommandFailure::ArrangementPlacementFades,
+            )
+        }
+        ProjectMutationAttempt::ApplyArrangementPlacementCrossfade { result } => {
+            arrangement_placement_edit_reopen_failure(
+                result,
+                reopen,
+                IdeWorkerCommandFailure::ArrangementPlacementCrossfade,
             )
         }
         ProjectMutationAttempt::TrimArrangementPlacementFront { result, .. } => {
@@ -27096,6 +27271,81 @@ mod tests {
     }
 
     #[test]
+    fn arrangement_crossfade_validates_both_identities_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::ApplyArrangementPlacementCrossfade {
+                outgoing_placement_id: String::new(),
+                incoming_placement_id: "018f47a2-6b2d-7c11-8a44-001122334465".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade,
+                reason: IdeWorkerCommandFailure::ArrangementPlacementCrossfade(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeArrangementPlacementEditError::InvalidPlacementIdentity
+            )
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::ApplyArrangementPlacementCrossfade {
+                outgoing_placement_id: "018f47a2-6b2d-7c11-8a44-001122334464".to_owned(),
+                incoming_placement_id: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade,
+                reason: IdeWorkerCommandFailure::ArrangementPlacementCrossfade(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeArrangementPlacementEditError::InvalidPlacementIdentity
+            )
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::ApplyArrangementPlacementCrossfade {
+                outgoing_placement_id: "018f47a2-6b2d-7c11-8a44-001122334464".to_owned(),
+                incoming_placement_id: "018f47a2-6b2d-7c11-8a44-001122334465".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ArrangementPlacementCrossfadeApplying
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade,
+                reason: IdeWorkerCommandFailure::ArrangementPlacementCrossfade(reason),
+            } if matches!(reason.as_ref(), IdeArrangementPlacementEditError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
     fn arrangement_front_trim_validates_identity_and_waits_for_the_mixer_fence() {
         let running = RunningDesktopIdeApplication {
             application: closed_application(),
@@ -28207,6 +28457,39 @@ mod tests {
     }
 
     #[test]
+    fn arrangement_placement_crossfade_is_undoable_only_after_publication() {
+        let edit = captured_mixer_edit("placement-crossfade");
+        let attempt = ProjectMutationAttempt::ApplyArrangementPlacementCrossfade {
+            result: Ok(edit.outcome.clone()),
+        };
+        assert!(matches!(
+            history_effect(&attempt),
+            HistoryEffect::Replacement(_)
+        ));
+        assert_eq!(
+            undo_label(IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade),
+            "placement crossfade"
+        );
+
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut history = UndoHistory::default();
+        observe_history(
+            &mut history,
+            &attempt,
+            IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade,
+            &events,
+        );
+        assert_eq!(history.undo.len(), 1);
+        assert_eq!(history.undo[0].label, "placement crossfade");
+        assert!(receiver.try_recv().is_ok());
+
+        let failed = ProjectMutationAttempt::ApplyArrangementPlacementCrossfade {
+            result: Err(IdeArrangementPlacementEditError::ArrangementResourceMissing),
+        };
+        assert!(matches!(history_effect(&failed), HistoryEffect::None));
+    }
+
+    #[test]
     fn a_structural_change_invalidates_the_retained_history() {
         assert!(matches!(
             history_effect(&ProjectMutationAttempt::EditControlMapping {
@@ -28822,6 +29105,10 @@ mod tests {
         (
             IdeWorkerCommandKind::SetArrangementPlacementFades,
             "placement fades",
+        ),
+        (
+            IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade,
+            "placement crossfade",
         ),
         (
             IdeWorkerCommandKind::TrimArrangementPlacementFront,

@@ -103,6 +103,7 @@ pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_cli
 #[cfg(test)]
 use hyper_playback_json::serialize_arrangement_scene_launch_addition;
 use hyper_playback_json::{
+    ArrangementPlacementCrossfadeSerializationError,
     ArrangementPlacementDocumentSerializationError, ArrangementPlacementFadeSerializationError,
     ArrangementPlacementGainSerializationError, ArrangementSceneLaunchAddition,
     AudioClipAdditionSerializationError, AudioClipDocumentSerializationError,
@@ -134,16 +135,16 @@ use hyper_playback_json::{
     SceneSlotEditSerializationError, TempoSerializationError,
     TimelineMarkerEdit as PlaybackTimelineMarkerEdit, TimelineMarkerSerializationError,
     serialize_arrangement_loop_range, serialize_arrangement_placement_activation,
-    serialize_arrangement_placement_addition, serialize_arrangement_placement_duplication,
-    serialize_arrangement_placement_duration, serialize_arrangement_placement_fades,
-    serialize_arrangement_placement_front_trim, serialize_arrangement_placement_gain,
-    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
-    serialize_arrangement_placement_split, serialize_arrangement_scene_launch_additions,
-    serialize_arrangement_scene_launch_move, serialize_arrangement_scene_launch_removal,
-    serialize_arrangement_scene_launch_scene_edit, serialize_audio_clip_activation,
-    serialize_audio_clip_duplication, serialize_audio_clip_fades, serialize_audio_clip_gain,
-    serialize_audio_clip_loop, serialize_audio_clip_removal, serialize_audio_clip_rename,
-    serialize_audio_clip_reverse, serialize_audio_clip_source_start,
+    serialize_arrangement_placement_addition, serialize_arrangement_placement_crossfade,
+    serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
+    serialize_arrangement_placement_fades, serialize_arrangement_placement_front_trim,
+    serialize_arrangement_placement_gain, serialize_arrangement_placement_move,
+    serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
+    serialize_arrangement_scene_launch_additions, serialize_arrangement_scene_launch_move,
+    serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
+    serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
+    serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_removal,
+    serialize_audio_clip_rename, serialize_audio_clip_reverse, serialize_audio_clip_source_start,
     serialize_audio_clip_source_view, serialize_audio_primary_route_change,
     serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_content_removal, serialize_audio_track_duplication,
@@ -5030,6 +5031,7 @@ pub enum IdeArrangementPlacementEditError {
     GainSerialization(ArrangementPlacementGainSerializationError),
     GainNativeValidation(ArrangementPlacementGainValidationError),
     FadeSerialization(ArrangementPlacementFadeSerializationError),
+    CrossfadeSerialization(ArrangementPlacementCrossfadeSerializationError),
     CapacityUnavailable,
     Publication {
         created_placement_id: Option<Box<str>>,
@@ -5088,6 +5090,10 @@ impl IdeArrangementPlacementEditError {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete arrangement-edit error taxonomy stays user-visible at one boundary"
+)]
 impl fmt::Display for IdeArrangementPlacementEditError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -5120,6 +5126,7 @@ impl fmt::Display for IdeArrangementPlacementEditError {
             Self::GainSerialization(source) => source.fmt(formatter),
             Self::GainNativeValidation(source) => source.fmt(formatter),
             Self::FadeSerialization(source) => source.fmt(formatter),
+            Self::CrossfadeSerialization(source) => source.fmt(formatter),
             Self::CapacityUnavailable => {
                 formatter.write_str("arrangement edit capacity is unavailable")
             }
@@ -5228,6 +5235,7 @@ impl Error for IdeArrangementPlacementEditError {
             Self::GainSerialization(source) => Some(source),
             Self::GainNativeValidation(source) => Some(source),
             Self::FadeSerialization(source) => Some(source),
+            Self::CrossfadeSerialization(source) => Some(source),
             Self::Publication { source, .. } => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
@@ -13326,6 +13334,29 @@ impl RunningDesktopIdeApplication {
         )
     }
 
+    fn prepare_arrangement_placement_crossfade(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        outgoing_placement_id: &str,
+        incoming_placement_id: &str,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        Self::prepare_arrangement_placement_edit(
+            application,
+            recovery,
+            |prepared, source, limits| {
+                let (project, _, _, _) = prepared.session().parts();
+                serialize_arrangement_placement_crossfade(
+                    project,
+                    source,
+                    outgoing_placement_id,
+                    incoming_placement_id,
+                    limits,
+                )
+                .map_err(IdeArrangementPlacementEditError::CrossfadeSerialization)
+            },
+        )
+    }
+
     fn prepare_arrangement_placement_front_trim(
         application: &DesktopIdeApplication,
         recovery: &DesktopPlaybackRecovery,
@@ -16722,6 +16753,7 @@ mod tests {
     const ARRANGEMENT_TEST_MIXER_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338507";
     const ARRANGEMENT_TEST_SCENE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338508";
     const ARRANGEMENT_TEST_SECOND_SCENE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338510";
+    const ARRANGEMENT_TEST_CROSSFADE_PLACEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338511";
 
     struct ArrangementProjectFixture {
         directory: TestDirectory,
@@ -16775,6 +16807,59 @@ mod tests {
             std::fs::write(&clip_path, &clip_bytes).unwrap();
             descriptor["byte_length"] = json!(clip_bytes.len());
             descriptor["sha256"] = json!(arrangement_test_sha256(&clip_bytes));
+            std::fs::write(manifest_path, arrangement_test_canonical(&manifest)).unwrap();
+            hyper_storage_engine::verify_project_package(&fixture.directory.0).unwrap();
+            fixture
+        }
+
+        fn with_crossfade_pair(self) -> Self {
+            let fixture = self;
+            let manifest_path = fixture.directory.0.join("project.json");
+            let mut manifest: Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            {
+                let descriptor = manifest["resources"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|descriptor| descriptor["id"] == ARRANGEMENT_TEST_CLIP_ID)
+                    .unwrap();
+                let path = descriptor["path"].as_str().unwrap().to_owned();
+                let clip_path = fixture.directory.0.join(&path);
+                let mut clip: Value =
+                    serde_json::from_slice(&std::fs::read(&clip_path).unwrap()).unwrap();
+                clip["enabled"] = true.into();
+                let clip_bytes = arrangement_test_canonical(&clip);
+                std::fs::write(&clip_path, &clip_bytes).unwrap();
+                descriptor["byte_length"] = json!(clip_bytes.len());
+                descriptor["sha256"] = json!(arrangement_test_sha256(&clip_bytes));
+            }
+            {
+                let descriptor = manifest["resources"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|descriptor| descriptor["id"] == ARRANGEMENT_TEST_RESOURCE_ID)
+                    .unwrap();
+                let path = descriptor["path"].as_str().unwrap().to_owned();
+                let arrangement_path = fixture.directory.0.join(&path);
+                let mut arrangement: Value =
+                    serde_json::from_slice(&std::fs::read(&arrangement_path).unwrap()).unwrap();
+                arrangement["placements"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({
+                        "id":ARRANGEMENT_TEST_CROSSFADE_PLACEMENT_ID,
+                        "track_id":ARRANGEMENT_TEST_TRACK_ID,
+                        "clip_id":ARRANGEMENT_TEST_CLIP_ID,
+                        "start_tick":2, "clip_start_tick":0,
+                        "duration_ticks":4, "enabled":true
+                    }));
+                let arrangement_bytes = arrangement_test_canonical(&arrangement);
+                std::fs::write(&arrangement_path, &arrangement_bytes).unwrap();
+                descriptor["byte_length"] = json!(arrangement_bytes.len());
+                descriptor["sha256"] = json!(arrangement_test_sha256(&arrangement_bytes));
+            }
             std::fs::write(manifest_path, arrangement_test_canonical(&manifest)).unwrap();
             hyper_storage_engine::verify_project_package(&fixture.directory.0).unwrap();
             fixture
@@ -18839,6 +18924,60 @@ mod tests {
         let unchanged = unchanged.publish().unwrap();
         assert!(!unchanged.changed());
         assert_eq!(unchanged.project_revision(), 2);
+    }
+
+    #[test]
+    fn arrangement_placement_crossfade_publishes_one_atomic_reopenable_edit() {
+        let fixture = ArrangementProjectFixture::new().with_crossfade_pair();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let arrangement = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Arrangement)
+            .unwrap();
+        let arrangement_id = arrangement.id().to_owned();
+        let source_arrangement = package.read_resource(&arrangement_id).unwrap();
+        let (project, _, _, _) = prepared.session().parts();
+        let arrangement_bytes = serialize_arrangement_placement_crossfade(
+            project,
+            &source_arrangement,
+            ARRANGEMENT_TEST_PLACEMENT_ID,
+            ARRANGEMENT_TEST_CROSSFADE_PLACEMENT_ID,
+            limits.session.documents,
+        )
+        .unwrap();
+        let plan = IdeArrangementPlacementEditPlan {
+            mixer: fixture_mixer_save_plan(&prepared),
+            arrangement_id: arrangement_id.clone(),
+            arrangement_bytes: arrangement_bytes.clone(),
+            addition: false,
+            created_placement_id: None,
+        };
+        drop(prepared);
+
+        let outcome = plan.publish().unwrap();
+        assert!(outcome.changed());
+        assert_eq!(outcome.project_revision(), 2);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let placements = reopened.session().arrangement().placements();
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].id(), ARRANGEMENT_TEST_PLACEMENT_ID);
+        assert_eq!(placements[0].fade_in_ticks(), 0);
+        assert_eq!(placements[0].fade_out_ticks(), 2);
+        assert_eq!(placements[1].id(), ARRANGEMENT_TEST_CROSSFADE_PLACEMENT_ID);
+        assert_eq!(placements[1].fade_in_ticks(), 2);
+        assert_eq!(placements[1].fade_out_ticks(), 0);
+        assert_eq!(
+            reopened.package().read_resource(&arrangement_id).unwrap(),
+            arrangement_bytes
+        );
     }
 
     #[test]
