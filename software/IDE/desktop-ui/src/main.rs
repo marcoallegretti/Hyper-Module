@@ -18732,10 +18732,22 @@ mod tests {
         let removal = ElementHandle::find_by_accessible_label(&ui, "Remove First automation take")
             .next()
             .expect("the first generated take exposes removal");
+        let channels = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Return from automation to mixer channels",
+        )
+        .next()
+        .expect("the automation panel exposes its channel navigation");
+        let performance =
+            ElementHandle::find_by_accessible_label(&ui, "Return from automation to performance")
+                .next()
+                .expect("the automation panel exposes its performance navigation");
         assert_eq!(first_edit.accessible_enabled(), Some(true));
         assert_eq!(second_edit.accessible_enabled(), Some(true));
         assert_eq!(activation.accessible_enabled(), Some(true));
         assert_eq!(removal.accessible_enabled(), Some(true));
+        assert_eq!(channels.accessible_enabled(), Some(true));
+        assert_eq!(performance.accessible_enabled(), Some(true));
         assert!(automation_take_direct_action_is_current(&ui, first_id));
 
         ui.set_automation_edit_visible(true);
@@ -18744,6 +18756,8 @@ mod tests {
         assert_eq!(second_edit.accessible_enabled(), Some(false));
         assert_eq!(activation.accessible_enabled(), Some(false));
         assert_eq!(removal.accessible_enabled(), Some(false));
+        assert_eq!(channels.accessible_enabled(), Some(false));
+        assert_eq!(performance.accessible_enabled(), Some(false));
 
         ui.set_automation_edit_visible(false);
         ui.set_automation_create_visible(true);
@@ -18751,12 +18765,16 @@ mod tests {
         assert_eq!(first_edit.accessible_enabled(), Some(false));
         assert_eq!(activation.accessible_enabled(), Some(false));
         assert_eq!(removal.accessible_enabled(), Some(false));
+        assert_eq!(channels.accessible_enabled(), Some(false));
+        assert_eq!(performance.accessible_enabled(), Some(false));
 
         ui.set_automation_create_visible(false);
         ui.set_automation_take_remove_confirming_id(first_id.into());
         assert!(!automation_take_direct_action_is_current(&ui, first_id));
         assert_eq!(first_edit.accessible_enabled(), Some(false));
         assert_eq!(activation.accessible_enabled(), Some(false));
+        assert_eq!(channels.accessible_enabled(), Some(false));
+        assert_eq!(performance.accessible_enabled(), Some(false));
         ui.hide().unwrap();
     }
 

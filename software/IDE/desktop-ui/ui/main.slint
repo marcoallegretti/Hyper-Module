@@ -3370,10 +3370,14 @@ export component MainWindow inherits Window {
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         Button {
                             text: "Channels";
+                            accessible-label: "Return from automation to mixer channels";
+                            enabled: !root.local-edit-form-visible;
                             clicked => { root.automation-create-visible = false; root.automation-edit-visible = false; root.automation-take-remove-confirming-id = ""; root.mixer-automation-visible = false; }
                         }
                         Button {
                             text: "Performance";
+                            accessible-label: "Return from automation to performance";
+                            enabled: !root.local-edit-form-visible;
                             clicked => {
                                 root.automation-create-visible = false;
                                 root.automation-edit-visible = false;
