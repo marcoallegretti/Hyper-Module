@@ -3662,7 +3662,11 @@ export component MainWindow inherits Window {
                                             accessible-label: take.editable
                                                 ? "Edit " + take.name + " automation take"
                                                 : "Editing is unavailable because " + take.name + " has multiple automation lanes";
-                                            enabled: root.app-mode == AppMode.running && take.editable;
+                                            enabled: root.app-mode == AppMode.running
+                                                && take.editable
+                                                && !root.automation-create-visible
+                                                && !root.automation-edit-visible
+                                                && root.automation-take-remove-confirming-id == "";
                                             clicked => {
                                                 root.automation-create-visible = false;
                                                 root.automation-take-remove-confirming-id = "";
@@ -3672,7 +3676,10 @@ export component MainWindow inherits Window {
                                         Button {
                                             text: take.enabled ? "Disable" : "Enable";
                                             accessible-label: (take.enabled ? "Disable " : "Enable ") + take.name + " automation take";
-                                            enabled: root.app-mode == AppMode.running;
+                                            enabled: root.app-mode == AppMode.running
+                                                && !root.automation-create-visible
+                                                && !root.automation-edit-visible
+                                                && root.automation-take-remove-confirming-id == "";
                                             clicked => {
                                                 root.automation-take-remove-confirming-id = "";
                                                 IdeActions.set-automation-take-active(take.id, !take.enabled);
@@ -3681,7 +3688,9 @@ export component MainWindow inherits Window {
                                         Button {
                                             text: root.automation-take-remove-confirming-id == take.id ? "Confirm" : "Remove";
                                             accessible-label: (root.automation-take-remove-confirming-id == take.id ? "Confirm removal of " : "Remove ") + take.name + " automation take";
-                                            enabled: root.app-mode == AppMode.running;
+                                            enabled: root.app-mode == AppMode.running
+                                                && !root.automation-create-visible
+                                                && !root.automation-edit-visible;
                                             clicked => {
                                                 if root.automation-take-remove-confirming-id == take.id {
                                                     IdeActions.remove-automation-take(take.id);

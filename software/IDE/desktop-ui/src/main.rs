@@ -11231,6 +11231,17 @@ fn format_automation_points(points: &[AutomationPoint]) -> String {
         .join(", ")
 }
 
+fn automation_take_form_is_open(ui: &MainWindow) -> bool {
+    ui.get_automation_create_visible() || ui.get_automation_edit_visible()
+}
+
+fn automation_take_direct_action_is_current(ui: &MainWindow, take_id: &str) -> bool {
+    ui.get_app_mode() == AppMode::Running
+        && !automation_take_form_is_open(ui)
+        && ui.get_automation_take_remove_confirming_id().is_empty()
+        && !take_id.is_empty()
+}
+
 fn bind_automation_take_edit_callbacks(
     ui: &MainWindow,
     worker: &WorkerCell,
@@ -11243,10 +11254,7 @@ fn bind_automation_take_edit_callbacks(
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        if ui.get_app_mode() != AppMode::Running
-            || ui.get_automation_create_visible()
-            || take_id.is_empty()
-        {
+        if !automation_take_direct_action_is_current(&ui, take_id.as_str()) {
             ui.set_error_text("Automation take edit request is no longer current".into());
             return;
         }
@@ -11456,7 +11464,7 @@ fn bind_automation_take_activation_callback(ui: &MainWindow, worker: &WorkerCell
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        if ui.get_app_mode() != AppMode::Running || take_id.is_empty() {
+        if !automation_take_direct_action_is_current(&ui, take_id.as_str()) {
             ui.set_error_text("Automation take edit request is no longer current".into());
             return;
         }
@@ -11503,6 +11511,7 @@ fn bind_automation_take_removal_callback_with(
             .iter()
             .any(|id| id == take_id.as_str());
         if ui.get_app_mode() != AppMode::Running
+            || automation_take_form_is_open(&ui)
             || take_id.is_empty()
             || current != take_id
             || !authoritative
@@ -18674,6 +18683,81 @@ mod tests {
             ),
             AppMode::Running
         );
+    }
+
+    #[test]
+    fn generated_automation_take_actions_close_while_an_edit_form_is_open() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        let first_id = "018f47a2-6b2d-7c11-8a44-0011223344a0";
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_visible(true);
+        ui.set_mixer_automation_visible(true);
+        ui.set_automation_takes(ModelRc::from(Rc::new(VecModel::from(vec![
+            AutomationTakeRow {
+                id: first_id.into(),
+                name: "First".into(),
+                enabled: true,
+                editable: true,
+                range: "TICK 0 to 960".into(),
+                target: "Main gain".into(),
+                interpolation: "Linear".into(),
+                points: "2 points".into(),
+            },
+            AutomationTakeRow {
+                id: "018f47a2-6b2d-7c11-8a44-0011223344a1".into(),
+                name: "Second".into(),
+                enabled: true,
+                editable: true,
+                range: "TICK 960 to 1920".into(),
+                target: "Main gain".into(),
+                interpolation: "Linear".into(),
+                points: "2 points".into(),
+            },
+        ]))));
+
+        ui.show().unwrap();
+        let first_edit = ElementHandle::find_by_accessible_label(&ui, "Edit First automation take")
+            .next()
+            .expect("the first generated take exposes edit");
+        let second_edit =
+            ElementHandle::find_by_accessible_label(&ui, "Edit Second automation take")
+                .next()
+                .expect("the second generated take exposes edit");
+        let activation =
+            ElementHandle::find_by_accessible_label(&ui, "Disable First automation take")
+                .next()
+                .expect("the first generated take exposes activation");
+        let removal = ElementHandle::find_by_accessible_label(&ui, "Remove First automation take")
+            .next()
+            .expect("the first generated take exposes removal");
+        assert_eq!(first_edit.accessible_enabled(), Some(true));
+        assert_eq!(second_edit.accessible_enabled(), Some(true));
+        assert_eq!(activation.accessible_enabled(), Some(true));
+        assert_eq!(removal.accessible_enabled(), Some(true));
+        assert!(automation_take_direct_action_is_current(&ui, first_id));
+
+        ui.set_automation_edit_visible(true);
+        assert!(!automation_take_direct_action_is_current(&ui, first_id));
+        assert_eq!(first_edit.accessible_enabled(), Some(false));
+        assert_eq!(second_edit.accessible_enabled(), Some(false));
+        assert_eq!(activation.accessible_enabled(), Some(false));
+        assert_eq!(removal.accessible_enabled(), Some(false));
+
+        ui.set_automation_edit_visible(false);
+        ui.set_automation_create_visible(true);
+        assert!(!automation_take_direct_action_is_current(&ui, first_id));
+        assert_eq!(first_edit.accessible_enabled(), Some(false));
+        assert_eq!(activation.accessible_enabled(), Some(false));
+        assert_eq!(removal.accessible_enabled(), Some(false));
+
+        ui.set_automation_create_visible(false);
+        ui.set_automation_take_remove_confirming_id(first_id.into());
+        assert!(!automation_take_direct_action_is_current(&ui, first_id));
+        assert_eq!(first_edit.accessible_enabled(), Some(false));
+        assert_eq!(activation.accessible_enabled(), Some(false));
+        ui.hide().unwrap();
     }
 
     fn automation_channel_fixture() -> Vec<MixerChannelFacts> {
