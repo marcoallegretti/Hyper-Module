@@ -931,6 +931,90 @@ fn bind_arrangement_fades_callback(
     });
 }
 
+fn bind_arrangement_crossfade_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let project_state = Rc::clone(project_state);
+    let worker = Rc::clone(worker);
+    bind_arrangement_crossfade_callback_with(
+        ui,
+        move |outgoing_placement_id, incoming_placement_id| {
+            let state = project_state.arrangement.borrow();
+            let binding = state
+                .as_ref()
+                .ok_or("Arrangement placement authority is no longer available")?;
+            resolve_arrangement_placement_crossfade(
+                binding.owner.as_ref(),
+                outgoing_placement_id,
+                incoming_placement_id,
+            )
+        },
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_arrangement_crossfade_callback_with(
+    ui: &MainWindow,
+    resolve_crossfade: impl Fn(&str, &str) -> Result<(String, String), &'static str> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    actions.on_apply_arrangement_placement_crossfade(
+        move |outgoing_placement_id, incoming_placement_id| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::Running {
+                ui.set_error_text(
+                    "Arrangement crossfades are not available in the current state".into(),
+                );
+                return;
+            }
+            let (outgoing_placement_id, incoming_placement_id) = match resolve_crossfade(
+                outgoing_placement_id.as_str(),
+                incoming_placement_id.as_str(),
+            ) {
+                Ok(pair) => pair,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
+            };
+            submit(
+                &ui,
+                IdeWorkerCommand::ApplyArrangementPlacementCrossfade {
+                    outgoing_placement_id,
+                    incoming_placement_id,
+                },
+            );
+        },
+    );
+}
+
+fn resolve_arrangement_placement_crossfade(
+    arrangement: &IdePlaybackArrangement,
+    requested_outgoing_placement_id: &str,
+    requested_incoming_placement_id: &str,
+) -> Result<(String, String), &'static str> {
+    let outgoing_index = arrangement
+        .placements()
+        .iter()
+        .position(|placement| placement.id() == requested_outgoing_placement_id)
+        .ok_or("The selected arrangement placement is no longer available")?;
+    let (incoming_index, _) = arrangement_crossfade_target(arrangement, outgoing_index).ok_or(
+        "A bounded arrangement crossfade is no longer available for the selected placement",
+    )?;
+    let outgoing = &arrangement.placements()[outgoing_index];
+    let incoming = &arrangement.placements()[incoming_index];
+    if incoming.id() != requested_incoming_placement_id {
+        return Err("The selected crossfade target is no longer authoritative");
+    }
+    Ok((outgoing.id().to_owned(), incoming.id().to_owned()))
+}
+
 fn bind_project_open_callback(ui: &MainWindow, worker: &WorkerCell) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -3438,6 +3522,7 @@ fn bind_arrangement_callback(
     bind_arrangement_duration_callback(ui, worker, project_state);
     bind_arrangement_gain_callback(ui, worker, project_state);
     bind_arrangement_fades_callback(ui, worker, project_state);
+    bind_arrangement_crossfade_callback(ui, worker, project_state);
     bind_arrangement_front_trim_callback(ui, worker, project_state);
     bind_arrangement_removal_callback(ui, worker, project_state);
 }
@@ -5186,6 +5271,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         | IdeWorkerCommandKind::SetArrangementPlacementDuration
         | IdeWorkerCommandKind::SetArrangementPlacementGain
         | IdeWorkerCommandKind::SetArrangementPlacementFades
+        | IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade
         | IdeWorkerCommandKind::TrimArrangementPlacementFront
         | IdeWorkerCommandKind::RemoveArrangementPlacement
         | IdeWorkerCommandKind::AddArrangementPlacement
@@ -5261,6 +5347,9 @@ fn arrangement_placement_submission_mode(command: IdeWorkerCommandKind) -> AppMo
         }
         IdeWorkerCommandKind::SetArrangementPlacementFades => {
             AppMode::ChangingArrangementPlacementFades
+        }
+        IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade => {
+            AppMode::ChangingArrangementPlacementCrossfade
         }
         IdeWorkerCommandKind::RemoveArrangementPlacement => AppMode::RemovingArrangementPlacement,
         IdeWorkerCommandKind::AddArrangementPlacement => AppMode::AddingArrangementPlacement,
@@ -5419,6 +5508,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetArrangementPlacementFades => {
             "Preserving mixer state, updating arrangement placement fades, and reopening project…"
+        }
+        IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade => {
+            "Preserving mixer state, applying the bounded arrangement crossfade, and reopening project…"
         }
         IdeWorkerCommandKind::TrimArrangementPlacementFront => {
             "Preserving mixer state, trimming the arrangement front, and reopening project…"
@@ -5829,6 +5921,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementFadesChanged { .. }
         | IdeWorkerEvent::ArrangementPlacementFadesChanging { .. }) => {
             apply_arrangement_placement_fades_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementPlacementCrossfadeApplied { .. }
+        | IdeWorkerEvent::ArrangementPlacementCrossfadeApplying) => {
+            apply_arrangement_placement_crossfade_event(ui, &event);
         }
         event @ (IdeWorkerEvent::ArrangementPlacementFrontTrimmed { .. }
         | IdeWorkerEvent::ArrangementPlacementFrontTrimming { .. }) => {
@@ -6744,6 +6840,32 @@ fn apply_arrangement_placement_fades_event(ui: &MainWindow, event: &IdeWorkerEve
     }
 }
 
+fn apply_arrangement_placement_crossfade_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementPlacementCrossfadeApplied { revision, changed } => {
+            ui.set_status_text(
+                if *changed {
+                    format!("Bounded arrangement crossfade applied in project revision {revision}")
+                } else {
+                    format!(
+                        "Arrangement placement fades already matched the bounded crossfade in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementPlacementCrossfadeApplying => {
+            ui.set_app_mode(AppMode::ChangingArrangementPlacementCrossfade);
+            ui.set_status_text(
+                "Waiting for native output before applying the bounded arrangement crossfade…"
+                    .into(),
+            );
+        }
+        _ => unreachable!("arrangement crossfade event dispatcher received another event"),
+    }
+}
+
 fn apply_arrangement_placement_front_trim_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::ArrangementPlacementFrontTrimmed {
@@ -7046,6 +7168,9 @@ fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWor
         }
         IdeWorkerCommandKind::SetArrangementPlacementFades => {
             "Arrangement placement fades".to_owned()
+        }
+        IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade => {
+            "Arrangement placement crossfade".to_owned()
         }
         _ => "Arrangement placement edit".to_owned(),
     };
@@ -8613,6 +8738,59 @@ struct ArrangementListModel {
     sample_rate_hz: u32,
 }
 
+/// Finds the one UI-presentable incoming placement for a bounded crossfade.
+///
+/// The worker remains authoritative; this only prevents the UI from offering a
+/// pair the committed arrangement cannot presently represent. A conflicting
+/// candidate fails closed rather than choosing an arbitrary edit target.
+fn arrangement_crossfade_target(
+    arrangement: &IdePlaybackArrangement,
+    outgoing_index: usize,
+) -> Option<(usize, u64)> {
+    let outgoing = arrangement.placements().get(outgoing_index)?;
+    if !outgoing.active() {
+        return None;
+    }
+    let outgoing_end_tick = outgoing
+        .start_tick()
+        .checked_add(outgoing.duration_ticks())?;
+    let outgoing_available_ticks = outgoing
+        .duration_ticks()
+        .checked_sub(outgoing.fade_in_ticks())?;
+    let mut candidate = None;
+
+    for (incoming_index, incoming) in arrangement.placements().iter().enumerate() {
+        if incoming_index == outgoing_index
+            || !incoming.active()
+            || incoming.track_index() != outgoing.track_index()
+            || outgoing.start_tick() >= incoming.start_tick()
+            || incoming.start_tick() >= outgoing_end_tick
+        {
+            continue;
+        }
+        let incoming_end_tick = incoming
+            .start_tick()
+            .checked_add(incoming.duration_ticks())?;
+        if incoming_end_tick < outgoing_end_tick {
+            continue;
+        }
+        let crossfade_ticks = outgoing_end_tick - incoming.start_tick();
+        let incoming_available_ticks = incoming
+            .duration_ticks()
+            .checked_sub(incoming.fade_out_ticks())?;
+        if crossfade_ticks > outgoing_available_ticks || crossfade_ticks > incoming_available_ticks
+        {
+            continue;
+        }
+        if candidate.is_some() {
+            return None;
+        }
+        candidate = Some((incoming_index, crossfade_ticks));
+    }
+
+    candidate
+}
+
 struct ArrangementSceneLaunchListModel {
     owner: Arc<IdePlaybackArrangement>,
     scene_ids: Vec<String>,
@@ -8655,6 +8833,19 @@ impl Model for ArrangementListModel {
         let clip_name = self.owner.clip_name(placement.clip_index())?;
         let start_percent = frame_progress_percent(placement.start_frame(), self.owner.end_frame());
         let end_percent = frame_progress_percent(placement.end_frame(), self.owner.end_frame());
+        let (crossfade_target_id, crossfade_target_label) =
+            if let Some((target_index, crossfade_ticks)) =
+                arrangement_crossfade_target(self.owner.as_ref(), row)
+            {
+                let target = self.owner.placements().get(target_index)?;
+                let target_clip_name = self.owner.clip_name(target.clip_index())?;
+                (
+                    target.id().into(),
+                    format!("{target_clip_name} ({crossfade_ticks} ticks)").into(),
+                )
+            } else {
+                (SharedString::default(), SharedString::default())
+            };
         Some(ArrangementRow {
             index: i32::try_from(row).ok()?,
             id: placement.id().into(),
@@ -8666,6 +8857,8 @@ impl Model for ArrangementListModel {
             gain_edit: format_gain_decibels(placement.gain_decibels()).into(),
             fade_in_edit: placement.fade_in_ticks().to_string().into(),
             fade_out_edit: placement.fade_out_ticks().to_string().into(),
+            crossfade_target_id,
+            crossfade_target_label,
             start_clock: format_frame_clock(placement.start_frame(), self.sample_rate_hz).into(),
             end_clock: format_frame_clock(placement.end_frame(), self.sample_rate_hz).into(),
             start_percent,
@@ -9848,6 +10041,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::SetArrangementPlacementFades
             if current == AppMode::ChangingArrangementPlacementFades =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade
+            if current == AppMode::ChangingArrangementPlacementCrossfade =>
         {
             AppMode::Running
         }
@@ -14016,6 +14214,8 @@ mod tests {
                 gain_edit: "0".into(),
                 fade_in_edit: "0".into(),
                 fade_out_edit: "0".into(),
+                crossfade_target_id: SharedString::default(),
+                crossfade_target_label: SharedString::default(),
                 start_clock: "00:00.250".into(),
                 end_clock: "00:00.750".into(),
                 start_percent: 0.0,
@@ -14077,6 +14277,8 @@ mod tests {
                 gain_edit: "0".into(),
                 fade_in_edit: "12".into(),
                 fade_out_edit: "24".into(),
+                crossfade_target_id: SharedString::default(),
+                crossfade_target_label: SharedString::default(),
                 start_clock: "00:00.250".into(),
                 end_clock: "00:00.750".into(),
                 start_percent: 0.0,
@@ -14121,6 +14323,88 @@ mod tests {
             submitted.borrow().as_slice(),
             [("placement-a".to_owned(), "16".to_owned(), "32".to_owned())]
         );
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn generated_arrangement_crossfade_control_submits_only_the_current_pair() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_arrangement_visible(true);
+        ui.set_arrangement_placements(ModelRc::from(Rc::new(VecModel::from(vec![
+            ArrangementRow {
+                index: 0,
+                id: "placement-a".into(),
+                track_name: "Audio".into(),
+                clip_name: "Lead".into(),
+                start_tick: "480".into(),
+                clip_start_tick: "0".into(),
+                duration_ticks: "960".into(),
+                gain_edit: "0".into(),
+                fade_in_edit: "0".into(),
+                fade_out_edit: "0".into(),
+                crossfade_target_id: "placement-b".into(),
+                crossfade_target_label: "Pad (480 ticks)".into(),
+                start_clock: "00:00.250".into(),
+                end_clock: "00:00.750".into(),
+                start_percent: 0.0,
+                width_percent: 100.0,
+                enabled: true,
+                active: true,
+            },
+        ]))));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_arrangement_crossfade_callback_with(
+            &ui,
+            |outgoing_placement_id, incoming_placement_id| {
+                if outgoing_placement_id == "placement-a" && incoming_placement_id == "placement-b"
+                {
+                    Ok((
+                        outgoing_placement_id.to_owned(),
+                        incoming_placement_id.to_owned(),
+                    ))
+                } else {
+                    Err("The selected crossfade target is no longer authoritative")
+                }
+            },
+            move |_, command| submitted_by_callback.borrow_mut().push(command),
+        );
+
+        ui.show().unwrap();
+        let crossfade = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Apply a bounded linear crossfade from Lead on Audio to Pad (480 ticks)",
+        )
+        .next()
+        .expect("the generated arrangement row exposes its bounded crossfade action");
+        assert_eq!(crossfade.accessible_enabled(), Some(true));
+        crossfade.mock_single_click(PointerEventButton::Left);
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::ApplyArrangementPlacementCrossfade {
+                outgoing_placement_id,
+                incoming_placement_id,
+            }] if outgoing_placement_id == "placement-a" && incoming_placement_id == "placement-b"
+        ));
+
+        ui.global::<IdeActions>()
+            .invoke_apply_arrangement_placement_crossfade("placement-a".into(), "other".into());
+        assert_eq!(submitted.borrow().len(), 1);
+        assert_eq!(
+            ui.get_error_text().as_str(),
+            "The selected crossfade target is no longer authoritative"
+        );
+
+        ui.set_app_mode(AppMode::Previewing);
+        ui.global::<IdeActions>()
+            .invoke_apply_arrangement_placement_crossfade(
+                "placement-a".into(),
+                "placement-b".into(),
+            );
+        assert_eq!(submitted.borrow().len(), 1);
         ui.hide().unwrap();
     }
 
@@ -18455,6 +18739,24 @@ mod tests {
             mode_after_failure(
                 AppMode::ChangingArrangementPlacementFades,
                 IdeWorkerCommandKind::SetArrangementPlacementFades,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn arrangement_crossfade_submission_has_a_dedicated_pending_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade,
+            ),
+            AppMode::ChangingArrangementPlacementCrossfade
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingArrangementPlacementCrossfade,
+                IdeWorkerCommandKind::ApplyArrangementPlacementCrossfade,
             ),
             AppMode::Running
         );

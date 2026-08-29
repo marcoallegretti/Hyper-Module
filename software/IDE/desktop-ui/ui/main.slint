@@ -40,6 +40,7 @@ export enum AppMode {
     trimming-arrangement-placement,
     changing-arrangement-placement-gain,
     changing-arrangement-placement-fades,
+    changing-arrangement-placement-crossfade,
     removing-arrangement-placement,
     renaming-clip,
     duplicating-clip,
@@ -215,6 +216,8 @@ export struct ArrangementRow {
     gain-edit: string,
     fade-in-edit: string,
     fade-out-edit: string,
+    crossfade-target-id: string,
+    crossfade-target-label: string,
     start-clock: string,
     end-clock: string,
     start-percent: float,
@@ -342,6 +345,7 @@ export global IdeActions {
     callback set-arrangement-placement-duration(string, string);
     callback set-arrangement-placement-gain(string, string);
     callback set-arrangement-placement-fades(string, string, string);
+    callback apply-arrangement-placement-crossfade(string, string);
     callback trim-arrangement-placement-front(string, string);
     callback remove-arrangement-placement(string);
     callback add-arrangement-placement(string, string);
@@ -1195,6 +1199,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.trimming-arrangement-placement ? "◌  TRIMMING CLIP"
                         : root.app-mode == AppMode.changing-arrangement-placement-gain ? "◌  UPDATING PLACEMENT GAIN"
                         : root.app-mode == AppMode.changing-arrangement-placement-fades ? "◌  UPDATING PLACEMENT FADES"
+                        : root.app-mode == AppMode.changing-arrangement-placement-crossfade ? "◌  CROSSFADE"
                         : root.app-mode == AppMode.removing-arrangement-placement ? "◌  REMOVING CLIP"
                         : root.app-mode == AppMode.changing-clip-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.changing-clip-gain ? "◌  UPDATING GAIN"
@@ -4769,7 +4774,7 @@ export component MainWindow inherits Window {
                         if !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible && root.arrangement-placements.length > 0 : ListView {
                             vertical-stretch: 1;
                             for placement in root.arrangement-placements : Rectangle {
-                                height: 112px;
+                                height: 160px;
                                 width: parent.width;
                                 background: placement.enabled ? #0e141b : #11151a;
                                 border-color: placement.enabled ? #27313d : #3a3330;
@@ -4807,6 +4812,12 @@ export component MainWindow inherits Window {
                                                 background: placement.active ? #245d78 : placement.enabled ? #34404d : #4a3c34;
                                                 border-radius: 3px;
                                             }
+                                        }
+                                        if placement.crossfade-target-id != "" : Text {
+                                            text: "X-FADE → " + placement.crossfade-target-label;
+                                            color: #75d7b4;
+                                            font-size: 8px;
+                                            overflow: elide;
                                         }
                                     }
                                     VerticalLayout {
@@ -4964,8 +4975,14 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     VerticalLayout {
-                                        width: 58px;
+                                        width: 64px;
                                         spacing: 4px;
+                                        if placement.crossfade-target-id != "" : Button {
+                                            text: "X-Fade";
+                                            accessible-label: "Apply a bounded linear crossfade from " + placement.clip-name + " on " + placement.track-name + " to " + placement.crossfade-target-label;
+                                            enabled: root.app-mode == AppMode.running;
+                                            clicked => { IdeActions.apply-arrangement-placement-crossfade(placement.id, placement.crossfade-target-id); }
+                                        }
                                         Button {
                                             text: "Locate";
                                             accessible-label: "Locate to " + placement.clip-name + " on " + placement.track-name;
@@ -5002,7 +5019,7 @@ export component MainWindow inherits Window {
                         }
 
                         if !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible : Text {
-                            text: "Scene markers and exact non-ripple placement edits persist. Markers must preserve single-track authority; this surface does not claim live performance capture, drag, snap, or waveform editing.";
+                            text: "Scene markers, exact non-ripple placement edits, and bounded linear crossfades persist. Crossfades appear only for an active same-track overlap whose incoming placement reaches the outgoing end; this surface does not claim live performance capture, drag, snap, or waveform editing.";
                             color: #65758a;
                             font-size: 9px;
                         }
