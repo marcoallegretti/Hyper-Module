@@ -12,11 +12,16 @@ use std::time::{Duration, Instant};
 use hyper_desktop_audio::{DesktopAudioPreviewSnapshot, DesktopAudioPreviewState};
 use hyper_fs_authority::path_is_proven_absent;
 use hyper_mixer_runtime::{
-    InteractiveSceneLaunchObservation, LatestOutputMeterSnapshot, PlaybackRecoverySnapshot,
-    PlaybackRecoveryTransportState, TransportCommand,
+    InteractiveMixerParameterObservation, InteractiveSceneLaunchObservation,
+    LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, PlaybackRecoveryTransportState,
+    TransportCommand,
 };
 use hyper_playback_compiler::scene::LaunchQuantization;
-use hyper_playback_json::SceneTrackAction;
+use hyper_playback_compiler::{FrameTimeline, FrameTimelineError};
+use hyper_playback_json::{
+    AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
+    AutomationSendParameter, AutomationTarget, AutomationValue, SceneTrackAction,
+};
 use hyper_project_history::{ProjectHistory, ProjectHistoryError, RecentProject};
 use hyper_project_model::{ResourceRole, is_valid_interactive_project_name};
 use hyper_recording_metadata::RecordingCaptureKind;
@@ -243,6 +248,7 @@ pub enum IdeWorkerCommandKind {
     StopRecording,
     AbortRecording,
     CaptureScenePerformance,
+    CaptureMixerAutomation,
     StartAudioPreview,
     StartAudioClipPreview,
     StopAudioPreview,
@@ -570,6 +576,11 @@ pub enum IdeWorkerCommand {
     AbortRecording,
     StartScenePerformanceCapture,
     StopScenePerformanceCapture,
+    StartMixerAutomationCapture {
+        name: String,
+        target: IdeAutomationTarget,
+    },
+    StopMixerAutomationCapture,
     StartAudioPreview {
         asset_id: String,
     },
@@ -719,6 +730,9 @@ impl IdeWorkerCommand {
             Self::AbortRecording => IdeWorkerCommandKind::AbortRecording,
             Self::StartScenePerformanceCapture | Self::StopScenePerformanceCapture => {
                 IdeWorkerCommandKind::CaptureScenePerformance
+            }
+            Self::StartMixerAutomationCapture { .. } | Self::StopMixerAutomationCapture => {
+                IdeWorkerCommandKind::CaptureMixerAutomation
             }
             Self::StartAudioPreview { .. } => IdeWorkerCommandKind::StartAudioPreview,
             Self::StartAudioClipPreview { .. } => IdeWorkerCommandKind::StartAudioClipPreview,
@@ -2293,6 +2307,152 @@ impl Error for IdeScenePerformanceCaptureError {
     }
 }
 
+/// Why a bounded live mixer-automation capture could not be completed.
+///
+/// Version 1 captures exactly one resolved mixer parameter from committed,
+/// rolling output callbacks. It fails closed when timing or callback evidence
+/// cannot produce one valid automation take.
+#[derive(Debug)]
+pub enum IdeMixerAutomationCaptureError {
+    ProjectSnapshotUnavailable,
+    InvalidName,
+    TransportMustBeStopped,
+    LoopEnabled,
+    TargetUnavailable,
+    TargetAlreadyAutomated,
+    NoRemainingAutomationCapacity,
+    NoRemainingPointCapacity,
+    EventSourceDisconnected,
+    EventOverflow {
+        dropped_event_count: usize,
+    },
+    LoopEnabledDuringCapture,
+    InvalidValueForTarget,
+    Timeline(FrameTimelineError),
+    PointCapacityUnavailable,
+    PointCapacityReached {
+        maximum_point_count: usize,
+    },
+    NonMonotonicPoint {
+        previous_tick: u64,
+        observed_tick: u64,
+    },
+    NoParameterChangesCaptured,
+    IntervalNotRepresentable {
+        start_tick: u64,
+        end_tick: u64,
+    },
+    Transport(super::DesktopDirectControlError),
+    StopUnavailable {
+        capture: Box<Self>,
+        source: super::DesktopDirectControlError,
+    },
+}
+
+impl fmt::Display for IdeMixerAutomationCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProjectSnapshotUnavailable => {
+                formatter.write_str("running playback exposes no verified project snapshot")
+            }
+            Self::InvalidName => {
+                formatter.write_str("automation take names must be trimmed and contain 1 to 120 characters")
+            }
+            Self::TransportMustBeStopped => {
+                formatter.write_str("mixer automation capture requires stopped transport")
+            }
+            Self::LoopEnabled => {
+                formatter.write_str("mixer automation capture cannot start while looping is enabled")
+            }
+            Self::TargetUnavailable => {
+                formatter.write_str("the selected mixer parameter is unavailable in the running project")
+            }
+            Self::TargetAlreadyAutomated => formatter.write_str(
+                "an enabled automation lane already controls the selected mixer parameter",
+            ),
+            Self::NoRemainingAutomationCapacity => {
+                formatter.write_str("the project cannot accept another automation take")
+            }
+            Self::NoRemainingPointCapacity => {
+                formatter.write_str("the project cannot accept another automation point")
+            }
+            Self::EventSourceDisconnected => {
+                formatter.write_str("the committed mixer-parameter event source disconnected")
+            }
+            Self::EventOverflow {
+                dropped_event_count,
+            } => write!(
+                formatter,
+                "{dropped_event_count} committed mixer parameter changes could not be captured"
+            ),
+            Self::LoopEnabledDuringCapture => formatter.write_str(
+                "looping was enabled during mixer automation capture, so its timing cannot be written",
+            ),
+            Self::InvalidValueForTarget => formatter.write_str(
+                "a committed mixer parameter value does not match its automation target",
+            ),
+            Self::Timeline(source) => source.fmt(formatter),
+            Self::PointCapacityUnavailable => {
+                formatter.write_str("mixer automation capture point capacity is unavailable")
+            }
+            Self::PointCapacityReached {
+                maximum_point_count,
+            } => write!(
+                formatter,
+                "mixer automation capture reached its {maximum_point_count}-point limit"
+            ),
+            Self::NonMonotonicPoint {
+                previous_tick,
+                observed_tick,
+            } => write!(
+                formatter,
+                "committed mixer automation timing moved backward from tick {previous_tick} to {observed_tick}"
+            ),
+            Self::NoParameterChangesCaptured => {
+                formatter.write_str("mixer automation capture ended without a committed parameter change")
+            }
+            Self::IntervalNotRepresentable {
+                start_tick,
+                end_tick,
+            } => write!(
+                formatter,
+                "captured mixer automation interval [{start_tick}, {end_tick}) is not representable"
+            ),
+            Self::Transport(source) => source.fmt(formatter),
+            Self::StopUnavailable { capture, source } => write!(
+                formatter,
+                "mixer automation capture became invalid ({capture}) and transport stop could not be queued: {source}"
+            ),
+        }
+    }
+}
+
+impl Error for IdeMixerAutomationCaptureError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Timeline(source) => Some(source),
+            Self::Transport(source) | Self::StopUnavailable { source, .. } => Some(source),
+            Self::ProjectSnapshotUnavailable
+            | Self::InvalidName
+            | Self::TransportMustBeStopped
+            | Self::LoopEnabled
+            | Self::TargetUnavailable
+            | Self::TargetAlreadyAutomated
+            | Self::NoRemainingAutomationCapacity
+            | Self::NoRemainingPointCapacity
+            | Self::EventSourceDisconnected
+            | Self::EventOverflow { .. }
+            | Self::LoopEnabledDuringCapture
+            | Self::InvalidValueForTarget
+            | Self::PointCapacityUnavailable
+            | Self::PointCapacityReached { .. }
+            | Self::NonMonotonicPoint { .. }
+            | Self::NoParameterChangesCaptured
+            | Self::IntervalNotRepresentable { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum IdeWorkerCommandFailure {
     Discovery(IdeOutputDiscoveryError),
@@ -2386,6 +2546,7 @@ pub enum IdeWorkerCommandFailure {
     SceneActivation(Box<IdeSceneEditError>),
     Recording(IdeRecordingError),
     ScenePerformanceCapture(Box<IdeScenePerformanceCaptureError>),
+    MixerAutomationCapture(Box<IdeMixerAutomationCaptureError>),
     AudioPreview(IdeAudioPreviewError),
     InvalidState,
     Publication(OutputInventoryError),
@@ -2552,6 +2713,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::SceneRename(source) | Self::SceneActivation(source) => source.fmt(formatter),
             Self::Recording(source) => source.fmt(formatter),
             Self::ScenePerformanceCapture(source) => source.fmt(formatter),
+            Self::MixerAutomationCapture(source) => source.fmt(formatter),
             Self::AudioPreview(source) => source.fmt(formatter),
             Self::InvalidState => {
                 formatter.write_str("command is invalid for the current IDE state")
@@ -2652,6 +2814,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::SceneRename(source) | Self::SceneActivation(source) => Some(source),
             Self::Recording(source) => Some(source),
             Self::ScenePerformanceCapture(source) => Some(source),
+            Self::MixerAutomationCapture(source) => Some(source),
             Self::AudioPreview(source) => Some(source),
             Self::Publication(source) => Some(source),
             Self::InputPublication(source) => Some(source),
@@ -3153,6 +3316,18 @@ pub enum IdeWorkerEvent {
         revision: u64,
         launch_count: usize,
     },
+    MixerAutomationCaptureStarted {
+        maximum_point_count: usize,
+    },
+    MixerAutomationCaptureProgress {
+        point_count: usize,
+    },
+    MixerAutomationCaptureStopping {
+        point_count: usize,
+    },
+    MixerAutomationCaptureSaving {
+        point_count: usize,
+    },
     AudioClipWaveform(super::IdeAudioClipWaveform),
     AudioPreviewPreparing,
     AudioPreviewStopRequested,
@@ -3638,6 +3813,19 @@ enum ScenePerformanceCapturePhase {
     },
 }
 
+fn capture_stopped_after_start(
+    state: PlaybackRecoveryTransportState,
+    committed_cycle_count: u64,
+    capture_start_committed_cycle_count: u64,
+    has_observed_rolling: bool,
+) -> bool {
+    // The recovery checkpoint advances for every output-owner accepted
+    // callback. It remains evidence of a completed start boundary even if the
+    // control thread polls after a brief rolling interval has ended.
+    state == PlaybackRecoveryTransportState::Stopped
+        && (has_observed_rolling || committed_cycle_count > capture_start_committed_cycle_count)
+}
+
 /// Single-owner, lossless scene-performance capture state.
 ///
 /// It deliberately retains scene indexes rather than duplicating scene IDs for
@@ -3650,17 +3838,23 @@ struct ScenePerformanceCapture {
     launches: Vec<CapturedScenePerformanceLaunch>,
     maximum_launch_count: usize,
     last_sequence: Option<u64>,
+    capture_start_committed_cycle_count: u64,
     has_observed_rolling: bool,
     phase: ScenePerformanceCapturePhase,
 }
 
 impl ScenePerformanceCapture {
-    const fn new(scenes: Vec<CapturedScenePerformanceScene>, maximum_launch_count: usize) -> Self {
+    const fn new(
+        scenes: Vec<CapturedScenePerformanceScene>,
+        maximum_launch_count: usize,
+        capture_start_committed_cycle_count: u64,
+    ) -> Self {
         Self {
             scenes,
             launches: Vec::new(),
             maximum_launch_count,
             last_sequence: None,
+            capture_start_committed_cycle_count,
             has_observed_rolling: false,
             phase: ScenePerformanceCapturePhase::Capturing,
         }
@@ -3717,8 +3911,17 @@ impl ScenePerformanceCapture {
         self.has_observed_rolling |= state == PlaybackRecoveryTransportState::Rolling;
     }
 
-    fn stopped_after_start(&self, state: PlaybackRecoveryTransportState) -> bool {
-        self.has_observed_rolling && state == PlaybackRecoveryTransportState::Stopped
+    fn stopped_after_start(
+        &self,
+        state: PlaybackRecoveryTransportState,
+        committed_cycle_count: u64,
+    ) -> bool {
+        capture_stopped_after_start(
+            state,
+            committed_cycle_count,
+            self.capture_start_committed_cycle_count,
+            self.has_observed_rolling,
+        )
     }
 
     fn observe(
@@ -3780,6 +3983,289 @@ impl ScenePerformanceCapture {
     }
 }
 
+#[derive(Debug)]
+enum MixerAutomationCapturePhase {
+    Capturing,
+    Stopping {
+        after_committed_cycle_count: u64,
+        failure: Option<IdeMixerAutomationCaptureError>,
+    },
+}
+
+/// Single-owner, lossless capture state for one live mixer parameter.
+///
+/// The selected target is resolved while this state is created. Structural
+/// project edits are unavailable until the capture either fails or is handed
+/// to the normal one-take publication lifecycle, so that resolved address and
+/// authored identity cannot diverge mid-capture.
+#[derive(Debug)]
+struct MixerAutomationCapture {
+    name: String,
+    authored_target: IdeAutomationTarget,
+    target: AutomationTarget,
+    interpolation: AutomationInterpolation,
+    timeline: FrameTimeline,
+    points: Vec<AutomationPoint>,
+    maximum_point_count: usize,
+    capture_start_committed_cycle_count: u64,
+    has_observed_rolling: bool,
+    phase: MixerAutomationCapturePhase,
+}
+
+impl MixerAutomationCapture {
+    fn new(
+        name: String,
+        authored_target: IdeAutomationTarget,
+        target: AutomationTarget,
+        timeline: FrameTimeline,
+        maximum_point_count: usize,
+        capture_start_committed_cycle_count: u64,
+    ) -> Self {
+        Self {
+            name,
+            authored_target,
+            target,
+            interpolation: mixer_automation_interpolation(target),
+            timeline,
+            points: Vec::new(),
+            maximum_point_count,
+            capture_start_committed_cycle_count,
+            has_observed_rolling: false,
+            phase: MixerAutomationCapturePhase::Capturing,
+        }
+    }
+
+    const fn captured_point_count(&self) -> usize {
+        self.points.len()
+    }
+
+    const fn is_capturing(&self) -> bool {
+        matches!(self.phase, MixerAutomationCapturePhase::Capturing)
+    }
+
+    fn stopping_after_committed_cycle_count(&self) -> Option<u64> {
+        match self.phase {
+            MixerAutomationCapturePhase::Capturing => None,
+            MixerAutomationCapturePhase::Stopping {
+                after_committed_cycle_count,
+                ..
+            } => Some(after_committed_cycle_count),
+        }
+    }
+
+    fn begin_stopping(
+        &mut self,
+        after_committed_cycle_count: u64,
+        failure: Option<IdeMixerAutomationCaptureError>,
+    ) {
+        self.phase = MixerAutomationCapturePhase::Stopping {
+            after_committed_cycle_count,
+            failure,
+        };
+    }
+
+    fn remember_failure(&mut self, failure: IdeMixerAutomationCaptureError) {
+        if let MixerAutomationCapturePhase::Stopping {
+            failure: terminal_failure,
+            ..
+        } = &mut self.phase
+            && terminal_failure.is_none()
+        {
+            *terminal_failure = Some(failure);
+        }
+    }
+
+    fn take_terminal_failure(&mut self) -> Option<IdeMixerAutomationCaptureError> {
+        match &mut self.phase {
+            MixerAutomationCapturePhase::Capturing => None,
+            MixerAutomationCapturePhase::Stopping { failure, .. } => failure.take(),
+        }
+    }
+
+    fn observe_transport_state(&mut self, state: PlaybackRecoveryTransportState) {
+        self.has_observed_rolling |= state == PlaybackRecoveryTransportState::Rolling;
+    }
+
+    fn stopped_after_start(
+        &self,
+        state: PlaybackRecoveryTransportState,
+        committed_cycle_count: u64,
+    ) -> bool {
+        capture_stopped_after_start(
+            state,
+            committed_cycle_count,
+            self.capture_start_committed_cycle_count,
+            self.has_observed_rolling,
+        )
+    }
+
+    fn observe(
+        &mut self,
+        observation: InteractiveMixerParameterObservation,
+    ) -> Result<(), IdeMixerAutomationCaptureError> {
+        self.observe_change(
+            observation.start_frame(),
+            observation.transport_rolling(),
+            observation.loop_enabled(),
+            observation.target(),
+            observation.value(),
+        )
+    }
+
+    fn observe_change(
+        &mut self,
+        start_frame: usize,
+        transport_rolling: bool,
+        loop_enabled: bool,
+        target: AutomationTarget,
+        value: AutomationValue,
+    ) -> Result<(), IdeMixerAutomationCaptureError> {
+        if loop_enabled {
+            return Err(IdeMixerAutomationCaptureError::LoopEnabledDuringCapture);
+        }
+        self.has_observed_rolling |= transport_rolling;
+        // A control command may have been committed after the fresh queue
+        // drain but before the requested start reaches the callback. Its
+        // callback-state bit keeps that pre-capture change out of the take.
+        if !transport_rolling || target != self.target {
+            return Ok(());
+        }
+        if !automation_value_matches_target(target, value) {
+            return Err(IdeMixerAutomationCaptureError::InvalidValueForTarget);
+        }
+        let tick = self
+            .timeline
+            .position_at_frame(start_frame)
+            .and_then(|position| position.quantize_forward(1))
+            .map_err(IdeMixerAutomationCaptureError::Timeline)?;
+        if let Some(previous) = self.points.last().copied() {
+            if tick < previous.tick() {
+                return Err(IdeMixerAutomationCaptureError::NonMonotonicPoint {
+                    previous_tick: previous.tick(),
+                    observed_tick: tick,
+                });
+            }
+            if tick == previous.tick() {
+                *self
+                    .points
+                    .last_mut()
+                    .expect("the prior captured point remains present") =
+                    AutomationPoint::new(tick, value);
+                return Ok(());
+            }
+        }
+        if self.points.len() >= self.maximum_point_count {
+            return Err(IdeMixerAutomationCaptureError::PointCapacityReached {
+                maximum_point_count: self.maximum_point_count,
+            });
+        }
+        self.points
+            .try_reserve(1)
+            .map_err(|_| IdeMixerAutomationCaptureError::PointCapacityUnavailable)?;
+        self.points.push(AutomationPoint::new(tick, value));
+        Ok(())
+    }
+
+    fn into_take_request(
+        self,
+        end_frame: usize,
+    ) -> Result<IdeAutomationTakeRequest, IdeMixerAutomationCaptureError> {
+        let Some(first) = self.points.first().copied() else {
+            return Err(IdeMixerAutomationCaptureError::NoParameterChangesCaptured);
+        };
+        let last = self
+            .points
+            .last()
+            .copied()
+            .expect("a nonempty captured point list retains its final point");
+        let end_tick = self
+            .timeline
+            .position_at_frame(end_frame)
+            .and_then(|position| position.quantize_forward(1))
+            .map_err(IdeMixerAutomationCaptureError::Timeline)?;
+        if end_tick <= last.tick() {
+            return Err(IdeMixerAutomationCaptureError::IntervalNotRepresentable {
+                start_tick: first.tick(),
+                end_tick,
+            });
+        }
+        Ok(IdeAutomationTakeRequest {
+            name: self.name,
+            start_tick: first.tick(),
+            end_tick,
+            target: self.authored_target,
+            interpolation: self.interpolation,
+            points: self.points,
+        })
+    }
+}
+
+fn mixer_automation_interpolation(target: AutomationTarget) -> AutomationInterpolation {
+    match target {
+        AutomationTarget::Channel {
+            parameter: AutomationChannelParameter::Gain | AutomationChannelParameter::Pan,
+            ..
+        }
+        | AutomationTarget::Send {
+            parameter: AutomationSendParameter::Gain | AutomationSendParameter::Pan,
+            ..
+        }
+        | AutomationTarget::Main {
+            parameter: AutomationMainParameter::Gain,
+        }
+        | AutomationTarget::Cue {
+            parameter: AutomationMainParameter::Gain,
+        } => AutomationInterpolation::Linear,
+        AutomationTarget::Channel {
+            parameter: AutomationChannelParameter::Mute | AutomationChannelParameter::Solo,
+            ..
+        }
+        | AutomationTarget::Send {
+            parameter: AutomationSendParameter::Enabled,
+            ..
+        }
+        | AutomationTarget::Main {
+            parameter: AutomationMainParameter::Mute,
+        }
+        | AutomationTarget::Cue {
+            parameter: AutomationMainParameter::Mute,
+        } => AutomationInterpolation::Hold,
+    }
+}
+
+fn automation_value_matches_target(target: AutomationTarget, value: AutomationValue) -> bool {
+    matches!(
+        (target, value),
+        (
+            AutomationTarget::Channel {
+                parameter: AutomationChannelParameter::Gain | AutomationChannelParameter::Pan,
+                ..
+            } | AutomationTarget::Send {
+                parameter: AutomationSendParameter::Gain | AutomationSendParameter::Pan,
+                ..
+            } | AutomationTarget::Main {
+                parameter: AutomationMainParameter::Gain,
+            } | AutomationTarget::Cue {
+                parameter: AutomationMainParameter::Gain,
+            },
+            AutomationValue::Integer(_)
+        ) | (
+            AutomationTarget::Channel {
+                parameter: AutomationChannelParameter::Mute | AutomationChannelParameter::Solo,
+                ..
+            } | AutomationTarget::Send {
+                parameter: AutomationSendParameter::Enabled,
+                ..
+            } | AutomationTarget::Main {
+                parameter: AutomationMainParameter::Mute,
+            } | AutomationTarget::Cue {
+                parameter: AutomationMainParameter::Mute,
+            },
+            AutomationValue::Boolean(_)
+        )
+    )
+}
+
 #[allow(
     clippy::large_enum_variant,
     reason = "state transitions move the sole application owner without allocating after native startup or shutdown"
@@ -3801,6 +4287,10 @@ enum WorkerState {
     ScenePerformanceCapture {
         application: RunningDesktopIdeApplication,
         capture: ScenePerformanceCapture,
+    },
+    MixerAutomationCapture {
+        application: RunningDesktopIdeApplication,
+        capture: MixerAutomationCapture,
     },
     AutosaveFence {
         application: RunningDesktopIdeApplication,
@@ -4566,6 +5056,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::AddArrangementPlacement => "placement",
         IdeWorkerCommandKind::AddArrangementSceneLaunch => "scene marker",
         IdeWorkerCommandKind::CaptureScenePerformance => "scene performance capture",
+        IdeWorkerCommandKind::CaptureMixerAutomation => "mixer automation capture",
         IdeWorkerCommandKind::DuplicateArrangementPlacement => "placement duplication",
         IdeWorkerCommandKind::SplitArrangementPlacement => "placement split",
         IdeWorkerCommandKind::AddScene => "scene",
@@ -4670,7 +5161,9 @@ fn run_worker(
                 | WorkerState::RecordingFence { .. }
                 | WorkerState::AudioPreviewFence { .. }
                 | WorkerState::CloseFence { .. }
+                | WorkerState::Running(_)
                 | WorkerState::ScenePerformanceCapture { .. }
+                | WorkerState::MixerAutomationCapture { .. }
                 | WorkerState::RecordingClosing { .. }
                 | WorkerState::OutputTestStopping { .. }
                 | WorkerState::Closing(_)
@@ -4921,12 +5414,15 @@ fn process_command(
         ),
         IdeWorkerCommand::Loudness(command) => process_loudness_command(state, command, events),
         IdeWorkerCommand::Mixer(command) => match state {
-            WorkerState::Running(application) => match application.try_send_mixer(command) {
-                Ok(()) => send_event(events, IdeWorkerEvent::MixerQueued(command)),
-                Err(reason) => {
-                    publish_failure(events, kind, IdeWorkerCommandFailure::Mixer(reason))
+            WorkerState::Running(application)
+            | WorkerState::MixerAutomationCapture { application, .. } => {
+                match application.try_send_mixer(command) {
+                    Ok(()) => send_event(events, IdeWorkerEvent::MixerQueued(command)),
+                    Err(reason) => {
+                        publish_failure(events, kind, IdeWorkerCommandFailure::Mixer(reason))
+                    }
                 }
-            },
+            }
             _ => publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState),
         },
         IdeWorkerCommand::Monitoring(command) => process_monitoring_command(state, command, events),
@@ -5011,6 +5507,12 @@ fn process_command(
         }
         IdeWorkerCommand::StopScenePerformanceCapture => {
             stop_scene_performance_capture(state, events)
+        }
+        IdeWorkerCommand::StartMixerAutomationCapture { name, target } => {
+            start_mixer_automation_capture(state, events, name, target)
+        }
+        IdeWorkerCommand::StopMixerAutomationCapture => {
+            stop_mixer_automation_capture(state, events)
         }
         IdeWorkerCommand::InspectAudioClipWaveform { clip_id } => {
             inspect_audio_clip_waveform(state, &clip_id, events)
@@ -5877,6 +6379,20 @@ fn process_transport_command(
                 IdeWorkerCommandFailure::InvalidState,
             ),
         },
+        WorkerState::MixerAutomationCapture { .. } => match command {
+            TransportCommand::Stop => stop_mixer_automation_capture(state, events),
+            TransportCommand::Start
+            | TransportCommand::Locate { .. }
+            | TransportCommand::LaunchScene { .. }
+            | TransportCommand::StopInteractiveScenes
+            | TransportCommand::SetLoopRange(_)
+            | TransportCommand::SetLoopEnabled(_)
+            | TransportCommand::SetMetronomeEnabled(_) => publish_failure(
+                events,
+                IdeWorkerCommandKind::Transport,
+                IdeWorkerCommandFailure::InvalidState,
+            ),
+        },
         _ => publish_failure(
             events,
             IdeWorkerCommandKind::Transport,
@@ -6442,7 +6958,11 @@ fn start_scene_performance_capture(
     };
     *state = WorkerState::ScenePerformanceCapture {
         application,
-        capture: ScenePerformanceCapture::new(scenes, maximum_launch_count),
+        capture: ScenePerformanceCapture::new(
+            scenes,
+            maximum_launch_count,
+            recovery.committed_cycle_count(),
+        ),
     };
     send_event(
         events,
@@ -6599,7 +7119,9 @@ fn poll_scene_performance_capture(
         }
     }
 
-    if capture.is_capturing() && capture.stopped_after_start(recovery.state()) {
+    if capture.is_capturing()
+        && capture.stopped_after_start(recovery.state(), recovery.committed_cycle_count())
+    {
         // An external control binding may have stopped transport directly. The
         // stopped recovery snapshot was read before this drain, and the native
         // publisher enqueues its launch before publishing recovery, so this is
@@ -6619,6 +7141,372 @@ fn poll_scene_performance_capture(
         return complete_scene_performance_capture(state, application, capture, events);
     }
     *state = WorkerState::ScenePerformanceCapture {
+        application,
+        capture,
+    };
+    true
+}
+
+fn resolve_mixer_automation_capture_target(
+    snapshot: &RunningIdeSnapshot<'_>,
+    requested: &IdeAutomationTarget,
+) -> Option<AutomationTarget> {
+    match requested {
+        IdeAutomationTarget::Channel {
+            track_id,
+            parameter,
+        } => {
+            let slot = snapshot.mixer_channel_ids[..snapshot.mixer_channel_count]
+                .iter()
+                .position(|candidate| *candidate == track_id)?;
+            if *parameter == AutomationChannelParameter::Solo
+                && snapshot.mixer_channel_kinds[slot] != IdeMixerChannelKind::Audio
+            {
+                return None;
+            }
+            Some(AutomationTarget::Channel {
+                slot,
+                parameter: *parameter,
+            })
+        }
+        IdeAutomationTarget::Send { send_id, parameter } => (0..snapshot.mixer_channel_count)
+            .find_map(|slot| {
+                snapshot.mixer_send_ids[slot][..snapshot.mixer_send_counts[slot]]
+                    .iter()
+                    .position(|candidate| *candidate == send_id)
+                    .map(|send| AutomationTarget::Send {
+                        slot,
+                        send,
+                        parameter: *parameter,
+                    })
+            }),
+        IdeAutomationTarget::Main { parameter } => Some(AutomationTarget::Main {
+            parameter: *parameter,
+        }),
+    }
+}
+
+fn enabled_automation_targets(snapshot: &RunningIdeSnapshot<'_>, target: AutomationTarget) -> bool {
+    snapshot
+        .automation
+        .takes()
+        .iter()
+        .filter(|take| take.enabled())
+        .flat_map(hyper_playback_session::PlaybackAutomationTake::lanes)
+        .any(|lane| lane.target() == target)
+}
+
+#[derive(Debug)]
+struct PreparedMixerAutomationCaptureStart {
+    resolved_target: AutomationTarget,
+    timeline: FrameTimeline,
+    maximum_point_count: usize,
+    capture_start_committed_cycle_count: u64,
+}
+
+fn prepare_mixer_automation_capture_start(
+    application: &RunningDesktopIdeApplication,
+    name: &str,
+    requested_target: &IdeAutomationTarget,
+) -> Result<PreparedMixerAutomationCaptureStart, IdeMixerAutomationCaptureError> {
+    if !super::automation_take_name_is_valid(name) {
+        return Err(IdeMixerAutomationCaptureError::InvalidName);
+    }
+    let (recovery, resolved_target, timeline) = {
+        let snapshot = application
+            .snapshot()
+            .ok_or(IdeMixerAutomationCaptureError::ProjectSnapshotUnavailable)?;
+        let resolved_target = resolve_mixer_automation_capture_target(&snapshot, requested_target)
+            .ok_or(IdeMixerAutomationCaptureError::TargetUnavailable)?;
+        if enabled_automation_targets(&snapshot, resolved_target) {
+            return Err(IdeMixerAutomationCaptureError::TargetAlreadyAutomated);
+        }
+        let timeline = FrameTimeline::try_new(
+            snapshot.loaded.sample_rate_hz(),
+            snapshot.loaded.tempo_events(),
+        )
+        .map_err(IdeMixerAutomationCaptureError::Timeline)?;
+        (snapshot.recovery, resolved_target, timeline)
+    };
+    if recovery.state() != PlaybackRecoveryTransportState::Stopped {
+        return Err(IdeMixerAutomationCaptureError::TransportMustBeStopped);
+    }
+    if recovery.loop_enabled() {
+        return Err(IdeMixerAutomationCaptureError::LoopEnabled);
+    }
+    match application.can_add_automation_take() {
+        Some(true) => {}
+        Some(false) => return Err(IdeMixerAutomationCaptureError::NoRemainingAutomationCapacity),
+        None => return Err(IdeMixerAutomationCaptureError::ProjectSnapshotUnavailable),
+    }
+    let maximum_point_count = application
+        .remaining_automation_capture_point_capacity()
+        .ok_or(IdeMixerAutomationCaptureError::ProjectSnapshotUnavailable)?;
+    if maximum_point_count == 0 {
+        return Err(IdeMixerAutomationCaptureError::NoRemainingPointCapacity);
+    }
+    Ok(PreparedMixerAutomationCaptureStart {
+        resolved_target,
+        timeline,
+        maximum_point_count,
+        capture_start_committed_cycle_count: recovery.committed_cycle_count(),
+    })
+}
+
+fn publish_mixer_automation_capture_failure(
+    events: &SyncSender<IdeWorkerEvent>,
+    reason: IdeMixerAutomationCaptureError,
+) -> bool {
+    publish_failure(
+        events,
+        IdeWorkerCommandKind::CaptureMixerAutomation,
+        IdeWorkerCommandFailure::MixerAutomationCapture(Box::new(reason)),
+    )
+}
+
+fn start_mixer_automation_capture(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    name: String,
+    target: IdeAutomationTarget,
+) -> bool {
+    let WorkerState::Running(application) = state else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CaptureMixerAutomation,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    };
+    if application.audio_preview_is_active() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CaptureMixerAutomation,
+            IdeWorkerCommandFailure::AudioPreview(IdeAudioPreviewError::Command(
+                hyper_desktop_audio::DesktopAudioPreviewCommandError::PreviewBusy,
+            )),
+        );
+    }
+    let prepared = match prepare_mixer_automation_capture_start(application, &name, &target) {
+        Ok(prepared) => prepared,
+        Err(reason) => return publish_mixer_automation_capture_failure(events, reason),
+    };
+
+    // Pre-capture changes and any overflow that occurred while no capture was
+    // active cannot make the next capture incomplete. A disconnected source,
+    // however, cannot provide later committed evidence and remains terminal.
+    let discarded_history = application.drain_interactive_mixer_parameter_changes(|_| {});
+    if discarded_history.sender_disconnected() {
+        return publish_mixer_automation_capture_failure(
+            events,
+            IdeMixerAutomationCaptureError::EventSourceDisconnected,
+        );
+    }
+    if let Err(source) = application.try_send_transport(TransportCommand::Start) {
+        return publish_mixer_automation_capture_failure(
+            events,
+            IdeMixerAutomationCaptureError::Transport(source),
+        );
+    }
+    let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("running state was checked before mixer-automation capture transfer");
+    };
+    let capture = MixerAutomationCapture::new(
+        name,
+        target,
+        prepared.resolved_target,
+        prepared.timeline,
+        prepared.maximum_point_count,
+        prepared.capture_start_committed_cycle_count,
+    );
+    *state = WorkerState::MixerAutomationCapture {
+        application,
+        capture,
+    };
+    send_event(
+        events,
+        IdeWorkerEvent::MixerAutomationCaptureStarted {
+            maximum_point_count: prepared.maximum_point_count,
+        },
+    )
+}
+
+fn queue_mixer_automation_capture_stop(
+    application: &mut RunningDesktopIdeApplication,
+    capture: &mut MixerAutomationCapture,
+    failure: Option<IdeMixerAutomationCaptureError>,
+) -> Result<(), IdeMixerAutomationCaptureError> {
+    if !capture.is_capturing() {
+        return Ok(());
+    }
+    let recovery = application
+        .snapshot()
+        .map(|snapshot| snapshot.recovery)
+        .ok_or(IdeMixerAutomationCaptureError::ProjectSnapshotUnavailable)?;
+    match application.try_send_transport(TransportCommand::Stop) {
+        Ok(()) => {
+            capture.begin_stopping(recovery.committed_cycle_count(), failure);
+            Ok(())
+        }
+        Err(source) => match failure {
+            Some(capture) => Err(IdeMixerAutomationCaptureError::StopUnavailable {
+                capture: Box::new(capture),
+                source,
+            }),
+            None => Err(IdeMixerAutomationCaptureError::Transport(source)),
+        },
+    }
+}
+
+fn stop_mixer_automation_capture(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let WorkerState::MixerAutomationCapture {
+        application,
+        capture,
+    } = state
+    else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CaptureMixerAutomation,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    };
+    if let Err(reason) = queue_mixer_automation_capture_stop(application, capture, None) {
+        return publish_mixer_automation_capture_failure(events, reason);
+    }
+    send_event(
+        events,
+        IdeWorkerEvent::MixerAutomationCaptureStopping {
+            point_count: capture.captured_point_count(),
+        },
+    )
+}
+
+fn finish_mixer_automation_capture_failure(
+    state: &mut WorkerState,
+    application: RunningDesktopIdeApplication,
+    reason: IdeMixerAutomationCaptureError,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    *state = WorkerState::Running(application);
+    let mut no_native_failure = None;
+    if !publish_state(state, events, &mut no_native_failure) {
+        return false;
+    }
+    publish_mixer_automation_capture_failure(events, reason)
+}
+
+fn complete_mixer_automation_capture(
+    state: &mut WorkerState,
+    application: RunningDesktopIdeApplication,
+    mut capture: MixerAutomationCapture,
+    end_frame: usize,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    if let Some(reason) = capture.take_terminal_failure() {
+        return finish_mixer_automation_capture_failure(state, application, reason, events);
+    }
+    let point_count = capture.captured_point_count();
+    let request = match capture.into_take_request(end_frame) {
+        Ok(request) => request,
+        Err(reason) => {
+            return finish_mixer_automation_capture_failure(state, application, reason, events);
+        }
+    };
+    *state = WorkerState::Running(application);
+    if !send_event(
+        events,
+        IdeWorkerEvent::MixerAutomationCaptureSaving { point_count },
+    ) {
+        return false;
+    }
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::AddAutomationTake { request },
+    )
+}
+
+fn poll_mixer_automation_capture(
+    state: &mut WorkerState,
+    mut application: RunningDesktopIdeApplication,
+    mut capture: MixerAutomationCapture,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let recovery = match application.snapshot() {
+        Some(snapshot) => snapshot.recovery,
+        None => {
+            return finish_mixer_automation_capture_failure(
+                state,
+                application,
+                IdeMixerAutomationCaptureError::ProjectSnapshotUnavailable,
+                events,
+            );
+        }
+    };
+    capture.observe_transport_state(recovery.state());
+    let mut observation_failure = None;
+    let drain = application.drain_interactive_mixer_parameter_changes(|observation| {
+        if observation_failure.is_none() {
+            observation_failure = capture.observe(observation).err();
+        }
+    });
+    if drain.dropped_event_count() > 0 {
+        observation_failure = Some(IdeMixerAutomationCaptureError::EventOverflow {
+            dropped_event_count: drain.dropped_event_count(),
+        });
+    }
+    if drain.sender_disconnected() {
+        observation_failure = Some(IdeMixerAutomationCaptureError::EventSourceDisconnected);
+    }
+    if capture.is_capturing() && recovery.loop_enabled() {
+        observation_failure = Some(IdeMixerAutomationCaptureError::LoopEnabledDuringCapture);
+    }
+    if let Some(reason) = observation_failure {
+        if capture.is_capturing() {
+            if let Err(reason) =
+                queue_mixer_automation_capture_stop(&mut application, &mut capture, Some(reason))
+            {
+                return finish_mixer_automation_capture_failure(state, application, reason, events);
+            }
+        } else {
+            capture.remember_failure(reason);
+        }
+    }
+
+    if capture.is_capturing()
+        && capture.stopped_after_start(recovery.state(), recovery.committed_cycle_count())
+    {
+        // The mixer publisher runs before recovery publication. Draining after
+        // this stopped snapshot therefore includes every rolling change before
+        // an externally requested stop boundary.
+        return complete_mixer_automation_capture(
+            state,
+            application,
+            capture,
+            recovery.position_frame(),
+            events,
+        );
+    }
+    if capture
+        .stopping_after_committed_cycle_count()
+        .is_some_and(|after| {
+            recovery.state() == PlaybackRecoveryTransportState::Stopped
+                && recovery.committed_cycle_count() > after
+        })
+    {
+        // The stop cycle's recovery snapshot is published after its committed
+        // parameter observations, so this drain contains the complete capture.
+        return complete_mixer_automation_capture(
+            state,
+            application,
+            capture,
+            recovery.position_frame(),
+            events,
+        );
+    }
+    *state = WorkerState::MixerAutomationCapture {
         application,
         capture,
     };
@@ -16293,6 +17181,15 @@ fn poll_pending_state(
     project_history: Option<&ProjectHistory>,
 ) -> bool {
     match std::mem::replace(state, WorkerState::Empty) {
+        WorkerState::Running(mut application) => {
+            // The callback publisher cannot notify this control thread directly.
+            // Drain while inactive so a burst before a requested capture cannot
+            // fill the fixed queue and be misattributed to that capture.
+            // A disconnected sender remains observable when capture begins.
+            let _inactive_history = application.drain_interactive_mixer_parameter_changes(|_| {});
+            *state = WorkerState::Running(application);
+            true
+        }
         WorkerState::Closing(pending) => match pending.wait(Duration::ZERO) {
             IdePendingCloseWait::Closed {
                 application,
@@ -16437,6 +17334,10 @@ fn poll_pending_state(
             application,
             capture,
         } => poll_scene_performance_capture(state, application, capture, events),
+        WorkerState::MixerAutomationCapture {
+            application,
+            capture,
+        } => poll_mixer_automation_capture(state, application, capture, events),
         WorkerState::CloseFence {
             application,
             sequence,
@@ -16616,6 +17517,17 @@ fn publish_state(
             } else {
                 IdeWorkerEvent::ScenePerformanceCaptureStopping {
                     launch_count: capture.captured_launch_count(),
+                }
+            }
+        }
+        WorkerState::MixerAutomationCapture { capture, .. } => {
+            if capture.is_capturing() {
+                IdeWorkerEvent::MixerAutomationCaptureProgress {
+                    point_count: capture.captured_point_count(),
+                }
+            } else {
+                IdeWorkerEvent::MixerAutomationCaptureStopping {
+                    point_count: capture.captured_point_count(),
                 }
             }
         }
@@ -17124,6 +18036,10 @@ fn shutdown_state(
                 IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
             },
+            WorkerState::MixerAutomationCapture { application, .. } => match application.close() {
+                IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
+                IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
+            },
             WorkerState::AutosaveFence { application, .. } => match application.close() {
                 IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
@@ -17256,6 +18172,7 @@ mod tests {
                 capture_scene("scene-b", true),
             ],
             3,
+            0,
         );
 
         capture.observe_launch(0, Some(960), 41, false).unwrap();
@@ -17297,6 +18214,7 @@ mod tests {
                 capture_scene("immediate", false),
             ],
             1,
+            0,
         );
 
         assert!(matches!(
@@ -17326,12 +18244,204 @@ mod tests {
     }
 
     #[test]
-    fn scene_performance_capture_accepts_a_directly_observed_stopped_endpoint_only_after_roll() {
-        let mut capture = ScenePerformanceCapture::new(vec![capture_scene("grid", true)], 1);
+    fn scene_performance_capture_accepts_a_stopped_endpoint_after_start_evidence() {
+        let mut capture = ScenePerformanceCapture::new(vec![capture_scene("grid", true)], 1, 8);
 
-        assert!(!capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped));
+        assert!(!capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 8));
+        assert!(capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 9));
         capture.observe_transport_state(PlaybackRecoveryTransportState::Rolling);
-        assert!(capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped));
+        assert!(capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 8));
+    }
+
+    fn mixer_automation_capture(
+        target: AutomationTarget,
+        authored_target: IdeAutomationTarget,
+        maximum_point_count: usize,
+    ) -> MixerAutomationCapture {
+        MixerAutomationCapture::new(
+            "Captured automation".to_owned(),
+            authored_target,
+            target,
+            FrameTimeline::try_new(
+                48_000,
+                &[hyper_playback_compiler::TempoEvent {
+                    tick: 0,
+                    microseconds_per_quarter: 500_000,
+                }],
+            )
+            .unwrap(),
+            maximum_point_count,
+            0,
+        )
+    }
+
+    #[test]
+    fn mixer_automation_capture_accepts_a_stopped_endpoint_after_start_evidence() {
+        let target = AutomationTarget::Main {
+            parameter: AutomationMainParameter::Gain,
+        };
+        let mut capture = mixer_automation_capture(
+            target,
+            IdeAutomationTarget::Main {
+                parameter: AutomationMainParameter::Gain,
+            },
+            1,
+        );
+
+        assert!(!capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 0));
+        assert!(capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 1));
+        capture
+            .observe_change(
+                0,
+                true,
+                false,
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Mute,
+                },
+                AutomationValue::Boolean(true),
+            )
+            .unwrap();
+        assert!(capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 0));
+    }
+
+    #[test]
+    fn mixer_automation_capture_records_only_rolling_selected_values() {
+        let target = AutomationTarget::Main {
+            parameter: AutomationMainParameter::Gain,
+        };
+        let mut capture = mixer_automation_capture(
+            target,
+            IdeAutomationTarget::Main {
+                parameter: AutomationMainParameter::Gain,
+            },
+            3,
+        );
+
+        capture
+            .observe_change(0, false, false, target, AutomationValue::Integer(100_000))
+            .unwrap();
+        capture
+            .observe_change(
+                0,
+                true,
+                false,
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Mute,
+                },
+                AutomationValue::Boolean(true),
+            )
+            .unwrap();
+        capture
+            .observe_change(0, true, false, target, AutomationValue::Integer(100_000))
+            .unwrap();
+        capture
+            .observe_change(0, true, false, target, AutomationValue::Integer(200_000))
+            .unwrap();
+        capture
+            .observe_change(
+                24_000,
+                true,
+                false,
+                target,
+                AutomationValue::Integer(300_000),
+            )
+            .unwrap();
+
+        let request = capture.into_take_request(48_000).unwrap();
+        assert_eq!(request.start_tick, 0);
+        assert_eq!(request.end_tick, 3_840);
+        assert_eq!(
+            request.target,
+            IdeAutomationTarget::Main {
+                parameter: AutomationMainParameter::Gain,
+            }
+        );
+        assert_eq!(request.interpolation, AutomationInterpolation::Linear);
+        assert_eq!(
+            request.points,
+            vec![
+                AutomationPoint::new(0, AutomationValue::Integer(200_000)),
+                AutomationPoint::new(1_920, AutomationValue::Integer(300_000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn mixer_automation_capture_preserves_boolean_semantics_and_capacity() {
+        let target = AutomationTarget::Main {
+            parameter: AutomationMainParameter::Mute,
+        };
+        let mut capture = mixer_automation_capture(
+            target,
+            IdeAutomationTarget::Main {
+                parameter: AutomationMainParameter::Mute,
+            },
+            1,
+        );
+
+        assert!(matches!(
+            capture.observe_change(0, true, false, target, AutomationValue::Integer(1)),
+            Err(IdeMixerAutomationCaptureError::InvalidValueForTarget)
+        ));
+        assert!(matches!(
+            capture.observe_change(0, true, true, target, AutomationValue::Boolean(false)),
+            Err(IdeMixerAutomationCaptureError::LoopEnabledDuringCapture)
+        ));
+        capture
+            .observe_change(0, true, false, target, AutomationValue::Boolean(false))
+            .unwrap();
+        assert!(matches!(
+            capture.observe_change(24_000, true, false, target, AutomationValue::Boolean(true)),
+            Err(IdeMixerAutomationCaptureError::PointCapacityReached {
+                maximum_point_count: 1,
+            })
+        ));
+
+        let request = capture.into_take_request(24_000).unwrap();
+        assert_eq!(request.interpolation, AutomationInterpolation::Hold);
+        assert_eq!(
+            request.points,
+            vec![AutomationPoint::new(0, AutomationValue::Boolean(false))]
+        );
+    }
+
+    #[test]
+    fn mixer_automation_capture_rejects_backward_or_empty_intervals() {
+        let target = AutomationTarget::Main {
+            parameter: AutomationMainParameter::Gain,
+        };
+        let authored_target = IdeAutomationTarget::Main {
+            parameter: AutomationMainParameter::Gain,
+        };
+        let mut backward = mixer_automation_capture(target, authored_target.clone(), 2);
+        backward
+            .observe_change(
+                24_000,
+                true,
+                false,
+                target,
+                AutomationValue::Integer(100_000),
+            )
+            .unwrap();
+        assert!(matches!(
+            backward.observe_change(0, true, false, target, AutomationValue::Integer(50_000)),
+            Err(IdeMixerAutomationCaptureError::NonMonotonicPoint {
+                previous_tick: 1_920,
+                observed_tick: 0,
+            })
+        ));
+
+        let mut empty_interval = mixer_automation_capture(target, authored_target, 1);
+        empty_interval
+            .observe_change(0, true, false, target, AutomationValue::Integer(100_000))
+            .unwrap();
+        assert!(matches!(
+            empty_interval.into_take_request(0),
+            Err(IdeMixerAutomationCaptureError::IntervalNotRepresentable {
+                start_tick: 0,
+                end_tick: 0,
+            })
+        ));
     }
 
     fn application_config() -> IdeApplicationConfig {

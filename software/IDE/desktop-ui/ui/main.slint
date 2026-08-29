@@ -76,6 +76,9 @@ export enum AppMode {
     capturing-scene-performance,
     stopping-scene-performance,
     saving-scene-performance,
+    capturing-mixer-automation,
+    stopping-mixer-automation,
+    saving-mixer-automation,
     closing,
     unavailable,
 }
@@ -310,6 +313,8 @@ export global IdeActions {
     callback transport-return-start();
     callback start-scene-performance-capture();
     callback stop-scene-performance-capture();
+    callback start-mixer-automation-capture(string, int);
+    callback stop-mixer-automation-capture();
     callback transport-seek(float);
     callback loop-mark-in();
     callback loop-mark-out();
@@ -807,6 +812,7 @@ export component MainWindow inherits Window {
         || root.native-compressor-add-visible
         || root.native-compressor-edit-visible
         || root.control-create-visible
+        || root.automation-capture-visible
         || root.automation-create-visible
         || root.automation-edit-visible
         || root.automation-take-remove-confirming-id != ""
@@ -916,6 +922,11 @@ export component MainWindow inherits Window {
     in property <[bool]> automation-target-boolean: [];
     in property <[string]> automation-target-domain: [];
     in-out property <bool> mixer-automation-visible: false;
+    in-out property <bool> automation-capture-visible: false;
+    in-out property <string> automation-capture-name: "";
+    in-out property <int> automation-capture-target-index: 0;
+    in property <int> mixer-automation-capture-point-count: 0;
+    in property <int> mixer-automation-capture-maximum-point-count: 0;
     in-out property <bool> automation-create-visible: false;
     in-out property <string> automation-create-name: "";
     in-out property <int> automation-create-target-index: 0;
@@ -1156,6 +1167,9 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.capturing-scene-performance ? "●  CAPTURING SCENES"
                         : root.app-mode == AppMode.stopping-scene-performance ? "◌  ENDING SCENE CAPTURE"
                         : root.app-mode == AppMode.saving-scene-performance ? "◌  SAVING SCENE CAPTURE"
+                        : root.app-mode == AppMode.capturing-mixer-automation ? "●  CAPTURING AUTOMATION"
+                        : root.app-mode == AppMode.stopping-mixer-automation ? "◌  ENDING AUTOMATION"
+                        : root.app-mode == AppMode.saving-mixer-automation ? "◌  SAVING AUTOMATION"
                         : root.app-mode == AppMode.starting-output-test ? "◌  STARTING TEST"
                         : root.app-mode == AppMode.output-testing ? "●  OUTPUT TEST"
                         : root.app-mode == AppMode.stopping-output-test ? "◌  STOPPING TEST"
@@ -1198,6 +1212,7 @@ export component MainWindow inherits Window {
                         : "◌  DISCOVERING";
                     color: root.app-mode == AppMode.recording ? #ff8b87
                         : root.app-mode == AppMode.capturing-scene-performance ? #ffd166
+                        : root.app-mode == AppMode.capturing-mixer-automation ? #ffd166
                         : root.app-mode == AppMode.previewing ? #7dcfff
                         : root.app-mode == AppMode.output-testing ? #ffd166
                         : root.app-mode == AppMode.running ? #63e6b5
@@ -3372,13 +3387,14 @@ export component MainWindow inherits Window {
                             text: "Channels";
                             accessible-label: "Return from automation to mixer channels";
                             enabled: !root.local-edit-form-visible;
-                            clicked => { root.automation-create-visible = false; root.automation-edit-visible = false; root.automation-take-remove-confirming-id = ""; root.mixer-automation-visible = false; }
+                            clicked => { root.automation-capture-visible = false; root.automation-create-visible = false; root.automation-edit-visible = false; root.automation-take-remove-confirming-id = ""; root.mixer-automation-visible = false; }
                         }
                         Button {
                             text: "Performance";
                             accessible-label: "Return from automation to performance";
                             enabled: !root.local-edit-form-visible;
                             clicked => {
+                                root.automation-capture-visible = false;
                                 root.automation-create-visible = false;
                                 root.automation-edit-visible = false;
                                 root.automation-take-remove-confirming-id = "";
@@ -3387,10 +3403,14 @@ export component MainWindow inherits Window {
                                 root.mixer-visible = false;
                             }
                         }
-                            Button {
-                                text: "Add take";
-                            enabled: root.app-mode == AppMode.running && !root.automation-create-visible && !root.automation-edit-visible;
+                        Button {
+                            text: "Add take";
+                            enabled: root.app-mode == AppMode.running
+                                && !root.automation-capture-visible
+                                && !root.automation-create-visible
+                                && !root.automation-edit-visible;
                             clicked => {
+                                root.automation-capture-visible = false;
                                 root.automation-create-name = "";
                                 root.automation-create-target-index = 0;
                                 root.automation-create-interpolation-index = 0;
@@ -3402,9 +3422,107 @@ export component MainWindow inherits Window {
                                 root.automation-create-visible = true;
                             }
                         }
+                        Button {
+                            text: "Capture live";
+                            accessible-label: "Capture one selected mixer parameter from committed rolling output callbacks";
+                            enabled: root.app-mode == AppMode.running
+                                && root.transport-start-available
+                                && !root.loop-engaged
+                                && root.automation-target-names.length > 0
+                                && !root.automation-capture-visible
+                                && !root.automation-create-visible
+                                && !root.automation-edit-visible;
+                            clicked => {
+                                root.automation-create-visible = false;
+                                root.automation-edit-visible = false;
+                                root.automation-take-remove-confirming-id = "";
+                                root.automation-capture-name = "";
+                                root.automation-capture-target-index = 0;
+                                root.automation-capture-visible = true;
+                            }
+                        }
                     }
 
                     Rectangle { height: 1px; background: #27313d; }
+
+                    if root.automation-capture-visible : VerticalLayout {
+                        spacing: 8px;
+                        Text { height: 16px; text: "CAPTURE LIVE MIXER AUTOMATION"; color: #e7b96d; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text {
+                            height: 14px;
+                            text: "Starts stopped transport, records one selected parameter only after a committed rolling callback, and writes one bounded take. Looping is unavailable.";
+                            color: #8fa0b4;
+                            font-size: 9px;
+                            overflow: elide;
+                        }
+                        HorizontalLayout {
+                            height: 48px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text { text: "Take name"; color: #8fa0b4; font-size: 9px; }
+                                IdeLineEdit {
+                                    placeholder-text: "Take name";
+                                    text <=> root.automation-capture-name;
+                                    enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 2;
+                                Text { text: "Target"; color: #8fa0b4; font-size: 9px; }
+                                ComboBox {
+                                    model: root.automation-target-names;
+                                    current-index <=> root.automation-capture-target-index;
+                                    enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 34px;
+                            spacing: 8px;
+                            if root.app-mode == AppMode.running : Button {
+                                text: "Cancel";
+                                clicked => {
+                                    root.automation-capture-visible = false;
+                                    root.automation-capture-name = "";
+                                }
+                            }
+                            if root.app-mode == AppMode.capturing-mixer-automation : Button {
+                                text: "■  End capture";
+                                accessible-label: "Stop live mixer automation capture and save its committed points";
+                                clicked => { IdeActions.stop-mixer-automation-capture(); }
+                            }
+                            if root.app-mode == AppMode.running : Button {
+                                horizontal-stretch: 1;
+                                text: "Start live capture";
+                                enabled: root.automation-capture-name != ""
+                                    && root.automation-target-names.length > 0
+                                    && root.transport-start-available
+                                    && !root.loop-engaged;
+                                clicked => {
+                                    IdeActions.start-mixer-automation-capture(
+                                        root.automation-capture-name,
+                                        root.automation-capture-target-index
+                                    );
+                                }
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                                text: root.app-mode == AppMode.capturing-mixer-automation
+                                    ? root.mixer-automation-capture-point-count + " committed points (limit " + root.mixer-automation-capture-maximum-point-count + ")"
+                                    : root.app-mode == AppMode.stopping-mixer-automation
+                                    ? "Ending after " + root.mixer-automation-capture-point-count + " committed points"
+                                    : root.app-mode == AppMode.saving-mixer-automation
+                                    ? "Saving " + root.mixer-automation-capture-point-count + " committed points"
+                                    : "Select one live mixer parameter";
+                                color: root.app-mode == AppMode.capturing-mixer-automation ? #ffd166 : #8fa0b4;
+                                font-size: 9px;
+                                overflow: elide;
+                            }
+                        }
+                        Rectangle { height: 1px; background: #27313d; }
+                    }
 
                     if root.automation-create-visible : VerticalLayout {
                         spacing: 8px;
@@ -3668,10 +3786,12 @@ export component MainWindow inherits Window {
                                                 : "Editing is unavailable because " + take.name + " has multiple automation lanes";
                                             enabled: root.app-mode == AppMode.running
                                                 && take.editable
+                                                && !root.automation-capture-visible
                                                 && !root.automation-create-visible
                                                 && !root.automation-edit-visible
                                                 && root.automation-take-remove-confirming-id == "";
                                             clicked => {
+                                                root.automation-capture-visible = false;
                                                 root.automation-create-visible = false;
                                                 root.automation-take-remove-confirming-id = "";
                                                 IdeActions.begin-edit-automation-take(take.id);
@@ -3681,6 +3801,7 @@ export component MainWindow inherits Window {
                                             text: take.enabled ? "Disable" : "Enable";
                                             accessible-label: (take.enabled ? "Disable " : "Enable ") + take.name + " automation take";
                                             enabled: root.app-mode == AppMode.running
+                                                && !root.automation-capture-visible
                                                 && !root.automation-create-visible
                                                 && !root.automation-edit-visible
                                                 && root.automation-take-remove-confirming-id == "";
@@ -3693,6 +3814,7 @@ export component MainWindow inherits Window {
                                             text: root.automation-take-remove-confirming-id == take.id ? "Confirm" : "Remove";
                                             accessible-label: (root.automation-take-remove-confirming-id == take.id ? "Confirm removal of " : "Remove ") + take.name + " automation take";
                                             enabled: root.app-mode == AppMode.running
+                                                && !root.automation-capture-visible
                                                 && !root.automation-create-visible
                                                 && !root.automation-edit-visible;
                                             clicked => {

@@ -8,7 +8,9 @@ use core::cell::Cell;
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use hyper_mixer_runtime::{InteractiveSceneLaunchPublisher, PlaybackRecoveryPublisher};
+use hyper_mixer_runtime::{
+    InteractiveMixerParameterPublisher, InteractiveSceneLaunchPublisher, PlaybackRecoveryPublisher,
+};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
@@ -343,6 +345,7 @@ impl WasapiThreadRunner {
         self,
         mut processor: P,
         mut publisher: PlaybackRecoveryPublisher,
+        mut mixer_parameter_publisher: InteractiveMixerParameterPublisher,
         mut scene_launch_publisher: InteractiveSceneLaunchPublisher,
     ) -> Result<(), WasapiStartError>
     where
@@ -357,17 +360,17 @@ impl WasapiThreadRunner {
             |output: &mut [f32]| {
                 pending_cycle.set(None);
                 processor.process_checkpointed(output).map(|rendered| {
-                    pending_cycle.set(Some((
-                        rendered.snapshot().cycle(),
-                        rendered.mixer_parameter_state().copied(),
-                        rendered.native_device_state().copied(),
-                    )));
+                    pending_cycle.set(Some(rendered));
                 })
             },
             || {
-                let (cycle, mixer_parameter_state, native_device_state) = pending_cycle
+                let rendered = pending_cycle
                     .take()
                     .expect("a rendered WASAPI block has a pending recovery cycle");
+                let cycle = rendered.snapshot().cycle();
+                let mixer_parameter_state = rendered.mixer_parameter_state().copied();
+                let native_device_state = rendered.native_device_state().copied();
+                let _ = mixer_parameter_publisher.publish_cycle(&rendered);
                 let _ = scene_launch_publisher.publish_cycle(cycle);
                 publisher.publish_cycle_with_native_device_state(
                     cycle,

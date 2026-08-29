@@ -71,14 +71,16 @@ pub use hyper_mixer_runtime::{
     TransportCommand, TransportLoopRange, TransportLoopRangeError,
 };
 use hyper_mixer_runtime::{
+    InteractiveMixerParameterDrain, InteractiveMixerParameterObservation,
     InteractiveSceneLaunchDrain, InteractiveSceneLaunchObservation, LatestOutputMeterSnapshot,
     LoudnessCommandSendError, MixerParameterCommand, MixerParameterResolveError,
     PlaybackRecoverySnapshot,
 };
 #[cfg(test)]
 use hyper_mixer_runtime::{
+    InteractiveMixerParameterPublisher, InteractiveMixerParameterReceiver,
     InteractiveSceneLaunchPublisher, InteractiveSceneLaunchReceiver, OutputMeterReceiver,
-    interactive_scene_launch_channel, output_meter_channel,
+    interactive_mixer_parameter_channel, interactive_scene_launch_channel, output_meter_channel,
 };
 use hyper_native_device::{
     DeviceChain, DeviceChainError, NativeCompressorState, NativeDeviceInstance, NativeFilterState,
@@ -223,12 +225,12 @@ pub use recording::{
 pub use worker::{
     DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeAudioClip,
     IdeAudioClipEditCommittedWarning, IdeAudioPreviewObservation, IdeClosedSnapshot,
-    IdeMixerChannel, IdeMixerChannelDestination, IdeMixerSend, IdeNativeCompressor,
-    IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError, IdeRecordingCaptureKind,
-    IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeRuntimePreparationError,
-    IdeScene, IdeScenePerformanceCaptureError, IdeSceneTrackAction, IdeSceneTrackSlot,
-    IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent,
-    IdeWorkerEventReceiveError, IdeWorkerJoinError, IdeWorkerPendingShutdownWait,
+    IdeMixerAutomationCaptureError, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerSend,
+    IdeNativeCompressor, IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError,
+    IdeRecordingCaptureKind, IdeRecordingState, IdeRecordingTake, IdeRunningObservation,
+    IdeRuntimePreparationError, IdeScene, IdeScenePerformanceCaptureError, IdeSceneTrackAction,
+    IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind,
+    IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError, IdeWorkerPendingShutdownWait,
     IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, IdeWorkerStartError,
     MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS, desktop_ide_worker_supervisor_snapshot,
 };
@@ -5489,6 +5491,11 @@ pub struct IdeAutomationTakeRequest {
     pub points: Vec<AutomationPoint>,
 }
 
+pub(crate) fn automation_take_name_is_valid(name: &str) -> bool {
+    let character_count = name.chars().count();
+    name.trim() == name && (1..=120).contains(&character_count)
+}
+
 /// One complete native-device mutation submitted through the project's
 /// close-publish-reopen lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -10070,6 +10077,8 @@ struct TestPlaybackSession {
     loudness_commands: Vec<IdeLoudnessCommand>,
     mixer_commands: Vec<IdeMixerCommand>,
     meters: OutputMeterReceiver,
+    mixer_parameter_observations: InteractiveMixerParameterReceiver,
+    _mixer_parameter_publisher: InteractiveMixerParameterPublisher,
     scene_launches: InteractiveSceneLaunchReceiver,
     _scene_launch_publisher: InteractiveSceneLaunchPublisher,
     close_failure: Option<IdeNativeCloseFailure>,
@@ -10089,12 +10098,16 @@ struct TestPlaybackSession {
 #[cfg(test)]
 impl Default for TestPlaybackSession {
     fn default() -> Self {
+        let (mixer_parameter_publisher, mixer_parameter_observations) =
+            interactive_mixer_parameter_channel();
         let (scene_launch_publisher, scene_launches) = interactive_scene_launch_channel();
         Self {
             commands: Vec::new(),
             loudness_commands: Vec::new(),
             mixer_commands: Vec::new(),
             meters: output_meter_channel().1,
+            mixer_parameter_observations,
+            _mixer_parameter_publisher: mixer_parameter_publisher,
             scene_launches,
             _scene_launch_publisher: scene_launch_publisher,
             close_failure: None,
@@ -14152,8 +14165,7 @@ impl RunningDesktopIdeApplication {
         recovery: &DesktopPlaybackRecovery,
         request: &IdeAutomationTakeRequest,
     ) -> Result<IdeAutomationTakePublicationPlan, IdeAutomationTakeCreationError> {
-        let name_length = request.name.chars().count();
-        if request.name.trim() != request.name || !(1..=120).contains(&name_length) {
+        if !automation_take_name_is_valid(&request.name) {
             return Err(IdeAutomationTakeCreationError::InvalidName);
         }
         let empty_target = match &request.target {
@@ -16131,6 +16143,26 @@ impl RunningDesktopIdeApplication {
         }
     }
 
+    /// Drains exact live mixer changes from the native commit stream.
+    ///
+    /// Unlike meters, this stream is loss-detecting; callers must treat either
+    /// overflow or disconnection reported by the drain as incomplete capture.
+    #[must_use]
+    pub fn drain_interactive_mixer_parameter_changes(
+        &mut self,
+        observe: impl FnMut(InteractiveMixerParameterObservation),
+    ) -> InteractiveMixerParameterDrain {
+        match &mut self.session {
+            IdePlaybackSessionOwner::Native(session) => {
+                session.mixer_parameter_receiver().drain(observe)
+            }
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => {
+                session.mixer_parameter_observations.drain(observe)
+            }
+        }
+    }
+
     /// Drains exact interactive-scene launches from the native commit stream.
     ///
     /// Unlike meters, this stream is loss-detecting; callers must treat either
@@ -16162,6 +16194,42 @@ impl RunningDesktopIdeApplication {
             .documents
             .max_scene_launches;
         Some(maximum.saturating_sub(snapshot.loaded.scene_launch_count()))
+    }
+
+    /// Returns whether the running project can add one single-lane automation
+    /// take without exceeding its configured document or lane limits.
+    #[must_use]
+    pub(crate) fn can_add_automation_take(&self) -> Option<bool> {
+        let snapshot = self.snapshot()?;
+        let documents = snapshot.automation.takes().len();
+        let lanes = snapshot
+            .automation
+            .takes()
+            .iter()
+            .try_fold(0_usize, |count, take| count.checked_add(take.lanes().len()))?;
+        let limits = self.application.config.project_limits.session.documents;
+        Some(documents < limits.max_automation_documents && lanes < limits.max_automation_lanes)
+    }
+
+    /// Returns the number of version-1 automation points the running project
+    /// can still retain across all takes.
+    #[must_use]
+    pub(crate) fn remaining_automation_capture_point_capacity(&self) -> Option<usize> {
+        let snapshot = self.snapshot()?;
+        let used = snapshot
+            .automation
+            .takes()
+            .iter()
+            .flat_map(hyper_playback_session::PlaybackAutomationTake::lanes)
+            .try_fold(0_usize, |count, lane| count.checked_add(lane.point_count()))?;
+        let maximum = self
+            .application
+            .config
+            .project_limits
+            .session
+            .documents
+            .max_automation_points;
+        Some(maximum.saturating_sub(used))
     }
 
     #[must_use]

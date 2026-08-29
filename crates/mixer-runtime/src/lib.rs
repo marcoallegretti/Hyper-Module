@@ -33,11 +33,17 @@ use sha2::{Digest, Sha256};
 
 use crate::metronome::Metronome;
 
+mod automation_capture;
 mod loudness_presentation;
 mod meter_ballistics;
 mod metronome;
 mod recovery;
 mod scene_capture;
+pub use automation_capture::{
+    InteractiveMixerParameterDrain, InteractiveMixerParameterObservation,
+    InteractiveMixerParameterPublication, InteractiveMixerParameterPublisher,
+    InteractiveMixerParameterReceiver, interactive_mixer_parameter_channel,
+};
 pub use hyper_playback_compiler::scene::{InteractiveSceneLaunch, SceneLaunchState};
 pub use loudness_presentation::{
     EBU_TARGET_LOUDNESS_LUFS, EbuLoudnessPresentationConfig, EbuLoudnessScale, LoudnessDisplayUnit,
@@ -70,6 +76,12 @@ pub const MAX_QUEUED_LOUDNESS_COMMANDS: usize = 32;
 pub const MAX_QUEUED_OUTPUT_METER_SNAPSHOTS: usize = 64;
 /// Bounded, loss-detecting control-thread capture queue for committed scene launches.
 pub const MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES: usize = 256;
+/// Bounded, loss-detecting control-thread queue for committed live mixer changes.
+///
+/// This holds four complete worst-case mixer command batches. The capture path
+/// treats any excess as an explicit incomplete capture rather than discarding
+/// timing evidence silently.
+pub const MAX_QUEUED_INTERACTIVE_MIXER_PARAMETER_OBSERVATIONS: usize = 256;
 const ALL_MAIN_MIXER_SLOT_INDICES: [usize; MAX_MAIN_MIXER_SLOTS] = [0, 1, 2, 3, 4, 5, 6, 7];
 const MIXER_PARAMETER_LAYOUT_SIGNATURE_VERSION: &[u8] = b"hyper-mixer-parameter-layout-v1";
 const NATIVE_DEVICE_LAYOUT_SIGNATURE_VERSION: &[u8] = b"hyper-native-device-layout-v1";
@@ -677,6 +689,146 @@ pub enum MixerParameterCommand {
     /// Opaque FIFO barrier allocated by the sole command producer.
     #[doc(hidden)]
     Fence(MixerParameterFence),
+}
+
+impl MixerParameterCommand {
+    fn automation_change(self) -> Option<MixerParameterChange> {
+        let (target, value) = match self {
+            Self::ChannelGain { channel, gain } => (
+                AutomationTarget::Channel {
+                    slot: channel.slot,
+                    parameter: AutomationChannelParameter::Gain,
+                },
+                AutomationValue::Integer(
+                    i32::try_from(gain.to_millionths())
+                        .expect("the bounded gain persistence domain fits i32"),
+                ),
+            ),
+            Self::ChannelPan { channel, pan } => (
+                AutomationTarget::Channel {
+                    slot: channel.slot,
+                    parameter: AutomationChannelParameter::Pan,
+                },
+                AutomationValue::Integer(pan.to_millionths()),
+            ),
+            Self::ChannelMute { channel, muted } => (
+                AutomationTarget::Channel {
+                    slot: channel.slot,
+                    parameter: AutomationChannelParameter::Mute,
+                },
+                AutomationValue::Boolean(muted),
+            ),
+            Self::ChannelSolo { channel, solo } => (
+                AutomationTarget::Channel {
+                    slot: channel.slot,
+                    parameter: AutomationChannelParameter::Solo,
+                },
+                AutomationValue::Boolean(solo),
+            ),
+            Self::SendGain { send, gain } => (
+                AutomationTarget::Send {
+                    slot: send.slot,
+                    send: send.send,
+                    parameter: AutomationSendParameter::Gain,
+                },
+                AutomationValue::Integer(
+                    i32::try_from(gain.to_millionths())
+                        .expect("the bounded gain persistence domain fits i32"),
+                ),
+            ),
+            Self::SendPan { send, pan } => (
+                AutomationTarget::Send {
+                    slot: send.slot,
+                    send: send.send,
+                    parameter: AutomationSendParameter::Pan,
+                },
+                AutomationValue::Integer(pan.to_millionths()),
+            ),
+            Self::SendEnabled { send, enabled } => (
+                AutomationTarget::Send {
+                    slot: send.slot,
+                    send: send.send,
+                    parameter: AutomationSendParameter::Enabled,
+                },
+                AutomationValue::Boolean(enabled),
+            ),
+            Self::MainGain { gain } => (
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+                AutomationValue::Integer(
+                    i32::try_from(gain.to_millionths())
+                        .expect("the bounded gain persistence domain fits i32"),
+                ),
+            ),
+            Self::MainMute { muted } => (
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Mute,
+                },
+                AutomationValue::Boolean(muted),
+            ),
+            Self::Fence(_) => return None,
+        };
+        Some(MixerParameterChange { target, value })
+    }
+}
+
+/// One live mixer parameter resolved to the compiled automation address.
+///
+/// This is kept private until its successful audio callback reaches the
+/// output-owner commit boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MixerParameterChange {
+    target: AutomationTarget,
+    value: AutomationValue,
+}
+
+/// Bounded live parameter changes accepted during one callback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MixerParameterChanges {
+    entries: [Option<MixerParameterChange>; MAX_QUEUED_MIXER_PARAMETER_COMMANDS],
+    count: usize,
+    sequence: Option<u64>,
+}
+
+impl Default for MixerParameterChanges {
+    fn default() -> Self {
+        Self {
+            entries: [None; MAX_QUEUED_MIXER_PARAMETER_COMMANDS],
+            count: 0,
+            sequence: None,
+        }
+    }
+}
+
+impl MixerParameterChanges {
+    const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    const fn len(&self) -> usize {
+        self.count
+    }
+
+    const fn sequence(&self) -> Option<u64> {
+        self.sequence
+    }
+
+    fn iter(&self) -> impl Iterator<Item = MixerParameterChange> + '_ {
+        self.entries[..self.count].iter().flatten().copied()
+    }
+
+    fn push(&mut self, change: MixerParameterChange) {
+        debug_assert!(self.count < MAX_QUEUED_MIXER_PARAMETER_COMMANDS);
+        self.entries[self.count] = Some(change);
+        self.count += 1;
+    }
+
+    fn commit(&mut self, sequence: u64) {
+        debug_assert!(!self.is_empty());
+        debug_assert_eq!(self.sequence, None);
+        self.sequence = Some(sequence);
+    }
 }
 
 /// Opaque mixer barrier carried through the realtime command queue.
@@ -2375,6 +2527,7 @@ pub struct InterleavedTransportCycle {
     snapshot: OutputMeterSnapshot,
     publication: OutputMeterPublication,
     mixer_parameter_state: Option<MixerParameterStateSnapshot>,
+    mixer_parameter_changes: MixerParameterChanges,
     native_device_state: Option<NativeDeviceStateSnapshot>,
 }
 
@@ -2394,6 +2547,15 @@ impl InterleavedTransportCycle {
     #[must_use]
     pub const fn mixer_parameter_state(&self) -> Option<&MixerParameterStateSnapshot> {
         self.mixer_parameter_state.as_ref()
+    }
+
+    /// Returns the live mixer changes accepted by this successful callback.
+    ///
+    /// This internal view remains unavailable outside the runtime crate; the
+    /// loss-detecting capture publisher converts it to committed observations
+    /// only after the output owner commits the callback.
+    const fn committed_mixer_parameter_changes(&self) -> &MixerParameterChanges {
+        &self.mixer_parameter_changes
     }
 
     /// Returns newly committed native-device state when this callback accepts
@@ -4237,6 +4399,7 @@ pub struct RoutedTransportRuntime<R> {
     mixer_parameter_command_consumer: Option<Consumer<MixerParameterCommand>>,
     native_device_command_consumer: Option<Consumer<NativeDeviceCommand>>,
     mixer_parameter_fence: Option<Arc<AtomicU64>>,
+    committed_mixer_parameter_change_sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -4249,6 +4412,13 @@ struct LoudnessCycleControl {
 struct MixerParameterDrain {
     applied_command_count: usize,
     greatest_fence: u64,
+    changes: MixerParameterChanges,
+}
+
+#[derive(Debug)]
+struct ProcessedTransportCycle {
+    cycle: TransportCycle,
+    mixer_parameter_changes: MixerParameterChanges,
 }
 
 pub type GraphTransportRuntime<'prepared, 'cache, 'schedule> =
@@ -4271,6 +4441,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             mixer_parameter_command_consumer: None,
             native_device_command_consumer: None,
             mixer_parameter_fence: None,
+            committed_mixer_parameter_change_sequence: 0,
         }
     }
 
@@ -4304,6 +4475,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 mixer_parameter_command_consumer: None,
                 native_device_command_consumer: None,
                 mixer_parameter_fence: None,
+                committed_mixer_parameter_change_sequence: 0,
             },
         )
     }
@@ -4368,6 +4540,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 mixer_parameter_command_consumer: Some(parameter_consumer),
                 native_device_command_consumer: None,
                 mixer_parameter_fence: Some(committed_fence),
+                committed_mixer_parameter_change_sequence: 0,
             },
         )
     }
@@ -4694,6 +4867,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         output: StereoOutput<'_>,
     ) -> Result<TransportCycle, RuntimeProcessError> {
         self.process_cycle_with_strip_meters(scratch, output, None)
+            .map(|processed| processed.cycle)
     }
 
     #[allow(
@@ -4705,7 +4879,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         scratch: &mut [RenderScratchSlot<'_>],
         output: StereoOutput<'_>,
         strip_meters: Option<&mut MixerStripMeterAccumulator>,
-    ) -> Result<TransportCycle, RuntimeProcessError> {
+    ) -> Result<ProcessedTransportCycle, RuntimeProcessError> {
         let frame_count = output.left.len();
         if frame_count != output.right.len() {
             return Err(RuntimeProcessError::OutputLengthMismatch {
@@ -4765,24 +4939,29 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             output.left.fill(0.0);
             output.right.fill(0.0);
             self.commit_mixer_parameter_fence(mixer_parameter_drain.greatest_fence);
-            return Ok(TransportCycle {
-                state: self.state,
-                start_frame,
-                position_frame: start_frame,
-                frame_count,
-                loop_wrap_count: 0,
-                loop_range: self.loop_range,
-                loop_enabled: self.loop_enabled,
-                metronome_available: self.metronome_available(),
-                metronome_enabled: self.metronome_enabled(),
-                active_slot_count: 0,
-                scene_launch_state: self.runtime.scene_launch_state(),
-                applied_command_count,
-                command_sender_disconnected,
-                applied_mixer_parameter_command_count,
-                mixer_parameter_command_sender_disconnected,
-                applied_native_device_command_count,
-                native_device_command_sender_disconnected,
+            let mixer_parameter_changes =
+                self.commit_mixer_parameter_changes(mixer_parameter_drain.changes);
+            return Ok(ProcessedTransportCycle {
+                cycle: TransportCycle {
+                    state: self.state,
+                    start_frame,
+                    position_frame: start_frame,
+                    frame_count,
+                    loop_wrap_count: 0,
+                    loop_range: self.loop_range,
+                    loop_enabled: self.loop_enabled,
+                    metronome_available: self.metronome_available(),
+                    metronome_enabled: self.metronome_enabled(),
+                    active_slot_count: 0,
+                    scene_launch_state: self.runtime.scene_launch_state(),
+                    applied_command_count,
+                    command_sender_disconnected,
+                    applied_mixer_parameter_command_count,
+                    mixer_parameter_command_sender_disconnected,
+                    applied_native_device_command_count,
+                    native_device_command_sender_disconnected,
+                },
+                mixer_parameter_changes,
             });
         }
         let rendered = self.render_cycle(start_frame, frame_count, scratch, output, strip_meters);
@@ -4808,24 +4987,29 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         };
         self.position_frame = next_frame;
         self.commit_mixer_parameter_fence(mixer_parameter_drain.greatest_fence);
-        Ok(TransportCycle {
-            state: self.state,
-            start_frame,
-            position_frame: next_frame,
-            frame_count,
-            loop_wrap_count,
-            loop_range: self.loop_range,
-            loop_enabled: self.loop_enabled,
-            metronome_available: self.metronome_available(),
-            metronome_enabled: self.metronome_enabled(),
-            active_slot_count: rendered.active_slot_count,
-            scene_launch_state: self.runtime.scene_launch_state(),
-            applied_command_count,
-            command_sender_disconnected,
-            applied_mixer_parameter_command_count,
-            mixer_parameter_command_sender_disconnected,
-            applied_native_device_command_count,
-            native_device_command_sender_disconnected,
+        let mixer_parameter_changes =
+            self.commit_mixer_parameter_changes(mixer_parameter_drain.changes);
+        Ok(ProcessedTransportCycle {
+            cycle: TransportCycle {
+                state: self.state,
+                start_frame,
+                position_frame: next_frame,
+                frame_count,
+                loop_wrap_count,
+                loop_range: self.loop_range,
+                loop_enabled: self.loop_enabled,
+                metronome_available: self.metronome_available(),
+                metronome_enabled: self.metronome_enabled(),
+                active_slot_count: rendered.active_slot_count,
+                scene_launch_state: self.runtime.scene_launch_state(),
+                applied_command_count,
+                command_sender_disconnected,
+                applied_mixer_parameter_command_count,
+                mixer_parameter_command_sender_disconnected,
+                applied_native_device_command_count,
+                native_device_command_sender_disconnected,
+            },
+            mixer_parameter_changes,
         })
     }
 
@@ -4904,7 +5088,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     {
         let mut strip_meters = MixerStripMeterAccumulator::new(self.runtime.slot_count());
         let processed = callback.process(interleaved_output, |output| {
-            let cycle = self.process_cycle_with_strip_meters(
+            let processed = self.process_cycle_with_strip_meters(
                 scratch,
                 StereoOutput {
                     left: &mut *output.left,
@@ -4913,9 +5097,10 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 Some(&mut strip_meters),
             )?;
             post_mix(output);
-            Ok(cycle)
+            Ok(processed)
         })?;
-        let (cycle, meter) = processed.into_parts();
+        let (processed, meter) = processed.into_parts();
+        let cycle = processed.cycle;
         let strip_meters = strip_meters.finish();
         let mixer_parameter_state = (cycle.applied_mixer_parameter_command_count() > 0)
             .then(|| self.runtime.capture_parameter_state());
@@ -4943,6 +5128,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             snapshot,
             publication,
             mixer_parameter_state,
+            mixer_parameter_changes: processed.mixer_parameter_changes,
             native_device_state,
         })
     }
@@ -4987,6 +5173,9 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             if let MixerParameterCommand::Fence(fence) = command {
                 drained.greatest_fence = drained.greatest_fence.max(fence.sequence);
             }
+            if let Some(change) = command.automation_change() {
+                drained.changes.push(change);
+            }
             self.runtime.apply_mixer_parameter_command(command);
             drained.applied_command_count += 1;
         }
@@ -4999,6 +5188,20 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         {
             committed.fetch_max(sequence, Ordering::Release);
         }
+    }
+
+    fn commit_mixer_parameter_changes(
+        &mut self,
+        mut changes: MixerParameterChanges,
+    ) -> MixerParameterChanges {
+        if !changes.is_empty() {
+            self.committed_mixer_parameter_change_sequence = self
+                .committed_mixer_parameter_change_sequence
+                .checked_add(1)
+                .expect("mixer parameter capture sequence space exhausted");
+            changes.commit(self.committed_mixer_parameter_change_sequence);
+        }
+        changes
     }
 
     fn mixer_parameter_command_sender_disconnected(&self) -> bool {

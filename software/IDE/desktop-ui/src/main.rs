@@ -1179,6 +1179,60 @@ fn bind_scene_performance_capture_callbacks(ui: &MainWindow, worker: &WorkerCell
     });
 }
 
+fn bind_mixer_automation_capture_callbacks(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+
+    let weak = ui.as_weak();
+    let worker_for_start = Rc::clone(worker);
+    let project_state_for_start = Rc::clone(project_state);
+    actions.on_start_mixer_automation_capture(move |name, target_index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_automation_capture_visible()
+            || !ui.get_transport_start_available()
+            || ui.get_loop_engaged()
+        {
+            return;
+        }
+        let choices =
+            automation_target_choices(&project_state_for_start.automation_channels.borrow());
+        let (name, target) =
+            match mixer_automation_capture_request(&choices, name.as_str(), target_index) {
+                Ok(request) => request,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
+            };
+        submit_to_ui(
+            &ui,
+            &worker_for_start,
+            IdeWorkerCommand::StartMixerAutomationCapture { name, target },
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_stop = Rc::clone(worker);
+    actions.on_stop_mixer_automation_capture(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() == AppMode::CapturingMixerAutomation {
+            submit_to_ui(
+                &ui,
+                &worker_for_stop,
+                IdeWorkerCommand::StopMixerAutomationCapture,
+            );
+        }
+    });
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the preview callbacks share one take-route authority and must be registered together"
@@ -3395,6 +3449,7 @@ fn bind_arrangement_scene_launch_callback(
 ) {
     bind_arrangement_scene_launch_addition_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_move_callback(ui, worker, project_state);
+    bind_mixer_automation_capture_callbacks(ui, worker, project_state);
     bind_automation_take_callback(ui, worker, project_state);
     bind_automation_take_edit_callbacks(ui, worker, project_state);
     bind_automation_take_activation_callback(ui, worker);
@@ -5002,6 +5057,8 @@ fn start_event_pump(
                 | AppMode::Recording
                 | AppMode::CapturingScenePerformance
                 | AppMode::StoppingScenePerformance
+                | AppMode::CapturingMixerAutomation
+                | AppMode::StoppingMixerAutomation
                 | AppMode::OutputTesting
         ) {
             observation_pending = false;
@@ -5026,6 +5083,8 @@ fn completes_observation(event: &IdeWorkerEvent) -> bool {
             | IdeWorkerEvent::Recording(_)
             | IdeWorkerEvent::ScenePerformanceCaptureProgress { .. }
             | IdeWorkerEvent::ScenePerformanceCaptureStopping { .. }
+            | IdeWorkerEvent::MixerAutomationCaptureProgress { .. }
+            | IdeWorkerEvent::MixerAutomationCaptureStopping { .. }
             | IdeWorkerEvent::OutputTest(_)
             | IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::Observe,
@@ -5177,6 +5236,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::CaptureScenePerformance => {
             scene_performance_capture_submission_mode(current)
         }
+        IdeWorkerCommandKind::CaptureMixerAutomation => {
+            mixer_automation_capture_submission_mode(current)
+        }
         IdeWorkerCommandKind::StartAudioPreview | IdeWorkerCommandKind::StartAudioClipPreview => {
             AppMode::PreparingPreview
         }
@@ -5218,6 +5280,17 @@ fn scene_performance_capture_submission_mode(current: AppMode) -> AppMode {
         AppMode::StoppingScenePerformance
     } else {
         AppMode::CapturingScenePerformance
+    }
+}
+
+fn mixer_automation_capture_submission_mode(current: AppMode) -> AppMode {
+    if matches!(
+        current,
+        AppMode::CapturingMixerAutomation | AppMode::StoppingMixerAutomation
+    ) {
+        AppMode::StoppingMixerAutomation
+    } else {
+        AppMode::CapturingMixerAutomation
     }
 }
 
@@ -5456,6 +5529,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::AbortRecording => "Aborting capture and retaining recovery data…",
         IdeWorkerCommandKind::CaptureScenePerformance => {
             "Scene-performance capture command queued…"
+        }
+        IdeWorkerCommandKind::CaptureMixerAutomation => {
+            "Live mixer automation capture command queued…"
         }
         IdeWorkerCommandKind::StartAudioPreview => {
             "Stopping transport and preparing dry take audition…"
@@ -6084,6 +6160,12 @@ fn apply_event(
         | IdeWorkerEvent::ScenePerformanceCaptureSaving { .. }
         | IdeWorkerEvent::ScenePerformanceCaptureSaved { .. }) => {
             apply_scene_performance_capture_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::MixerAutomationCaptureStarted { .. }
+        | IdeWorkerEvent::MixerAutomationCaptureProgress { .. }
+        | IdeWorkerEvent::MixerAutomationCaptureStopping { .. }
+        | IdeWorkerEvent::MixerAutomationCaptureSaving { .. }) => {
+            apply_mixer_automation_capture_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioPreviewPreparing
         | IdeWorkerEvent::AudioPreviewStopRequested
@@ -8896,6 +8978,70 @@ fn apply_scene_performance_capture_event(ui: &MainWindow, event: &IdeWorkerEvent
     }
 }
 
+fn apply_mixer_automation_capture_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::MixerAutomationCaptureStarted {
+            maximum_point_count,
+        } => {
+            ui.set_app_mode(AppMode::CapturingMixerAutomation);
+            ui.set_mixer_automation_capture_point_count(0);
+            ui.set_mixer_automation_capture_maximum_point_count(
+                i32::try_from(*maximum_point_count).unwrap_or(i32::MAX),
+            );
+            ui.set_status_text(
+                format!(
+                    "Live mixer automation capture armed: transport start is queued; committed rolling changes will be retained (0 of {maximum_point_count})"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::MixerAutomationCaptureProgress { point_count } => {
+            ui.set_app_mode(AppMode::CapturingMixerAutomation);
+            ui.set_mixer_automation_capture_point_count(
+                i32::try_from(*point_count).unwrap_or(i32::MAX),
+            );
+            ui.set_status_text(
+                format!(
+                    "Live mixer automation capture active: {point_count} committed {} will be saved as one bounded take",
+                    if *point_count == 1 { "point" } else { "points" }
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::MixerAutomationCaptureStopping { point_count } => {
+            ui.set_app_mode(AppMode::StoppingMixerAutomation);
+            ui.set_mixer_automation_capture_point_count(
+                i32::try_from(*point_count).unwrap_or(i32::MAX),
+            );
+            ui.set_status_text(
+                format!(
+                    "Ending live mixer automation capture after {point_count} committed {}; waiting for the stopped audio cycle",
+                    if *point_count == 1 { "point" } else { "points" }
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::MixerAutomationCaptureSaving { point_count } => {
+            ui.set_app_mode(AppMode::SavingMixerAutomation);
+            ui.set_mixer_automation_capture_point_count(
+                i32::try_from(*point_count).unwrap_or(i32::MAX),
+            );
+            ui.set_status_text(
+                format!(
+                    "Saving {point_count} committed mixer {} as one bounded automation take…",
+                    if *point_count == 1 { "point" } else { "points" }
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("mixer-automation capture dispatcher received another event"),
+    }
+}
+
 fn set_recording_targets(
     ui: &MainWindow,
     recording_routes: &RecordingRoutes,
@@ -9551,6 +9697,7 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_automation_target_boolean(ModelRc::default());
     ui.set_automation_target_domain(ModelRc::default());
     ui.set_mixer_automation_visible(false);
+    reset_mixer_automation_capture_form(ui);
     reset_automation_creation_form(ui);
     reset_automation_take_edit_form(ui);
     ui.set_control_bindings(ModelRc::default());
@@ -9722,6 +9869,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::AddAutomationTake if current == AppMode::AddingAutomationTake => {
             AppMode::Running
         }
+        IdeWorkerCommandKind::AddAutomationTake | IdeWorkerCommandKind::CaptureMixerAutomation
+            if current == AppMode::SavingMixerAutomation =>
+        {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::SetAutomationTakeActive
             if current == AppMode::ChangingAutomationTakeActivation =>
         {
@@ -9848,6 +10000,16 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             if current == AppMode::SavingScenePerformance =>
         {
             AppMode::Running
+        }
+        IdeWorkerCommandKind::CaptureMixerAutomation
+            if current == AppMode::CapturingMixerAutomation =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::CaptureMixerAutomation
+            if current == AppMode::StoppingMixerAutomation =>
+        {
+            AppMode::CapturingMixerAutomation
         }
         IdeWorkerCommandKind::StartAudioPreview | IdeWorkerCommandKind::StartAudioClipPreview
             if current == AppMode::PreparingPreview =>
@@ -10979,6 +11141,9 @@ fn set_automation_targets(
     if ui.get_automation_create_target_index() >= choice_count {
         ui.set_automation_create_target_index(0);
     }
+    if ui.get_automation_capture_target_index() >= choice_count {
+        ui.set_automation_capture_target_index(0);
+    }
     if ui.get_automation_edit_target_index() >= choice_count {
         ui.set_automation_edit_target_index(0);
     }
@@ -11181,6 +11346,26 @@ fn automation_take_request(
     })
 }
 
+/// Builds the only authoring input that live capture is allowed to choose:
+/// a normalized take name and one target from the current compiled topology.
+fn mixer_automation_capture_request(
+    choices: &[AutomationTargetChoice],
+    name: &str,
+    target_index: i32,
+) -> Result<(String, IdeAutomationTarget), &'static str> {
+    let target = usize::try_from(target_index)
+        .ok()
+        .and_then(|index| choices.get(index))
+        .ok_or("The selected automation target is unavailable")?
+        .target
+        .clone();
+    let name = name.trim();
+    if !(1..=120).contains(&name.chars().count()) {
+        return Err("Automation take names must contain 1 through 120 characters");
+    }
+    Ok((name.to_owned(), target))
+}
+
 struct AutomationTakeEditForm {
     take_id: String,
     name: String,
@@ -11241,7 +11426,9 @@ fn format_automation_points(points: &[AutomationPoint]) -> String {
 }
 
 fn automation_take_form_is_open(ui: &MainWindow) -> bool {
-    ui.get_automation_create_visible() || ui.get_automation_edit_visible()
+    ui.get_automation_capture_visible()
+        || ui.get_automation_create_visible()
+        || ui.get_automation_edit_visible()
 }
 
 fn automation_take_direct_action_is_current(ui: &MainWindow, take_id: &str) -> bool {
@@ -11584,6 +11771,14 @@ fn reset_automation_creation_form(ui: &MainWindow) {
     ui.set_automation_create_points(SharedString::default());
 }
 
+fn reset_mixer_automation_capture_form(ui: &MainWindow) {
+    ui.set_automation_capture_visible(false);
+    ui.set_automation_capture_name(SharedString::default());
+    ui.set_automation_capture_target_index(0);
+    ui.set_mixer_automation_capture_point_count(0);
+    ui.set_mixer_automation_capture_maximum_point_count(0);
+}
+
 fn reset_automation_take_edit_form(ui: &MainWindow) {
     ui.set_automation_edit_visible(false);
     ui.set_automation_edit_take_id(SharedString::default());
@@ -11602,25 +11797,55 @@ fn apply_automation_take_creation_event(ui: &MainWindow, event: &IdeWorkerEvent)
             take_id: _,
             name,
         } => {
-            reset_automation_creation_form(ui);
-            ui.set_status_text(
-                format!("Automation take {name} added in project revision {revision}").into(),
-            );
+            if ui.get_app_mode() == AppMode::SavingMixerAutomation {
+                let point_count = ui.get_mixer_automation_capture_point_count();
+                reset_mixer_automation_capture_form(ui);
+                ui.set_app_mode(AppMode::Running);
+                ui.set_status_text(
+                    format!(
+                        "Captured {point_count} committed mixer {} in project revision {revision}",
+                        if point_count == 1 { "point" } else { "points" }
+                    )
+                    .into(),
+                );
+            } else {
+                reset_automation_creation_form(ui);
+                ui.set_status_text(
+                    format!("Automation take {name} added in project revision {revision}").into(),
+                );
+            }
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::AutomationTakeCreationCommittedWithWarning { name, warning } => {
-            reset_automation_creation_form(ui);
-            ui.set_status_text(
-                committed_warning_status(ui.get_app_mode(), &format!("Automation take {name}"))
+            if ui.get_app_mode() == AppMode::SavingMixerAutomation {
+                let point_count = ui.get_mixer_automation_capture_point_count();
+                reset_mixer_automation_capture_form(ui);
+                ui.set_app_mode(AppMode::Running);
+                ui.set_status_text(
+                    format!(
+                        "Captured {point_count} committed mixer {} but project reopening needs attention",
+                        if point_count == 1 { "point" } else { "points" }
+                    )
                     .into(),
-            );
+                );
+            } else {
+                reset_automation_creation_form(ui);
+                ui.set_status_text(
+                    committed_warning_status(ui.get_app_mode(), &format!("Automation take {name}"))
+                        .into(),
+                );
+            }
             ui.set_error_text(warning.to_string().into());
         }
         IdeWorkerEvent::AutomationTakeAdding => {
-            ui.set_app_mode(AppMode::AddingAutomationTake);
-            ui.set_status_text(
-                "Waiting for native output before adding the automation take…".into(),
-            );
+            if ui.get_app_mode() == AppMode::SavingMixerAutomation {
+                ui.set_status_text("Persisting the completed mixer automation capture…".into());
+            } else {
+                ui.set_app_mode(AppMode::AddingAutomationTake);
+                ui.set_status_text(
+                    "Waiting for native output before adding the automation take…".into(),
+                );
+            }
         }
         _ => unreachable!("automation take event dispatcher received another event"),
     }
@@ -16645,6 +16870,88 @@ mod tests {
     }
 
     #[test]
+    fn mixer_automation_capture_ui_lifecycle_preserves_generic_take_save_boundaries() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_automation_capture_visible(true);
+        ui.set_automation_capture_name("Live main gain".into());
+
+        apply_mixer_automation_capture_event(
+            &ui,
+            &IdeWorkerEvent::MixerAutomationCaptureStarted {
+                maximum_point_count: 4,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::CapturingMixerAutomation);
+        assert_eq!(ui.get_mixer_automation_capture_point_count(), 0);
+        assert_eq!(ui.get_mixer_automation_capture_maximum_point_count(), 4);
+        assert!(ui.get_status_text().contains("transport start is queued"));
+
+        apply_mixer_automation_capture_event(
+            &ui,
+            &IdeWorkerEvent::MixerAutomationCaptureProgress { point_count: 2 },
+        );
+        assert_eq!(ui.get_mixer_automation_capture_point_count(), 2);
+        assert!(ui.get_status_text().contains("2 committed points"));
+
+        apply_mixer_automation_capture_event(
+            &ui,
+            &IdeWorkerEvent::MixerAutomationCaptureStopping { point_count: 2 },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::StoppingMixerAutomation);
+        assert!(ui.get_status_text().contains("stopped audio cycle"));
+
+        apply_mixer_automation_capture_event(
+            &ui,
+            &IdeWorkerEvent::MixerAutomationCaptureSaving { point_count: 2 },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::SavingMixerAutomation);
+        apply_automation_take_creation_event(&ui, &IdeWorkerEvent::AutomationTakeAdding);
+        assert_eq!(
+            ui.get_app_mode(),
+            AppMode::SavingMixerAutomation,
+            "the generic mutation event must not erase capture ownership"
+        );
+        assert!(ui.get_status_text().contains("Persisting"));
+
+        apply_automation_take_creation_event(
+            &ui,
+            &IdeWorkerEvent::AutomationTakeAdded {
+                revision: 9,
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+                name: "Live main gain".to_owned(),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(!ui.get_automation_capture_visible());
+        assert!(ui.get_automation_capture_name().is_empty());
+        assert!(ui.get_status_text().contains("project revision 9"));
+
+        assert_eq!(
+            mixer_automation_capture_submission_mode(AppMode::Running),
+            AppMode::CapturingMixerAutomation
+        );
+        assert_eq!(
+            mixer_automation_capture_submission_mode(AppMode::CapturingMixerAutomation),
+            AppMode::StoppingMixerAutomation
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::StoppingMixerAutomation,
+                IdeWorkerCommandKind::CaptureMixerAutomation,
+            ),
+            AppMode::CapturingMixerAutomation
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::SavingMixerAutomation,
+                IdeWorkerCommandKind::AddAutomationTake,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
     fn scene_rename_command_normalizes_name_and_preserves_identity() {
         assert!(matches!(
             scene_rename_command("scene-a", "Intro", " Verse A "),
@@ -19309,6 +19616,23 @@ mod tests {
         assert!(automation_take_request(&choices, "Empty", 2, 0, "1920", "1920", "0=0").is_err());
         assert!(automation_take_request(&choices, "Reversed", 2, 0, "1920", "0", "0=0").is_err());
         assert!(automation_take_request(&choices, "Switch", 4, 0, "0", "1920", "0=5").is_err());
+    }
+
+    #[test]
+    fn mixer_automation_capture_request_normalizes_name_and_requires_current_target() {
+        let choices = automation_target_choices(&automation_channel_fixture());
+        let (name, target) =
+            mixer_automation_capture_request(&choices, "  Live main gain  ", 0).unwrap();
+        assert_eq!(name, "Live main gain");
+        assert_eq!(
+            target,
+            IdeAutomationTarget::Main {
+                parameter: AutomationMainParameter::Gain,
+            }
+        );
+        assert!(mixer_automation_capture_request(&choices, "", 0).is_err());
+        assert!(mixer_automation_capture_request(&choices, "Valid", -1).is_err());
+        assert!(mixer_automation_capture_request(&choices, "Valid", 100).is_err());
     }
 
     fn assert_automation_take_events_report_durable_outcomes(ui: &MainWindow) {

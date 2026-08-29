@@ -8,29 +8,33 @@ use hyper_audio_engine::{
 use hyper_media_cache::PreparedSceneAvailability;
 use hyper_mixer_runtime::{
     EbuLoudnessPresentationConfig, EbuLoudnessScale, FlatMainRuntime, GraphMainRuntime,
-    GraphTransportRuntime, InteractiveSceneLaunchPublication, LocateState,
-    LoudnessCommandSendError, LoudnessCommandSender, LoudnessDisplayUnit,
-    MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES, MAX_QUEUED_LOUDNESS_COMMANDS,
-    MAX_QUEUED_MIXER_PARAMETER_COMMANDS, MAX_QUEUED_NATIVE_DEVICE_COMMANDS,
-    MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, MetronomePlan,
-    MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSendError,
-    MixerParameterCommandSender, MixerParameterResolveError, MixerParameterStateRestoreError,
-    MixerParameterTargetError, NativeDeviceCommand, NativeDeviceCommandSendError,
-    NativeDeviceResolveError, NativeDeviceTargetError, OutputMeterPublication, OutputMeterReceiver,
-    OutputMeterSender, OutputMeterSnapshot, PreparedPlaybackMainRuntime,
-    PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError,
-    RuntimeProjectComponent, SamplePeakBallisticsConfig, SceneLaunchState,
+    GraphTransportRuntime, InteractiveMixerParameterPublication, InteractiveSceneLaunchPublication,
+    LocateState, LoudnessCommandSendError, LoudnessCommandSender, LoudnessDisplayUnit,
+    MAX_QUEUED_INTERACTIVE_MIXER_PARAMETER_OBSERVATIONS, MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES,
+    MAX_QUEUED_LOUDNESS_COMMANDS, MAX_QUEUED_MIXER_PARAMETER_COMMANDS,
+    MAX_QUEUED_NATIVE_DEVICE_COMMANDS, MAX_QUEUED_OUTPUT_METER_SNAPSHOTS,
+    MAX_QUEUED_TRANSPORT_COMMANDS, MetronomePlan, MixerChannelHandle, MixerParameterCommand,
+    MixerParameterCommandSendError, MixerParameterCommandSender, MixerParameterResolveError,
+    MixerParameterStateRestoreError, MixerParameterTargetError, NativeDeviceCommand,
+    NativeDeviceCommandSendError, NativeDeviceResolveError, NativeDeviceTargetError,
+    OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
+    PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, RuntimeCreationError,
+    RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig, SceneLaunchState,
     StereoSamplePeakBallistics, TransportCommand, TransportCommandApplyError,
     TransportCommandSendError, TransportCycle, TransportLoopRange, TransportLoopRangeError,
     TransportOutputCreationError, TransportOutputProcessor, TransportState,
-    interactive_scene_launch_channel, loudness_command_channel, output_meter_channel,
-    playback_recovery_channel,
+    interactive_mixer_parameter_channel, interactive_scene_launch_channel,
+    loudness_command_channel, output_meter_channel, playback_recovery_channel,
 };
 use hyper_native_device::{
     DeviceChain, NativeCompressorState, NativeDeviceInstance, NativeDeviceState, NativeFilterMode,
     NativeFilterState,
 };
 use hyper_playback_compiler::{MeterEvent, TempoEvent};
+use hyper_playback_json::{
+    AutomationChannelParameter, AutomationMainParameter, AutomationSendParameter, AutomationTarget,
+    AutomationValue,
+};
 
 use common::{PlaybackFixture, fixture, graph_fixture, playback_fixture};
 
@@ -3406,6 +3410,289 @@ fn interleaved_cycle_carries_mixer_state_only_when_controls_changed() {
         )
         .unwrap();
     assert_eq!(unchanged.mixer_parameter_state(), None);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one callback-level fixture pins every live mixer domain to its persisted automation value"
+)]
+fn interactive_mixer_parameter_channel_preserves_resolved_values_in_fifo_order() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 1).unwrap();
+    let (mut transport_sender, mut parameter_sender, mut transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+    let source = parameter_sender
+        .resolve_channel(GRAPH_SOURCE_TRACK_ID)
+        .unwrap();
+    let send = parameter_sender.resolve_send(GRAPH_SEND_A_ID).unwrap();
+    let (mut publisher, mut receiver) = interactive_mixer_parameter_channel();
+    let mut callback = InterleavedStereoCallback::try_new(1, 48_000).unwrap();
+    let mut scratch_left = [[0.0_f32; 1]; 5];
+    let mut scratch_right = [[0.0_f32; 1]; 5];
+    let [left_0, left_1, left_2, left_3, left_4] = &mut scratch_left;
+    let [right_0, right_1, right_2, right_3, right_4] = &mut scratch_right;
+    let mut scratch = [
+        RenderScratchSlot::new(left_0, right_0),
+        RenderScratchSlot::new(left_1, right_1),
+        RenderScratchSlot::new(left_2, right_2),
+        RenderScratchSlot::new(left_3, right_3),
+        RenderScratchSlot::new(left_4, right_4),
+    ];
+    let (mut meter_sender, _meter_receiver) = output_meter_channel();
+    let mut interleaved = [0.0_f32; 2];
+
+    transport_sender.try_send(TransportCommand::Start).unwrap();
+    for command in [
+        MixerParameterCommand::ChannelGain {
+            channel: source,
+            gain: LinearGain::new(0.75).unwrap(),
+        },
+        MixerParameterCommand::ChannelPan {
+            channel: source,
+            pan: Pan::new(-0.25).unwrap(),
+        },
+        MixerParameterCommand::ChannelMute {
+            channel: source,
+            muted: true,
+        },
+        MixerParameterCommand::ChannelSolo {
+            channel: source,
+            solo: true,
+        },
+        MixerParameterCommand::SendGain {
+            send,
+            gain: LinearGain::new(0.625).unwrap(),
+        },
+        MixerParameterCommand::SendPan {
+            send,
+            pan: Pan::new(-0.375).unwrap(),
+        },
+        MixerParameterCommand::SendEnabled {
+            send,
+            enabled: false,
+        },
+        MixerParameterCommand::MainGain {
+            gain: LinearGain::new(0.5).unwrap(),
+        },
+        MixerParameterCommand::MainMute { muted: true },
+    ] {
+        parameter_sender.try_send(command).unwrap();
+    }
+
+    let cycle = transport
+        .process_interleaved_cycle(
+            &mut callback,
+            &mut scratch,
+            &mut interleaved,
+            &mut meter_sender,
+        )
+        .unwrap();
+    assert_eq!(
+        publisher.publish_cycle(&cycle),
+        InteractiveMixerParameterPublication::Published
+    );
+    assert_eq!(
+        publisher.publish_cycle(&cycle),
+        InteractiveMixerParameterPublication::NoChanges
+    );
+
+    let mut observations = Vec::new();
+    let drained = receiver.drain(|observation| observations.push(observation));
+    assert_eq!(drained.delivered_event_count(), 9);
+    assert_eq!(drained.dropped_event_count(), 0);
+    assert!(!drained.sender_disconnected());
+    let actual: Vec<(AutomationTarget, AutomationValue)> = observations
+        .iter()
+        .copied()
+        .map(|observation| {
+            assert_eq!(observation.start_frame(), 0);
+            assert!(observation.transport_rolling());
+            assert!(!observation.loop_enabled());
+            (observation.target(), observation.value())
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Gain,
+                },
+                AutomationValue::Integer(750_000),
+            ),
+            (
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Pan,
+                },
+                AutomationValue::Integer(-250_000),
+            ),
+            (
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Mute,
+                },
+                AutomationValue::Boolean(true),
+            ),
+            (
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Solo,
+                },
+                AutomationValue::Boolean(true),
+            ),
+            (
+                AutomationTarget::Send {
+                    slot: 0,
+                    send: 0,
+                    parameter: AutomationSendParameter::Gain,
+                },
+                AutomationValue::Integer(625_000),
+            ),
+            (
+                AutomationTarget::Send {
+                    slot: 0,
+                    send: 0,
+                    parameter: AutomationSendParameter::Pan,
+                },
+                AutomationValue::Integer(-375_000),
+            ),
+            (
+                AutomationTarget::Send {
+                    slot: 0,
+                    send: 0,
+                    parameter: AutomationSendParameter::Enabled,
+                },
+                AutomationValue::Boolean(false),
+            ),
+            (
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+                AutomationValue::Integer(500_000),
+            ),
+            (
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Mute,
+                },
+                AutomationValue::Boolean(true),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn interactive_mixer_parameter_channel_preserves_order_and_reports_overflow() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 1).unwrap();
+    let (_transport_sender, mut parameter_sender, mut transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+    let (mut publisher, mut receiver) = interactive_mixer_parameter_channel();
+    assert_eq!(
+        publisher.capacity(),
+        MAX_QUEUED_INTERACTIVE_MIXER_PARAMETER_OBSERVATIONS
+    );
+    assert_eq!(
+        receiver.capacity(),
+        MAX_QUEUED_INTERACTIVE_MIXER_PARAMETER_OBSERVATIONS
+    );
+    let mut callback = InterleavedStereoCallback::try_new(1, 48_000).unwrap();
+    let (mut meter_sender, _meter_receiver) = output_meter_channel();
+    let mut interleaved = [0.0_f32; 2];
+    let mut scratch = [];
+    let mut last_cycle = None;
+
+    for index in 0..=MAX_QUEUED_INTERACTIVE_MIXER_PARAMETER_OBSERVATIONS {
+        parameter_sender
+            .try_send(MixerParameterCommand::MainMute {
+                muted: index % 2 == 0,
+            })
+            .unwrap();
+        let cycle = transport
+            .process_interleaved_cycle(
+                &mut callback,
+                &mut scratch,
+                &mut interleaved,
+                &mut meter_sender,
+            )
+            .unwrap();
+        assert_eq!(
+            publisher.publish_cycle(&cycle),
+            if index < MAX_QUEUED_INTERACTIVE_MIXER_PARAMETER_OBSERVATIONS {
+                InteractiveMixerParameterPublication::Published
+            } else {
+                InteractiveMixerParameterPublication::QueueFull
+            }
+        );
+        last_cycle = Some(cycle);
+    }
+    assert_eq!(
+        publisher.publish_cycle(last_cycle.as_ref().unwrap()),
+        InteractiveMixerParameterPublication::NoChanges
+    );
+
+    let mut observations = Vec::new();
+    let drained = receiver.drain(|observation| observations.push(observation));
+    assert_eq!(
+        drained.delivered_event_count(),
+        MAX_QUEUED_INTERACTIVE_MIXER_PARAMETER_OBSERVATIONS
+    );
+    assert_eq!(drained.dropped_event_count(), 1);
+    assert!(!drained.sender_disconnected());
+    for (index, observation) in observations.iter().copied().enumerate() {
+        assert_eq!(observation.start_frame(), 0);
+        assert!(!observation.transport_rolling());
+        assert!(!observation.loop_enabled());
+        assert_eq!(
+            observation.target(),
+            AutomationTarget::Main {
+                parameter: AutomationMainParameter::Mute,
+            }
+        );
+        assert_eq!(
+            observation.value(),
+            AutomationValue::Boolean(index % 2 == 0)
+        );
+    }
+
+    parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: true })
+        .unwrap();
+    let recovered_cycle = transport
+        .process_interleaved_cycle(
+            &mut callback,
+            &mut scratch,
+            &mut interleaved,
+            &mut meter_sender,
+        )
+        .unwrap();
+    assert_eq!(
+        publisher.publish_cycle(&recovered_cycle),
+        InteractiveMixerParameterPublication::Published
+    );
+    let mut recovered = Vec::new();
+    let drained = receiver.drain(|observation| recovered.push(observation));
+    assert_eq!(drained.delivered_event_count(), 1);
+    assert_eq!(drained.dropped_event_count(), 0);
+    assert!(!drained.sender_disconnected());
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].value(), AutomationValue::Boolean(true));
+}
+
+#[test]
+fn interactive_mixer_parameter_receiver_reports_an_abandoned_publisher() {
+    let (publisher, mut receiver) = interactive_mixer_parameter_channel();
+    drop(publisher);
+
+    let drained = receiver.drain(|_| {});
+
+    assert_eq!(drained.delivered_event_count(), 0);
+    assert_eq!(drained.dropped_event_count(), 0);
+    assert!(drained.sender_disconnected());
 }
 
 #[test]
