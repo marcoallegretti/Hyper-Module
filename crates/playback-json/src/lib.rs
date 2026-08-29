@@ -1703,6 +1703,21 @@ pub enum ArrangementPlacementFadeSerializationError {
     Document(ArrangementPlacementDocumentSerializationError),
 }
 
+/// The exact reasons an arrangement crossfade cannot be represented by the
+/// version-1 placement-envelope model.
+#[derive(Debug)]
+pub enum ArrangementPlacementCrossfadeSerializationError {
+    DistinctPlacementsRequired,
+    ActivePlacementsRequired,
+    SameTrackRequired,
+    OutgoingMustPrecedeIncoming,
+    PlacementsMustOverlap,
+    IncomingMustReachOutgoingEnd,
+    OutgoingFadeBoundaryConflict,
+    IncomingFadeBoundaryConflict,
+    Document(ArrangementPlacementDocumentSerializationError),
+}
+
 pub type ArrangementPlacementFrontTrimSerializationError =
     ArrangementPlacementDocumentSerializationError;
 pub type ArrangementPlacementRemovalSerializationError =
@@ -2306,6 +2321,52 @@ impl Error for ArrangementPlacementFadeSerializationError {
         match self {
             Self::Document(source) => Some(source),
             Self::CombinedDurationExceedsPlacement => None,
+        }
+    }
+}
+
+impl fmt::Display for ArrangementPlacementCrossfadeSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DistinctPlacementsRequired => {
+                formatter.write_str("an arrangement crossfade requires two distinct placements")
+            }
+            Self::ActivePlacementsRequired => formatter.write_str(
+                "an arrangement crossfade requires active placements in an active arrangement",
+            ),
+            Self::SameTrackRequired => formatter
+                .write_str("an arrangement crossfade requires placements on the same track"),
+            Self::OutgoingMustPrecedeIncoming => formatter
+                .write_str("the outgoing placement must begin before the incoming placement"),
+            Self::PlacementsMustOverlap => {
+                formatter.write_str("an arrangement crossfade requires overlapping placements")
+            }
+            Self::IncomingMustReachOutgoingEnd => {
+                formatter.write_str("the incoming placement must reach the outgoing placement end")
+            }
+            Self::OutgoingFadeBoundaryConflict => formatter.write_str(
+                "the derived crossfade does not fit the outgoing placement fade boundary",
+            ),
+            Self::IncomingFadeBoundaryConflict => formatter.write_str(
+                "the derived crossfade does not fit the incoming placement fade boundary",
+            ),
+            Self::Document(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ArrangementPlacementCrossfadeSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::DistinctPlacementsRequired
+            | Self::ActivePlacementsRequired
+            | Self::SameTrackRequired
+            | Self::OutgoingMustPrecedeIncoming
+            | Self::PlacementsMustOverlap
+            | Self::IncomingMustReachOutgoingEnd
+            | Self::OutgoingFadeBoundaryConflict
+            | Self::IncomingFadeBoundaryConflict => None,
         }
     }
 }
@@ -7904,6 +7965,82 @@ pub fn serialize_arrangement_placement_fades(
     .map_err(ArrangementPlacementFadeSerializationError::Document)
 }
 
+/// Applies one bounded, linear arrangement crossfade without introducing a
+/// separately persisted crossfade relationship.
+///
+/// The outgoing placement must begin before the incoming placement, and the
+/// incoming placement must cover the outgoing placement's end. The exact
+/// overlap duration becomes the outgoing placement's fade-out and the incoming
+/// placement's fade-in. Existing opposite-edge fades are retained.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the pair is inactive or cannot be
+/// represented by the placement-envelope model, the supplied arrangement is
+/// stale, or either edited placement cannot execute.
+pub fn serialize_arrangement_placement_crossfade(
+    project: &LoadedPlaybackProject,
+    source_arrangement: &[u8],
+    outgoing_placement_id: &str,
+    incoming_placement_id: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ArrangementPlacementCrossfadeSerializationError> {
+    if outgoing_placement_id == incoming_placement_id {
+        return Err(ArrangementPlacementCrossfadeSerializationError::DistinctPlacementsRequired);
+    }
+    let arrangement = project
+        .arrangement
+        .as_ref()
+        .ok_or(ArrangementPlacementDocumentSerializationError::ArrangementMissing)
+        .map_err(ArrangementPlacementCrossfadeSerializationError::Document)?;
+    let outgoing = arrangement
+        .placements
+        .iter()
+        .find(|placement| placement.id == outgoing_placement_id)
+        .ok_or(ArrangementPlacementDocumentSerializationError::PlacementMissing)
+        .map_err(ArrangementPlacementCrossfadeSerializationError::Document)?;
+    let incoming = arrangement
+        .placements
+        .iter()
+        .find(|placement| placement.id == incoming_placement_id)
+        .ok_or(ArrangementPlacementDocumentSerializationError::PlacementMissing)
+        .map_err(ArrangementPlacementCrossfadeSerializationError::Document)?;
+    if !arrangement_placement_is_active(project, arrangement, outgoing)
+        || !arrangement_placement_is_active(project, arrangement, incoming)
+    {
+        return Err(ArrangementPlacementCrossfadeSerializationError::ActivePlacementsRequired);
+    }
+    if outgoing.track_id != incoming.track_id {
+        return Err(ArrangementPlacementCrossfadeSerializationError::SameTrackRequired);
+    }
+
+    let crossfade_ticks = arrangement_crossfade_ticks(outgoing, incoming)?;
+    if crossfade_ticks > outgoing.duration_ticks - outgoing.fade_in_ticks {
+        return Err(ArrangementPlacementCrossfadeSerializationError::OutgoingFadeBoundaryConflict);
+    }
+    if crossfade_ticks > incoming.duration_ticks - incoming.fade_out_ticks {
+        return Err(ArrangementPlacementCrossfadeSerializationError::IncomingFadeBoundaryConflict);
+    }
+
+    serialize_arrangement_placement_pair_document_edit(
+        project,
+        source_arrangement,
+        outgoing_placement_id,
+        incoming_placement_id,
+        limits,
+        |_, _, outgoing_document, incoming_document| {
+            outgoing_document.insert("fade_out_ticks".to_owned(), crossfade_ticks.into());
+            incoming_document.insert("fade_in_ticks".to_owned(), crossfade_ticks.into());
+            Ok(())
+        },
+        |edited_project| {
+            validate_arrangement_placement_execution(edited_project, outgoing_placement_id)?;
+            validate_arrangement_placement_execution(edited_project, incoming_placement_id)
+        },
+    )
+    .map_err(ArrangementPlacementCrossfadeSerializationError::Document)
+}
+
 /// Trims or extends the front of one validated arrangement placement to an
 /// exact project tick while preserving its right edge and playback content.
 ///
@@ -8124,6 +8261,54 @@ fn validate_arrangement_placement_execution(
     .map_err(ArrangementPlacementDocumentSerializationError::Compilation)
 }
 
+fn arrangement_placement_is_active(
+    project: &LoadedPlaybackProject,
+    arrangement: &LoadedArrangement,
+    placement: &LoadedPlacement,
+) -> bool {
+    arrangement.enabled
+        && placement.enabled
+        && project
+            .tracks
+            .iter()
+            .any(|track| track.id == placement.track_id && track.active)
+        && project.clips.iter().any(|clip| {
+            clip.id == placement.clip_id && clip.track_id == placement.track_id && clip.enabled
+        })
+}
+
+fn arrangement_crossfade_ticks(
+    outgoing: &LoadedPlacement,
+    incoming: &LoadedPlacement,
+) -> Result<u64, ArrangementPlacementCrossfadeSerializationError> {
+    if outgoing.start_tick >= incoming.start_tick {
+        return Err(ArrangementPlacementCrossfadeSerializationError::OutgoingMustPrecedeIncoming);
+    }
+    let outgoing_end_tick = outgoing
+        .start_tick
+        .checked_add(outgoing.duration_ticks)
+        .ok_or(ArrangementPlacementCrossfadeSerializationError::Document(
+            ArrangementPlacementDocumentSerializationError::Compilation(
+                CompileError::ArithmeticOverflow,
+            ),
+        ))?;
+    if incoming.start_tick >= outgoing_end_tick {
+        return Err(ArrangementPlacementCrossfadeSerializationError::PlacementsMustOverlap);
+    }
+    let incoming_end_tick = incoming
+        .start_tick
+        .checked_add(incoming.duration_ticks)
+        .ok_or(ArrangementPlacementCrossfadeSerializationError::Document(
+            ArrangementPlacementDocumentSerializationError::Compilation(
+                CompileError::ArithmeticOverflow,
+            ),
+        ))?;
+    if incoming_end_tick < outgoing_end_tick {
+        return Err(ArrangementPlacementCrossfadeSerializationError::IncomingMustReachOutgoingEnd);
+    }
+    Ok(outgoing_end_tick - incoming.start_tick)
+}
+
 fn serialize_arrangement_placement_document_edit(
     project: &LoadedPlaybackProject,
     source_arrangement: &[u8],
@@ -8177,6 +8362,135 @@ fn serialize_arrangement_placement_document_edit(
             .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
         edit(current_placement, document)?;
     }
+    if placements
+        .iter()
+        .any(|placement| placement_sort_key(placement).is_none())
+    {
+        return Err(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape);
+    }
+    placements.sort_unstable_by(|left, right| {
+        match (placement_sort_key(left), placement_sort_key(right)) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            _ => core::cmp::Ordering::Equal,
+        }
+    });
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(ArrangementPlacementDocumentSerializationError::Serialization)?;
+    let edited = load_arrangement(
+        &output,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_placements,
+        limits.max_scene_launches,
+    )
+    .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+    let mut edited_project = project.clone();
+    edited_project.arrangement = Some(edited);
+    validate_loaded_identities(&edited_project)
+        .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+    validate_edit(&edited_project)?;
+    Ok(output)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the coupled placement transaction keeps source authority, dual mutable selection, canonical output, and candidate validation at one boundary"
+)]
+fn serialize_arrangement_placement_pair_document_edit(
+    project: &LoadedPlaybackProject,
+    source_arrangement: &[u8],
+    first_placement_id: &str,
+    second_placement_id: &str,
+    limits: LoaderLimits,
+    edit: impl FnOnce(
+        &LoadedPlacement,
+        &LoadedPlacement,
+        &mut serde_json::Map<String, Value>,
+        &mut serde_json::Map<String, Value>,
+    ) -> Result<(), ArrangementPlacementDocumentSerializationError>,
+    validate_edit: impl FnOnce(
+        &LoadedPlaybackProject,
+    ) -> Result<(), ArrangementPlacementDocumentSerializationError>,
+) -> Result<Vec<u8>, ArrangementPlacementDocumentSerializationError> {
+    let current = project
+        .arrangement
+        .as_ref()
+        .ok_or(ArrangementPlacementDocumentSerializationError::ArrangementMissing)?;
+    let first_placement = current
+        .placements
+        .iter()
+        .find(|placement| placement.id == first_placement_id)
+        .ok_or(ArrangementPlacementDocumentSerializationError::PlacementMissing)?;
+    let second_placement = current
+        .placements
+        .iter()
+        .find(|placement| placement.id == second_placement_id)
+        .ok_or(ArrangementPlacementDocumentSerializationError::PlacementMissing)?;
+    let source = load_arrangement(
+        source_arrangement,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_placements,
+        limits.max_scene_launches,
+    )
+    .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+    if &source != current {
+        return Err(ArrangementPlacementDocumentSerializationError::SourceArrangementMismatch);
+    }
+
+    let mut value: Value = serde_json::from_slice(source_arrangement)
+        .map_err(ArrangementPlacementDocumentSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&value)
+        .map_err(ArrangementPlacementDocumentSerializationError::Serialization)?;
+    if canonical_source != source_arrangement {
+        return Err(ArrangementPlacementDocumentSerializationError::NonCanonicalSource);
+    }
+    let placements = value
+        .get_mut("placements")
+        .and_then(Value::as_array_mut)
+        .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
+    let first_document_index = placements
+        .iter()
+        .position(|placement| {
+            placement.get("id").and_then(Value::as_str) == Some(first_placement_id)
+        })
+        .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
+    let second_document_index = placements
+        .iter()
+        .position(|placement| {
+            placement.get("id").and_then(Value::as_str) == Some(second_placement_id)
+        })
+        .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
+    if first_document_index == second_document_index {
+        return Err(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape);
+    }
+    let (first_document, second_document) = if first_document_index < second_document_index {
+        let (before_second, second_and_after) = placements.split_at_mut(second_document_index);
+        (
+            before_second[first_document_index]
+                .as_object_mut()
+                .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?,
+            second_and_after[0]
+                .as_object_mut()
+                .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?,
+        )
+    } else {
+        let (before_first, first_and_after) = placements.split_at_mut(first_document_index);
+        (
+            first_and_after[0]
+                .as_object_mut()
+                .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?,
+            before_first[second_document_index]
+                .as_object_mut()
+                .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?,
+        )
+    };
+    edit(
+        first_placement,
+        second_placement,
+        first_document,
+        second_document,
+    )?;
     if placements
         .iter()
         .any(|placement| placement_sort_key(placement).is_none())
@@ -15953,6 +16267,320 @@ mod tests {
         assert_eq!(entry.compiled.clip_spec().fade_out_frames, 0);
         assert_eq!(entry.compiled.placement_spec().fade_in_frames, 25);
         assert_eq!(entry.compiled.placement_spec().fade_out_frames, 50);
+    }
+
+    #[test]
+    fn arrangement_placement_crossfade_is_atomic_legacy_safe_and_effective() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let mut source: Value = serde_json::from_slice(&two_voice_arrangement_source()).unwrap();
+        source["extensions"]["org.example.arrangement"] = json!({"opaque": [1, 2, 3]});
+        source["placements"][0]["fade_in_ticks"] = 1.into();
+        source["placements"][1]["fade_out_ticks"] = 1.into();
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let outgoing_placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+        let incoming_placement_id = "018f47a2-6b2d-7c11-8a44-001122334465";
+
+        let edited = serialize_arrangement_placement_crossfade(
+            &loaded,
+            &source,
+            outgoing_placement_id,
+            incoming_placement_id,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["placements"][0]["fade_out_ticks"] = 2.into();
+        expected["placements"][1]["fade_in_ticks"] = 2.into();
+        assert_eq!(edited, serde_json_canonicalizer::to_vec(&expected).unwrap());
+        assert_eq!(
+            expected["extensions"]["org.example.arrangement"],
+            json!({"opaque": [1, 2, 3]})
+        );
+
+        let reopened = load(
+            input(TIMELINE, &tracks, &clips, Some(&edited)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let compiled = reopened
+            .compile_playback(
+                &asset_facts(),
+                GraphLimits::VERSION_1,
+                SceneLimits::VERSION_1,
+            )
+            .unwrap();
+        let entries = compiled.arrangement().entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].placement_fade_in_ticks, 1);
+        assert_eq!(entries[0].placement_fade_out_ticks, 2);
+        assert_eq!(entries[0].compiled.placement_spec().fade_in_frames, 25);
+        assert_eq!(entries[0].compiled.placement_spec().fade_out_frames, 50);
+        assert_eq!(entries[1].placement_fade_in_ticks, 2);
+        assert_eq!(entries[1].placement_fade_out_ticks, 1);
+        assert_eq!(entries[1].compiled.placement_spec().fade_in_frames, 50);
+        assert_eq!(entries[1].compiled.placement_spec().fade_out_frames, 25);
+        assert_eq!(
+            serialize_arrangement_placement_crossfade(
+                &reopened,
+                &edited,
+                outgoing_placement_id,
+                incoming_placement_id,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            edited
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one rejection matrix keeps topology, activation, fade-boundary, canonical-source, and compiler refusal precedence together"
+    )]
+    fn arrangement_placement_crossfade_refuses_unsupported_or_untrusted_pairs() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let source = two_voice_arrangement_source();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let outgoing_placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+        let incoming_placement_id = "018f47a2-6b2d-7c11-8a44-001122334465";
+
+        assert!(matches!(
+            serialize_arrangement_placement_crossfade(
+                &loaded,
+                &source,
+                outgoing_placement_id,
+                outgoing_placement_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementCrossfadeSerializationError::DistinctPlacementsRequired)
+        ));
+        assert!(matches!(
+            serialize_arrangement_placement_crossfade(
+                &loaded,
+                &source,
+                outgoing_placement_id,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementCrossfadeSerializationError::Document(
+                ArrangementPlacementDocumentSerializationError::PlacementMissing
+            ))
+        ));
+        assert!(matches!(
+            serialize_arrangement_placement_crossfade(
+                &loaded,
+                &source,
+                incoming_placement_id,
+                outgoing_placement_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementCrossfadeSerializationError::OutgoingMustPrecedeIncoming)
+        ));
+
+        let mut inactive_source: Value = serde_json::from_slice(&source).unwrap();
+        inactive_source["placements"][1]["enabled"] = false.into();
+        let inactive_source = serde_json_canonicalizer::to_vec(&inactive_source).unwrap();
+        let inactive = load(
+            input(TIMELINE, &tracks, &clips, Some(&inactive_source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_crossfade(
+                &inactive,
+                &inactive_source,
+                outgoing_placement_id,
+                incoming_placement_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementCrossfadeSerializationError::ActivePlacementsRequired)
+        ));
+
+        let mut non_overlapping_source: Value = serde_json::from_slice(&source).unwrap();
+        non_overlapping_source["placements"][1]["start_tick"] = 4.into();
+        let non_overlapping_source =
+            serde_json_canonicalizer::to_vec(&non_overlapping_source).unwrap();
+        let non_overlapping = load(
+            input(TIMELINE, &tracks, &clips, Some(&non_overlapping_source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_crossfade(
+                &non_overlapping,
+                &non_overlapping_source,
+                outgoing_placement_id,
+                incoming_placement_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementCrossfadeSerializationError::PlacementsMustOverlap)
+        ));
+
+        let mut short_incoming_source: Value = serde_json::from_slice(&source).unwrap();
+        short_incoming_source["placements"][1]["duration_ticks"] = 1.into();
+        let short_incoming_source =
+            serde_json_canonicalizer::to_vec(&short_incoming_source).unwrap();
+        let short_incoming = load(
+            input(TIMELINE, &tracks, &clips, Some(&short_incoming_source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_crossfade(
+                &short_incoming,
+                &short_incoming_source,
+                outgoing_placement_id,
+                incoming_placement_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementCrossfadeSerializationError::IncomingMustReachOutgoingEnd)
+        ));
+
+        let mut outgoing_boundary_source: Value = serde_json::from_slice(&source).unwrap();
+        outgoing_boundary_source["placements"][0]["fade_in_ticks"] = 3.into();
+        let outgoing_boundary_source =
+            serde_json_canonicalizer::to_vec(&outgoing_boundary_source).unwrap();
+        let outgoing_boundary = load(
+            input(TIMELINE, &tracks, &clips, Some(&outgoing_boundary_source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_crossfade(
+                &outgoing_boundary,
+                &outgoing_boundary_source,
+                outgoing_placement_id,
+                incoming_placement_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementCrossfadeSerializationError::OutgoingFadeBoundaryConflict)
+        ));
+
+        let mut incoming_boundary_source: Value = serde_json::from_slice(&source).unwrap();
+        incoming_boundary_source["placements"][1]["fade_out_ticks"] = 3.into();
+        let incoming_boundary_source =
+            serde_json_canonicalizer::to_vec(&incoming_boundary_source).unwrap();
+        let incoming_boundary = load(
+            input(TIMELINE, &tracks, &clips, Some(&incoming_boundary_source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_crossfade(
+                &incoming_boundary,
+                &incoming_boundary_source,
+                outgoing_placement_id,
+                incoming_placement_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementCrossfadeSerializationError::IncomingFadeBoundaryConflict)
+        ));
+
+        let mut stale: Value = serde_json::from_slice(&source).unwrap();
+        stale["name"] = "Stale arrangement".into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_crossfade(
+                &loaded,
+                &stale,
+                outgoing_placement_id,
+                incoming_placement_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementCrossfadeSerializationError::Document(
+                ArrangementPlacementDocumentSerializationError::SourceArrangementMismatch
+            ))
+        ));
+
+        let noncanonical =
+            serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(&source).unwrap()).unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_crossfade(
+                &loaded,
+                &noncanonical,
+                outgoing_placement_id,
+                incoming_placement_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementCrossfadeSerializationError::Document(
+                ArrangementPlacementDocumentSerializationError::NonCanonicalSource
+            ))
+        ));
+
+        let mut sample_locked_clip: Value = serde_json::from_slice(CLIP).unwrap();
+        sample_locked_clip["format_version"] = 2.into();
+        sample_locked_clip["timebase"] = "sample-locked".into();
+        let sample_locked_clip = serde_json_canonicalizer::to_vec(&sample_locked_clip).unwrap();
+        let sample_locked_clips: [&[u8]; 1] = [&sample_locked_clip];
+        let sample_locked = load(
+            input(TIMELINE, &tracks, &sample_locked_clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_crossfade(
+                &sample_locked,
+                &source,
+                outgoing_placement_id,
+                incoming_placement_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementCrossfadeSerializationError::Document(
+                ArrangementPlacementDocumentSerializationError::Compilation(
+                    CompileError::InvalidPlacementFades
+                )
+            ))
+        ));
+    }
+
+    #[test]
+    fn arrangement_placement_crossfade_requires_one_track() {
+        let second_track_id = "018f47a2-6b2d-7c11-8a44-001122334466";
+        let second_clip_id = "018f47a2-6b2d-7c11-8a44-001122334467";
+        let mut second_track: Value = serde_json::from_slice(TRACK).unwrap();
+        second_track["id"] = second_track_id.into();
+        second_track["name"] = "Second audio".into();
+        second_track["order"] = 1.into();
+        second_track["clip_ids"] = json!([second_clip_id]);
+        let second_track = serde_json_canonicalizer::to_vec(&second_track).unwrap();
+        let mut second_clip: Value = serde_json::from_slice(CLIP).unwrap();
+        second_clip["id"] = second_clip_id.into();
+        second_clip["track_id"] = second_track_id.into();
+        second_clip["name"] = "Second clip".into();
+        let second_clip = serde_json_canonicalizer::to_vec(&second_clip).unwrap();
+        let tracks: [&[u8]; 2] = [TRACK, &second_track];
+        let clips: [&[u8]; 2] = [CLIP, &second_clip];
+        let mut source: Value = serde_json::from_slice(&two_voice_arrangement_source()).unwrap();
+        source["placements"][1]["track_id"] = second_track_id.into();
+        source["placements"][1]["clip_id"] = second_clip_id.into();
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            serialize_arrangement_placement_crossfade(
+                &loaded,
+                &source,
+                "018f47a2-6b2d-7c11-8a44-001122334464",
+                "018f47a2-6b2d-7c11-8a44-001122334465",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementCrossfadeSerializationError::SameTrackRequired)
+        ));
     }
 
     #[test]
