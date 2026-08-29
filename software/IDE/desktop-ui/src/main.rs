@@ -10842,12 +10842,6 @@ fn automation_channel_choices(
             true,
             AutomationChannelParameter::Mute,
         ),
-        (
-            "solo",
-            AUTOMATION_SWITCH_DOMAIN,
-            true,
-            AutomationChannelParameter::Solo,
-        ),
     ] {
         choices.push(AutomationTargetChoice {
             label: format!("{} {suffix}", channel.name),
@@ -10858,6 +10852,21 @@ fn automation_channel_choices(
                 parameter,
             },
             resolved: AutomationTarget::Channel { slot, parameter },
+        });
+    }
+    if channel.audio {
+        choices.push(AutomationTargetChoice {
+            label: format!("{} solo", channel.name),
+            domain: AUTOMATION_SWITCH_DOMAIN.to_owned(),
+            boolean: true,
+            target: IdeAutomationTarget::Channel {
+                track_id: channel.track_id.clone(),
+                parameter: AutomationChannelParameter::Solo,
+            },
+            resolved: AutomationTarget::Channel {
+                slot,
+                parameter: AutomationChannelParameter::Solo,
+            },
         });
     }
 }
@@ -19197,14 +19206,6 @@ mod tests {
                         parameter: AutomationChannelParameter::Mute
                     }
                 ),
-                (
-                    "Reverb solo",
-                    true,
-                    AutomationTarget::Channel {
-                        slot: 1,
-                        parameter: AutomationChannelParameter::Solo
-                    }
-                ),
             ]
         );
         assert_eq!(choices[3].domain, AUTOMATION_PAN_DOMAIN);
@@ -19245,15 +19246,15 @@ mod tests {
         assert_eq!(ui.get_automation_target_domain().row_count(), 2);
 
         set_automation_targets(ui, &project_state, &channels);
-        assert_eq!(ui.get_automation_target_names().row_count(), 13);
+        assert_eq!(ui.get_automation_target_names().row_count(), 12);
 
         reset_project(ui, &recording_routes, &take_routes, &project_state);
         assert_eq!(ui.get_automation_target_names().row_count(), 0);
 
         set_automation_targets(ui, &project_state, &channels);
-        assert_eq!(ui.get_automation_target_names().row_count(), 13);
-        assert_eq!(ui.get_automation_target_boolean().row_count(), 13);
-        assert_eq!(ui.get_automation_target_domain().row_count(), 13);
+        assert_eq!(ui.get_automation_target_names().row_count(), 12);
+        assert_eq!(ui.get_automation_target_boolean().row_count(), 12);
+        assert_eq!(ui.get_automation_target_domain().row_count(), 12);
     }
 
     #[test]
