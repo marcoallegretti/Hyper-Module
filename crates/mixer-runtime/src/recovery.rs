@@ -1,7 +1,8 @@
 use super::{
-    LocateState, MAX_MAIN_MIXER_SLOTS, MAX_MIXER_SENDS_PER_SLOT, MixerChannelParameterState,
-    MixerParameterStateSnapshot, MixerSendParameterState, NativeDeviceStateSnapshot,
-    TransportCommand, TransportCycle, TransportLoopRange, TransportState,
+    LocateState, MAX_MAIN_MIXER_SLOTS, MAX_MIXER_SENDS_PER_SLOT, MetronomeGain,
+    MixerChannelParameterState, MixerParameterStateSnapshot, MixerSendParameterState,
+    NativeDeviceStateSnapshot, TransportCommand, TransportCycle, TransportLoopRange,
+    TransportState,
 };
 use core::hint::spin_loop;
 use core::sync::atomic::{
@@ -109,6 +110,41 @@ impl PlaybackRecoverySnapshot {
     }
 }
 
+/// Session-only metronome facts that seed a recovery channel's zero-cycle
+/// observation.
+///
+/// This deliberately remains separate from [`PlaybackRecoverySnapshot`]: the
+/// current click level is useful to a live observer, but reopening playback
+/// must not restore it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InitialMetronomeState {
+    available: bool,
+    enabled: bool,
+    gain: MetronomeGain,
+}
+
+impl InitialMetronomeState {
+    /// Builds state for a session with no prepared metronome plan.
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self {
+            available: false,
+            enabled: false,
+            gain: MetronomeGain::UNITY,
+        }
+    }
+
+    /// Builds state for a session that owns a prepared metronome plan.
+    #[must_use]
+    pub const fn prepared(enabled: bool, gain: MetronomeGain) -> Self {
+        Self {
+            available: true,
+            enabled,
+            gain,
+        }
+    }
+}
+
 /// Coherent state from the last audio cycle accepted by the output owner.
 ///
 /// Interactive scene feedback is observation-only. Reopening playback restores
@@ -124,6 +160,7 @@ pub struct PlaybackCycleObservation {
     loop_enabled: bool,
     metronome_available: bool,
     metronome_enabled: bool,
+    metronome_gain: MetronomeGain,
     queued_scene_index: Option<usize>,
     queued_scene_launch_frame: Option<usize>,
     last_launched_scene_index: Option<usize>,
@@ -172,6 +209,17 @@ impl PlaybackCycleObservation {
     #[must_use]
     pub const fn metronome_enabled(self) -> bool {
         self.metronome_enabled
+    }
+
+    /// Returns the committed session-only click gain when this session owns a
+    /// prepared metronome plan.
+    #[must_use]
+    pub const fn metronome_gain(self) -> Option<MetronomeGain> {
+        if self.metronome_available {
+            Some(self.metronome_gain)
+        } else {
+            None
+        }
     }
 
     #[must_use]
@@ -612,30 +660,42 @@ impl AtomicLoopObservation {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AtomicMetronomeObservation {
     available: AtomicBool,
     enabled: AtomicBool,
+    gain_millionths: AtomicU32,
 }
 
 impl AtomicMetronomeObservation {
-    const fn new(available: bool, enabled: bool) -> Self {
+    const fn new(available: bool, enabled: bool, gain: MetronomeGain) -> Self {
         Self {
             available: AtomicBool::new(available),
             enabled: AtomicBool::new(enabled),
+            gain_millionths: AtomicU32::new(gain.millionths()),
         }
     }
 
-    fn store(&self, available: bool, enabled: bool) {
+    fn store(&self, available: bool, enabled: bool, gain: MetronomeGain) {
         self.available.store(available, Ordering::Relaxed);
         self.enabled.store(enabled, Ordering::Relaxed);
+        self.gain_millionths
+            .store(gain.millionths(), Ordering::Relaxed);
     }
 
-    fn load(&self) -> (bool, bool) {
+    fn load(&self) -> (bool, bool, MetronomeGain) {
         (
             self.available.load(Ordering::Relaxed),
             self.enabled.load(Ordering::Relaxed),
+            MetronomeGain::from_millionths(self.gain_millionths.load(Ordering::Relaxed))
+                .expect("a recovery checkpoint stores only bounded metronome gains"),
         )
+    }
+}
+
+impl Default for AtomicMetronomeObservation {
+    fn default() -> Self {
+        Self::new(false, false, MetronomeGain::UNITY)
     }
 }
 
@@ -721,7 +781,8 @@ impl PlaybackRecoveryCheckpoint {
             let committed_capture_start_sequence =
                 self.inner.capture_start_sequence.load(Ordering::Relaxed);
             let (loop_range, loop_enabled) = self.inner.loop_observation.load();
-            let (metronome_available, metronome_enabled) = self.inner.metronome_observation.load();
+            let (metronome_available, metronome_enabled, metronome_gain) =
+                self.inner.metronome_observation.load();
             let (queued_scene_index, queued_scene_launch_frame, last_launched_scene_index) =
                 self.inner.scene_launch.load();
             fence(Ordering::Acquire);
@@ -736,6 +797,7 @@ impl PlaybackRecoveryCheckpoint {
                     loop_enabled,
                     metronome_available,
                     metronome_enabled,
+                    metronome_gain,
                     queued_scene_index,
                     queued_scene_launch_frame,
                     last_launched_scene_index,
@@ -772,6 +834,7 @@ struct PlaybackCyclePublication {
     loop_enabled: bool,
     metronome_available: bool,
     metronome_enabled: bool,
+    metronome_gain: MetronomeGain,
     queued_scene_index: Option<usize>,
     queued_scene_launch_frame: Option<usize>,
     last_launched_scene_index: Option<usize>,
@@ -808,6 +871,7 @@ impl PlaybackRecoveryPublisher {
                 loop_enabled: cycle.loop_enabled(),
                 metronome_available: cycle.metronome_available(),
                 metronome_enabled: cycle.metronome_enabled(),
+                metronome_gain: cycle.metronome_gain().unwrap_or(MetronomeGain::UNITY),
                 queued_scene_index: scene.queued_scene_index(),
                 queued_scene_launch_frame: scene.queued_launch_frame(),
                 last_launched_scene_index: scene.last_launched_scene_index(),
@@ -833,6 +897,7 @@ impl PlaybackRecoveryPublisher {
                 loop_enabled: false,
                 metronome_available: false,
                 metronome_enabled: false,
+                metronome_gain: MetronomeGain::UNITY,
                 queued_scene_index: None,
                 queued_scene_launch_frame: None,
                 last_launched_scene_index: None,
@@ -867,6 +932,7 @@ impl PlaybackRecoveryPublisher {
         self.inner.metronome_observation.store(
             publication.metronome_available,
             publication.metronome_enabled,
+            publication.metronome_gain,
         );
         self.inner.scene_launch.store(
             publication.queued_scene_index,
@@ -918,21 +984,19 @@ pub fn playback_recovery_channel_with_initial_loop(
         initial_mixer_parameter_state,
         initial_loop_range,
         initial_loop_enabled,
-        false,
-        false,
+        InitialMetronomeState::unavailable(),
     )
 }
 
 /// Creates a recovery channel whose zero-cycle observation also carries the
-/// session-only metronome capability and state.
+/// session-only metronome capability, state, and gain.
 #[must_use]
 pub fn playback_recovery_channel_with_initial_loop_and_metronome(
     snapshot: Option<&PlaybackRecoverySnapshot>,
     initial_mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
     initial_loop_range: Option<TransportLoopRange>,
     initial_loop_enabled: bool,
-    initial_metronome_available: bool,
-    initial_metronome_enabled: bool,
+    initial_metronome: InitialMetronomeState,
 ) -> (PlaybackRecoveryPublisher, PlaybackRecoveryCheckpoint) {
     playback_recovery_channel_with_initial_loop_metronome_and_native_device_state(
         snapshot,
@@ -940,14 +1004,14 @@ pub fn playback_recovery_channel_with_initial_loop_and_metronome(
         None,
         initial_loop_range,
         initial_loop_enabled,
-        initial_metronome_available,
-        initial_metronome_enabled,
+        initial_metronome,
     )
 }
 
-/// Creates a recovery channel with session-only initial native-device
-/// state. A previously committed recovery snapshot takes precedence over the
-/// supplied initial state.
+/// Creates a recovery channel with session-only initial native-device and
+/// metronome state. A previously committed recovery snapshot takes precedence
+/// over supplied persisted state, while the metronome always seeds a new live
+/// session.
 #[must_use]
 pub fn playback_recovery_channel_with_initial_loop_metronome_and_native_device_state(
     snapshot: Option<&PlaybackRecoverySnapshot>,
@@ -955,8 +1019,7 @@ pub fn playback_recovery_channel_with_initial_loop_metronome_and_native_device_s
     initial_native_device_state: Option<&NativeDeviceStateSnapshot>,
     initial_loop_range: Option<TransportLoopRange>,
     initial_loop_enabled: bool,
-    initial_metronome_available: bool,
-    initial_metronome_enabled: bool,
+    initial_metronome: InitialMetronomeState,
 ) -> (PlaybackRecoveryPublisher, PlaybackRecoveryCheckpoint) {
     let mixer_parameters = AtomicMixerParameterState::default();
     if let Some(state) = snapshot
@@ -993,8 +1056,9 @@ pub fn playback_recovery_channel_with_initial_loop_metronome_and_native_device_s
             observation
         },
         metronome_observation: AtomicMetronomeObservation::new(
-            initial_metronome_available,
-            initial_metronome_enabled,
+            initial_metronome.available,
+            initial_metronome.enabled,
+            initial_metronome.gain,
         ),
         scene_launch: AtomicSceneLaunchObservation::default(),
         mixer_parameters,
@@ -1130,6 +1194,7 @@ mod tests {
             loop_enabled: false,
             metronome_available: false,
             metronome_enabled: false,
+            metronome_gain: MetronomeGain::UNITY,
             active_slot_count: 0,
             scene_launch_state: hyper_playback_compiler::scene::SceneLaunchState::default(),
             applied_command_count: 0,
@@ -1168,6 +1233,7 @@ mod tests {
                 loop_enabled: false,
                 metronome_available: false,
                 metronome_enabled: false,
+                metronome_gain: MetronomeGain::UNITY,
                 queued_scene_index: None,
                 queued_scene_launch_frame: None,
                 last_launched_scene_index: None,
@@ -1178,14 +1244,38 @@ mod tests {
     #[test]
     fn zero_cycle_observation_exposes_session_only_metronome_capability() {
         let (_publisher, checkpoint) = playback_recovery_channel_with_initial_loop_and_metronome(
-            None, None, None, false, true, false,
+            None,
+            None,
+            None,
+            false,
+            InitialMetronomeState::prepared(
+                false,
+                MetronomeGain::from_millionths(725_000).unwrap(),
+            ),
         );
 
         let observation = checkpoint.observe_cycle();
         assert_eq!(observation.committed_cycle_count(), 0);
         assert!(observation.metronome_available());
         assert!(!observation.metronome_enabled());
+        assert_eq!(
+            observation.metronome_gain(),
+            Some(MetronomeGain::from_millionths(725_000).unwrap())
+        );
         assert!(!checkpoint.snapshot().loop_enabled());
+
+        let (_publisher, unavailable_checkpoint) =
+            playback_recovery_channel_with_initial_loop_and_metronome(
+                None,
+                None,
+                None,
+                false,
+                InitialMetronomeState::unavailable(),
+            );
+        let unavailable = unavailable_checkpoint.observe_cycle();
+        assert!(!unavailable.metronome_available());
+        assert!(!unavailable.metronome_enabled());
+        assert_eq!(unavailable.metronome_gain(), None);
     }
 
     #[test]
@@ -1264,8 +1354,7 @@ mod tests {
                 Some(&initial),
                 None,
                 false,
-                false,
-                false,
+                InitialMetronomeState::unavailable(),
             );
         assert_eq!(checkpoint.snapshot().native_device_state(), Some(initial));
 
@@ -1325,6 +1414,10 @@ mod tests {
                         loop_enabled,
                         metronome_available: !generation.is_multiple_of(3),
                         metronome_enabled: generation.is_multiple_of(5),
+                        metronome_gain: MetronomeGain::from_millionths(
+                            u32::try_from(generation % 1_000_001).unwrap(),
+                        )
+                        .unwrap(),
                         queued_scene_index: scene.map(|value| value.0),
                         queued_scene_launch_frame: scene.map(|value| value.1),
                         last_launched_scene_index: scene.map(|value| value.2),
@@ -1358,6 +1451,13 @@ mod tests {
                 assert_eq!(
                     observation.metronome_enabled(),
                     generation.is_multiple_of(5)
+                );
+                let expected_metronome_gain =
+                    MetronomeGain::from_millionths(u32::try_from(generation % 1_000_001).unwrap())
+                        .unwrap();
+                assert_eq!(
+                    observation.metronome_gain(),
+                    (!generation.is_multiple_of(3)).then_some(expected_metronome_gain)
                 );
                 let expected_scene = (!generation.is_multiple_of(2)).then_some((
                     generation % 8,

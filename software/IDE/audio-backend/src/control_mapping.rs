@@ -659,9 +659,8 @@ impl RuntimeControlSink for DesktopControlSink {
                     | TransportCommand::StopInteractiveScenes
                     | TransportCommand::SetLoopRange(_)
                     | TransportCommand::SetLoopEnabled(_)
-                    | TransportCommand::SetMetronomeEnabled(_) => {
-                        DirectControlStateUpdate::Unchanged
-                    }
+                    | TransportCommand::SetMetronomeEnabled(_)
+                    | TransportCommand::SetMetronomeGain(_) => DirectControlStateUpdate::Unchanged,
                 })
             }
         }

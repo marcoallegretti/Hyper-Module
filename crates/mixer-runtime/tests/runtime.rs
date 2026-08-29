@@ -13,14 +13,15 @@ use hyper_mixer_runtime::{
     MAX_QUEUED_INTERACTIVE_MIXER_PARAMETER_OBSERVATIONS, MAX_QUEUED_INTERACTIVE_SCENE_LAUNCHES,
     MAX_QUEUED_LOUDNESS_COMMANDS, MAX_QUEUED_MIXER_PARAMETER_COMMANDS,
     MAX_QUEUED_NATIVE_DEVICE_COMMANDS, MAX_QUEUED_OUTPUT_METER_SNAPSHOTS,
-    MAX_QUEUED_TRANSPORT_COMMANDS, MetronomePlan, MixerChannelHandle, MixerParameterCommand,
-    MixerParameterCommandSendError, MixerParameterCommandSender, MixerParameterResolveError,
-    MixerParameterStateRestoreError, MixerParameterTargetError, NativeDeviceCommand,
-    NativeDeviceCommandSendError, NativeDeviceResolveError, NativeDeviceTargetError,
-    OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
-    PlaybackRecoveryTransportState, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
-    RuntimeCreationError, RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig,
-    SceneLaunchState, StereoSamplePeakBallistics, TransportCommand, TransportCommandApplyError,
+    MAX_QUEUED_TRANSPORT_COMMANDS, MetronomeGain, MetronomePlan, MixerChannelHandle,
+    MixerParameterCommand, MixerParameterCommandSendError, MixerParameterCommandSender,
+    MixerParameterResolveError, MixerParameterStateRestoreError, MixerParameterTargetError,
+    NativeDeviceCommand, NativeDeviceCommandSendError, NativeDeviceResolveError,
+    NativeDeviceTargetError, OutputMeterPublication, OutputMeterReceiver, OutputMeterSender,
+    OutputMeterSnapshot, PlaybackRecoveryTransportState, PreparedPlaybackMainRuntime,
+    PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError,
+    RuntimeProjectComponent, SamplePeakBallisticsConfig, SceneLaunchState,
+    StereoSamplePeakBallistics, TransportCommand, TransportCommandApplyError,
     TransportCommandSendError, TransportCycle, TransportLoopRange, TransportLoopRangeError,
     TransportOutputCreationError, TransportOutputProcessor, TransportState,
     interactive_mixer_parameter_channel, interactive_scene_launch_channel,
@@ -2766,7 +2767,13 @@ fn metronome_commands_commit_at_the_transport_boundary_and_mix_into_output() {
     assert!(sender.metronome_available());
     assert!(transport.metronome_available());
     assert!(!transport.metronome_enabled());
+    assert_eq!(transport.metronome_gain(), Some(MetronomeGain::UNITY));
 
+    sender
+        .try_send(TransportCommand::SetMetronomeGain(
+            MetronomeGain::from_millionths(500_000).unwrap(),
+        ))
+        .unwrap();
     sender
         .try_send(TransportCommand::SetMetronomeEnabled(true))
         .unwrap();
@@ -2780,6 +2787,10 @@ fn metronome_commands_commit_at_the_transport_boundary_and_mix_into_output() {
     let enabled = process_transport(&mut transport, &mut left, &mut right).unwrap();
     assert!(enabled.metronome_available());
     assert!(enabled.metronome_enabled());
+    assert_eq!(
+        enabled.metronome_gain(),
+        Some(MetronomeGain::from_millionths(500_000).unwrap())
+    );
     for ((left, right), (baseline_left, baseline_right)) in left
         .iter()
         .zip(&right)
@@ -2790,11 +2801,12 @@ fn metronome_commands_commit_at_the_transport_boundary_and_mix_into_output() {
             "the transport click is a centered output voice"
         );
     }
-    assert!(
-        left.iter()
-            .zip(&baseline_left)
-            .any(|(actual, baseline)| { (*actual - *baseline).abs() > f32::EPSILON })
-    );
+    let unity_click_delta = left
+        .iter()
+        .zip(&baseline_left)
+        .map(|(actual, baseline)| (actual - baseline).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(unity_click_delta > f32::EPSILON);
 
     sender
         .try_send(TransportCommand::Locate {
@@ -2805,6 +2817,20 @@ fn metronome_commands_commit_at_the_transport_boundary_and_mix_into_output() {
     let next_beat = process_transport(&mut transport, &mut left, &mut right).unwrap();
     assert_eq!(next_beat.start_frame(), 47_996);
     assert!(left[4..].iter().any(|sample| sample.abs() > f32::EPSILON));
+
+    sender
+        .try_send(TransportCommand::SetMetronomeGain(MetronomeGain::SILENCE))
+        .unwrap();
+    sender
+        .try_send(TransportCommand::Locate {
+            frame: 96_000,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    let silent = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(silent.metronome_gain(), Some(MetronomeGain::SILENCE));
+    assert_constant(&left, 0.0);
+    assert_constant(&right, 0.0);
 
     sender
         .try_send(TransportCommand::SetMetronomeEnabled(false))
@@ -2835,6 +2861,15 @@ fn direct_metronome_command_reports_unprepared_transport() {
     );
     assert!(!transport.metronome_available());
     assert!(!transport.metronome_enabled());
+    assert_eq!(transport.metronome_gain(), None);
+
+    let gain_command = TransportCommand::SetMetronomeGain(MetronomeGain::SILENCE);
+    assert_eq!(
+        transport.apply_command(gain_command),
+        Err(TransportCommandApplyError::MetronomeUnavailable {
+            command: gain_command
+        })
+    );
 }
 
 #[test]

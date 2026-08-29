@@ -8,9 +8,9 @@ use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{InterleavedStereoCallback, LoudnessMeasurementCommand, StereoOutput};
 use hyper_mixer_runtime::{
     EbuLoudnessPresentationConfig, FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime,
-    MetronomePlan, MixerParameterCommand, NativeDeviceCommand, PreparedPlaybackMainRuntime,
-    PreparedPlaybackTransportRuntime, TransportCommand, TransportOutputProcessor,
-    loudness_command_channel, output_meter_channel,
+    MetronomeGain, MetronomePlan, MixerParameterCommand, NativeDeviceCommand,
+    PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, TransportCommand,
+    TransportOutputProcessor, loudness_command_channel, output_meter_channel,
 };
 use hyper_native_device::{
     DeviceChain, NativeDeviceInstance, NativeDeviceState, NativeFilterMode, NativeFilterState,
@@ -135,6 +135,9 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     );
     let start_result = sender.try_send(TransportCommand::Start);
     let metronome_result = sender.try_send(TransportCommand::SetMetronomeEnabled(true));
+    let metronome_gain_result = sender.try_send(TransportCommand::SetMetronomeGain(
+        MetronomeGain::from_millionths(725_000).unwrap(),
+    ));
     let automated_result = transport.process_interleaved_cycle(
         &mut callback,
         &mut scratch,
@@ -153,6 +156,7 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     assert!(result.is_ok());
     assert!(start_result.is_ok());
     assert!(metronome_result.is_ok());
+    assert!(metronome_gain_result.is_ok());
     assert!(automated_result.is_ok());
     assert!(stop_result.is_ok());
     assert!(stopped_result.is_ok());

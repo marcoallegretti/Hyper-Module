@@ -53,11 +53,13 @@ pub use meter_ballistics::{
     ChannelSamplePeakBallistics, SamplePeakBallisticsConfig, SamplePeakBallisticsConfigError,
     StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot,
 };
-pub use metronome::{MetronomePlan, MetronomePlanError, MetronomeProcessError};
+pub use metronome::{
+    MetronomeGain, MetronomeGainError, MetronomePlan, MetronomePlanError, MetronomeProcessError,
+};
 pub use recovery::{
-    PlaybackCycleObservation, PlaybackRecoveryCheckpoint, PlaybackRecoveryPublisher,
-    PlaybackRecoverySnapshot, PlaybackRecoveryTransportState, playback_recovery_channel,
-    playback_recovery_channel_with_initial_loop,
+    InitialMetronomeState, PlaybackCycleObservation, PlaybackRecoveryCheckpoint,
+    PlaybackRecoveryPublisher, PlaybackRecoverySnapshot, PlaybackRecoveryTransportState,
+    playback_recovery_channel, playback_recovery_channel_with_initial_loop,
     playback_recovery_channel_with_initial_loop_and_metronome,
     playback_recovery_channel_with_initial_loop_metronome_and_native_device_state,
 };
@@ -337,6 +339,7 @@ pub enum TransportCommand {
     SetLoopRange(Option<TransportLoopRange>),
     SetLoopEnabled(bool),
     SetMetronomeEnabled(bool),
+    SetMetronomeGain(MetronomeGain),
 }
 
 /// A half-open `[start, end)` span the transport repeats while looping.
@@ -1939,7 +1942,10 @@ impl TransportCommandSender {
                 return Err(TransportCommandSendError::SceneUnavailable { command, reason });
             }
         }
-        if matches!(command, TransportCommand::SetMetronomeEnabled(_)) && !self.metronome_available
+        if matches!(
+            command,
+            TransportCommand::SetMetronomeEnabled(_) | TransportCommand::SetMetronomeGain(_)
+        ) && !self.metronome_available
         {
             return Err(TransportCommandSendError::MetronomeUnavailable { command });
         }
@@ -1981,6 +1987,7 @@ pub struct TransportCycle {
     loop_enabled: bool,
     metronome_available: bool,
     metronome_enabled: bool,
+    metronome_gain: MetronomeGain,
     active_slot_count: usize,
     scene_launch_state: SceneLaunchState,
     applied_command_count: usize,
@@ -2022,6 +2029,17 @@ impl TransportCycle {
     #[must_use]
     pub const fn metronome_enabled(self) -> bool {
         self.metronome_enabled
+    }
+
+    /// Returns the committed session-only metronome gain when a prepared plan
+    /// is available for this transport.
+    #[must_use]
+    pub const fn metronome_gain(self) -> Option<MetronomeGain> {
+        if self.metronome_available {
+            Some(self.metronome_gain)
+        } else {
+            None
+        }
     }
 
     #[must_use]
@@ -2328,6 +2346,7 @@ pub fn output_meter_snapshot_for_test(
             loop_enabled: false,
             metronome_available: false,
             metronome_enabled: false,
+            metronome_gain: MetronomeGain::UNITY,
             active_slot_count: 1,
             scene_launch_state: SceneLaunchState::default(),
             applied_command_count: 0,
@@ -4756,6 +4775,12 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         self.metronome.as_ref().is_some_and(Metronome::enabled)
     }
 
+    /// Returns the session-only click gain for a prepared metronome.
+    #[must_use]
+    pub fn metronome_gain(&self) -> Option<MetronomeGain> {
+        self.metronome.as_ref().map(Metronome::gain)
+    }
+
     #[must_use]
     pub const fn position_frame(&self) -> usize {
         self.position_frame
@@ -4857,6 +4882,12 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                     return Err(TransportCommandApplyError::MetronomeUnavailable { command });
                 };
                 metronome.set_enabled(enabled);
+            }
+            TransportCommand::SetMetronomeGain(gain) => {
+                let Some(metronome) = &mut self.metronome else {
+                    return Err(TransportCommandApplyError::MetronomeUnavailable { command });
+                };
+                metronome.set_gain(gain);
             }
         }
         Ok(())
@@ -5073,6 +5104,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                     loop_enabled: self.loop_enabled,
                     metronome_available: self.metronome_available(),
                     metronome_enabled: self.metronome_enabled(),
+                    metronome_gain: self.metronome_gain().unwrap_or(MetronomeGain::UNITY),
                     active_slot_count: 0,
                     scene_launch_state: self.runtime.scene_launch_state(),
                     applied_command_count,
@@ -5122,6 +5154,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 loop_enabled: self.loop_enabled,
                 metronome_available: self.metronome_available(),
                 metronome_enabled: self.metronome_enabled(),
+                metronome_gain: self.metronome_gain().unwrap_or(MetronomeGain::UNITY),
                 active_slot_count: rendered.active_slot_count,
                 scene_launch_state: self.runtime.scene_launch_state(),
                 applied_command_count,

@@ -26,13 +26,13 @@ use hyper_desktop_audio::{
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
     ChannelSamplePeakBallistics, EbuLoudnessPresentationConfig, LocateState,
-    LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay, MixerChannelHandle,
-    MixerParameterCommand, MixerParameterStateSnapshot, MixerSendHandle, MixerStripMeterSnapshot,
-    NativeDeviceCommand, NativeDeviceHandle, NativeDeviceStateSnapshot, OutputMeterReceiver,
-    PlaybackCycleObservation, PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
-    PlaybackRecoveryTransportState, SamplePeakBallisticsConfig, ScaledLoudnessValue,
-    StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot, TransportCommand,
-    TransportLoopRange,
+    LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay, MetronomeGain,
+    MixerChannelHandle, MixerParameterCommand, MixerParameterStateSnapshot, MixerSendHandle,
+    MixerStripMeterSnapshot, NativeDeviceCommand, NativeDeviceHandle, NativeDeviceStateSnapshot,
+    OutputMeterReceiver, PlaybackCycleObservation, PlaybackRecoveryCheckpoint,
+    PlaybackRecoverySnapshot, PlaybackRecoveryTransportState, SamplePeakBallisticsConfig,
+    ScaledLoudnessValue, StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot,
+    TransportCommand, TransportLoopRange,
 };
 use hyper_native_device::{
     NativeCompressorState, NativeDeviceState, NativeFilterMode, NativeFilterState,
@@ -340,6 +340,9 @@ enum OperatorCommand {
     SetMetronomeEnabled {
         enabled: bool,
     },
+    SetMetronomeGain {
+        gain: MetronomeGain,
+    },
     SetLoudnessState {
         state: LoudnessMeasurementState,
     },
@@ -409,6 +412,7 @@ struct OperatorLoopAuthority {
 struct OperatorMetronomeAuthority {
     available: bool,
     enabled: bool,
+    gain: MetronomeGain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -787,6 +791,12 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
                         "metronome disable queued".to_owned()
                     }),
                     Err(error) => diagnostic(format!("metronome toggle refused: {error}")),
+                }
+            }
+            OperatorCommand::SetMetronomeGain { gain } => {
+                match host.queue_transport(TransportCommand::SetMetronomeGain(gain)) {
+                    Ok(()) => diagnostic("metronome level queued".to_owned()),
+                    Err(error) => diagnostic(format!("metronome level refused: {error}")),
                 }
             }
             OperatorCommand::SetLoudnessState { state } => {
@@ -1344,6 +1354,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_loop_toggle(&ui, &commands_tx, &diagnostic, &loop_authority);
     wire_operator_loop_range(&ui, &commands_tx, &diagnostic, &loop_authority);
     wire_operator_metronome_toggle(&ui, &commands_tx, &diagnostic, &metronome_authority);
+    wire_operator_metronome_level(&ui, &commands_tx, &diagnostic, &metronome_authority);
 
     apply_operator_cycle_observation(
         &ui,
@@ -2769,6 +2780,27 @@ fn operator_gain_percent_to_millionths(percent: f32) -> Result<u32, ()> {
 
 #[allow(
     clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "finite Runtime metronome percent is range-checked before quantization"
+)]
+fn operator_metronome_percent_to_gain(percent: f32) -> Result<MetronomeGain, ()> {
+    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+        return Err(());
+    }
+    let millionths = (percent * 10_000.0).round() as u32;
+    MetronomeGain::from_millionths(millionths).map_err(|_| ())
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the exact zero-through-unity metronome millionths domain is presented as a bounded percentage"
+)]
+fn operator_metronome_gain_to_percent(gain: MetronomeGain) -> f32 {
+    gain.millionths() as f32 / 10_000.0
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
     reason = "finite Runtime mixer pan percent is range-checked before quantization"
 )]
 fn operator_pan_percent_to_millionths(percent: f32) -> Result<i32, ()> {
@@ -2841,6 +2873,45 @@ fn wire_operator_metronome_toggle(
             OperatorCommand::SetMetronomeEnabled {
                 enabled: !current.enabled,
             },
+            &diagnostic,
+        );
+    });
+}
+
+fn wire_operator_metronome_level(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    authority: &Rc<Cell<Option<OperatorMetronomeAuthority>>>,
+) {
+    let sender = sender.clone();
+    let diagnostic = Arc::clone(diagnostic);
+    let authority = Rc::clone(authority);
+    ui.on_set_metronome_gain_requested(move |percent| {
+        let Some(current) = authority.get() else {
+            set_diagnostic(
+                &diagnostic,
+                "metronome level refused: accepted state is unavailable".to_owned(),
+            );
+            return;
+        };
+        if !current.available {
+            set_diagnostic(
+                &diagnostic,
+                "metronome level refused: this session has no metronome plan".to_owned(),
+            );
+            return;
+        }
+        let Ok(gain) = operator_metronome_percent_to_gain(percent) else {
+            set_diagnostic(
+                &diagnostic,
+                "metronome level refused: value is outside 0..=100%".to_owned(),
+            );
+            return;
+        };
+        send_operator_command(
+            &sender,
+            OperatorCommand::SetMetronomeGain { gain },
             &diagnostic,
         );
     });
@@ -3452,6 +3523,7 @@ fn apply_operator_metronome_observation(
     let current = OperatorMetronomeAuthority {
         available: observation.metronome_available(),
         enabled: observation.metronome_enabled(),
+        gain: observation.metronome_gain().unwrap_or(MetronomeGain::UNITY),
     };
     authority.set(Some(current));
     if current.available {
@@ -3466,10 +3538,14 @@ fn apply_operator_metronome_observation(
             "Enable metronome".into()
         });
         ui.set_metronome_toggle_enabled(true);
+        ui.set_metronome_gain_percent(operator_metronome_gain_to_percent(current.gain));
+        ui.set_metronome_gain_enabled(true);
     } else {
         ui.set_metronome_state("Session unavailable".into());
         ui.set_metronome_toggle_label("Metronome unavailable".into());
         ui.set_metronome_toggle_enabled(false);
+        ui.set_metronome_gain_percent(0.0);
+        ui.set_metronome_gain_enabled(false);
     }
 }
 
@@ -3676,6 +3752,8 @@ fn revoke_operator_metronome_authority(
     ui.set_metronome_state("Runtime stopped".into());
     ui.set_metronome_toggle_label("Runtime stopped".into());
     ui.set_metronome_toggle_enabled(false);
+    ui.set_metronome_gain_percent(0.0);
+    ui.set_metronome_gain_enabled(false);
 }
 
 fn revoke_operator_loudness_authority(
@@ -4369,6 +4447,28 @@ mod tests {
             f32::NEG_INFINITY,
         ] {
             assert_eq!(operator_pan_percent_to_millionths(percent), Err(()));
+        }
+
+        assert_eq!(
+            operator_metronome_percent_to_gain(0.0),
+            Ok(MetronomeGain::SILENCE)
+        );
+        assert_eq!(
+            operator_metronome_percent_to_gain(72.5),
+            Ok(MetronomeGain::from_millionths(725_000).unwrap())
+        );
+        assert_eq!(
+            operator_metronome_percent_to_gain(100.0),
+            Ok(MetronomeGain::UNITY)
+        );
+        for percent in [
+            f32::from_bits(0.0_f32.to_bits() | 0x8000_0001),
+            f32::from_bits(100.0_f32.to_bits() + 1),
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            assert_eq!(operator_metronome_percent_to_gain(percent), Err(()));
         }
     }
 
@@ -7469,6 +7569,7 @@ mod tests {
         wire_operator_loop_toggle(&ui, &sender, &diagnostic, &loop_authority);
         wire_operator_loop_range(&ui, &sender, &diagnostic, &loop_authority);
         wire_operator_metronome_toggle(&ui, &sender, &diagnostic, &metronome_authority);
+        wire_operator_metronome_level(&ui, &sender, &diagnostic, &metronome_authority);
         wire_operator_seek(&ui, &sender, &diagnostic, &seek_authority);
 
         let facts = RuntimeFacts {
@@ -7713,8 +7814,10 @@ mod tests {
                 None,
                 Some(terminal_range),
                 true,
-                true,
-                false,
+                hyper_mixer_runtime::InitialMetronomeState::prepared(
+                    false,
+                    MetronomeGain::from_millionths(725_000).unwrap(),
+                ),
             );
         let terminal_observers = RuntimeObservers {
             facts: facts.clone(),
@@ -7773,10 +7876,27 @@ mod tests {
             Some(OperatorMetronomeAuthority {
                 available: true,
                 enabled: false,
+                gain: MetronomeGain::from_millionths(725_000).unwrap(),
             })
         );
         assert_eq!(ui.get_metronome_state().as_str(), "Committed off");
         assert!(ui.get_metronome_toggle_enabled());
+        assert!(ui.get_metronome_gain_enabled());
+        assert_operator_float(ui.get_metronome_gain_percent(), 72.5);
+        ui.invoke_set_metronome_gain_requested(75.25);
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::SetMetronomeGain {
+                gain: MetronomeGain::from_millionths(752_500).unwrap(),
+            })
+        );
+        assert_operator_float(ui.get_metronome_gain_percent(), 72.5);
+        ui.invoke_set_metronome_gain_requested(100.1);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "metronome level refused: value is outside 0..=100%"
+        );
         ui.invoke_toggle_metronome_requested();
         assert_eq!(
             receiver.try_recv(),
@@ -7818,6 +7938,8 @@ mod tests {
         assert!(!ui.get_transport_stop_enabled());
         assert!(!ui.get_transport_return_to_start_enabled());
         assert!(!ui.get_metronome_toggle_enabled());
+        assert!(!ui.get_metronome_gain_enabled());
+        assert_operator_float(ui.get_metronome_gain_percent(), 0.0);
         assert!(!terminal_scene_launch_authority.get());
         assert!(!terminal_scenes.row_data(0).unwrap().controls_enabled);
         assert!(!terminal_scene_stop_authority.get());

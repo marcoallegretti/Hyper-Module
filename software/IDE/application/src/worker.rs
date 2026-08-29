@@ -11,10 +11,12 @@ use std::time::{Duration, Instant};
 
 use hyper_desktop_audio::{DesktopAudioPreviewSnapshot, DesktopAudioPreviewState};
 use hyper_fs_authority::path_is_proven_absent;
+#[cfg(feature = "ui-test-support")]
+use hyper_mixer_runtime::PlaybackRecoveryCheckpoint;
 use hyper_mixer_runtime::{
     InteractiveMixerParameterObservation, InteractiveSceneLaunchObservation,
-    LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, PlaybackRecoveryTransportState,
-    TransportCommand,
+    LatestOutputMeterSnapshot, PlaybackCycleObservation, PlaybackRecoverySnapshot,
+    PlaybackRecoveryTransportState, TransportCommand,
 };
 use hyper_playback_compiler::scene::LaunchQuantization;
 use hyper_playback_compiler::{FrameTimeline, FrameTimelineError};
@@ -962,6 +964,7 @@ pub struct IdeRunningObservation {
     output: OutputStreamSnapshot,
     monitoring: Option<IdeMonitoringState>,
     recovery: PlaybackRecoverySnapshot,
+    transport_cycle: PlaybackCycleObservation,
     meter: IdeOutputMeterObservation,
 }
 
@@ -1693,8 +1696,21 @@ impl IdeRunningObservation {
             output: OutputStreamSnapshot::default(),
             monitoring: None,
             recovery,
+            transport_cycle: PlaybackRecoveryCheckpoint::default().observe_cycle(),
             meter: IdeOutputMeterObservation::empty(),
         }
+    }
+
+    /// Replaces the lock-free transport-cycle projection in a generated UI
+    /// test without manufacturing audio-meter evidence.
+    #[cfg(feature = "ui-test-support")]
+    #[must_use]
+    pub fn with_transport_cycle_for_ui_test(
+        mut self,
+        transport_cycle: PlaybackCycleObservation,
+    ) -> Self {
+        self.transport_cycle = transport_cycle;
+        self
     }
 
     /// Sets the authoritative dirty-mixer projection for a generated UI test.
@@ -1893,6 +1909,12 @@ impl IdeRunningObservation {
     #[must_use]
     pub const fn recovery(&self) -> PlaybackRecoverySnapshot {
         self.recovery
+    }
+
+    /// Returns the current lock-free committed transport facts.
+    #[must_use]
+    pub const fn transport_cycle(&self) -> PlaybackCycleObservation {
+        self.transport_cycle
     }
 
     /// Returns the coherent raw-meter and final-output display observation for
@@ -6430,7 +6452,8 @@ fn process_transport_command(
             | TransportCommand::Locate { .. }
             | TransportCommand::SetLoopRange(_)
             | TransportCommand::SetLoopEnabled(_)
-            | TransportCommand::SetMetronomeEnabled(_) => publish_failure(
+            | TransportCommand::SetMetronomeEnabled(_)
+            | TransportCommand::SetMetronomeGain(_) => publish_failure(
                 events,
                 IdeWorkerCommandKind::Transport,
                 IdeWorkerCommandFailure::InvalidState,
@@ -6444,7 +6467,8 @@ fn process_transport_command(
             | TransportCommand::StopInteractiveScenes
             | TransportCommand::SetLoopRange(_)
             | TransportCommand::SetLoopEnabled(_)
-            | TransportCommand::SetMetronomeEnabled(_) => publish_failure(
+            | TransportCommand::SetMetronomeEnabled(_)
+            | TransportCommand::SetMetronomeGain(_) => publish_failure(
                 events,
                 IdeWorkerCommandKind::Transport,
                 IdeWorkerCommandFailure::InvalidState,
@@ -18148,6 +18172,7 @@ fn running_observation(
         output: snapshot.output,
         monitoring: snapshot.monitoring,
         recovery: snapshot.recovery,
+        transport_cycle: snapshot.transport_cycle,
         meter: application.observe_output_meter(),
     })
 }

@@ -37,11 +37,11 @@ use hyper_desktop_ide::{
     MAX_IDE_SCENES, MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
     MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
     MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MIN_FILTER_CUTOFF_MILLIHERTZ,
-    MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, NativeFilterMode, OfflineExportRange,
-    OfflineExportReport, OfflineTrackStemExportFormat, PlaybackRecoveryTransportState,
-    ProjectHistory, RecentProject, SceneAction, TempoEvent, TimelineMapEdit, TransportAction,
-    TransportCommand, TransportLoopRange, TriggerBehavior, audio_import_file_extensions,
-    bpm_for_microseconds_per_quarter, desktop_ide_application_config,
+    MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, MetronomeGain, NativeFilterMode,
+    OfflineExportRange, OfflineExportReport, OfflineTrackStemExportFormat,
+    PlaybackRecoveryTransportState, ProjectHistory, RecentProject, SceneAction, TempoEvent,
+    TimelineMapEdit, TransportAction, TransportCommand, TransportLoopRange, TriggerBehavior,
+    audio_import_file_extensions, bpm_for_microseconds_per_quarter, desktop_ide_application_config,
     ide_audio_clip_gain_is_supported, meter_is_in_version_one_domain,
     microseconds_per_quarter_for_bpm, musical_position, musical_position_at_frame,
 };
@@ -1540,6 +1540,11 @@ fn bind_playback_callbacks(
         ui,
         Rc::new(move |ui, command| submit_to_ui(ui, &worker_for_metronome, command)),
     );
+    let worker_for_metronome_gain = Rc::clone(worker);
+    bind_metronome_gain_callback_with(
+        ui,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker_for_metronome_gain, command)),
+    );
 
     let weak = ui.as_weak();
     let worker_for_return = Rc::clone(worker);
@@ -1606,6 +1611,26 @@ fn bind_metronome_toggle_callback_with(ui: &MainWindow, submitter: UiCommandSubm
                 !ui.get_metronome_enabled(),
             )),
         );
+    });
+}
+
+fn bind_metronome_gain_callback_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    actions.on_metronome_gain(move |percent| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_metronome_available() {
+            return;
+        }
+        match metronome_percent_to_gain(percent) {
+            Ok(gain) => submitter(
+                &ui,
+                IdeWorkerCommand::Transport(TransportCommand::SetMetronomeGain(gain)),
+            ),
+            Err(message) => ui.set_error_text(message.into()),
+        }
     });
 }
 
@@ -5779,6 +5804,9 @@ fn apply_event(
                     }
                     TransportCommand::SetMetronomeEnabled(false) => {
                         "Metronome disable queued for the audio runtime"
+                    }
+                    TransportCommand::SetMetronomeGain(_) => {
+                        "Metronome level queued for the audio runtime"
                     }
                 }
                 .into(),
@@ -9973,14 +10001,14 @@ fn apply_transport_recovery_availability(ui: &MainWindow, state: PlaybackRecover
 }
 
 fn apply_metronome_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
-    let Some(snapshot) = observation.meter().snapshot() else {
-        ui.set_metronome_available(false);
-        ui.set_metronome_enabled(false);
-        return;
-    };
-    let cycle = snapshot.cycle();
+    let cycle = observation.transport_cycle();
     ui.set_metronome_available(cycle.metronome_available());
     ui.set_metronome_enabled(cycle.metronome_enabled());
+    ui.set_metronome_gain_percent(
+        cycle
+            .metronome_gain()
+            .map_or(0.0, metronome_gain_to_percent),
+    );
 }
 
 fn reset_arrangement_ui(ui: &MainWindow) {
@@ -10041,6 +10069,7 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_loop_engaged(false);
     ui.set_metronome_available(false);
     ui.set_metronome_enabled(false);
+    ui.set_metronome_gain_percent(0.0);
     reset_arrangement_scene_launch_addition_form(ui);
     reset_arrangement_scene_launch_move_form(ui);
     reset_arrangement_scene_launch_scene_form(ui);
@@ -11039,6 +11068,28 @@ fn preview_percent_to_millionths(percent: f32) -> Result<u32, &'static str> {
         return Err("Take audition gain is outside its supported range");
     }
     Ok((percent * 10_000.0).round() as u32)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the UI accepts only finite values in the metronome's bounded 0..=100 percent domain"
+)]
+fn metronome_percent_to_gain(percent: f32) -> Result<MetronomeGain, &'static str> {
+    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+        return Err("Metronome click level is outside its supported range");
+    }
+    let millionths = (percent * 10_000.0).round() as u32;
+    MetronomeGain::from_millionths(millionths)
+        .map_err(|_| "Metronome click level is outside its supported range")
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the exact zero-through-unity millionths domain is presented as a bounded percentage"
+)]
+fn metronome_gain_to_percent(gain: MetronomeGain) -> f32 {
+    gain.millionths() as f32 / 10_000.0
 }
 
 #[allow(
@@ -14308,6 +14359,74 @@ mod tests {
         ui.set_app_mode(AppMode::Previewing);
         ui.global::<IdeActions>().invoke_metronome_toggle();
         assert_eq!(submitted.borrow().len(), 2);
+    }
+
+    #[test]
+    fn metronome_gain_callback_submits_only_a_bounded_command_without_optimistic_ui_state() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_metronome_gain_callback_with(
+            &ui,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_metronome_gain_percent(40.0);
+        ui.set_metronome_available(false);
+        ui.global::<IdeActions>().invoke_metronome_gain(75.25);
+        assert!(submitted.borrow().is_empty());
+
+        ui.set_metronome_available(true);
+        ui.global::<IdeActions>().invoke_metronome_gain(75.25);
+        assert_eq!(
+            ui.get_metronome_gain_percent().to_bits(),
+            40.0_f32.to_bits()
+        );
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::Transport(TransportCommand::SetMetronomeGain(gain))]
+                if *gain == MetronomeGain::from_millionths(752_500).unwrap()
+        ));
+
+        ui.global::<IdeActions>().invoke_metronome_gain(100.1);
+        assert_eq!(submitted.borrow().len(), 1);
+        assert_eq!(
+            ui.get_error_text().as_str(),
+            "Metronome click level is outside its supported range"
+        );
+    }
+
+    #[test]
+    fn metronome_observation_uses_committed_transport_state_without_meter_delivery() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let (_publisher, checkpoint) =
+            hyper_mixer_runtime::playback_recovery_channel_with_initial_loop_and_metronome(
+                None,
+                None,
+                None,
+                false,
+                hyper_mixer_runtime::InitialMetronomeState::prepared(
+                    true,
+                    MetronomeGain::from_millionths(725_000).unwrap(),
+                ),
+            );
+        let observation = IdeRunningObservation::for_ui_test(PlaybackRecoverySnapshot::for_test(
+            PlaybackRecoveryTransportState::Stopped,
+            0,
+        ))
+        .with_transport_cycle_for_ui_test(checkpoint.observe_cycle());
+
+        apply_metronome_observation(&ui, &observation);
+
+        assert!(ui.get_metronome_available());
+        assert!(ui.get_metronome_enabled());
+        assert_eq!(
+            ui.get_metronome_gain_percent().to_bits(),
+            72.5_f32.to_bits()
+        );
     }
 
     #[test]

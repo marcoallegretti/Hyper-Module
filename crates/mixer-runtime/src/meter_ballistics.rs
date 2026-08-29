@@ -373,6 +373,7 @@ mod tests {
                 loop_enabled: false,
                 metronome_available: false,
                 metronome_enabled: false,
+                metronome_gain: crate::MetronomeGain::UNITY,
                 active_slot_count: 1,
                 scene_launch_state: SceneLaunchState::default(),
                 applied_command_count: 0,

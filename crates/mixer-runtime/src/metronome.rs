@@ -11,6 +11,66 @@ const NORMAL_CLICK_AMPLITUDE: f32 = 0.10;
 const ACCENT_CLICK_AMPLITUDE: f32 = 0.14;
 const CLICK_DURATION_DIVISOR: usize = 80;
 const MAX_CLICK_FRAMES: usize = 8_192;
+const MAX_METRONOME_GAIN_MILLIONTHS: u32 = 1_000_000;
+
+/// A session-only click gain in the closed linear range `0.0..=1.0`.
+///
+/// The integer representation makes the command domain exact and keeps the
+/// existing unity click level as its hard upper bound. It is deliberately not
+/// a general mixer gain: a metronome cannot increase final-output headroom.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MetronomeGain(u32);
+
+impl MetronomeGain {
+    pub const SILENCE: Self = Self(0);
+    pub const UNITY: Self = Self(MAX_METRONOME_GAIN_MILLIONTHS);
+
+    /// Creates a gain from its exact integer-millionths representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetronomeGainError::OutOfRange`] above unity.
+    pub const fn from_millionths(value: u32) -> Result<Self, MetronomeGainError> {
+        if value <= MAX_METRONOME_GAIN_MILLIONTHS {
+            Ok(Self(value))
+        } else {
+            Err(MetronomeGainError::OutOfRange { value })
+        }
+    }
+
+    /// Returns the exact transport-command representation.
+    #[must_use]
+    pub const fn millionths(self) -> u32 {
+        self.0
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the bounded integer-millionths domain is exactly representable enough for one linear amplitude multiplier"
+    )]
+    const fn linear(self) -> f32 {
+        self.0 as f32 / MAX_METRONOME_GAIN_MILLIONTHS as f32
+    }
+}
+
+/// An invalid [`MetronomeGain`] construction request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetronomeGainError {
+    OutOfRange { value: u32 },
+}
+
+impl fmt::Display for MetronomeGainError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutOfRange { value } => write!(
+                formatter,
+                "metronome gain {value} millionths is outside the supported 0..={MAX_METRONOME_GAIN_MILLIONTHS} range"
+            ),
+        }
+    }
+}
+
+impl Error for MetronomeGainError {}
 
 /// Preallocated timing and voice data for one transport metronome.
 ///
@@ -142,6 +202,7 @@ impl Error for MetronomeProcessError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MetronomeState {
     enabled: bool,
+    gain: MetronomeGain,
     active_voice: Option<ActiveVoice>,
     last_trigger_tick: Option<u64>,
 }
@@ -149,6 +210,7 @@ pub(crate) struct MetronomeState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveVoice {
     accent: bool,
+    gain: MetronomeGain,
     offset: usize,
 }
 
@@ -165,6 +227,7 @@ impl Metronome {
             plan,
             state: MetronomeState {
                 enabled: false,
+                gain: MetronomeGain::UNITY,
                 active_voice: None,
                 last_trigger_tick: None,
             },
@@ -175,11 +238,19 @@ impl Metronome {
         self.state.enabled
     }
 
+    pub(crate) const fn gain(&self) -> MetronomeGain {
+        self.state.gain
+    }
+
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
         self.state.enabled = enabled;
         if !enabled {
             self.clear_voice();
         }
+    }
+
+    pub(crate) fn set_gain(&mut self, gain: MetronomeGain) {
+        self.state.gain = gain;
     }
 
     pub(crate) const fn checkpoint(&self) -> MetronomeState {
@@ -226,6 +297,7 @@ impl Metronome {
             if self.is_beat_start(tick) && self.state.last_trigger_tick != Some(tick) {
                 self.state.active_voice = Some(ActiveVoice {
                     accent: self.is_bar_start(tick),
+                    gain: self.state.gain,
                     offset: 0,
                 });
                 self.state.last_trigger_tick = Some(tick);
@@ -238,12 +310,13 @@ impl Metronome {
             } else {
                 &self.plan.normal_voice
             };
-            let sample = voice[active.offset];
+            let sample = voice[active.offset] * active.gain.linear();
             output.left[offset] += sample;
             output.right[offset] += sample;
             let next_offset = active.offset + 1;
             self.state.active_voice = (next_offset < voice.len()).then_some(ActiveVoice {
                 accent: active.accent,
+                gain: active.gain,
                 offset: next_offset,
             });
         }
@@ -398,6 +471,22 @@ mod tests {
     }
 
     #[test]
+    fn gain_is_exactly_bounded_to_unity() {
+        assert_eq!(
+            MetronomeGain::from_millionths(0),
+            Ok(MetronomeGain::SILENCE)
+        );
+        assert_eq!(
+            MetronomeGain::from_millionths(1_000_000),
+            Ok(MetronomeGain::UNITY)
+        );
+        assert_eq!(
+            MetronomeGain::from_millionths(1_000_001),
+            Err(MetronomeGainError::OutOfRange { value: 1_000_001 })
+        );
+    }
+
+    #[test]
     fn click_is_silent_until_enabled_and_accents_each_bar() {
         let mut metronome =
             Metronome::new(MetronomePlan::try_new(48_000, &TEMPO, &FOUR_FOUR).unwrap());
@@ -431,6 +520,95 @@ mod tests {
         );
         assert!(left[0].abs() > f32::EPSILON);
         assert!(left.iter().any(|sample| sample.abs() > f32::EPSILON));
+    }
+
+    #[test]
+    fn gain_changes_apply_to_the_next_click_without_stepping_the_active_voice() {
+        let mut metronome =
+            Metronome::new(MetronomePlan::try_new(48_000, &TEMPO, &FOUR_FOUR).unwrap());
+        metronome.set_enabled(true);
+
+        let mut first_left = [0.0; 8];
+        let mut first_right = [0.0; 8];
+        metronome
+            .mix_window(
+                0,
+                StereoOutput {
+                    left: &mut first_left,
+                    right: &mut first_right,
+                },
+            )
+            .unwrap();
+        assert!(first_left.iter().any(|sample| sample.abs() > f32::EPSILON));
+
+        metronome.set_gain(MetronomeGain::SILENCE);
+        let mut tail_left = [0.0; 8];
+        let mut tail_right = [0.0; 8];
+        metronome
+            .mix_window(
+                8,
+                StereoOutput {
+                    left: &mut tail_left,
+                    right: &mut tail_right,
+                },
+            )
+            .unwrap();
+        assert!(tail_left.iter().any(|sample| sample.abs() > f32::EPSILON));
+
+        let mut next_left = [0.0; 8];
+        let mut next_right = [0.0; 8];
+        metronome
+            .mix_window(
+                24_000,
+                StereoOutput {
+                    left: &mut next_left,
+                    right: &mut next_right,
+                },
+            )
+            .unwrap();
+        assert!(next_left.iter().all(|sample| sample.abs() <= f32::EPSILON));
+        assert!(next_right.iter().all(|sample| sample.abs() <= f32::EPSILON));
+    }
+
+    #[test]
+    fn a_bounded_gain_scales_each_new_click_linearly() {
+        let mut unity = Metronome::new(MetronomePlan::try_new(48_000, &TEMPO, &FOUR_FOUR).unwrap());
+        let mut half = Metronome::new(MetronomePlan::try_new(48_000, &TEMPO, &FOUR_FOUR).unwrap());
+        unity.set_enabled(true);
+        half.set_enabled(true);
+        half.set_gain(MetronomeGain::from_millionths(500_000).unwrap());
+
+        let mut unity_left = [0.0; 8];
+        let mut unity_right = [0.0; 8];
+        unity
+            .mix_window(
+                0,
+                StereoOutput {
+                    left: &mut unity_left,
+                    right: &mut unity_right,
+                },
+            )
+            .unwrap();
+        let mut half_left = [0.0; 8];
+        let mut half_right = [0.0; 8];
+        half.mix_window(
+            0,
+            StereoOutput {
+                left: &mut half_left,
+                right: &mut half_right,
+            },
+        )
+        .unwrap();
+
+        for ((unity_left, unity_right), (half_left, half_right)) in unity_left
+            .iter()
+            .zip(&unity_right)
+            .zip(half_left.iter().zip(&half_right))
+        {
+            assert!((*unity_left - *unity_right).abs() <= f32::EPSILON);
+            assert!((*half_left - *half_right).abs() <= f32::EPSILON);
+            assert!((*half_left - *unity_left * 0.5).abs() <= f32::EPSILON);
+        }
     }
 
     #[test]

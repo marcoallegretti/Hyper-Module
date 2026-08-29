@@ -67,8 +67,9 @@ pub use hyper_mixer_runtime::{
     LoudnessDisplayUnit as IdeLoudnessDisplayUnit,
     LoudnessPresentationSnapshot as IdeLoudnessPresentationSnapshot,
     LoudnessScaleRegion as IdeLoudnessScaleRegion,
-    MaximumTruePeakDisplay as IdeMaximumTruePeakDisplay, PlaybackRecoveryTransportState,
-    ScaledLoudnessValue as IdeScaledLoudnessValue, SceneLaunchState as IdeSceneLaunchState,
+    MaximumTruePeakDisplay as IdeMaximumTruePeakDisplay, MetronomeGain, PlaybackCycleObservation,
+    PlaybackRecoveryTransportState, ScaledLoudnessValue as IdeScaledLoudnessValue,
+    SceneLaunchState as IdeSceneLaunchState,
     StereoSamplePeakBallisticsSnapshot as IdeOutputPeakBallisticsSnapshot, TransportCommand,
     TransportLoopRange, TransportLoopRangeError,
 };
@@ -10172,6 +10173,9 @@ pub struct RunningIdeSnapshot<'a> {
     pub monitoring: Option<IdeMonitoringState>,
     pub preview: DesktopAudioPreviewSnapshot,
     pub recovery: PlaybackRecoverySnapshot,
+    /// Current lock-free committed transport facts that must not become durable
+    /// project or crash-recovery state.
+    pub transport_cycle: PlaybackCycleObservation,
 }
 
 fn unused_sample_cleanup_summary(
@@ -15564,7 +15568,9 @@ impl RunningDesktopIdeApplication {
         {
             return None;
         }
-        let recovery = session.recovery_checkpoint().snapshot();
+        let recovery_checkpoint = session.recovery_checkpoint();
+        let recovery = recovery_checkpoint.snapshot();
+        let transport_cycle = recovery_checkpoint.observe_cycle();
         let mixer_parameters = recovery.mixer_parameter_state();
         if mixer_parameters.is_some_and(|state| state.channel_count() != mixer_channel_count) {
             return None;
@@ -15699,6 +15705,7 @@ impl RunningDesktopIdeApplication {
             monitoring,
             preview: session.audio_preview_snapshot(),
             recovery,
+            transport_cycle,
         })
     }
 

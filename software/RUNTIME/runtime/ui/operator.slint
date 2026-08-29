@@ -495,6 +495,8 @@ export component OperatorWindow inherits Window {
     in property <string> metronome-state: "Metronome unavailable";
     in property <string> metronome-toggle-label: "Metronome unavailable";
     in property <bool> metronome-toggle-enabled: false;
+    in property <float> metronome-gain-percent: 0;
+    in property <bool> metronome-gain-enabled: false;
     in property <string> stream-state;
     in property <string> callback-count;
     in property <string> stream-failures;
@@ -545,6 +547,7 @@ export component OperatorWindow inherits Window {
     callback set-loop-out-requested();
     callback clear-loop-range-requested();
     callback toggle-metronome-requested();
+    callback set-metronome-gain-requested(float);
     callback reset-output-peak-requested();
     callback loudness-run-requested();
     callback loudness-standby-requested();
@@ -713,6 +716,26 @@ export component OperatorWindow inherits Window {
             }
             Rectangle { horizontal-stretch: 1; }
             Button { text: "Shut down Runtime"; clicked => { root.quit-requested(); } }
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+            Text {
+                text: "METRONOME LEVEL " + Math.round(root.metronome-gain-percent) + "%";
+                color: #8d99ad;
+                font-size: 10px;
+                vertical-alignment: center;
+            }
+            CommittedSlider {
+                horizontal-stretch: 1;
+                minimum: 0;
+                maximum: 100;
+                step: 0.1;
+                committed-value: root.metronome-gain-percent;
+                enabled: root.metronome-gain-enabled;
+                control-label: "Committed session metronome click level";
+                released(value) => { root.set-metronome-gain-requested(value); }
+            }
         }
 
         HorizontalLayout {

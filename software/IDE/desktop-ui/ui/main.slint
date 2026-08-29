@@ -324,6 +324,7 @@ export global IdeActions {
     callback loop-toggle();
     callback loop-clear();
     callback metronome-toggle();
+    callback metronome-gain(float);
     callback set-tempo(string);
     callback set-meter(string);
     callback add-timeline-tempo(string, string);
@@ -1007,6 +1008,7 @@ export component MainWindow inherits Window {
     in property <bool> loop-engaged: false;
     in property <bool> metronome-available: false;
     in property <bool> metronome-enabled: false;
+    in property <float> metronome-gain-percent: 0;
     in property <string> tempo-bpm: "";
     in property <bool> tempo-available: false;
     in property <string> tempo-locked-reason: "";
@@ -2036,6 +2038,24 @@ export component MainWindow inherits Window {
                                         enabled: root.metronome-available && root.app-mode == AppMode.running;
                                         accessible-label: root.metronome-enabled ? "Disable the committed transport metronome" : "Enable the transport metronome at the next audio cycle";
                                         clicked => { IdeActions.metronome-toggle(); }
+                                    }
+                                    Text {
+                                        width: 62px;
+                                        text: "CLICK " + Math.round(root.metronome-gain-percent) + "%";
+                                        color: root.metronome-available ? #8fa0b4 : #65758a;
+                                        font-size: 9px;
+                                        vertical-alignment: center;
+                                    }
+                                    Slider {
+                                        min-width: 64px;
+                                        max-width: 112px;
+                                        horizontal-stretch: 1;
+                                        minimum: 0;
+                                        maximum: 100;
+                                        value: root.metronome-gain-percent;
+                                        enabled: root.metronome-available && root.app-mode == AppMode.running;
+                                        accessible-label: "Session metronome click level";
+                                        released(value) => { IdeActions.metronome-gain(value); }
                                     }
                                 }
                                 Text {

@@ -31,14 +31,14 @@ use hyper_control_runtime::{ControlRuntime, ControlRuntimeBuildErrorReason};
 use hyper_mapping_compiler::{CompiledControlMappingTable, ControlMappingCompileError};
 use hyper_media_cache::{DecodedMediaCache, PreparePlaybackError};
 use hyper_mixer_runtime::{
-    InteractiveMixerParameterReceiver, InteractiveSceneLaunchReceiver, LoudnessCommandSender,
-    MetronomePlan, MetronomePlanError, MixerChannelHandle, MixerParameterCommand,
-    MixerParameterCommandSender, MixerParameterResolveError, MixerParameterStateRestoreError,
-    MixerSendHandle, NativeDeviceCommand, NativeDeviceCommandSender, NativeDeviceHandle,
-    NativeDeviceResolveError, OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime,
-    RuntimeCreationError, TransportCommand, TransportCommandSendError, TransportCommandSender,
-    TransportLoopRange, TransportLoopRangeError, TransportOutputCreationError,
-    TransportOutputProcessor, interactive_mixer_parameter_channel,
+    InitialMetronomeState, InteractiveMixerParameterReceiver, InteractiveSceneLaunchReceiver,
+    LoudnessCommandSender, MetronomePlan, MetronomePlanError, MixerChannelHandle,
+    MixerParameterCommand, MixerParameterCommandSender, MixerParameterResolveError,
+    MixerParameterStateRestoreError, MixerSendHandle, NativeDeviceCommand,
+    NativeDeviceCommandSender, NativeDeviceHandle, NativeDeviceResolveError, OutputMeterReceiver,
+    RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError, TransportCommand,
+    TransportCommandSendError, TransportCommandSender, TransportLoopRange, TransportLoopRangeError,
+    TransportOutputCreationError, TransportOutputProcessor, interactive_mixer_parameter_channel,
     interactive_scene_launch_channel, loudness_command_channel, output_meter_channel,
     playback_recovery_channel_with_initial_loop_metronome_and_native_device_state,
 };
@@ -2425,8 +2425,11 @@ fn initialize_session(
     let initial_native_device_state = transport.native_device_state();
     let initial_loop_range = transport.loop_range();
     let initial_loop_enabled = transport.loop_enabled();
-    let initial_metronome_available = transport.metronome_available();
-    let initial_metronome_enabled = transport.metronome_enabled();
+    let initial_metronome = transport
+        .metronome_gain()
+        .map_or(InitialMetronomeState::unavailable(), |gain| {
+            InitialMetronomeState::prepared(transport.metronome_enabled(), gain)
+        });
     let (mut meter_sender, meters) = output_meter_channel();
     let (mixer_parameter_publisher, mixer_parameter_observations) =
         interactive_mixer_parameter_channel();
@@ -2454,8 +2457,7 @@ fn initialize_session(
             Some(&initial_native_device_state),
             initial_loop_range,
             initial_loop_enabled,
-            initial_metronome_available,
-            initial_metronome_enabled,
+            initial_metronome,
         );
     let controls = build_session_controls(
         commands,
