@@ -2281,6 +2281,72 @@ impl OutputMeterSnapshot {
     }
 }
 
+/// Builds one valid constant-signal output-meter snapshot for consumer tests.
+///
+/// This helper is deliberately available only to this crate's tests and to
+/// dependants that opt into `test-support`. Production snapshots remain owned
+/// by the output processor after a successful callback.
+///
+/// # Panics
+///
+/// Panics when the requested callback frame count is outside the supported
+/// bound or either supplied sample is non-finite.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn output_meter_snapshot_for_test(
+    frame_count: usize,
+    left_sample: f32,
+    right_sample: f32,
+) -> OutputMeterSnapshot {
+    assert!(
+        (1..=MAX_PROCESS_FRAMES).contains(&frame_count),
+        "test meter snapshot frame count must fit one valid callback"
+    );
+    assert!(
+        left_sample.is_finite() && right_sample.is_finite(),
+        "test meter snapshot samples must be finite"
+    );
+    let mut callback = InterleavedStereoCallback::try_new(frame_count, 48_000)
+        .expect("a bounded 48 kHz test callback must be constructible");
+    let mut interleaved = vec![0.0_f32; frame_count * 2];
+    let processed = callback
+        .process(&mut interleaved, |output| {
+            output.left.fill(left_sample);
+            output.right.fill(right_sample);
+            Ok::<_, ()>(())
+        })
+        .expect("a finite constant-signal test callback must succeed");
+    let ((), meter) = processed.into_parts();
+    OutputMeterSnapshot {
+        cycle: TransportCycle {
+            state: TransportState::Rolling,
+            start_frame: 0,
+            position_frame: frame_count,
+            frame_count,
+            loop_wrap_count: 0,
+            loop_range: None,
+            loop_enabled: false,
+            metronome_available: false,
+            metronome_enabled: false,
+            active_slot_count: 1,
+            scene_launch_state: SceneLaunchState::default(),
+            applied_command_count: 0,
+            capture_start_sequence: 0,
+            command_sender_disconnected: false,
+            applied_mixer_parameter_command_count: 0,
+            mixer_parameter_command_sender_disconnected: false,
+            applied_native_device_command_count: 0,
+            native_device_command_sender_disconnected: false,
+        },
+        meter,
+        strip_meters: MixerStripMeterSnapshot::silence(1),
+        processed_frame_end: 0,
+        dropped_before: 0,
+        applied_loudness_command_count: 0,
+        loudness_command_sender_disconnected: false,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OutputMeterPublishError {
     Full(OutputMeterSnapshot),

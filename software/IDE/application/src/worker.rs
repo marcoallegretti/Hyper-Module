@@ -1895,23 +1895,30 @@ impl IdeRunningObservation {
         self.recovery
     }
 
+    /// Returns the coherent raw-meter and final-output display observation for
+    /// this running-state publication.
+    #[must_use]
+    pub const fn output_meter_observation(&self) -> &IdeOutputMeterObservation {
+        &self.meter
+    }
+
     #[must_use]
     pub const fn meter(&self) -> LatestOutputMeterSnapshot {
-        self.meter.latest()
+        self.output_meter_observation().latest()
     }
 
     /// Returns the persistent final-output sample-peak display state, when
     /// the running session has received coherent meter evidence.
     #[must_use]
     pub const fn output_peak_ballistics(&self) -> Option<super::IdeOutputPeakBallisticsSnapshot> {
-        self.meter.sample_peak_ballistics()
+        self.output_meter_observation().sample_peak_ballistics()
     }
 
     /// Whether a final-output peak hold has been established since opening or
     /// the most recent explicit clear action.
     #[must_use]
     pub const fn output_peak_hold_available(&self) -> bool {
-        self.meter.peak_hold_available()
+        self.output_meter_observation().peak_hold_available()
     }
 
     /// Returns scene-launch state from the newest committed audio cycle, when
@@ -2917,7 +2924,7 @@ pub enum IdeWorkerEvent {
         input_failure: Option<IdeInputDiscoveryError>,
     },
     Running(IdeRunningObservation),
-    OutputPeakHoldReset(IdeRunningObservation),
+    OutputPeakHoldReset(IdeOutputMeterObservation),
     OutputTest(IdeOutputTestSnapshot),
     OutputTestStopping,
     OutputTestStopped,
@@ -6655,17 +6662,10 @@ fn process_output_peak_hold_reset(
     events: &SyncSender<IdeWorkerEvent>,
 ) -> bool {
     match state {
-        WorkerState::Running(application) => {
-            application.reset_output_peak_hold();
-            match running_observation(application) {
-                Ok(observation) => {
-                    send_event(events, IdeWorkerEvent::OutputPeakHoldReset(observation))
-                }
-                Err(reason) => {
-                    publish_failure(events, IdeWorkerCommandKind::ResetOutputPeakHold, reason)
-                }
-            }
-        }
+        WorkerState::Running(application) => send_event(
+            events,
+            IdeWorkerEvent::OutputPeakHoldReset(application.reset_output_peak_hold()),
+        ),
         _ => publish_failure(
             events,
             IdeWorkerCommandKind::ResetOutputPeakHold,
@@ -18346,6 +18346,7 @@ mod tests {
     };
     use hyper_audio_source::{AudioContainer, DecodeLimits, decode_bytes};
     use hyper_media_cache::CacheLimits;
+    use hyper_mixer_runtime::output_meter_snapshot_for_test;
     use hyper_playback_json::{LoaderLimits, RoutingBusRemovalSerializationError};
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
     use hyper_project_loader::ProjectPlaybackLimits;
@@ -25645,7 +25646,7 @@ mod tests {
         let IdeWorkerEvent::OutputPeakHoldReset(observation) = recv_native_mutation(&worker) else {
             panic!("the running worker must confirm the display-only peak-hold reset");
         };
-        assert_eq!(observation.project_id(), project_id.as_str());
+        assert!(!observation.peak_hold_available());
         assert_eq!(
             verify_project_package(&project)
                 .unwrap()
@@ -25661,6 +25662,50 @@ mod tests {
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn output_peak_hold_reset_confirms_a_cached_hold_without_project_projection() {
+        let mut session = TestPlaybackSession::default();
+        session
+            .meter_publisher
+            .try_publish(output_meter_snapshot_for_test(48, 1.0, 0.5))
+            .unwrap();
+        let mut running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(session),
+        };
+        let held = running.observe_output_meter();
+        assert!(held.peak_hold_available());
+        assert_eq!(
+            held.sample_peak_ballistics()
+                .unwrap()
+                .left()
+                .held_peak_dbfs()
+                .to_bits(),
+            0.0_f32.to_bits()
+        );
+
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 2).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::ResetOutputPeakHold)
+            .unwrap();
+        let IdeWorkerEvent::OutputPeakHoldReset(observation) = recv(&worker) else {
+            panic!("the display-only action must not require a project projection");
+        };
+        assert!(!observation.peak_hold_available());
+        let snapshot = observation.sample_peak_ballistics().unwrap();
+        assert_eq!(snapshot.left().level_dbfs().to_bits(), 0.0_f32.to_bits());
+        assert!((snapshot.right().level_dbfs() + 6.0206).abs() < 0.001);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
     }
 
     #[test]

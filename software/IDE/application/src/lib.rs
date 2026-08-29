@@ -82,7 +82,7 @@ use hyper_mixer_runtime::{
 #[cfg(test)]
 use hyper_mixer_runtime::{
     InteractiveMixerParameterPublisher, InteractiveMixerParameterReceiver,
-    InteractiveSceneLaunchPublisher, InteractiveSceneLaunchReceiver,
+    InteractiveSceneLaunchPublisher, InteractiveSceneLaunchReceiver, OutputMeterSender,
     interactive_mixer_parameter_channel, interactive_scene_launch_channel, output_meter_channel,
 };
 use hyper_native_device::{
@@ -1155,9 +1155,14 @@ impl IdeOutputMeterObserver {
         self.peak_hold_available = false;
     }
 
-    fn reset_peak_hold(&mut self) {
+    fn reset_peak_hold(&mut self) -> IdeOutputMeterObservation {
         self.ballistics.reset_peak_hold();
         self.peak_hold_available = false;
+        IdeOutputMeterObservation {
+            latest: LatestOutputMeterSnapshot::empty(),
+            sample_peak_ballistics: self.latest,
+            peak_hold_available: false,
+        }
     }
 }
 
@@ -10213,6 +10218,7 @@ struct TestPlaybackSession {
     commands: Vec<TransportCommand>,
     loudness_commands: Vec<IdeLoudnessCommand>,
     mixer_commands: Vec<IdeMixerCommand>,
+    meter_publisher: OutputMeterSender,
     meters: OutputMeterReceiver,
     mixer_parameter_observations: InteractiveMixerParameterReceiver,
     _mixer_parameter_publisher: InteractiveMixerParameterPublisher,
@@ -10236,6 +10242,7 @@ struct TestPlaybackSession {
 #[cfg(test)]
 impl Default for TestPlaybackSession {
     fn default() -> Self {
+        let (meter_publisher, meters) = output_meter_channel();
         let (mixer_parameter_publisher, mixer_parameter_observations) =
             interactive_mixer_parameter_channel();
         let (scene_launch_publisher, scene_launches) = interactive_scene_launch_channel();
@@ -10243,7 +10250,8 @@ impl Default for TestPlaybackSession {
             commands: Vec::new(),
             loudness_commands: Vec::new(),
             mixer_commands: Vec::new(),
-            meters: output_meter_channel().1,
+            meter_publisher,
+            meters,
             mixer_parameter_observations,
             _mixer_parameter_publisher: mixer_parameter_publisher,
             scene_launches,
@@ -16334,9 +16342,11 @@ impl RunningDesktopIdeApplication {
     /// Clears only the final-output sample-peak hold.
     ///
     /// This is an IDE display action; it does not send a callback, mixer, or
-    /// project command.
-    pub fn reset_output_peak_hold(&mut self) {
-        self.application.output_meter_observer.reset_peak_hold();
+    /// project command. The returned observation preserves the most recently
+    /// displayed live level but exposes no held peak until a later meter read.
+    #[must_use]
+    pub fn reset_output_peak_hold(&mut self) -> IdeOutputMeterObservation {
+        self.application.output_meter_observer.reset_peak_hold()
     }
 
     /// Drains the current meter receiver without bypassing the persistent
@@ -16871,6 +16881,7 @@ mod tests {
         ChannelParameter, ControlSource, ControlTransform, SendParameter,
     };
     use hyper_media_cache::CacheLimits;
+    use hyper_mixer_runtime::output_meter_snapshot_for_test;
     use hyper_playback_json::{LoaderLimits, PlaybackJsonInput, load};
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
     use serde_json::{Value, json};
@@ -22904,6 +22915,44 @@ mod tests {
             application.outputs().outputs()[0].display_name(),
             "Output A"
         );
+    }
+
+    #[test]
+    fn output_meter_observer_resets_held_peaks_and_clears_terminal_state() {
+        let mut observer =
+            IdeOutputMeterObserver::new(config(256).unwrap().output_meter_ballistics());
+        let (mut publisher, mut receiver) = output_meter_channel();
+        publisher
+            .try_publish(output_meter_snapshot_for_test(48, 1.0, 0.5))
+            .unwrap();
+
+        let initial = observer.observe(&mut receiver);
+        let initial_snapshot = initial.sample_peak_ballistics().unwrap();
+        assert!(initial.peak_hold_available());
+        assert_eq!(
+            initial_snapshot.left().held_peak_dbfs().to_bits(),
+            0.0_f32.to_bits()
+        );
+        assert!((initial_snapshot.right().held_peak_dbfs() + 6.0206).abs() < 0.001);
+
+        let reset = observer.reset_peak_hold();
+        assert!(!reset.peak_hold_available());
+        assert!(reset.latest().snapshot().is_none());
+
+        publisher
+            .try_publish(output_meter_snapshot_for_test(48, 0.25, 0.125))
+            .unwrap();
+        let resumed = observer.observe(&mut receiver);
+        let resumed_snapshot = resumed.sample_peak_ballistics().unwrap();
+        assert!(resumed.peak_hold_available());
+        assert!((resumed_snapshot.left().held_peak_dbfs() + 12.0412).abs() < 0.001);
+        assert!((resumed_snapshot.right().held_peak_dbfs() + 18.0618).abs() < 0.001);
+
+        drop(publisher);
+        let terminal = observer.observe(&mut receiver);
+        assert!(terminal.latest().sender_disconnected());
+        assert!(terminal.sample_peak_ballistics().is_none());
+        assert!(!terminal.peak_hold_available());
     }
 
     #[test]

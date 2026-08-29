@@ -22,19 +22,19 @@ use hyper_desktop_ide::{
     IdeLoudnessScale, IdeLoudnessScaleRegion, IdeMaximumTruePeakDisplay, IdeMixerChannel,
     IdeMixerChannelDestination, IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap,
     IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice, IdeNativeFilterEdit,
-    IdeOutputSelection, IdeOutputTestState, IdePlaybackArrangement, IdePlaybackAutomation,
-    IdePlaybackAutomationLane, IdePlaybackExtent, IdeProjectExportFormat, IdeRecordingAbortOutcome,
-    IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeResourceRestoreError,
-    IdeRoutingBusKind, IdeRunningObservation, IdeScaledLoudnessValue, IdeScene,
-    IdeSceneAvailability, IdeSceneLaunchQuantization, IdeSceneLaunchState, IdeSceneSlotEdit,
-    IdeSceneTrackAction, IdeTimelineMarker, IdeTimelineMarkerEdit, IdeUnusedSampleCleanupSummary,
-    IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait,
-    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState,
-    MAX_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
-    MAX_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RELEASE_MICROSECONDS,
-    MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MAX_FILTER_CUTOFF_MILLIHERTZ,
-    MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL, MAX_IDE_SCENES,
-    MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    IdeOutputMeterObservation, IdeOutputSelection, IdeOutputTestState, IdePlaybackArrangement,
+    IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeProjectExportFormat,
+    IdeRecordingAbortOutcome, IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake,
+    IdeResourceRestoreError, IdeRoutingBusKind, IdeRunningObservation, IdeScaledLoudnessValue,
+    IdeScene, IdeSceneAvailability, IdeSceneLaunchQuantization, IdeSceneLaunchState,
+    IdeSceneSlotEdit, IdeSceneTrackAction, IdeTimelineMarker, IdeTimelineMarkerEdit,
+    IdeUnusedSampleCleanupSummary, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
+    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeWorkerShutdownReport, LocateState, MAX_COMPRESSOR_ATTACK_MICROSECONDS,
+    MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS, MAX_COMPRESSOR_RATIO_MILLIONTHS,
+    MAX_COMPRESSOR_RELEASE_MICROSECONDS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
+    MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL,
+    MAX_IDE_SCENES, MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
     MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
     MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MIN_FILTER_CUTOFF_MILLIHERTZ,
     MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, NativeFilterMode, OfflineExportRange,
@@ -5744,14 +5744,7 @@ fn apply_event(
             &observation,
         ),
         IdeWorkerEvent::OutputPeakHoldReset(observation) => {
-            apply_running_event(
-                ui,
-                &routes.recordings,
-                &routes.takes,
-                &routes.audio_imports,
-                project_state,
-                &observation,
-            );
+            apply_final_output_meter_observation(ui, &observation);
             ui.set_output_peak_hold_reset_pending(false);
             ui.set_status_text("Final-output sample-peak hold cleared".into());
             ui.set_error_text(SharedString::default());
@@ -8493,7 +8486,13 @@ fn next_audio_track_name(track_count: i32) -> SharedString {
 }
 
 fn apply_output_meter_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
-    let peak_hold_available = observation.output_peak_hold_available();
+    apply_final_output_meter_observation(ui, observation.output_meter_observation());
+    apply_mixer_strip_meter_observation(ui, observation);
+    apply_loudness_observation(ui, observation);
+}
+
+fn apply_final_output_meter_observation(ui: &MainWindow, observation: &IdeOutputMeterObservation) {
+    let peak_hold_available = observation.peak_hold_available();
     let (
         left_level,
         left_reading,
@@ -8503,7 +8502,7 @@ fn apply_output_meter_observation(ui: &MainWindow, observation: &IdeRunningObser
         right_reading,
         right_peak_reading,
         right_peak_overload_latched,
-    ) = observation.output_peak_ballistics().map_or_else(
+    ) = observation.sample_peak_ballistics().map_or_else(
         || {
             (
                 0.0,
@@ -8548,8 +8547,6 @@ fn apply_output_meter_observation(ui: &MainWindow, observation: &IdeRunningObser
     ui.set_left_peak_overload_latched(left_peak_overload_latched);
     ui.set_right_peak_overload_latched(right_peak_overload_latched);
     ui.set_output_peak_hold_available(peak_hold_available);
-    apply_mixer_strip_meter_observation(ui, observation);
-    apply_loudness_observation(ui, observation);
 }
 
 fn reset_output_peak_hold_presentation(ui: &MainWindow) {
@@ -14355,6 +14352,53 @@ mod tests {
 
         ui.global::<IdeActions>().invoke_reset_output_peak_hold();
         assert_eq!(*submissions.borrow(), 2);
+    }
+
+    #[test]
+    fn output_peak_hold_reset_event_clears_pending_without_replacing_project_ui() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let project_state = Rc::new(ProjectUiState::default());
+        ui.set_app_mode(AppMode::Running);
+        ui.set_project_name("Retained project".into());
+        ui.set_track_count(3);
+        ui.set_left_meter(0.75);
+        ui.set_right_meter(0.5);
+        ui.set_left_reading("-7.5 dBFS".into());
+        ui.set_right_reading("-12.0 dBFS".into());
+        ui.set_left_peak_reading("hold 0.0".into());
+        ui.set_right_peak_reading("hold -3.0".into());
+        ui.set_left_peak_overload_latched(true);
+        ui.set_right_peak_overload_latched(false);
+        ui.set_output_peak_hold_available(true);
+        ui.set_output_peak_hold_reset_pending(true);
+        ui.set_error_text("previous error".into());
+
+        apply_event(
+            &ui,
+            &UiRoutes::default(),
+            &project_state,
+            IdeWorkerEvent::OutputPeakHoldReset(IdeOutputMeterObservation::empty()),
+        );
+
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(ui.get_project_name(), "Retained project");
+        assert_eq!(ui.get_track_count(), 3);
+        assert_eq!(ui.get_left_meter().to_bits(), 0.0_f32.to_bits());
+        assert_eq!(ui.get_right_meter().to_bits(), 0.0_f32.to_bits());
+        assert_eq!(ui.get_left_reading(), "— dBFS");
+        assert_eq!(ui.get_right_reading(), "— dBFS");
+        assert_eq!(ui.get_left_peak_reading(), "hold —");
+        assert_eq!(ui.get_right_peak_reading(), "hold —");
+        assert!(!ui.get_left_peak_overload_latched());
+        assert!(!ui.get_right_peak_overload_latched());
+        assert!(!ui.get_output_peak_hold_available());
+        assert!(!ui.get_output_peak_hold_reset_pending());
+        assert_eq!(
+            ui.get_status_text(),
+            "Final-output sample-peak hold cleared"
+        );
+        assert!(ui.get_error_text().is_empty());
     }
 
     #[test]
