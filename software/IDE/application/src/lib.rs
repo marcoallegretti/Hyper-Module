@@ -61,6 +61,7 @@ use hyper_mapping_editor::{
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::MixerParameterStateSnapshot;
 pub use hyper_mixer_runtime::{
+    ChannelSamplePeakBallistics as IdeOutputPeakChannel,
     EbuLoudnessPresentationConfig as IdeLoudnessPresentationConfig,
     EbuLoudnessScale as IdeLoudnessScale, LocateState,
     LoudnessDisplayUnit as IdeLoudnessDisplayUnit,
@@ -68,18 +69,20 @@ pub use hyper_mixer_runtime::{
     LoudnessScaleRegion as IdeLoudnessScaleRegion,
     MaximumTruePeakDisplay as IdeMaximumTruePeakDisplay, PlaybackRecoveryTransportState,
     ScaledLoudnessValue as IdeScaledLoudnessValue, SceneLaunchState as IdeSceneLaunchState,
-    TransportCommand, TransportLoopRange, TransportLoopRangeError,
+    StereoSamplePeakBallisticsSnapshot as IdeOutputPeakBallisticsSnapshot, TransportCommand,
+    TransportLoopRange, TransportLoopRangeError,
 };
 use hyper_mixer_runtime::{
     InteractiveMixerParameterDrain, InteractiveMixerParameterObservation,
     InteractiveSceneLaunchDrain, InteractiveSceneLaunchObservation, LatestOutputMeterSnapshot,
     LoudnessCommandSendError, MixerParameterCommand, MixerParameterResolveError,
-    PlaybackRecoverySnapshot,
+    OutputMeterReceiver, PlaybackRecoverySnapshot, SamplePeakBallisticsConfig,
+    SamplePeakBallisticsConfigError, StereoSamplePeakBallistics,
 };
 #[cfg(test)]
 use hyper_mixer_runtime::{
     InteractiveMixerParameterPublisher, InteractiveMixerParameterReceiver,
-    InteractiveSceneLaunchPublisher, InteractiveSceneLaunchReceiver, OutputMeterReceiver,
+    InteractiveSceneLaunchPublisher, InteractiveSceneLaunchReceiver,
     interactive_mixer_parameter_channel, interactive_scene_launch_channel, output_meter_channel,
 };
 use hyper_native_device::{
@@ -237,11 +240,14 @@ pub use worker::{
 };
 
 const DESKTOP_MAXIMUM_BLOCK_FRAMES: usize = 4_096;
+const DESKTOP_SAMPLE_RATE_HZ: u32 = 48_000;
 const DESKTOP_MONITORING_TRANSPORT_FRAMES: usize = DESKTOP_MAXIMUM_BLOCK_FRAMES * 2;
 const DESKTOP_MONITORING_TARGET_FRAMES: usize = 256;
 const DESKTOP_MONITORING_CHUNK_FRAMES: usize = 64;
 const MONITOR_GAIN_MILLIONTHS_MAXIMUM: u32 = 1_000_000;
 const PREVIEW_GAIN_MILLIONTHS_MAXIMUM: u32 = 1_000_000;
+const IDE_OUTPUT_METER_FLOOR_DBFS: f32 = -60.0;
+const IDE_OUTPUT_METER_FALLOFF_DB_PER_SECOND: f32 = 13.3;
 pub const IDE_OUTPUT_TEST_FREQUENCY_HZ: f64 = 1_000.0;
 pub const IDE_OUTPUT_TEST_LEVEL_DBFS: f32 = -18.0;
 /// Fixed number of visual extrema returned for one inspected clip source view.
@@ -980,6 +986,7 @@ pub enum IdeApplicationConfigError {
     Output(DesktopOutputConfigError),
     Input(DesktopInputConfigError),
     Monitoring(DesktopMonitoringConfigError),
+    OutputMeterBallistics(SamplePeakBallisticsConfigError),
 }
 
 impl fmt::Display for IdeApplicationConfigError {
@@ -988,6 +995,7 @@ impl fmt::Display for IdeApplicationConfigError {
             Self::Output(source) => source.fmt(formatter),
             Self::Input(source) => source.fmt(formatter),
             Self::Monitoring(source) => source.fmt(formatter),
+            Self::OutputMeterBallistics(source) => source.fmt(formatter),
         }
     }
 }
@@ -998,15 +1006,21 @@ impl Error for IdeApplicationConfigError {
             Self::Output(source) => Some(source),
             Self::Input(source) => Some(source),
             Self::Monitoring(source) => Some(source),
+            Self::OutputMeterBallistics(source) => Some(source),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IdeApplicationConfig {
     maximum_block_frames: usize,
     project_limits: ProjectPlaybackLimits,
+    output_meter_ballistics: SamplePeakBallisticsConfig,
 }
+
+// Construction rejects non-finite meter policy values, so the contained f32
+// values remain reflexive and the configuration retains value equality.
+impl Eq for IdeApplicationConfig {}
 
 impl IdeApplicationConfig {
     /// Creates the fixed 48 kHz desktop application policy.
@@ -1018,9 +1032,9 @@ impl IdeApplicationConfig {
         maximum_block_frames: usize,
         project_limits: ProjectPlaybackLimits,
     ) -> Result<Self, IdeApplicationConfigError> {
-        let output = DesktopOutputConfig::try_new(48_000, maximum_block_frames)
+        let output = DesktopOutputConfig::try_new(DESKTOP_SAMPLE_RATE_HZ, maximum_block_frames)
             .map_err(IdeApplicationConfigError::Output)?;
-        let input = DesktopInputConfig::try_new(48_000, maximum_block_frames)
+        let input = DesktopInputConfig::try_new(DESKTOP_SAMPLE_RATE_HZ, maximum_block_frames)
             .map_err(IdeApplicationConfigError::Input)?;
         DesktopMonitoringConfig::try_new(
             input,
@@ -1030,9 +1044,17 @@ impl IdeApplicationConfig {
             DESKTOP_MONITORING_CHUNK_FRAMES,
         )
         .map_err(IdeApplicationConfigError::Monitoring)?;
+        let output_meter_ballistics = SamplePeakBallisticsConfig::try_new(
+            DESKTOP_SAMPLE_RATE_HZ,
+            IDE_OUTPUT_METER_FLOOR_DBFS,
+            IDE_OUTPUT_METER_FALLOFF_DB_PER_SECOND,
+            u64::MAX,
+        )
+        .map_err(IdeApplicationConfigError::OutputMeterBallistics)?;
         Ok(Self {
             maximum_block_frames,
             project_limits,
+            output_meter_ballistics,
         })
     }
 
@@ -1045,6 +1067,98 @@ impl IdeApplicationConfig {
     pub const fn project_limits(self) -> ProjectPlaybackLimits {
         self.project_limits
     }
+
+    const fn output_meter_ballistics(self) -> SamplePeakBallisticsConfig {
+        self.output_meter_ballistics
+    }
+}
+
+/// One running-session read of the final output meter.
+///
+/// The raw snapshot remains available for existing loudness and strip-meter
+/// consumers, while the ballistic snapshot is only for the final-output
+/// sample-peak display.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IdeOutputMeterObservation {
+    latest: LatestOutputMeterSnapshot,
+    sample_peak_ballistics: Option<IdeOutputPeakBallisticsSnapshot>,
+    peak_hold_available: bool,
+}
+
+impl IdeOutputMeterObservation {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            latest: LatestOutputMeterSnapshot::empty(),
+            sample_peak_ballistics: None,
+            peak_hold_available: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn latest(self) -> LatestOutputMeterSnapshot {
+        self.latest
+    }
+
+    #[must_use]
+    pub const fn sample_peak_ballistics(self) -> Option<IdeOutputPeakBallisticsSnapshot> {
+        self.sample_peak_ballistics
+    }
+
+    #[must_use]
+    pub const fn peak_hold_available(self) -> bool {
+        self.peak_hold_available
+    }
+}
+
+#[derive(Debug)]
+struct IdeOutputMeterObserver {
+    ballistics: StereoSamplePeakBallistics,
+    latest: Option<IdeOutputPeakBallisticsSnapshot>,
+    peak_hold_available: bool,
+}
+
+impl IdeOutputMeterObserver {
+    const fn new(config: SamplePeakBallisticsConfig) -> Self {
+        Self {
+            ballistics: StereoSamplePeakBallistics::new(config),
+            latest: None,
+            peak_hold_available: false,
+        }
+    }
+
+    fn observe(&mut self, receiver: &mut OutputMeterReceiver) -> IdeOutputMeterObservation {
+        let read = receiver.read_ballistics(&mut self.ballistics);
+        let latest = read.latest();
+        if latest.sender_disconnected() {
+            self.reset();
+            return IdeOutputMeterObservation {
+                latest,
+                sample_peak_ballistics: None,
+                peak_hold_available: false,
+            };
+        }
+        if let Some(snapshot) = read.ballistics() {
+            self.latest = Some(snapshot);
+            self.peak_hold_available = true;
+        }
+        IdeOutputMeterObservation {
+            latest,
+            sample_peak_ballistics: self.latest,
+            peak_hold_available: self.peak_hold_available,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.ballistics.reset();
+        self.latest = None;
+        self.peak_hold_available = false;
+    }
+
+    fn reset_peak_hold(&mut self) {
+        self.ballistics.reset_peak_hold();
+        self.peak_hold_available = false;
+    }
 }
 
 #[derive(Debug)]
@@ -1055,6 +1169,7 @@ pub struct DesktopIdeApplication {
     inputs: Option<IdeAudioInputInventory>,
     input_selection: IdeInputSelection,
     playback_session_generation: u64,
+    output_meter_observer: IdeOutputMeterObserver,
 }
 
 #[derive(Debug)]
@@ -1102,6 +1217,9 @@ impl DesktopIdeApplication {
                 inputs,
                 input_selection: IdeInputSelection::Disabled,
                 playback_session_generation: 0,
+                output_meter_observer: IdeOutputMeterObserver::new(
+                    config.output_meter_ballistics(),
+                ),
             },
             input_failure,
         })
@@ -1119,6 +1237,7 @@ impl DesktopIdeApplication {
             inputs: None,
             input_selection: IdeInputSelection::Disabled,
             playback_session_generation: 0,
+            output_meter_observer: IdeOutputMeterObserver::new(config.output_meter_ballistics()),
         }
     }
 
@@ -1135,6 +1254,7 @@ impl DesktopIdeApplication {
             inputs: Some(inputs),
             input_selection: IdeInputSelection::Disabled,
             playback_session_generation: 0,
+            output_meter_observer: IdeOutputMeterObserver::new(config.output_meter_ballistics()),
         }
     }
 
@@ -1295,6 +1415,7 @@ impl DesktopIdeApplication {
         match opened {
             Ok(session) => {
                 self.playback_session_generation = next_playback_session_generation;
+                self.output_meter_observer.reset();
                 let running = RunningDesktopIdeApplication {
                     application: self,
                     session: IdePlaybackSessionOwner::Native(session),
@@ -1357,8 +1478,9 @@ impl DesktopIdeApplication {
     }
 
     fn output_test_config(&self) -> Result<DesktopOutputConfig, IdeOutputTestError> {
-        let output = DesktopOutputConfig::try_new(48_000, self.config.maximum_block_frames)
-            .map_err(IdeOutputTestError::OutputConfig)?;
+        let output =
+            DesktopOutputConfig::try_new(DESKTOP_SAMPLE_RATE_HZ, self.config.maximum_block_frames)
+                .map_err(IdeOutputTestError::OutputConfig)?;
         match &self.output_selection {
             IdeOutputSelection::SystemDefault => Ok(output),
             IdeOutputSelection::Routed(routing_id) => {
@@ -1373,8 +1495,9 @@ impl DesktopIdeApplication {
     }
 
     fn output_config(&self) -> Result<DesktopOutputConfig, IdeProjectOpenError> {
-        let output = DesktopOutputConfig::try_new(48_000, self.config.maximum_block_frames)
-            .map_err(IdeProjectOpenError::OutputConfig)?;
+        let output =
+            DesktopOutputConfig::try_new(DESKTOP_SAMPLE_RATE_HZ, self.config.maximum_block_frames)
+                .map_err(IdeProjectOpenError::OutputConfig)?;
         match &self.output_selection {
             IdeOutputSelection::SystemDefault => Ok(output),
             IdeOutputSelection::Routed(routing_id) => {
@@ -1417,9 +1540,12 @@ impl DesktopIdeApplication {
                 if inputs.inputs().is_empty() {
                     return Err(IdeProjectOpenError::SelectedInputUnavailable);
                 }
-                DesktopInputConfig::try_new(48_000, self.config.maximum_block_frames)
-                    .map(Some)
-                    .map_err(IdeProjectOpenError::InputConfig)
+                DesktopInputConfig::try_new(
+                    DESKTOP_SAMPLE_RATE_HZ,
+                    self.config.maximum_block_frames,
+                )
+                .map(Some)
+                .map_err(IdeProjectOpenError::InputConfig)
             }
             IdeInputSelection::Routed(routing_id) => {
                 let inputs = self
@@ -1429,11 +1555,14 @@ impl DesktopIdeApplication {
                 if inputs.find(routing_id).is_none() {
                     return Err(IdeProjectOpenError::SelectedInputUnavailable);
                 }
-                DesktopInputConfig::try_new(48_000, self.config.maximum_block_frames)
-                    .map_err(IdeProjectOpenError::InputConfig)?
-                    .with_routing_id(routing_id)
-                    .map(Some)
-                    .map_err(IdeProjectOpenError::InputConfig)
+                DesktopInputConfig::try_new(
+                    DESKTOP_SAMPLE_RATE_HZ,
+                    self.config.maximum_block_frames,
+                )
+                .map_err(IdeProjectOpenError::InputConfig)?
+                .with_routing_id(routing_id)
+                .map(Some)
+                .map_err(IdeProjectOpenError::InputConfig)
             }
         }
     }
@@ -16183,13 +16312,38 @@ impl RunningDesktopIdeApplication {
         }
     }
 
+    /// Drains the final-output receiver through its session-local peak-display
+    /// state while retaining the newest raw snapshot for other consumers.
+    #[must_use]
+    pub fn observe_output_meter(&mut self) -> IdeOutputMeterObservation {
+        let Self {
+            application,
+            session,
+        } = self;
+        match session {
+            IdePlaybackSessionOwner::Native(session) => application
+                .output_meter_observer
+                .observe(session.meter_receiver()),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => application
+                .output_meter_observer
+                .observe(&mut session.meters),
+        }
+    }
+
+    /// Clears only the final-output sample-peak hold.
+    ///
+    /// This is an IDE display action; it does not send a callback, mixer, or
+    /// project command.
+    pub fn reset_output_peak_hold(&mut self) {
+        self.application.output_meter_observer.reset_peak_hold();
+    }
+
+    /// Drains the current meter receiver without bypassing the persistent
+    /// final-output display state.
     #[must_use]
     pub fn read_latest_meter(&mut self) -> LatestOutputMeterSnapshot {
-        match &mut self.session {
-            IdePlaybackSessionOwner::Native(session) => session.meter_receiver().read_latest(),
-            #[cfg(test)]
-            IdePlaybackSessionOwner::Test(session) => session.meters.read_latest(),
-        }
+        self.observe_output_meter().latest()
     }
 
     /// Drains exact live mixer changes from the native commit stream.
@@ -17462,6 +17616,20 @@ mod tests {
         let config = config(512).unwrap();
         assert_eq!(config.maximum_block_frames(), 512);
         assert_eq!(config.project_limits().max_total_resource_bytes, 1_048_576);
+        let output_meter_ballistics = config.output_meter_ballistics();
+        assert_eq!(
+            output_meter_ballistics.sample_rate_hz(),
+            DESKTOP_SAMPLE_RATE_HZ
+        );
+        assert_eq!(
+            output_meter_ballistics.floor_dbfs().to_bits(),
+            IDE_OUTPUT_METER_FLOOR_DBFS.to_bits()
+        );
+        assert_eq!(
+            output_meter_ballistics.falloff_db_per_second().to_bits(),
+            IDE_OUTPUT_METER_FALLOFF_DB_PER_SECOND.to_bits()
+        );
+        assert_eq!(output_meter_ballistics.peak_hold_frames(), u64::MAX);
     }
 
     #[test]

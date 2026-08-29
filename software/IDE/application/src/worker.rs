@@ -60,18 +60,19 @@ use super::{
     IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
     IdeMixerMainState, IdeMixerPrimaryDestination, IdeMixerStripReorderError, IdeMonitoringCommand,
     IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure, IdeNativeFilterEdit,
-    IdeNativeFilterEditError, IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError,
-    IdeOutputTestError, IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
-    IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
-    IdePendingSaveCloseWait, IdeProjectExportError, IdeProjectExportFormat, IdeProjectOpenError,
-    IdeProjectSaveError, IdeRecordingAbortError, IdeRecordingAbortOutcome,
-    IdeRecordingClipCreationError, IdeRecordingDiscardError, IdeRecordingError,
-    IdeRecordingImportOutcome, IdeRecordingObservation, IdeResourceRestoreError,
-    IdeReturnSendEditError, IdeRoutingBusCreationError, IdeRoutingBusKind,
-    IdeRoutingBusRemovalError, IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability,
-    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization,
-    IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError,
-    IdeTempoEditError, IdeTimelineMarker, IdeTimelineMarkerEdit, IdeTimelineMarkerLocateError,
+    IdeNativeFilterEditError, IdeOutputDiscoveryError, IdeOutputMeterObservation,
+    IdeOutputSelection, IdeOutputSelectionError, IdeOutputTestError, IdeOutputTestSnapshot,
+    IdeOutputTestStartOutcome, IdeOutputTestStopOutcome, IdePendingCloseWait,
+    IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait, IdePendingSaveCloseWait,
+    IdeProjectExportError, IdeProjectExportFormat, IdeProjectOpenError, IdeProjectSaveError,
+    IdeRecordingAbortError, IdeRecordingAbortOutcome, IdeRecordingClipCreationError,
+    IdeRecordingDiscardError, IdeRecordingError, IdeRecordingImportOutcome,
+    IdeRecordingObservation, IdeResourceRestoreError, IdeReturnSendEditError,
+    IdeRoutingBusCreationError, IdeRoutingBusKind, IdeRoutingBusRemovalError,
+    IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability, IdeSceneCreationError,
+    IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRemovalError,
+    IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError, IdeTempoEditError,
+    IdeTimelineMarker, IdeTimelineMarkerEdit, IdeTimelineMarkerLocateError,
     IdeTrackFreezeHistoryAuthority, IdeTransportSeekError, IdeUnusedSampleCleanupError,
     IdeUnusedSampleCleanupSummary, InputInventoryError, LocateState, MAX_DEVICES_PER_CHAIN,
     NativeFilterMode, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
@@ -170,6 +171,7 @@ pub enum IdeWorkerCommandKind {
     LocateSceneLaunch,
     LocateTimelineMarker,
     Loudness,
+    ResetOutputPeakHold,
     Mixer,
     Monitoring,
     SaveProject,
@@ -302,6 +304,7 @@ pub enum IdeWorkerCommand {
         state: LocateState,
     },
     Loudness(IdeLoudnessCommand),
+    ResetOutputPeakHold,
     Mixer(IdeMixerCommand),
     Monitoring(IdeMonitoringCommand),
     SaveProject,
@@ -630,6 +633,7 @@ impl IdeWorkerCommand {
             Self::LocateSceneLaunch { .. } => IdeWorkerCommandKind::LocateSceneLaunch,
             Self::LocateTimelineMarker { .. } => IdeWorkerCommandKind::LocateTimelineMarker,
             Self::Loudness(_) => IdeWorkerCommandKind::Loudness,
+            Self::ResetOutputPeakHold => IdeWorkerCommandKind::ResetOutputPeakHold,
             Self::Mixer(_) => IdeWorkerCommandKind::Mixer,
             Self::Monitoring(_) => IdeWorkerCommandKind::Monitoring,
             Self::SaveProject => IdeWorkerCommandKind::SaveProject,
@@ -958,7 +962,7 @@ pub struct IdeRunningObservation {
     output: OutputStreamSnapshot,
     monitoring: Option<IdeMonitoringState>,
     recovery: PlaybackRecoverySnapshot,
-    meter: LatestOutputMeterSnapshot,
+    meter: IdeOutputMeterObservation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1689,7 +1693,7 @@ impl IdeRunningObservation {
             output: OutputStreamSnapshot::default(),
             monitoring: None,
             recovery,
-            meter: LatestOutputMeterSnapshot::empty(),
+            meter: IdeOutputMeterObservation::empty(),
         }
     }
 
@@ -1893,7 +1897,21 @@ impl IdeRunningObservation {
 
     #[must_use]
     pub const fn meter(&self) -> LatestOutputMeterSnapshot {
-        self.meter
+        self.meter.latest()
+    }
+
+    /// Returns the persistent final-output sample-peak display state, when
+    /// the running session has received coherent meter evidence.
+    #[must_use]
+    pub const fn output_peak_ballistics(&self) -> Option<super::IdeOutputPeakBallisticsSnapshot> {
+        self.meter.sample_peak_ballistics()
+    }
+
+    /// Whether a final-output peak hold has been established since opening or
+    /// the most recent explicit clear action.
+    #[must_use]
+    pub const fn output_peak_hold_available(&self) -> bool {
+        self.meter.peak_hold_available()
     }
 
     /// Returns scene-launch state from the newest committed audio cycle, when
@@ -1901,6 +1919,7 @@ impl IdeRunningObservation {
     #[must_use]
     pub fn scene_launch_state(&self) -> Option<super::IdeSceneLaunchState> {
         self.meter
+            .latest()
             .snapshot()
             .map(|snapshot| snapshot.cycle().scene_launch_state())
     }
@@ -1913,6 +1932,7 @@ impl IdeRunningObservation {
         config: super::IdeLoudnessPresentationConfig,
     ) -> Option<super::IdeLoudnessPresentationSnapshot> {
         self.meter
+            .latest()
             .snapshot()
             .map(|snapshot| snapshot.present_loudness(config))
     }
@@ -2897,6 +2917,7 @@ pub enum IdeWorkerEvent {
         input_failure: Option<IdeInputDiscoveryError>,
     },
     Running(IdeRunningObservation),
+    OutputPeakHoldReset(IdeRunningObservation),
     OutputTest(IdeOutputTestSnapshot),
     OutputTestStopping,
     OutputTestStopped,
@@ -5093,6 +5114,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::LocateSceneLaunch
         | IdeWorkerCommandKind::LocateTimelineMarker
         | IdeWorkerCommandKind::Loudness
+        | IdeWorkerCommandKind::ResetOutputPeakHold
         | IdeWorkerCommandKind::Mixer
         | IdeWorkerCommandKind::Monitoring
         | IdeWorkerCommandKind::AddAudioTrack
@@ -5425,6 +5447,7 @@ fn process_command(
             events,
         ),
         IdeWorkerCommand::Loudness(command) => process_loudness_command(state, command, events),
+        IdeWorkerCommand::ResetOutputPeakHold => process_output_peak_hold_reset(state, events),
         IdeWorkerCommand::Mixer(command) => match state {
             WorkerState::Running(application)
             | WorkerState::MixerAutomationCapture { application, .. } => {
@@ -6622,6 +6645,30 @@ fn process_loudness_command(
         _ => publish_failure(
             events,
             IdeWorkerCommandKind::Loudness,
+            IdeWorkerCommandFailure::InvalidState,
+        ),
+    }
+}
+
+fn process_output_peak_hold_reset(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    match state {
+        WorkerState::Running(application) => {
+            application.reset_output_peak_hold();
+            match running_observation(application) {
+                Ok(observation) => {
+                    send_event(events, IdeWorkerEvent::OutputPeakHoldReset(observation))
+                }
+                Err(reason) => {
+                    publish_failure(events, IdeWorkerCommandKind::ResetOutputPeakHold, reason)
+                }
+            }
+        }
+        _ => publish_failure(
+            events,
+            IdeWorkerCommandKind::ResetOutputPeakHold,
             IdeWorkerCommandFailure::InvalidState,
         ),
     }
@@ -18101,7 +18148,7 @@ fn running_observation(
         output: snapshot.output,
         monitoring: snapshot.monitoring,
         recovery: snapshot.recovery,
-        meter: application.read_latest_meter(),
+        meter: application.observe_output_meter(),
     })
 }
 
@@ -25559,6 +25606,79 @@ mod tests {
                 IdeWorkerEvent::LoudnessQueued(actual) if actual == command
             ));
         }
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn output_peak_hold_reset_preserves_the_open_project_and_its_revision() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-output-peak-hold-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        let revision = created.project().manifest().revision();
+        drop(created);
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv_native_mutation(&worker) else {
+            panic!("the verified project must open before a display-only meter action");
+        };
+        let project_id = opened.project_id().to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::ResetOutputPeakHold)
+            .unwrap();
+        let IdeWorkerEvent::OutputPeakHoldReset(observation) = recv_native_mutation(&worker) else {
+            panic!("the running worker must confirm the display-only peak-hold reset");
+        };
+        assert_eq!(observation.project_id(), project_id.as_str());
+        assert_eq!(
+            verify_project_package(&project)
+                .unwrap()
+                .manifest()
+                .revision(),
+            revision
+        );
+
+        worker.try_send(IdeWorkerCommand::Observe).unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::Running(observation) if observation.project_id() == project_id.as_str()
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn output_peak_hold_reset_rejects_a_closed_worker() {
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 2).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+
+        worker
+            .try_send(IdeWorkerCommand::ResetOutputPeakHold)
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ResetOutputPeakHold,
+                reason: IdeWorkerCommandFailure::InvalidState,
+            }
+        ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
     }
 

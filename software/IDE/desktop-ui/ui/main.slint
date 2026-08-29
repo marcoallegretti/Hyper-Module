@@ -372,6 +372,7 @@ export global IdeActions {
     callback loudness-run();
     callback loudness-standby();
     callback loudness-reset();
+    callback reset-output-peak-hold();
     callback launch-scene(int);
     callback begin-add-scene();
     callback add-scene(string, int, string);
@@ -464,6 +465,8 @@ component Meter inherits Rectangle {
     in property <float> level: 0;
     in property <string> channel-name;
     in property <string> reading: "—";
+    in property <string> peak-reading: "hold —";
+    in property <bool> peak-overload-latched: false;
 
     background: #090d12;
     border-color: #27313d;
@@ -496,6 +499,16 @@ component Meter inherits Rectangle {
         text: root.reading;
         color: #e7edf5;
         font-size: 11px;
+        horizontal-alignment: center;
+    }
+
+    Text {
+        x: 0;
+        y: 23px;
+        width: parent.width;
+        text: root.peak-reading;
+        color: root.peak-overload-latched ? #ff8a85 : #a8b7c8;
+        font-size: 9px;
         horizontal-alignment: center;
     }
 }
@@ -1007,6 +1020,12 @@ export component MainWindow inherits Window {
     in property <float> right-meter: 0;
     in property <string> left-reading: "—";
     in property <string> right-reading: "—";
+    in property <string> left-peak-reading: "hold —";
+    in property <string> right-peak-reading: "hold —";
+    in property <bool> left-peak-overload-latched: false;
+    in property <bool> right-peak-overload-latched: false;
+    in property <bool> output-peak-hold-available: false;
+    in-out property <bool> output-peak-hold-reset-pending: false;
     in property <string> status-text: "Discovering desktop audio outputs…";
     in property <string> error-text: "";
     private property <bool> performance-visible:
@@ -2039,8 +2058,38 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-                        Meter { width: 64px; level: root.left-meter; channel-name: "LEFT"; reading: root.left-reading; }
-                        Meter { width: 64px; level: root.right-meter; channel-name: "RIGHT"; reading: root.right-reading; }
+                        VerticalLayout {
+                            width: 146px;
+                            spacing: 4px;
+                            HorizontalLayout {
+                                vertical-stretch: 1;
+                                spacing: 6px;
+                                Meter {
+                                    width: 70px;
+                                    level: root.left-meter;
+                                    channel-name: "LEFT";
+                                    reading: root.left-reading;
+                                    peak-reading: root.left-peak-reading;
+                                    peak-overload-latched: root.left-peak-overload-latched;
+                                }
+                                Meter {
+                                    width: 70px;
+                                    level: root.right-meter;
+                                    channel-name: "RIGHT";
+                                    reading: root.right-reading;
+                                    peak-reading: root.right-peak-reading;
+                                    peak-overload-latched: root.right-peak-overload-latched;
+                                }
+                            }
+                            Button {
+                                text: root.output-peak-hold-reset-pending ? "Clearing hold…" : "Clear hold";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.output-peak-hold-available
+                                    && !root.output-peak-hold-reset-pending;
+                                accessible-label: "Clear the displayed final-output sample-peak hold without changing audio or project state";
+                                clicked => { IdeActions.reset-output-peak-hold(); }
+                            }
+                        }
                     }
 
                     Rectangle { height: 1px; background: #27313d; }

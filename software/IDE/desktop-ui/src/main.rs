@@ -74,6 +74,7 @@ const MAX_VISIBLE_SCENE_NAME_CHARS: usize = 20;
 const MAX_VISIBLE_MIXER_NAME_CHARS: usize = 10;
 const MAX_VISIBLE_RECENT_PROJECT_NAME_CHARS: usize = 28;
 const MAX_SAFE_TIMELINE_TICK: u64 = 9_007_199_254_740_991;
+const FINAL_OUTPUT_METER_FLOOR_DBFS: f32 = -60.0;
 const MIXER_STRIP_METER_FLOOR_DBFS: f32 = -60.0;
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
@@ -1573,6 +1574,7 @@ fn bind_playback_callbacks(
     bind_arrangement_callback(ui, worker, project_state);
     bind_audio_clip_callback(ui, worker, project_state);
     bind_loudness_callbacks(ui, worker);
+    bind_output_peak_hold_callback(ui, worker);
     bind_scene_callbacks(ui, worker, project_state);
 
     bind_project_save_callback(ui, worker, project_state);
@@ -3183,6 +3185,35 @@ fn bind_loudness_callbacks(ui: &MainWindow, worker: &WorkerCell) {
             &worker_for_reset,
             IdeWorkerCommand::Loudness(IdeLoudnessCommand::Reset),
         );
+    });
+}
+
+fn bind_output_peak_hold_callback(ui: &MainWindow, worker: &WorkerCell) {
+    bind_output_peak_hold_callback_with(ui, {
+        let worker = Rc::clone(worker);
+        move |ui| try_submit_to_ui(ui, &worker, IdeWorkerCommand::ResetOutputPeakHold)
+    });
+}
+
+fn bind_output_peak_hold_callback_with(
+    ui: &MainWindow,
+    submit: impl Fn(&MainWindow) -> bool + 'static,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    actions.on_reset_output_peak_hold(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_output_peak_hold_available()
+            || ui.get_output_peak_hold_reset_pending()
+        {
+            return;
+        }
+        if submit(&ui) {
+            ui.set_output_peak_hold_reset_pending(true);
+        }
     });
 }
 
@@ -5190,6 +5221,10 @@ fn submit_path(ui: &MainWindow, worker: &WorkerCell, path: PathBuf) {
 }
 
 fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand) {
+    let _ = try_submit_to_ui(ui, worker, command);
+}
+
+fn try_submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand) -> bool {
     let command_kind = command.kind();
     let worker_ref = worker.borrow();
     let Some(worker) = worker_ref.as_ref() else {
@@ -5199,7 +5234,7 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
             UiSubmissionFailure::Disconnected,
         ));
         ui.set_error_text("IDE worker is no longer available".into());
-        return;
+        return false;
     };
     match worker.try_send(command) {
         Ok(()) => {
@@ -5215,6 +5250,7 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
             }
             ui.set_error_text(SharedString::default());
             ui.set_status_text(command_status(command_kind).into());
+            true
         }
         Err(error) => {
             let failure = match error {
@@ -5227,6 +5263,7 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 failure,
             ));
             ui.set_error_text(error.to_string().into());
+            false
         }
     }
 }
@@ -5409,6 +5446,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::LocateSceneLaunch => "Scene-marker locate queued…",
         IdeWorkerCommandKind::LocateTimelineMarker => "Navigation-marker locate queued…",
         IdeWorkerCommandKind::Loudness => "Loudness measurement command queued…",
+        IdeWorkerCommandKind::ResetOutputPeakHold => "Clearing final-output peak hold…",
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
         IdeWorkerCommandKind::Monitoring => "Applying input cue control…",
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
@@ -5705,6 +5743,19 @@ fn apply_event(
             project_state,
             &observation,
         ),
+        IdeWorkerEvent::OutputPeakHoldReset(observation) => {
+            apply_running_event(
+                ui,
+                &routes.recordings,
+                &routes.takes,
+                &routes.audio_imports,
+                project_state,
+                &observation,
+            );
+            ui.set_output_peak_hold_reset_pending(false);
+            ui.set_status_text("Final-output sample-peak hold cleared".into());
+            ui.set_error_text(SharedString::default());
+        }
         event @ (IdeWorkerEvent::OutputTest(_)
         | IdeWorkerEvent::OutputTestStopping
         | IdeWorkerEvent::OutputTestStopped) => apply_output_test_event(ui, &event),
@@ -6281,6 +6332,9 @@ fn apply_event(
             ui.set_status_text("Waiting for native output to close…".into());
         }
         IdeWorkerEvent::CommandFailed { command, reason } => {
+            if command == IdeWorkerCommandKind::ResetOutputPeakHold {
+                ui.set_output_peak_hold_reset_pending(false);
+            }
             ui.set_app_mode(mode_after_failure(ui.get_app_mode(), command));
             ui.set_error_text(format!("{}: {reason}", command_status(command)).into());
         }
@@ -8439,21 +8493,72 @@ fn next_audio_track_name(track_count: i32) -> SharedString {
 }
 
 fn apply_output_meter_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
-    let (left_level, left_reading, right_level, right_reading) = observation
-        .meter()
-        .snapshot()
-        .map_or((0.0, "—".to_owned(), 0.0, "—".to_owned()), |snapshot| {
-            let meter = snapshot.meter();
-            let (left_level, left_reading) = meter_presentation(meter.left().sample_peak());
-            let (right_level, right_reading) = meter_presentation(meter.right().sample_peak());
-            (left_level, left_reading, right_level, right_reading)
-        });
+    let peak_hold_available = observation.output_peak_hold_available();
+    let (
+        left_level,
+        left_reading,
+        left_peak_reading,
+        left_peak_overload_latched,
+        right_level,
+        right_reading,
+        right_peak_reading,
+        right_peak_overload_latched,
+    ) = observation.output_peak_ballistics().map_or_else(
+        || {
+            (
+                0.0,
+                "— dBFS".to_owned(),
+                "hold —".to_owned(),
+                false,
+                0.0,
+                "— dBFS".to_owned(),
+                "hold —".to_owned(),
+                false,
+            )
+        },
+        |snapshot| {
+            let left = snapshot.left();
+            let right = snapshot.right();
+            let (left_level, left_reading) =
+                meter_presentation(left.measurement_available(), left.level_dbfs());
+            let (left_peak_reading, left_peak_overload_latched) =
+                output_peak_hold_presentation(peak_hold_available, left.held_peak_dbfs());
+            let (right_level, right_reading) =
+                meter_presentation(right.measurement_available(), right.level_dbfs());
+            let (right_peak_reading, right_peak_overload_latched) =
+                output_peak_hold_presentation(peak_hold_available, right.held_peak_dbfs());
+            (
+                left_level,
+                left_reading,
+                left_peak_reading,
+                left_peak_overload_latched,
+                right_level,
+                right_reading,
+                right_peak_reading,
+                right_peak_overload_latched,
+            )
+        },
+    );
     ui.set_left_meter(left_level);
     ui.set_right_meter(right_level);
     ui.set_left_reading(left_reading.into());
     ui.set_right_reading(right_reading.into());
+    ui.set_left_peak_reading(left_peak_reading.into());
+    ui.set_right_peak_reading(right_peak_reading.into());
+    ui.set_left_peak_overload_latched(left_peak_overload_latched);
+    ui.set_right_peak_overload_latched(right_peak_overload_latched);
+    ui.set_output_peak_hold_available(peak_hold_available);
     apply_mixer_strip_meter_observation(ui, observation);
     apply_loudness_observation(ui, observation);
+}
+
+fn reset_output_peak_hold_presentation(ui: &MainWindow) {
+    ui.set_left_peak_reading("hold —".into());
+    ui.set_right_peak_reading("hold —".into());
+    ui.set_left_peak_overload_latched(false);
+    ui.set_right_peak_overload_latched(false);
+    ui.set_output_peak_hold_available(false);
+    ui.set_output_peak_hold_reset_pending(false);
 }
 
 fn apply_mixer_strip_meter_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
@@ -9087,6 +9192,7 @@ fn apply_recording_event(ui: &MainWindow, state: &hyper_desktop_ide::IdeRecordin
     ui.set_right_meter(0.0);
     ui.set_left_reading("—".into());
     ui.set_right_reading("—".into());
+    reset_output_peak_hold_presentation(ui);
     ui.set_status_text("Capturing a monitored take; project playback remains paused".into());
     ui.set_error_text(SharedString::default());
 }
@@ -9860,6 +9966,7 @@ fn reset_project(
     ui.set_right_meter(0.0);
     ui.set_left_reading("—".into());
     ui.set_right_reading("—".into());
+    reset_output_peak_hold_presentation(ui);
     reset_loudness_observation(ui);
 }
 
@@ -13972,19 +14079,30 @@ fn mode_after_submission_failure(
     }
 }
 
-fn meter_presentation(sample_peak: Option<f32>) -> (f32, String) {
-    let Some(sample_peak) = sample_peak.filter(|value| value.is_finite() && *value >= 0.0) else {
-        return (0.0, "—".to_owned());
-    };
-    let dbfs = if sample_peak == 0.0 {
-        -60.0
+fn meter_presentation(measurement_available: bool, dbfs: f32) -> (f32, String) {
+    if !measurement_available || !dbfs.is_finite() {
+        return (0.0, "— dBFS".to_owned());
+    }
+    let level =
+        ((dbfs - FINAL_OUTPUT_METER_FLOOR_DBFS) / -FINAL_OUTPUT_METER_FLOOR_DBFS).clamp(0.0, 1.0);
+    let reading = if dbfs <= FINAL_OUTPUT_METER_FLOOR_DBFS {
+        format!("≤ {FINAL_OUTPUT_METER_FLOOR_DBFS:.1} dBFS")
     } else {
-        (20.0 * sample_peak.log10()).max(-60.0)
+        format!("{dbfs:.1} dBFS")
     };
-    (
-        ((dbfs + 60.0) / 60.0).clamp(0.0, 1.0),
-        format!("{dbfs:.1} dB"),
-    )
+    (level, reading)
+}
+
+fn output_peak_hold_presentation(peak_hold_available: bool, dbfs: f32) -> (String, bool) {
+    if !peak_hold_available || !dbfs.is_finite() {
+        return ("hold —".to_owned(), false);
+    }
+    let reading = if dbfs <= FINAL_OUTPUT_METER_FLOOR_DBFS {
+        format!("hold ≤ {FINAL_OUTPUT_METER_FLOOR_DBFS:.1}")
+    } else {
+        format!("hold {dbfs:.1}")
+    };
+    (reading, dbfs >= 0.0)
 }
 
 fn mixer_strip_meter_presentation(sample_peak: Option<f32>) -> (f32, String) {
@@ -14193,6 +14311,50 @@ mod tests {
         ui.set_app_mode(AppMode::Previewing);
         ui.global::<IdeActions>().invoke_metronome_toggle();
         assert_eq!(submitted.borrow().len(), 2);
+    }
+
+    #[test]
+    fn output_peak_hold_reset_callback_submits_once_only_after_worker_acceptance() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_left_reading("-7.5 dBFS".into());
+        ui.set_right_reading("-0.4 dBFS".into());
+
+        let submissions = Rc::new(RefCell::new(0_usize));
+        let submissions_by_callback = Rc::clone(&submissions);
+        let accepted = Rc::new(RefCell::new(false));
+        let accepted_by_callback = Rc::clone(&accepted);
+        bind_output_peak_hold_callback_with(&ui, move |_| {
+            *submissions_by_callback.borrow_mut() += 1;
+            *accepted_by_callback.borrow()
+        });
+
+        ui.set_app_mode(AppMode::Previewing);
+        ui.set_output_peak_hold_available(true);
+        ui.global::<IdeActions>().invoke_reset_output_peak_hold();
+        assert_eq!(*submissions.borrow(), 0);
+        assert!(!ui.get_output_peak_hold_reset_pending());
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_output_peak_hold_available(false);
+        ui.global::<IdeActions>().invoke_reset_output_peak_hold();
+        assert_eq!(*submissions.borrow(), 0);
+        assert!(!ui.get_output_peak_hold_reset_pending());
+
+        ui.set_output_peak_hold_available(true);
+        ui.global::<IdeActions>().invoke_reset_output_peak_hold();
+        assert_eq!(*submissions.borrow(), 1);
+        assert!(!ui.get_output_peak_hold_reset_pending());
+
+        *accepted.borrow_mut() = true;
+        ui.global::<IdeActions>().invoke_reset_output_peak_hold();
+        assert_eq!(*submissions.borrow(), 2);
+        assert!(ui.get_output_peak_hold_reset_pending());
+        assert_eq!(ui.get_left_reading(), "-7.5 dBFS");
+        assert_eq!(ui.get_right_reading(), "-0.4 dBFS");
+
+        ui.global::<IdeActions>().invoke_reset_output_peak_hold();
+        assert_eq!(*submissions.borrow(), 2);
     }
 
     #[test]
@@ -16773,11 +16935,34 @@ mod tests {
 
     #[test]
     fn meter_presentation_is_bounded_and_preserves_unavailable_state() {
-        assert_eq!(meter_presentation(None), (0.0, "—".to_owned()));
-        assert_eq!(meter_presentation(Some(f32::NAN)), (0.0, "—".to_owned()));
-        assert_eq!(meter_presentation(Some(0.0)), (0.0, "-60.0 dB".to_owned()));
-        assert_eq!(meter_presentation(Some(1.0)), (1.0, "0.0 dB".to_owned()));
-        assert!((meter_presentation(Some(2.0)).0 - 1.0).abs() <= f32::EPSILON);
+        assert_eq!(meter_presentation(false, 0.0), (0.0, "— dBFS".to_owned()));
+        assert_eq!(
+            meter_presentation(true, f32::NAN),
+            (0.0, "— dBFS".to_owned())
+        );
+        assert_eq!(
+            meter_presentation(true, FINAL_OUTPUT_METER_FLOOR_DBFS),
+            (0.0, "≤ -60.0 dBFS".to_owned())
+        );
+        assert_eq!(meter_presentation(true, 0.0), (1.0, "0.0 dBFS".to_owned()));
+        assert!((meter_presentation(true, 6.0).0 - 1.0).abs() <= f32::EPSILON);
+
+        assert_eq!(
+            output_peak_hold_presentation(false, 0.0),
+            ("hold —".to_owned(), false)
+        );
+        assert_eq!(
+            output_peak_hold_presentation(true, f32::NAN),
+            ("hold —".to_owned(), false)
+        );
+        assert_eq!(
+            output_peak_hold_presentation(true, FINAL_OUTPUT_METER_FLOOR_DBFS),
+            ("hold ≤ -60.0".to_owned(), false)
+        );
+        assert_eq!(
+            output_peak_hold_presentation(true, 0.0),
+            ("hold 0.0".to_owned(), true)
+        );
     }
 
     #[test]
