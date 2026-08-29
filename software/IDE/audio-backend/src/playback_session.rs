@@ -635,6 +635,17 @@ impl SessionControlHandles {
             .try_send_direct(DesktopDirectControlCommand::Transport(command))
     }
 
+    fn try_start_capture_transport(&mut self) -> Result<u64, DesktopDirectControlError> {
+        let _ = self.runtime_mut().sink_mut().take_capture_start_sequence();
+        self.runtime_mut()
+            .try_send_direct(DesktopDirectControlCommand::CaptureStart)?;
+        Ok(self
+            .runtime_mut()
+            .sink_mut()
+            .take_capture_start_sequence()
+            .expect("a successful capture-start direct command records its sequence"))
+    }
+
     fn resolve_channel(
         &self,
         track_id: &str,
@@ -1625,6 +1636,19 @@ impl DesktopPlaybackSession {
         command: TransportCommand,
     ) -> Result<(), DesktopDirectControlError> {
         self.controls.try_send_transport(command)
+    }
+
+    /// Queues one capture-specific transport start through the session's only
+    /// control owner.
+    ///
+    /// The returned sequence is acknowledged only through a successful output
+    /// cycle's recovery publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns queue, disconnection, or sequence-space exhaustion evidence.
+    pub fn try_start_capture_transport(&mut self) -> Result<u64, DesktopDirectControlError> {
+        self.controls.try_start_capture_transport()
     }
 
     /// Starts dry audition of one recording retained by the verified project.
@@ -3369,9 +3393,7 @@ mod tests {
                 muted: true,
             })
             .unwrap();
-        controls
-            .try_send_transport(TransportCommand::Start)
-            .unwrap();
+        assert_eq!(controls.try_start_capture_transport().unwrap(), 1);
         assert_eq!(controls.try_send_mixer_fence().unwrap(), Some(1));
         assert_eq!(controls.committed_mixer_fence(), 0);
         assert_eq!(controls.mapping_statuses().len(), 1);

@@ -26,6 +26,7 @@ pub struct PlaybackRecoverySnapshot {
     state: PlaybackRecoveryTransportState,
     position_frame: usize,
     committed_cycle_count: u64,
+    committed_capture_start_sequence: u64,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
     mixer_parameter_state: Option<MixerParameterStateSnapshot>,
@@ -44,6 +45,7 @@ impl PlaybackRecoverySnapshot {
             state,
             position_frame,
             committed_cycle_count: 0,
+            committed_capture_start_sequence: 0,
             loop_range: None,
             loop_enabled: false,
             mixer_parameter_state: None,
@@ -64,6 +66,13 @@ impl PlaybackRecoverySnapshot {
     #[must_use]
     pub const fn committed_cycle_count(&self) -> u64 {
         self.committed_cycle_count
+    }
+
+    /// Returns the greatest capture-start sequence acknowledged by this
+    /// session's successful output cycles.
+    #[must_use]
+    pub const fn committed_capture_start_sequence(&self) -> u64 {
+        self.committed_capture_start_sequence
     }
 
     #[must_use]
@@ -110,6 +119,7 @@ pub struct PlaybackCycleObservation {
     state: PlaybackRecoveryTransportState,
     position_frame: usize,
     committed_cycle_count: u64,
+    committed_capture_start_sequence: u64,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
     metronome_available: bool,
@@ -133,6 +143,13 @@ impl PlaybackCycleObservation {
     #[must_use]
     pub const fn committed_cycle_count(self) -> u64 {
         self.committed_cycle_count
+    }
+
+    /// Returns the greatest capture-start sequence acknowledged by this
+    /// session's successful output cycles.
+    #[must_use]
+    pub const fn committed_capture_start_sequence(self) -> u64 {
+        self.committed_capture_start_sequence
     }
 
     #[must_use]
@@ -627,6 +644,7 @@ struct PlaybackRecoveryState {
     sequence: AtomicU64,
     position_frame: AtomicUsize,
     transport_state: AtomicU8,
+    capture_start_sequence: AtomicU64,
     loop_observation: AtomicLoopObservation,
     metronome_observation: AtomicMetronomeObservation,
     scene_launch: AtomicSceneLaunchObservation,
@@ -665,6 +683,8 @@ impl PlaybackRecoveryCheckpoint {
             }
             let position_frame = self.inner.position_frame.load(Ordering::Relaxed);
             let state = decode_state(self.inner.transport_state.load(Ordering::Relaxed));
+            let committed_capture_start_sequence =
+                self.inner.capture_start_sequence.load(Ordering::Relaxed);
             let (loop_range, loop_enabled) = self.inner.loop_observation.load();
             let mixer_parameter_state = self.inner.mixer_parameters.load();
             let native_device_state = self.inner.native_device_state.load();
@@ -675,6 +695,7 @@ impl PlaybackRecoveryCheckpoint {
                     state,
                     position_frame,
                     committed_cycle_count: after / 2,
+                    committed_capture_start_sequence,
                     loop_range,
                     loop_enabled,
                     mixer_parameter_state,
@@ -697,6 +718,8 @@ impl PlaybackRecoveryCheckpoint {
             }
             let position_frame = self.inner.position_frame.load(Ordering::Relaxed);
             let state = decode_state(self.inner.transport_state.load(Ordering::Relaxed));
+            let committed_capture_start_sequence =
+                self.inner.capture_start_sequence.load(Ordering::Relaxed);
             let (loop_range, loop_enabled) = self.inner.loop_observation.load();
             let (metronome_available, metronome_enabled) = self.inner.metronome_observation.load();
             let (queued_scene_index, queued_scene_launch_frame, last_launched_scene_index) =
@@ -708,6 +731,7 @@ impl PlaybackRecoveryCheckpoint {
                     state,
                     position_frame,
                     committed_cycle_count: after / 2,
+                    committed_capture_start_sequence,
                     loop_range,
                     loop_enabled,
                     metronome_available,
@@ -743,6 +767,7 @@ pub struct PlaybackRecoveryPublisher {
 struct PlaybackCyclePublication {
     state: PlaybackRecoveryTransportState,
     position_frame: usize,
+    capture_start_sequence: u64,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
     metronome_available: bool,
@@ -778,6 +803,7 @@ impl PlaybackRecoveryPublisher {
                     TransportState::Rolling => PlaybackRecoveryTransportState::Rolling,
                 },
                 position_frame: cycle.position_frame(),
+                capture_start_sequence: cycle.capture_start_sequence(),
                 loop_range: cycle.loop_range(),
                 loop_enabled: cycle.loop_enabled(),
                 metronome_available: cycle.metronome_available(),
@@ -802,6 +828,7 @@ impl PlaybackRecoveryPublisher {
             PlaybackCyclePublication {
                 state,
                 position_frame,
+                capture_start_sequence: 0,
                 loop_range: None,
                 loop_enabled: false,
                 metronome_available: false,
@@ -829,6 +856,11 @@ impl PlaybackRecoveryPublisher {
         self.inner
             .transport_state
             .store(publication.state as u8, Ordering::Relaxed);
+        if publication.capture_start_sequence != 0 {
+            self.inner
+                .capture_start_sequence
+                .fetch_max(publication.capture_start_sequence, Ordering::Relaxed);
+        }
         self.inner
             .loop_observation
             .store(publication.loop_range, publication.loop_enabled);
@@ -948,6 +980,9 @@ pub fn playback_recovery_channel_with_initial_loop_metronome_and_native_device_s
                 snapshot.state as u8
             }),
         ),
+        // Capture-start acknowledgement sequences belong to this queue owner,
+        // so they must not survive a recovered playback session.
+        capture_start_sequence: AtomicU64::new(0),
         loop_observation: {
             let observation = AtomicLoopObservation::default();
             let (range, enabled) = snapshot
@@ -1098,6 +1133,7 @@ mod tests {
             active_slot_count: 0,
             scene_launch_state: hyper_playback_compiler::scene::SceneLaunchState::default(),
             applied_command_count: 0,
+            capture_start_sequence: 0,
             command_sender_disconnected: false,
             applied_mixer_parameter_command_count: 0,
             mixer_parameter_command_sender_disconnected: false,
@@ -1114,6 +1150,7 @@ mod tests {
                 state: PlaybackRecoveryTransportState::Stopped,
                 position_frame: 0,
                 committed_cycle_count: 0,
+                committed_capture_start_sequence: 0,
                 loop_range: None,
                 loop_enabled: false,
                 mixer_parameter_state: None,
@@ -1126,6 +1163,7 @@ mod tests {
                 state: PlaybackRecoveryTransportState::Stopped,
                 position_frame: 0,
                 committed_cycle_count: 0,
+                committed_capture_start_sequence: 0,
                 loop_range: None,
                 loop_enabled: false,
                 metronome_available: false,
@@ -1160,6 +1198,7 @@ mod tests {
                 state: PlaybackRecoveryTransportState::Rolling,
                 position_frame: 256,
                 committed_cycle_count: 1,
+                committed_capture_start_sequence: 0,
                 loop_range: None,
                 loop_enabled: false,
                 mixer_parameter_state: None,
@@ -1180,6 +1219,7 @@ mod tests {
                 state: PlaybackRecoveryTransportState::Stopped,
                 position_frame: 256,
                 committed_cycle_count: 2,
+                committed_capture_start_sequence: 0,
                 loop_range: None,
                 loop_enabled: false,
                 mixer_parameter_state: None,
@@ -1280,6 +1320,7 @@ mod tests {
                     PlaybackCyclePublication {
                         state,
                         position_frame: generation,
+                        capture_start_sequence: 0,
                         loop_range,
                         loop_enabled,
                         metronome_available: !generation.is_multiple_of(3),
@@ -1365,6 +1406,7 @@ mod tests {
             state: PlaybackRecoveryTransportState::Rolling,
             position_frame: 512,
             committed_cycle_count: 7,
+            committed_capture_start_sequence: 0,
             loop_range: Some(TransportLoopRange::new(128, 640).unwrap()),
             loop_enabled: true,
             mixer_parameter_state: Some(mixer),
@@ -1380,6 +1422,7 @@ mod tests {
                 state: PlaybackRecoveryTransportState::Rolling,
                 position_frame: 512,
                 committed_cycle_count: 7,
+                committed_capture_start_sequence: 0,
                 loop_range: Some(TransportLoopRange::new(128, 640).unwrap()),
                 loop_enabled: true,
                 mixer_parameter_state: Some(mixer),
@@ -1400,5 +1443,28 @@ mod tests {
         assert_eq!(snapshot.position_frame(), 0);
         assert_eq!(snapshot.committed_cycle_count(), 0);
         assert_eq!(snapshot.mixer_parameter_state(), Some(mixer));
+    }
+
+    #[test]
+    fn capture_start_acknowledgement_is_retained_only_by_its_session() {
+        let (mut publisher, checkpoint) = playback_recovery_channel(None, None);
+        let mut cycle = transport_cycle_for_test();
+        cycle.capture_start_sequence = 7;
+        publisher.publish_cycle(cycle, None);
+
+        let acknowledged = checkpoint.snapshot();
+        assert_eq!(acknowledged.committed_capture_start_sequence(), 7);
+        assert_eq!(
+            checkpoint
+                .observe_cycle()
+                .committed_capture_start_sequence(),
+            7
+        );
+
+        publisher.publish(PlaybackRecoveryTransportState::Stopped, 128, None);
+        assert_eq!(checkpoint.snapshot().committed_capture_start_sequence(), 7);
+
+        let (_reopened_publisher, reopened) = playback_recovery_channel(Some(&acknowledged), None);
+        assert_eq!(reopened.snapshot().committed_capture_start_sequence(), 0);
     }
 }

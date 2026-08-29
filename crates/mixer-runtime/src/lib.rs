@@ -1813,16 +1813,23 @@ pub fn loudness_command_channel() -> (LoudnessCommandSender, LoudnessCommandRece
     )
 }
 
+#[derive(Clone, Copy, Debug)]
+enum QueuedTransportCommand {
+    Transport(TransportCommand),
+    CaptureStart { sequence: u64 },
+}
+
 /// Application-thread half of the bounded transport command queue.
 #[derive(Debug)]
 pub struct TransportCommandSender {
-    producer: Producer<TransportCommand>,
+    producer: Producer<QueuedTransportCommand>,
     max_block_frames: usize,
     scene_count: usize,
     scene_ready_mask: u8,
     scene_disabled_mask: u8,
     scene_consolidation_mask: u8,
     metronome_available: bool,
+    next_capture_start_sequence: u64,
 }
 
 impl TransportCommandSender {
@@ -1838,6 +1845,37 @@ impl TransportCommandSender {
             fence(Ordering::Acquire);
         }
         disconnected
+    }
+
+    /// Allocates and enqueues one capture-specific start request without
+    /// waiting or allocating.
+    ///
+    /// The returned sequence is carried by the same FIFO entry as the start
+    /// command. A successful output cycle exposes it through
+    /// [`TransportCycle::capture_start_sequence`].
+    ///
+    /// Returns `Ok(None)` only after the nonzero sequence space is exhausted.
+    /// Queue rejection does not consume a sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a start-command rejection when the bounded queue is full or
+    /// the receiving transport has been destroyed.
+    pub fn try_send_capture_start(&mut self) -> Result<Option<u64>, TransportCommandSendError> {
+        let sequence = self.next_capture_start_sequence;
+        if sequence == 0 {
+            return Ok(None);
+        }
+        if self.is_disconnected() {
+            return Err(TransportCommandSendError::Disconnected(
+                TransportCommand::Start,
+            ));
+        }
+        self.producer
+            .push(QueuedTransportCommand::CaptureStart { sequence })
+            .map_err(|_| TransportCommandSendError::Full(TransportCommand::Start))?;
+        self.next_capture_start_sequence = sequence.checked_add(1).unwrap_or(0);
+        Ok(Some(sequence))
     }
 
     /// Returns the immutable number of validated scene targets in this command domain.
@@ -1919,9 +1957,9 @@ impl TransportCommandSender {
         if self.is_disconnected() {
             return Err(TransportCommandSendError::Disconnected(command));
         }
-        self.producer.push(command).map_err(|error| match error {
-            PushError::Full(command) => TransportCommandSendError::Full(command),
-        })
+        self.producer
+            .push(QueuedTransportCommand::Transport(command))
+            .map_err(|_| TransportCommandSendError::Full(command))
     }
 }
 
@@ -1946,6 +1984,7 @@ pub struct TransportCycle {
     active_slot_count: usize,
     scene_launch_state: SceneLaunchState,
     applied_command_count: usize,
+    capture_start_sequence: u64,
     command_sender_disconnected: bool,
     applied_mixer_parameter_command_count: usize,
     mixer_parameter_command_sender_disconnected: bool,
@@ -2021,6 +2060,13 @@ impl TransportCycle {
     /// Transport commands applied at the beginning of this successful cycle.
     pub const fn applied_command_count(self) -> usize {
         self.applied_command_count
+    }
+
+    /// The capture-start sequence committed by this successful cycle, or zero
+    /// when it did not accept a capture-specific start request.
+    #[must_use]
+    pub const fn capture_start_sequence(self) -> u64 {
+        self.capture_start_sequence
     }
 
     #[must_use]
@@ -4395,7 +4441,7 @@ pub struct RoutedTransportRuntime<R> {
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
     metronome: Option<Metronome>,
-    command_consumer: Option<Consumer<TransportCommand>>,
+    command_consumer: Option<Consumer<QueuedTransportCommand>>,
     mixer_parameter_command_consumer: Option<Consumer<MixerParameterCommand>>,
     native_device_command_consumer: Option<Consumer<NativeDeviceCommand>>,
     mixer_parameter_fence: Option<Arc<AtomicU64>>,
@@ -4413,6 +4459,12 @@ struct MixerParameterDrain {
     applied_command_count: usize,
     greatest_fence: u64,
     changes: MixerParameterChanges,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TransportCommandDrain {
+    applied_command_count: usize,
+    capture_start_sequence: u64,
 }
 
 #[derive(Debug)]
@@ -4463,6 +4515,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 scene_disabled_mask,
                 scene_consolidation_mask,
                 metronome_available: false,
+                next_capture_start_sequence: 1,
             },
             Self {
                 runtime,
@@ -4522,6 +4575,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 scene_disabled_mask,
                 scene_consolidation_mask,
                 metronome_available: false,
+                next_capture_start_sequence: 1,
             },
             MixerParameterCommandSender {
                 producer: parameter_producer,
@@ -4901,8 +4955,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         let committed_parameters = self.runtime.capture_parameter_state();
         let committed_native_devices = self.runtime.capture_native_device_state();
         let committed_renderer = self.runtime.renderer_checkpoint();
-        let applied_command_count = match self.drain_commands() {
-            Ok(count) => count,
+        let transport_command_drain = match self.drain_commands() {
+            Ok(drain) => drain,
             Err(source) => {
                 self.state = committed_state;
                 self.position_frame = committed_position;
@@ -4926,6 +4980,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 });
             }
         };
+        let applied_command_count = transport_command_drain.applied_command_count;
         let command_sender_disconnected = self.command_sender_disconnected();
         let mixer_parameter_drain = self.drain_mixer_parameter_commands();
         let applied_mixer_parameter_command_count = mixer_parameter_drain.applied_command_count;
@@ -4955,6 +5010,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                     active_slot_count: 0,
                     scene_launch_state: self.runtime.scene_launch_state(),
                     applied_command_count,
+                    capture_start_sequence: transport_command_drain.capture_start_sequence,
                     command_sender_disconnected,
                     applied_mixer_parameter_command_count,
                     mixer_parameter_command_sender_disconnected,
@@ -5003,6 +5059,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 active_slot_count: rendered.active_slot_count,
                 scene_launch_state: self.runtime.scene_launch_state(),
                 applied_command_count,
+                capture_start_sequence: transport_command_drain.capture_start_sequence,
                 command_sender_disconnected,
                 applied_mixer_parameter_command_count,
                 mixer_parameter_command_sender_disconnected,
@@ -5133,8 +5190,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         })
     }
 
-    fn drain_commands(&mut self) -> Result<usize, TransportCommandApplyError> {
-        let mut applied = 0;
+    fn drain_commands(&mut self) -> Result<TransportCommandDrain, TransportCommandApplyError> {
+        let mut drained = TransportCommandDrain::default();
         for _ in 0..MAX_QUEUED_TRANSPORT_COMMANDS {
             let command = self
                 .command_consumer
@@ -5143,10 +5200,16 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             let Some(command) = command else {
                 break;
             };
-            self.apply_command(command)?;
-            applied += 1;
+            match command {
+                QueuedTransportCommand::Transport(command) => self.apply_command(command)?,
+                QueuedTransportCommand::CaptureStart { sequence } => {
+                    self.apply_command(TransportCommand::Start)?;
+                    drained.capture_start_sequence = drained.capture_start_sequence.max(sequence);
+                }
+            }
+            drained.applied_command_count += 1;
         }
-        Ok(applied)
+        Ok(drained)
     }
 
     fn command_sender_disconnected(&self) -> bool {

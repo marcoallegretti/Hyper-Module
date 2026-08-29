@@ -10086,6 +10086,7 @@ struct TestPlaybackSession {
     commit_mixer_fences: bool,
     committed_mixer_fence: u64,
     next_mixer_fence: u64,
+    next_capture_start_sequence: u64,
     close_requires_discard: Option<bool>,
     extent: IdePlaybackExtent,
     arrangement_project_id: String,
@@ -10115,6 +10116,7 @@ impl Default for TestPlaybackSession {
             commit_mixer_fences: false,
             committed_mixer_fence: 0,
             next_mixer_fence: 1,
+            next_capture_start_sequence: 1,
             close_requires_discard: Some(false),
             extent: IdePlaybackExtent::Bounded { end_frame: 0 },
             arrangement_project_id: String::new(),
@@ -10181,6 +10183,22 @@ impl RunningDesktopIdeApplication {
                     session.committed_mixer_fence = session.committed_mixer_fence.max(sequence);
                 }
                 Ok(Some(sequence))
+            }
+        }
+    }
+
+    fn try_start_capture_transport(&mut self) -> Result<u64, DesktopDirectControlError> {
+        match &mut self.session {
+            IdePlaybackSessionOwner::Native(session) => session.try_start_capture_transport(),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => {
+                let sequence = session.next_capture_start_sequence;
+                if sequence == 0 {
+                    return Err(DesktopDirectControlError::CaptureStartSequenceExhausted);
+                }
+                session.commands.push(TransportCommand::Start);
+                session.next_capture_start_sequence = sequence.checked_add(1).unwrap_or(0);
+                Ok(sequence)
             }
         }
     }

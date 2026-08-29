@@ -18,9 +18,9 @@ use hyper_mixer_runtime::{
     MixerParameterStateRestoreError, MixerParameterTargetError, NativeDeviceCommand,
     NativeDeviceCommandSendError, NativeDeviceResolveError, NativeDeviceTargetError,
     OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
-    PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, RuntimeCreationError,
-    RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig, SceneLaunchState,
-    StereoSamplePeakBallistics, TransportCommand, TransportCommandApplyError,
+    PlaybackRecoveryTransportState, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
+    RuntimeCreationError, RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig,
+    SceneLaunchState, StereoSamplePeakBallistics, TransportCommand, TransportCommandApplyError,
     TransportCommandSendError, TransportCycle, TransportLoopRange, TransportLoopRangeError,
     TransportOutputCreationError, TransportOutputProcessor, TransportState,
     interactive_mixer_parameter_channel, interactive_scene_launch_channel,
@@ -3017,6 +3017,85 @@ fn queued_transport_commands_preserve_fifo_order_across_threads() {
     assert!(left[0] > 0.0);
     assert!(right[0] > 0.0);
     sender.try_send(TransportCommand::Stop).unwrap();
+}
+
+#[test]
+fn capture_start_sequence_respects_backpressure_and_disconnection() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
+
+    assert_eq!(sender.try_send_capture_start().unwrap(), Some(1));
+    for _ in 1..sender.capacity() {
+        sender.try_send(TransportCommand::Stop).unwrap();
+    }
+    assert_eq!(
+        sender.try_send_capture_start(),
+        Err(TransportCommandSendError::Full(TransportCommand::Start))
+    );
+
+    let mut left = [0.0_f32; 1];
+    let mut right = [0.0_f32; 1];
+    process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(sender.try_send_capture_start().unwrap(), Some(2));
+
+    drop(transport);
+    assert_eq!(
+        sender.try_send_capture_start(),
+        Err(TransportCommandSendError::Disconnected(
+            TransportCommand::Start
+        ))
+    );
+}
+
+#[test]
+fn capture_start_acknowledgement_requires_a_successful_cycle_and_survives_stop() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 1).unwrap();
+    let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
+    let (mut recovery_publisher, recovery) = playback_recovery_channel(None, None);
+
+    assert_eq!(sender.try_send_capture_start().unwrap(), Some(1));
+    let mut incomplete = [];
+    let mut left = [0.0_f32; 1];
+    let mut right = [0.0_f32; 1];
+    assert!(
+        transport
+            .process_cycle(
+                &mut incomplete,
+                StereoOutput {
+                    left: &mut left,
+                    right: &mut right,
+                },
+            )
+            .is_err()
+    );
+    assert_eq!(transport.state(), TransportState::Stopped);
+    assert_eq!(recovery.snapshot().committed_capture_start_sequence(), 0);
+
+    let stopped_before_start = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(stopped_before_start.state(), TransportState::Stopped);
+    assert_eq!(stopped_before_start.capture_start_sequence(), 0);
+    recovery_publisher.publish_cycle(stopped_before_start, None);
+    assert_eq!(recovery.snapshot().committed_capture_start_sequence(), 0);
+
+    assert_eq!(sender.try_send_capture_start().unwrap(), Some(2));
+    let started = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(started.state(), TransportState::Rolling);
+    assert_eq!(started.capture_start_sequence(), 2);
+    recovery_publisher.publish_cycle(started, None);
+    assert_eq!(recovery.snapshot().committed_capture_start_sequence(), 2);
+
+    sender.try_send(TransportCommand::Stop).unwrap();
+    let stopped_after_start = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(stopped_after_start.state(), TransportState::Stopped);
+    assert_eq!(stopped_after_start.capture_start_sequence(), 0);
+    recovery_publisher.publish_cycle(stopped_after_start, None);
+    let recovered = recovery.snapshot();
+    assert_eq!(recovered.state(), PlaybackRecoveryTransportState::Stopped);
+    assert_eq!(recovered.committed_capture_start_sequence(), 2);
 }
 
 fn assert_channel_solo_capabilities(

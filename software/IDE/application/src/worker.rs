@@ -3815,15 +3815,11 @@ enum ScenePerformanceCapturePhase {
 
 fn capture_stopped_after_start(
     state: PlaybackRecoveryTransportState,
-    committed_cycle_count: u64,
-    capture_start_committed_cycle_count: u64,
-    has_observed_rolling: bool,
+    committed_capture_start_sequence: u64,
+    capture_start_sequence: u64,
 ) -> bool {
-    // The recovery checkpoint advances for every output-owner accepted
-    // callback. It remains evidence of a completed start boundary even if the
-    // control thread polls after a brief rolling interval has ended.
     state == PlaybackRecoveryTransportState::Stopped
-        && (has_observed_rolling || committed_cycle_count > capture_start_committed_cycle_count)
+        && committed_capture_start_sequence >= capture_start_sequence
 }
 
 /// Single-owner, lossless scene-performance capture state.
@@ -3838,8 +3834,7 @@ struct ScenePerformanceCapture {
     launches: Vec<CapturedScenePerformanceLaunch>,
     maximum_launch_count: usize,
     last_sequence: Option<u64>,
-    capture_start_committed_cycle_count: u64,
-    has_observed_rolling: bool,
+    capture_start_sequence: u64,
     phase: ScenePerformanceCapturePhase,
 }
 
@@ -3847,15 +3842,14 @@ impl ScenePerformanceCapture {
     const fn new(
         scenes: Vec<CapturedScenePerformanceScene>,
         maximum_launch_count: usize,
-        capture_start_committed_cycle_count: u64,
+        capture_start_sequence: u64,
     ) -> Self {
         Self {
             scenes,
             launches: Vec::new(),
             maximum_launch_count,
             last_sequence: None,
-            capture_start_committed_cycle_count,
-            has_observed_rolling: false,
+            capture_start_sequence,
             phase: ScenePerformanceCapturePhase::Capturing,
         }
     }
@@ -3907,20 +3901,15 @@ impl ScenePerformanceCapture {
         }
     }
 
-    fn observe_transport_state(&mut self, state: PlaybackRecoveryTransportState) {
-        self.has_observed_rolling |= state == PlaybackRecoveryTransportState::Rolling;
-    }
-
     fn stopped_after_start(
         &self,
         state: PlaybackRecoveryTransportState,
-        committed_cycle_count: u64,
+        committed_capture_start_sequence: u64,
     ) -> bool {
         capture_stopped_after_start(
             state,
-            committed_cycle_count,
-            self.capture_start_committed_cycle_count,
-            self.has_observed_rolling,
+            committed_capture_start_sequence,
+            self.capture_start_sequence,
         )
     }
 
@@ -4007,8 +3996,7 @@ struct MixerAutomationCapture {
     timeline: FrameTimeline,
     points: Vec<AutomationPoint>,
     maximum_point_count: usize,
-    capture_start_committed_cycle_count: u64,
-    has_observed_rolling: bool,
+    capture_start_sequence: u64,
     phase: MixerAutomationCapturePhase,
 }
 
@@ -4019,7 +4007,7 @@ impl MixerAutomationCapture {
         target: AutomationTarget,
         timeline: FrameTimeline,
         maximum_point_count: usize,
-        capture_start_committed_cycle_count: u64,
+        capture_start_sequence: u64,
     ) -> Self {
         Self {
             name,
@@ -4029,8 +4017,7 @@ impl MixerAutomationCapture {
             timeline,
             points: Vec::new(),
             maximum_point_count,
-            capture_start_committed_cycle_count,
-            has_observed_rolling: false,
+            capture_start_sequence,
             phase: MixerAutomationCapturePhase::Capturing,
         }
     }
@@ -4082,20 +4069,15 @@ impl MixerAutomationCapture {
         }
     }
 
-    fn observe_transport_state(&mut self, state: PlaybackRecoveryTransportState) {
-        self.has_observed_rolling |= state == PlaybackRecoveryTransportState::Rolling;
-    }
-
     fn stopped_after_start(
         &self,
         state: PlaybackRecoveryTransportState,
-        committed_cycle_count: u64,
+        committed_capture_start_sequence: u64,
     ) -> bool {
         capture_stopped_after_start(
             state,
-            committed_cycle_count,
-            self.capture_start_committed_cycle_count,
-            self.has_observed_rolling,
+            committed_capture_start_sequence,
+            self.capture_start_sequence,
         )
     }
 
@@ -4123,7 +4105,6 @@ impl MixerAutomationCapture {
         if loop_enabled {
             return Err(IdeMixerAutomationCaptureError::LoopEnabledDuringCapture);
         }
-        self.has_observed_rolling |= transport_rolling;
         // A control command may have been committed after the fresh queue
         // drain but before the requested start reaches the callback. Its
         // callback-state bit keeps that pre-capture change out of the take.
@@ -6947,22 +6928,21 @@ fn start_scene_performance_capture(
             IdeScenePerformanceCaptureError::EventSourceDisconnected,
         );
     }
-    if let Err(source) = application.try_send_transport(TransportCommand::Start) {
-        return publish_scene_performance_capture_failure(
-            events,
-            IdeScenePerformanceCaptureError::Transport(source),
-        );
-    }
+    let capture_start_sequence = match application.try_start_capture_transport() {
+        Ok(sequence) => sequence,
+        Err(source) => {
+            return publish_scene_performance_capture_failure(
+                events,
+                IdeScenePerformanceCaptureError::Transport(source),
+            );
+        }
+    };
     let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty) else {
         unreachable!("running state was checked before scene-performance capture transfer");
     };
     *state = WorkerState::ScenePerformanceCapture {
         application,
-        capture: ScenePerformanceCapture::new(
-            scenes,
-            maximum_launch_count,
-            recovery.committed_cycle_count(),
-        ),
+        capture: ScenePerformanceCapture::new(scenes, maximum_launch_count, capture_start_sequence),
     };
     send_event(
         events,
@@ -7084,7 +7064,6 @@ fn poll_scene_performance_capture(
             );
         }
     };
-    capture.observe_transport_state(recovery.state());
     let mut observation_failure = None;
     let drain = application.drain_interactive_scene_launches(|observation| {
         if observation_failure.is_none() {
@@ -7120,7 +7099,10 @@ fn poll_scene_performance_capture(
     }
 
     if capture.is_capturing()
-        && capture.stopped_after_start(recovery.state(), recovery.committed_cycle_count())
+        && capture.stopped_after_start(
+            recovery.state(),
+            recovery.committed_capture_start_sequence(),
+        )
     {
         // An external control binding may have stopped transport directly. The
         // stopped recovery snapshot was read before this drain, and the native
@@ -7201,7 +7183,6 @@ struct PreparedMixerAutomationCaptureStart {
     resolved_target: AutomationTarget,
     timeline: FrameTimeline,
     maximum_point_count: usize,
-    capture_start_committed_cycle_count: u64,
 }
 
 fn prepare_mixer_automation_capture_start(
@@ -7249,7 +7230,6 @@ fn prepare_mixer_automation_capture_start(
         resolved_target,
         timeline,
         maximum_point_count,
-        capture_start_committed_cycle_count: recovery.committed_cycle_count(),
     })
 }
 
@@ -7301,12 +7281,15 @@ fn start_mixer_automation_capture(
             IdeMixerAutomationCaptureError::EventSourceDisconnected,
         );
     }
-    if let Err(source) = application.try_send_transport(TransportCommand::Start) {
-        return publish_mixer_automation_capture_failure(
-            events,
-            IdeMixerAutomationCaptureError::Transport(source),
-        );
-    }
+    let capture_start_sequence = match application.try_start_capture_transport() {
+        Ok(sequence) => sequence,
+        Err(source) => {
+            return publish_mixer_automation_capture_failure(
+                events,
+                IdeMixerAutomationCaptureError::Transport(source),
+            );
+        }
+    };
     let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty) else {
         unreachable!("running state was checked before mixer-automation capture transfer");
     };
@@ -7316,7 +7299,7 @@ fn start_mixer_automation_capture(
         prepared.resolved_target,
         prepared.timeline,
         prepared.maximum_point_count,
-        prepared.capture_start_committed_cycle_count,
+        capture_start_sequence,
     );
     *state = WorkerState::MixerAutomationCapture {
         application,
@@ -7445,7 +7428,6 @@ fn poll_mixer_automation_capture(
             );
         }
     };
-    capture.observe_transport_state(recovery.state());
     let mut observation_failure = None;
     let drain = application.drain_interactive_mixer_parameter_changes(|observation| {
         if observation_failure.is_none() {
@@ -7476,7 +7458,10 @@ fn poll_mixer_automation_capture(
     }
 
     if capture.is_capturing()
-        && capture.stopped_after_start(recovery.state(), recovery.committed_cycle_count())
+        && capture.stopped_after_start(
+            recovery.state(),
+            recovery.committed_capture_start_sequence(),
+        )
     {
         // The mixer publisher runs before recovery publication. Draining after
         // this stopped snapshot therefore includes every rolling change before
@@ -18244,13 +18229,14 @@ mod tests {
     }
 
     #[test]
-    fn scene_performance_capture_accepts_a_stopped_endpoint_after_start_evidence() {
-        let mut capture = ScenePerformanceCapture::new(vec![capture_scene("grid", true)], 1, 8);
+    fn scene_performance_capture_requires_its_start_acknowledgement() {
+        let capture = ScenePerformanceCapture::new(vec![capture_scene("grid", true)], 1, 8);
 
-        assert!(!capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 8));
-        assert!(capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 9));
-        capture.observe_transport_state(PlaybackRecoveryTransportState::Rolling);
+        assert!(!capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 0));
+        assert!(!capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 7));
         assert!(capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 8));
+        assert!(capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 9));
+        assert!(!capture.stopped_after_start(PlaybackRecoveryTransportState::Rolling, 9));
     }
 
     fn mixer_automation_capture(
@@ -18271,12 +18257,12 @@ mod tests {
             )
             .unwrap(),
             maximum_point_count,
-            0,
+            1,
         )
     }
 
     #[test]
-    fn mixer_automation_capture_accepts_a_stopped_endpoint_after_start_evidence() {
+    fn mixer_automation_capture_requires_its_start_acknowledgement() {
         let target = AutomationTarget::Main {
             parameter: AutomationMainParameter::Gain,
         };
@@ -18301,7 +18287,7 @@ mod tests {
                 AutomationValue::Boolean(true),
             )
             .unwrap();
-        assert!(capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 0));
+        assert!(!capture.stopped_after_start(PlaybackRecoveryTransportState::Stopped, 0));
     }
 
     #[test]

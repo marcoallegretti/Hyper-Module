@@ -84,6 +84,7 @@ pub enum DesktopDirectControlCommand {
     Mixer(MixerParameterCommand),
     NativeDevice(NativeDeviceCommand),
     Transport(TransportCommand),
+    CaptureStart,
 }
 
 #[derive(Debug, PartialEq)]
@@ -92,6 +93,7 @@ pub enum DesktopDirectControlError {
     NativeDevice(NativeDeviceCommandSendError),
     NativeDeviceUnavailable,
     Transport(TransportCommandSendError),
+    CaptureStartSequenceExhausted,
 }
 
 impl fmt::Display for DesktopDirectControlError {
@@ -103,6 +105,9 @@ impl fmt::Display for DesktopDirectControlError {
                 formatter.write_str("native device control is unavailable for this session")
             }
             Self::Transport(source) => source.fmt(formatter),
+            Self::CaptureStartSequenceExhausted => {
+                formatter.write_str("capture-start sequence space is exhausted")
+            }
         }
     }
 }
@@ -112,7 +117,7 @@ impl Error for DesktopDirectControlError {
         match self {
             Self::Mixer(source) => Some(source),
             Self::NativeDevice(source) => Some(source),
-            Self::NativeDeviceUnavailable => None,
+            Self::NativeDeviceUnavailable | Self::CaptureStartSequenceExhausted => None,
             Self::Transport(source) => Some(source),
         }
     }
@@ -160,6 +165,7 @@ pub struct DesktopControlSink {
     mixer: MixerParameterCommandSender,
     native_devices: Option<NativeDeviceCommandSender>,
     recovery: PlaybackRecoveryCheckpoint,
+    pending_capture_start_sequence: Option<u64>,
 }
 
 impl DesktopControlSink {
@@ -174,6 +180,7 @@ impl DesktopControlSink {
             mixer,
             native_devices: None,
             recovery,
+            pending_capture_start_sequence: None,
         }
     }
 
@@ -189,6 +196,7 @@ impl DesktopControlSink {
             mixer,
             native_devices: Some(native_devices),
             recovery,
+            pending_capture_start_sequence: None,
         }
     }
 
@@ -234,6 +242,10 @@ impl DesktopControlSink {
         self.mixer
             .try_send_fence()
             .map_err(DesktopDirectControlError::Mixer)
+    }
+
+    pub(crate) fn take_capture_start_sequence(&mut self) -> Option<u64> {
+        self.pending_capture_start_sequence.take()
     }
 
     fn direct_mixer_update(
@@ -610,6 +622,15 @@ impl RuntimeControlSink for DesktopControlSink {
                     .try_send(command)
                     .map_err(DesktopDirectControlError::NativeDevice)?;
                 Ok(DirectControlStateUpdate::Unchanged)
+            }
+            DesktopDirectControlCommand::CaptureStart => {
+                let sequence = self
+                    .transport
+                    .try_send_capture_start()
+                    .map_err(DesktopDirectControlError::Transport)?
+                    .ok_or(DesktopDirectControlError::CaptureStartSequenceExhausted)?;
+                self.pending_capture_start_sequence = Some(sequence);
+                Ok(DirectControlStateUpdate::Transport { rolling: true })
             }
             DesktopDirectControlCommand::Transport(command) => {
                 self.transport
