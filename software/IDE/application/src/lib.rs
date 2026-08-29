@@ -67,9 +67,10 @@ pub use hyper_mixer_runtime::{
     LoudnessDisplayUnit as IdeLoudnessDisplayUnit,
     LoudnessPresentationSnapshot as IdeLoudnessPresentationSnapshot,
     LoudnessScaleRegion as IdeLoudnessScaleRegion,
-    MaximumTruePeakDisplay as IdeMaximumTruePeakDisplay, MetronomeGain, PlaybackCycleObservation,
-    PlaybackRecoveryTransportState, ScaledLoudnessValue as IdeScaledLoudnessValue,
-    SceneLaunchState as IdeSceneLaunchState,
+    MaximumTruePeakDisplay as IdeMaximumTruePeakDisplay, MetronomeGain,
+    MixerStripSamplePeakBallisticsSnapshot as IdeMixerStripPeakBallisticsSnapshot,
+    PlaybackCycleObservation, PlaybackRecoveryTransportState,
+    ScaledLoudnessValue as IdeScaledLoudnessValue, SceneLaunchState as IdeSceneLaunchState,
     StereoSamplePeakBallisticsSnapshot as IdeOutputPeakBallisticsSnapshot, TransportCommand,
     TransportLoopRange, TransportLoopRangeError,
 };
@@ -77,8 +78,8 @@ use hyper_mixer_runtime::{
     InteractiveMixerParameterDrain, InteractiveMixerParameterObservation,
     InteractiveSceneLaunchDrain, InteractiveSceneLaunchObservation, LatestOutputMeterSnapshot,
     LoudnessCommandSendError, MixerParameterCommand, MixerParameterResolveError,
-    OutputMeterReceiver, PlaybackRecoverySnapshot, SamplePeakBallisticsConfig,
-    SamplePeakBallisticsConfigError, StereoSamplePeakBallistics,
+    MixerStripSamplePeakBallistics, OutputMeterReceiver, PlaybackRecoverySnapshot,
+    SamplePeakBallisticsConfig, SamplePeakBallisticsConfigError, StereoSamplePeakBallistics,
 };
 #[cfg(test)]
 use hyper_mixer_runtime::{
@@ -1076,13 +1077,14 @@ impl IdeApplicationConfig {
 
 /// One running-session read of the final output meter.
 ///
-/// The raw snapshot remains available for existing loudness and strip-meter
-/// consumers, while the ballistic snapshot is only for the final-output
-/// sample-peak display.
+/// The raw snapshot remains available for loudness consumers. Separate
+/// display snapshots provide bounded final-output and post-fader strip
+/// sample-peak presentation without changing audio-engine state.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IdeOutputMeterObservation {
     latest: LatestOutputMeterSnapshot,
     sample_peak_ballistics: Option<IdeOutputPeakBallisticsSnapshot>,
+    mixer_strip_ballistics: Option<IdeMixerStripPeakBallisticsSnapshot>,
     peak_hold_available: bool,
 }
 
@@ -1092,6 +1094,7 @@ impl IdeOutputMeterObservation {
         Self {
             latest: LatestOutputMeterSnapshot::empty(),
             sample_peak_ballistics: None,
+            mixer_strip_ballistics: None,
             peak_hold_available: false,
         }
     }
@@ -1106,6 +1109,15 @@ impl IdeOutputMeterObservation {
         self.sample_peak_ballistics
     }
 
+    /// Returns newly delivered decaying post-fader strip sample-peak values.
+    ///
+    /// The values are absent until a raw meter snapshot arrives and do not
+    /// become durable project or audio-engine state.
+    #[must_use]
+    pub const fn mixer_strip_ballistics(self) -> Option<IdeMixerStripPeakBallisticsSnapshot> {
+        self.mixer_strip_ballistics
+    }
+
     #[must_use]
     pub const fn peak_hold_available(self) -> bool {
         self.peak_hold_available
@@ -1115,6 +1127,7 @@ impl IdeOutputMeterObservation {
 #[derive(Debug)]
 struct IdeOutputMeterObserver {
     ballistics: StereoSamplePeakBallistics,
+    strip_ballistics: MixerStripSamplePeakBallistics,
     latest: Option<IdeOutputPeakBallisticsSnapshot>,
     peak_hold_available: bool,
 }
@@ -1123,19 +1136,22 @@ impl IdeOutputMeterObserver {
     const fn new(config: SamplePeakBallisticsConfig) -> Self {
         Self {
             ballistics: StereoSamplePeakBallistics::new(config),
+            strip_ballistics: MixerStripSamplePeakBallistics::new(config),
             latest: None,
             peak_hold_available: false,
         }
     }
 
     fn observe(&mut self, receiver: &mut OutputMeterReceiver) -> IdeOutputMeterObservation {
-        let read = receiver.read_ballistics(&mut self.ballistics);
+        let read =
+            receiver.read_ballistics_with_strips(&mut self.ballistics, &mut self.strip_ballistics);
         let latest = read.latest();
         if latest.sender_disconnected() {
             self.reset();
             return IdeOutputMeterObservation {
                 latest,
                 sample_peak_ballistics: None,
+                mixer_strip_ballistics: None,
                 peak_hold_available: false,
             };
         }
@@ -1146,12 +1162,14 @@ impl IdeOutputMeterObserver {
         IdeOutputMeterObservation {
             latest,
             sample_peak_ballistics: self.latest,
+            mixer_strip_ballistics: read.strip_ballistics(),
             peak_hold_available: self.peak_hold_available,
         }
     }
 
     fn reset(&mut self) {
         self.ballistics.reset();
+        self.strip_ballistics.reset();
         self.latest = None;
         self.peak_hold_available = false;
     }
@@ -1162,6 +1180,7 @@ impl IdeOutputMeterObserver {
         IdeOutputMeterObservation {
             latest: LatestOutputMeterSnapshot::empty(),
             sample_peak_ballistics: self.latest,
+            mixer_strip_ballistics: None,
             peak_hold_available: false,
         }
     }
@@ -22935,7 +22954,23 @@ mod tests {
 
         let initial = observer.observe(&mut receiver);
         let initial_snapshot = initial.sample_peak_ballistics().unwrap();
+        let initial_strips = initial
+            .mixer_strip_ballistics()
+            .expect("a delivered raw snapshot must produce strip ballistics");
         assert!(initial.peak_hold_available());
+        assert_eq!(
+            initial_strips.processed_frame_end(),
+            initial.latest().snapshot().unwrap().processed_frame_end()
+        );
+        assert_eq!(
+            initial_strips.slot_count(),
+            initial
+                .latest()
+                .snapshot()
+                .unwrap()
+                .strip_meters()
+                .slot_count()
+        );
         assert_eq!(
             initial_snapshot.left().held_peak_dbfs().to_bits(),
             0.0_f32.to_bits()
@@ -22945,6 +22980,7 @@ mod tests {
         let reset = observer.reset_peak_hold();
         assert!(!reset.peak_hold_available());
         assert!(reset.latest().snapshot().is_none());
+        assert!(reset.mixer_strip_ballistics().is_none());
 
         publisher
             .try_publish(output_meter_snapshot_for_test(48, 0.25, 0.125))
@@ -22959,6 +22995,7 @@ mod tests {
         let terminal = observer.observe(&mut receiver);
         assert!(terminal.latest().sender_disconnected());
         assert!(terminal.sample_peak_ballistics().is_none());
+        assert!(terminal.mixer_strip_ballistics().is_none());
         assert!(!terminal.peak_hold_available());
     }
 

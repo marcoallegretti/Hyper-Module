@@ -50,8 +50,10 @@ pub use loudness_presentation::{
     LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay, ScaledLoudnessValue,
 };
 pub use meter_ballistics::{
-    ChannelSamplePeakBallistics, SamplePeakBallisticsConfig, SamplePeakBallisticsConfigError,
-    StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot,
+    ChannelSamplePeakBallistics, ChannelSamplePeakDisplay, MixerStripSamplePeakBallistics,
+    MixerStripSamplePeakBallisticsSnapshot, SamplePeakBallisticsConfig,
+    SamplePeakBallisticsConfigError, StereoSamplePeakBallistics,
+    StereoSamplePeakBallisticsSnapshot, StereoSamplePeakDisplay,
 };
 pub use metronome::{
     MetronomeGain, MetronomeGainError, MetronomePlan, MetronomePlanError, MetronomeProcessError,
@@ -2549,17 +2551,45 @@ impl OutputMeterReceiver {
         &mut self,
         ballistics: &mut StereoSamplePeakBallistics,
     ) -> OutputMeterBallisticsRead {
+        self.read_ballistics_with(ballistics, None)
+    }
+
+    /// Drains every available snapshot through persistent final-output and
+    /// post-fader strip sample-peak display state.
+    ///
+    /// This has the same FIFO, coalescing, and dropped-snapshot behavior as
+    /// [`Self::read_ballistics`]. It is explicit because a consumer that does
+    /// not present mixer strips should not allocate or update strip state.
+    #[must_use]
+    pub fn read_ballistics_with_strips(
+        &mut self,
+        ballistics: &mut StereoSamplePeakBallistics,
+        strip_ballistics: &mut MixerStripSamplePeakBallistics,
+    ) -> OutputMeterBallisticsRead {
+        self.read_ballistics_with(ballistics, Some(strip_ballistics))
+    }
+
+    fn read_ballistics_with(
+        &mut self,
+        ballistics: &mut StereoSamplePeakBallistics,
+        mut strip_ballistics: Option<&mut MixerStripSamplePeakBallistics>,
+    ) -> OutputMeterBallisticsRead {
         let mut latest_ballistics = None;
+        let mut latest_strip_ballistics = None;
         let mut ballistics_reset = false;
         let channel_id = self.channel_id;
         let latest = self.drain_with(|snapshot| {
             let update = ballistics.update(channel_id, &snapshot);
             ballistics_reset |= update.ballistics_reset();
             latest_ballistics = Some(update.snapshot());
+            if let Some(strip_ballistics) = strip_ballistics.as_deref_mut() {
+                latest_strip_ballistics = Some(strip_ballistics.update(channel_id, &snapshot));
+            }
         });
         OutputMeterBallisticsRead {
             latest,
             ballistics: latest_ballistics,
+            strip_ballistics: latest_strip_ballistics,
             ballistics_reset,
         }
     }
@@ -2602,6 +2632,7 @@ impl OutputMeterReceiver {
 pub struct OutputMeterBallisticsRead {
     latest: LatestOutputMeterSnapshot,
     ballistics: Option<StereoSamplePeakBallisticsSnapshot>,
+    strip_ballistics: Option<MixerStripSamplePeakBallisticsSnapshot>,
     ballistics_reset: bool,
 }
 
@@ -2614,6 +2645,14 @@ impl OutputMeterBallisticsRead {
     #[must_use]
     pub const fn ballistics(self) -> Option<StereoSamplePeakBallisticsSnapshot> {
         self.ballistics
+    }
+
+    /// Returns the newest bounded per-strip sample-peak display values from
+    /// this drain when a raw snapshot was delivered through
+    /// [`OutputMeterReceiver::read_ballistics_with_strips`].
+    #[must_use]
+    pub const fn strip_ballistics(self) -> Option<MixerStripSamplePeakBallisticsSnapshot> {
+        self.strip_ballistics
     }
 
     /// True when reused state observed a different meter channel or a

@@ -8587,17 +8587,16 @@ fn reset_output_peak_hold_presentation(ui: &MainWindow) {
 }
 
 fn apply_mixer_strip_meter_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
-    let meter = observation.meter();
+    let meter = observation.output_meter_observation();
     let channels = ui.get_mixer_channels();
-    let Some(snapshot) = meter.snapshot() else {
+    let Some(strip_meters) = meter.mixer_strip_ballistics() else {
         clear_mixer_strip_meter_observation(&channels);
         return;
     };
-    if meter.sender_disconnected() {
+    if meter.latest().sender_disconnected() {
         clear_mixer_strip_meter_observation(&channels);
         return;
     }
-    let strip_meters = snapshot.strip_meters();
     let layout_matches = channels.row_count() == strip_meters.slot_count()
         && (0..strip_meters.slot_count()).all(|slot| {
             channels.row_data(slot).is_some_and(|row| {
@@ -8617,9 +8616,12 @@ fn apply_mixer_strip_meter_observation(ui: &MainWindow, observation: &IdeRunning
             clear_mixer_strip_meter_observation(&channels);
             return;
         };
-        let (left_level, left_reading) = mixer_strip_meter_presentation(strip.left_sample_peak());
+        let left = strip.left();
+        let right = strip.right();
+        let (left_level, left_reading) =
+            mixer_strip_meter_presentation(left.measurement_available(), left.level_dbfs());
         let (right_level, right_reading) =
-            mixer_strip_meter_presentation(strip.right_sample_peak());
+            mixer_strip_meter_presentation(right.measurement_available(), right.level_dbfs());
         row.meter_left_level = left_level;
         row.meter_right_level = right_level;
         row.meter_left_reading = left_reading.into();
@@ -14153,15 +14155,10 @@ fn output_peak_hold_presentation(peak_hold_available: bool, dbfs: f32) -> (Strin
     (reading, dbfs >= 0.0)
 }
 
-fn mixer_strip_meter_presentation(sample_peak: Option<f32>) -> (f32, String) {
-    let Some(sample_peak) = sample_peak.filter(|value| value.is_finite() && *value >= 0.0) else {
+fn mixer_strip_meter_presentation(measurement_available: bool, dbfs: f32) -> (f32, String) {
+    if !measurement_available || !dbfs.is_finite() {
         return (0.0, "—".to_owned());
-    };
-    let dbfs = if sample_peak == 0.0 {
-        MIXER_STRIP_METER_FLOOR_DBFS
-    } else {
-        (20.0 * sample_peak.log10()).max(MIXER_STRIP_METER_FLOOR_DBFS)
-    };
+    }
     let reading = if dbfs <= MIXER_STRIP_METER_FLOOR_DBFS {
         format!("≤ {MIXER_STRIP_METER_FLOOR_DBFS:.0}")
     } else {
@@ -17129,26 +17126,29 @@ mod tests {
     }
 
     #[test]
-    fn mixer_strip_meter_presentation_is_explicitly_sample_peak_only() {
-        assert_eq!(mixer_strip_meter_presentation(None), (0.0, "—".to_owned()));
+    fn mixer_strip_meter_presentation_preserves_decaying_sample_peak_values() {
         assert_eq!(
-            mixer_strip_meter_presentation(Some(f32::NAN)),
+            mixer_strip_meter_presentation(false, 0.0),
             (0.0, "—".to_owned())
         );
         assert_eq!(
-            mixer_strip_meter_presentation(Some(-0.1)),
+            mixer_strip_meter_presentation(true, f32::NAN),
             (0.0, "—".to_owned())
         );
         assert_eq!(
-            mixer_strip_meter_presentation(Some(0.0)),
+            mixer_strip_meter_presentation(true, -30.0),
+            (0.5, "-30.0".to_owned())
+        );
+        assert_eq!(
+            mixer_strip_meter_presentation(true, MIXER_STRIP_METER_FLOOR_DBFS),
             (0.0, "≤ -60".to_owned())
         );
         assert_eq!(
-            mixer_strip_meter_presentation(Some(1.0)),
+            mixer_strip_meter_presentation(true, 0.0),
             (1.0, "0.0".to_owned())
         );
         assert_eq!(
-            mixer_strip_meter_presentation(Some(2.0)),
+            mixer_strip_meter_presentation(true, 6.0),
             (1.0, "6.0".to_owned())
         );
     }

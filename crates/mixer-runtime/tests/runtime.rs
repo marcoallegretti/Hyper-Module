@@ -16,16 +16,17 @@ use hyper_mixer_runtime::{
     MAX_QUEUED_TRANSPORT_COMMANDS, MetronomeGain, MetronomePlan, MixerChannelHandle,
     MixerParameterCommand, MixerParameterCommandSendError, MixerParameterCommandSender,
     MixerParameterResolveError, MixerParameterStateRestoreError, MixerParameterTargetError,
-    NativeDeviceCommand, NativeDeviceCommandSendError, NativeDeviceResolveError,
-    NativeDeviceTargetError, OutputMeterPublication, OutputMeterReceiver, OutputMeterSender,
-    OutputMeterSnapshot, PlaybackRecoveryTransportState, PreparedPlaybackMainRuntime,
-    PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError,
-    RuntimeProjectComponent, SamplePeakBallisticsConfig, SceneLaunchState,
-    StereoSamplePeakBallistics, TransportCommand, TransportCommandApplyError,
-    TransportCommandSendError, TransportCycle, TransportLoopRange, TransportLoopRangeError,
-    TransportOutputCreationError, TransportOutputProcessor, TransportState,
-    interactive_mixer_parameter_channel, interactive_scene_launch_channel,
-    loudness_command_channel, output_meter_channel, playback_recovery_channel,
+    MixerStripSamplePeakBallistics, MixerStripSamplePeakBallisticsSnapshot, NativeDeviceCommand,
+    NativeDeviceCommandSendError, NativeDeviceResolveError, NativeDeviceTargetError,
+    OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
+    PlaybackRecoveryTransportState, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
+    RuntimeCreationError, RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig,
+    SceneLaunchState, StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot,
+    TransportCommand, TransportCommandApplyError, TransportCommandSendError, TransportCycle,
+    TransportLoopRange, TransportLoopRangeError, TransportOutputCreationError,
+    TransportOutputProcessor, TransportState, interactive_mixer_parameter_channel,
+    interactive_scene_launch_channel, loudness_command_channel, output_meter_channel,
+    playback_recovery_channel,
 };
 use hyper_native_device::{
     DeviceChain, NativeCompressorState, NativeDeviceInstance, NativeDeviceState, NativeFilterMode,
@@ -1015,15 +1016,7 @@ fn assert_meter_delivery_and_backpressure(
     mut meter_receiver: OutputMeterReceiver,
     first_snapshot: &OutputMeterSnapshot,
 ) {
-    let first_read = meter_receiver.read_latest();
-    assert_eq!(first_read.snapshot().as_ref(), Some(first_snapshot));
-    assert_eq!(first_read.coalesced_snapshot_count(), 0);
-    assert_eq!(first_read.dropped_snapshot_count(), 0);
-    assert!(!first_read.sender_disconnected());
-    assert_eq!(
-        first_snapshot.processed_frame_end(),
-        u64::try_from(first_snapshot.meter().frame_count()).unwrap()
-    );
+    assert_initial_meter_delivery(&mut meter_receiver, first_snapshot);
 
     for _ in 0..MAX_QUEUED_OUTPUT_METER_SNAPSHOTS {
         let report = transport
@@ -1035,10 +1028,11 @@ fn assert_meter_delivery_and_backpressure(
         .process_interleaved_cycle(callback, scratch, interleaved, meter_sender)
         .unwrap();
     assert_eq!(full.publication(), OutputMeterPublication::QueueFull);
-    let mut ballistics = StereoSamplePeakBallistics::new(
-        SamplePeakBallisticsConfig::try_new(48_000, -90.0, 13.3, 0).unwrap(),
-    );
-    let ballistic_read = meter_receiver.read_ballistics(&mut ballistics);
+    let ballistic_policy = SamplePeakBallisticsConfig::try_new(48_000, -90.0, 13.3, 0).unwrap();
+    let mut ballistics = StereoSamplePeakBallistics::new(ballistic_policy);
+    let mut strip_ballistics = MixerStripSamplePeakBallistics::new(ballistic_policy);
+    let ballistic_read =
+        meter_receiver.read_ballistics_with_strips(&mut ballistics, &mut strip_ballistics);
     let latest = ballistic_read.latest();
     assert!(latest.snapshot().is_some());
     assert_eq!(
@@ -1048,9 +1042,13 @@ fn assert_meter_delivery_and_backpressure(
     assert_eq!(latest.dropped_snapshot_count(), 0);
     assert!(!latest.sender_disconnected());
     assert!(!ballistic_read.ballistics_reset());
-    assert_eq!(
-        ballistic_read.ballistics().unwrap().processed_frame_end(),
-        latest.snapshot().unwrap().processed_frame_end()
+    let strip_snapshot = ballistic_read
+        .strip_ballistics()
+        .expect("a delivered raw snapshot must update strip ballistics");
+    assert_ballistics_match_raw_snapshot(
+        latest.snapshot().as_ref().unwrap(),
+        ballistic_read.ballistics().unwrap(),
+        &strip_snapshot,
     );
     let loudness = latest
         .snapshot()
@@ -1095,16 +1093,18 @@ fn assert_meter_delivery_and_backpressure(
             .processed_frame_end()
             .saturating_add(frame_count)
     );
-    let recovery_ballistics = meter_receiver.read_ballistics(&mut ballistics);
+    let recovery_ballistics =
+        meter_receiver.read_ballistics_with_strips(&mut ballistics, &mut strip_ballistics);
     let recovery_read = recovery_ballistics.latest();
     assert_eq!(recovery_read.snapshot(), Some(recovered.snapshot()));
     assert_eq!(recovery_read.dropped_snapshot_count(), 1);
-    assert_eq!(
-        recovery_ballistics
-            .ballistics()
-            .unwrap()
-            .processed_frame_end(),
-        recovered.snapshot().processed_frame_end()
+    let recovered_strip_snapshot = recovery_ballistics
+        .strip_ballistics()
+        .expect("a recovered raw snapshot must update strip ballistics");
+    assert_ballistics_match_raw_snapshot(
+        &recovered.snapshot(),
+        recovery_ballistics.ballistics().unwrap(),
+        &recovered_strip_snapshot,
     );
     assert!(!recovery_ballistics.ballistics_reset());
 
@@ -1116,6 +1116,34 @@ fn assert_meter_delivery_and_backpressure(
         meter_sender,
         &mut meter_receiver,
     );
+}
+
+fn assert_initial_meter_delivery(
+    meter_receiver: &mut OutputMeterReceiver,
+    first_snapshot: &OutputMeterSnapshot,
+) {
+    let first_read = meter_receiver.read_latest();
+    assert_eq!(first_read.snapshot().as_ref(), Some(first_snapshot));
+    assert_eq!(first_read.coalesced_snapshot_count(), 0);
+    assert_eq!(first_read.dropped_snapshot_count(), 0);
+    assert!(!first_read.sender_disconnected());
+    assert_eq!(
+        first_snapshot.processed_frame_end(),
+        u64::try_from(first_snapshot.meter().frame_count()).unwrap()
+    );
+}
+
+fn assert_ballistics_match_raw_snapshot(
+    raw: &OutputMeterSnapshot,
+    final_output: StereoSamplePeakBallisticsSnapshot,
+    strips: &MixerStripSamplePeakBallisticsSnapshot,
+) {
+    assert_eq!(
+        final_output.processed_frame_end(),
+        raw.processed_frame_end()
+    );
+    assert_eq!(strips.processed_frame_end(), raw.processed_frame_end());
+    assert_eq!(strips.slot_count(), raw.strip_meters().slot_count());
 }
 
 fn assert_terminal_meter_drop_delivery(

@@ -25,14 +25,15 @@ use hyper_desktop_audio::{
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
-    ChannelSamplePeakBallistics, EbuLoudnessPresentationConfig, LocateState,
-    LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay, MetronomeGain,
-    MixerChannelHandle, MixerParameterCommand, MixerParameterStateSnapshot, MixerSendHandle,
-    MixerStripMeterSnapshot, NativeDeviceCommand, NativeDeviceHandle, NativeDeviceStateSnapshot,
-    OutputMeterReceiver, PlaybackCycleObservation, PlaybackRecoveryCheckpoint,
-    PlaybackRecoverySnapshot, PlaybackRecoveryTransportState, SamplePeakBallisticsConfig,
-    ScaledLoudnessValue, StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot,
-    TransportCommand, TransportLoopRange,
+    ChannelSamplePeakBallistics, ChannelSamplePeakDisplay, EbuLoudnessPresentationConfig,
+    LocateState, LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay,
+    MetronomeGain, MixerChannelHandle, MixerParameterCommand, MixerParameterStateSnapshot,
+    MixerSendHandle, MixerStripSamplePeakBallistics, MixerStripSamplePeakBallisticsSnapshot,
+    NativeDeviceCommand, NativeDeviceHandle, NativeDeviceStateSnapshot, OutputMeterReceiver,
+    PlaybackCycleObservation, PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
+    PlaybackRecoveryTransportState, SamplePeakBallisticsConfig, ScaledLoudnessValue,
+    StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot, TransportCommand,
+    TransportLoopRange,
 };
 use hyper_native_device::{
     NativeCompressorState, NativeDeviceState, NativeFilterMode, NativeFilterState,
@@ -254,7 +255,8 @@ struct OperatorMeterObserver {
     ballistics: StereoSamplePeakBallistics,
     latest: Option<StereoSamplePeakBallisticsSnapshot>,
     latest_loudness: Option<LoudnessPresentationSnapshot>,
-    latest_strip_meters: Option<MixerStripMeterSnapshot>,
+    strip_ballistics: MixerStripSamplePeakBallistics,
+    latest_strip_ballistics: Option<MixerStripSamplePeakBallisticsSnapshot>,
     peak_hold_available: bool,
     coalesced_snapshot_count: u64,
     dropped_snapshot_count: u64,
@@ -266,9 +268,10 @@ impl OperatorMeterObserver {
         Self {
             receiver,
             ballistics: StereoSamplePeakBallistics::new(config),
+            strip_ballistics: MixerStripSamplePeakBallistics::new(config),
             latest: None,
             latest_loudness: None,
-            latest_strip_meters: None,
+            latest_strip_ballistics: None,
             peak_hold_available: false,
             coalesced_snapshot_count: 0,
             dropped_snapshot_count: 0,
@@ -277,7 +280,9 @@ impl OperatorMeterObserver {
     }
 
     fn observe(&mut self) -> OperatorMeterObservation {
-        let read = self.receiver.read_ballistics(&mut self.ballistics);
+        let read = self
+            .receiver
+            .read_ballistics_with_strips(&mut self.ballistics, &mut self.strip_ballistics);
         let latest = read.latest();
         self.coalesced_snapshot_count = self
             .coalesced_snapshot_count
@@ -289,7 +294,9 @@ impl OperatorMeterObserver {
         if let Some(snapshot) = latest.snapshot() {
             self.latest_loudness =
                 Some(snapshot.present_loudness(EbuLoudnessPresentationConfig::default()));
-            self.latest_strip_meters = Some(snapshot.strip_meters());
+        }
+        if let Some(snapshot) = read.strip_ballistics() {
+            self.latest_strip_ballistics = Some(snapshot);
         }
         if let Some(snapshot) = read.ballistics() {
             self.latest = Some(snapshot);
@@ -304,7 +311,7 @@ impl OperatorMeterObserver {
                 self.sender_disconnected,
                 self.latest_loudness,
             ),
-            strip_meters: self.latest_strip_meters,
+            strip_meters: self.latest_strip_ballistics,
         }
     }
 
@@ -3816,7 +3823,7 @@ struct OperatorMeterPresentation {
 #[derive(Debug)]
 struct OperatorMeterObservation {
     presentation: OperatorMeterPresentation,
-    strip_meters: Option<MixerStripMeterSnapshot>,
+    strip_meters: Option<MixerStripSamplePeakBallisticsSnapshot>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -4003,18 +4010,8 @@ fn operator_meter_level_presentation(measurement_available: bool, dbfs: f32) -> 
     (level, reading)
 }
 
-fn operator_strip_meter_presentation(sample_peak: Option<f32>) -> (f32, String) {
-    let Some(sample_peak) =
-        sample_peak.filter(|sample_peak| sample_peak.is_finite() && *sample_peak >= 0.0)
-    else {
-        return (0.0, "— dBFS".to_owned());
-    };
-    let dbfs = if sample_peak == 0.0 {
-        OUTPUT_METER_FLOOR_DBFS
-    } else {
-        (20.0 * sample_peak.log10()).max(OUTPUT_METER_FLOOR_DBFS)
-    };
-    operator_meter_level_presentation(true, dbfs)
+fn operator_strip_meter_presentation(channel: ChannelSamplePeakDisplay) -> (f32, String) {
+    operator_meter_level_presentation(channel.measurement_available(), channel.level_dbfs())
 }
 
 fn operator_peak_hold_presentation(measurement_available: bool, dbfs: f32) -> (String, bool) {
@@ -4164,7 +4161,7 @@ fn apply_operator_meter_observation(
 
 fn apply_operator_strip_meter_observation(
     ui: &OperatorWindow,
-    strip_meters: Option<MixerStripMeterSnapshot>,
+    strip_meters: Option<MixerStripSamplePeakBallisticsSnapshot>,
     terminal_latched: bool,
 ) {
     let model = ui.get_mixer_channels();
@@ -4191,10 +4188,8 @@ fn apply_operator_strip_meter_observation(
             clear_operator_strip_meter_observation(&model);
             return;
         };
-        let (left_level, left_reading) =
-            operator_strip_meter_presentation(strip.left_sample_peak());
-        let (right_level, right_reading) =
-            operator_strip_meter_presentation(strip.right_sample_peak());
+        let (left_level, left_reading) = operator_strip_meter_presentation(strip.left());
+        let (right_level, right_reading) = operator_strip_meter_presentation(strip.right());
         row.meter_left_level = left_level;
         row.meter_right_level = right_level;
         row.meter_left_reading = left_reading.into();
@@ -6673,15 +6668,18 @@ mod tests {
             &loudness_authority,
             false,
         );
-        let strip_meters = launched.snapshot().strip_meters();
+        let strip_meters = meter_observer
+            .borrow()
+            .latest_strip_ballistics
+            .expect("the delivered meter snapshot must produce strip ballistics");
         assert_eq!(generated_mixer.row_count(), strip_meters.slot_count());
         for slot in 0..strip_meters.slot_count() {
             let strip = strip_meters.slot(slot).unwrap();
             let row = generated_mixer.row_data(slot).unwrap();
             let (expected_left_level, expected_left_reading) =
-                operator_strip_meter_presentation(strip.left_sample_peak());
+                operator_strip_meter_presentation(strip.left());
             let (expected_right_level, expected_right_reading) =
-                operator_strip_meter_presentation(strip.right_sample_peak());
+                operator_strip_meter_presentation(strip.right());
             assert_eq!(row.index, i32::try_from(slot).unwrap());
             assert_operator_float(row.meter_left_level, expected_left_level);
             assert_operator_float(row.meter_right_level, expected_right_level);
@@ -6774,6 +6772,26 @@ mod tests {
             ui.get_output_meter_telemetry().as_str(),
             "meter frame 960 · 0 coalesced · 0 dropped"
         );
+        let decayed_strip_meters = meter_observer
+            .borrow()
+            .latest_strip_ballistics
+            .expect("the next delivered meter snapshot must update strip ballistics");
+        assert_eq!(
+            generated_mixer.row_count(),
+            decayed_strip_meters.slot_count()
+        );
+        for slot in 0..decayed_strip_meters.slot_count() {
+            let strip = decayed_strip_meters.slot(slot).unwrap();
+            let row = generated_mixer.row_data(slot).unwrap();
+            let (expected_left_level, expected_left_reading) =
+                operator_strip_meter_presentation(strip.left());
+            let (expected_right_level, expected_right_reading) =
+                operator_strip_meter_presentation(strip.right());
+            assert_operator_float(row.meter_left_level, expected_left_level);
+            assert_operator_float(row.meter_right_level, expected_right_level);
+            assert_eq!(row.meter_left_reading.as_str(), expected_left_reading);
+            assert_eq!(row.meter_right_reading.as_str(), expected_right_reading);
+        }
 
         ui.invoke_reset_output_peak_requested();
         assert_eq!(ui.get_left_output_reading(), live_left_before_reset);
@@ -8390,26 +8408,6 @@ mod tests {
             (1.0, "3.0 dBFS".to_owned())
         );
         assert_eq!(
-            operator_strip_meter_presentation(None),
-            (0.0, "— dBFS".to_owned())
-        );
-        assert_eq!(
-            operator_strip_meter_presentation(Some(f32::NAN)),
-            (0.0, "— dBFS".to_owned())
-        );
-        assert_eq!(
-            operator_strip_meter_presentation(Some(-0.1)),
-            (0.0, "— dBFS".to_owned())
-        );
-        assert_eq!(
-            operator_strip_meter_presentation(Some(0.0)),
-            (0.0, "≤ -90.0 dBFS".to_owned())
-        );
-        assert_eq!(
-            operator_strip_meter_presentation(Some(1.0)),
-            (1.0, "0.0 dBFS".to_owned())
-        );
-        assert_eq!(
             operator_peak_hold_presentation(false, 3.0),
             ("hold —".to_owned(), false)
         );
@@ -8445,7 +8443,7 @@ mod tests {
         assert_eq!(observer.dropped_snapshot_count, 11);
         assert!(observer.sender_disconnected);
         assert!(observer.latest.is_none());
-        assert!(observer.latest_strip_meters.is_none());
+        assert!(observer.latest_strip_ballistics.is_none());
 
         let unavailable =
             operator_meter_presentation(None, false, u64::MAX, u64::MAX - 1, true, None);

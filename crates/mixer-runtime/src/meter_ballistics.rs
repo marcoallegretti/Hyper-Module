@@ -1,7 +1,7 @@
 use core::error::Error;
 use core::fmt;
 
-use super::OutputMeterSnapshot;
+use super::{MAX_MAIN_MIXER_SLOTS, OutputMeterSnapshot};
 
 /// Explicit policy for persistent sample-peak display behavior.
 ///
@@ -175,6 +175,64 @@ impl ChannelSamplePeakBallistics {
     }
 }
 
+/// Current display value for one decaying sample-peak channel.
+///
+/// Unlike [`ChannelSamplePeakBallistics`], this value intentionally carries no
+/// held maximum. It is used where the product exposes only the live display
+/// level, such as a main-mixer strip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChannelSamplePeakDisplay {
+    level_dbfs: f32,
+    measurement_available: bool,
+}
+
+impl ChannelSamplePeakDisplay {
+    #[must_use]
+    pub const fn level_dbfs(self) -> f32 {
+        self.level_dbfs
+    }
+
+    #[must_use]
+    pub const fn measurement_available(self) -> bool {
+        self.measurement_available
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DisplayChannelState {
+    level_dbfs: f32,
+}
+
+impl DisplayChannelState {
+    const fn at_floor(floor_dbfs: f32) -> Self {
+        Self {
+            level_dbfs: floor_dbfs,
+        }
+    }
+
+    fn update(
+        &mut self,
+        sample_peak: Option<f32>,
+        previous_frame_end: u64,
+        frame_end: u64,
+        config: SamplePeakBallisticsConfig,
+    ) -> ChannelSamplePeakDisplay {
+        let level_after_falloff = fall(
+            self.level_dbfs,
+            frame_end.saturating_sub(previous_frame_end),
+            config,
+        );
+        let measured_dbfs = sample_peak.map(|peak| sample_peak_dbfs(peak, config.floor_dbfs));
+        self.level_dbfs = measured_dbfs.map_or(level_after_falloff, |measured| {
+            measured.max(level_after_falloff)
+        });
+        ChannelSamplePeakDisplay {
+            level_dbfs: self.level_dbfs,
+            measurement_available: measured_dbfs.is_some(),
+        }
+    }
+}
+
 /// Persistent stereo sample-peak values after one output snapshot.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StereoSamplePeakBallisticsSnapshot {
@@ -196,6 +254,37 @@ impl StereoSamplePeakBallisticsSnapshot {
 
     #[must_use]
     pub const fn right(self) -> ChannelSamplePeakBallistics {
+        self.right
+    }
+}
+
+/// Current stereo display values for a decaying sample-peak meter without a
+/// held maximum.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StereoSamplePeakDisplay {
+    left: ChannelSamplePeakDisplay,
+    right: ChannelSamplePeakDisplay,
+}
+
+impl StereoSamplePeakDisplay {
+    const fn at_floor(floor_dbfs: f32) -> Self {
+        let channel = ChannelSamplePeakDisplay {
+            level_dbfs: floor_dbfs,
+            measurement_available: false,
+        };
+        Self {
+            left: channel,
+            right: channel,
+        }
+    }
+
+    #[must_use]
+    pub const fn left(self) -> ChannelSamplePeakDisplay {
+        self.left
+    }
+
+    #[must_use]
+    pub const fn right(self) -> ChannelSamplePeakDisplay {
         self.right
     }
 }
@@ -309,6 +398,137 @@ impl StereoSamplePeakBallistics {
     }
 }
 
+/// Persistent post-fader sample-peak display values for the fixed compiled
+/// main-mixer layout.
+///
+/// This is consumer-side display state. It derives only from published raw
+/// strip sample peaks and the successful output-frame clock; it does not alter
+/// callback processing or the mixer signal path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MixerStripSamplePeakBallisticsSnapshot {
+    processed_frame_end: u64,
+    slot_count: usize,
+    strips: [StereoSamplePeakDisplay; MAX_MAIN_MIXER_SLOTS],
+}
+
+impl MixerStripSamplePeakBallisticsSnapshot {
+    /// Returns the successful output frame at which these values were
+    /// calculated.
+    #[must_use]
+    pub const fn processed_frame_end(self) -> u64 {
+        self.processed_frame_end
+    }
+
+    /// Returns the number of compiled main-mixer strips represented here.
+    #[must_use]
+    pub const fn slot_count(self) -> usize {
+        self.slot_count
+    }
+
+    /// Returns one strip's stereo values only when it belongs to this compiled
+    /// meter layout.
+    #[must_use]
+    pub const fn slot(self, slot: usize) -> Option<StereoSamplePeakDisplay> {
+        if slot < self.slot_count && slot < MAX_MAIN_MIXER_SLOTS {
+            Some(self.strips[slot])
+        } else {
+            None
+        }
+    }
+}
+
+/// Frame-time display state for bounded post-fader mixer-strip sample peaks.
+///
+/// The state resets across an output-meter channel change, a regressed frame
+/// clock, or a changed compiled slot count so a former strip cannot contribute
+/// visual history to a different current strip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MixerStripSamplePeakBallistics {
+    config: SamplePeakBallisticsConfig,
+    channel_id: Option<u64>,
+    last_frame_end: Option<u64>,
+    slot_count: usize,
+    strips: [[DisplayChannelState; 2]; MAX_MAIN_MIXER_SLOTS],
+}
+
+impl MixerStripSamplePeakBallistics {
+    /// Creates display state for the fixed main-mixer slot bound.
+    #[must_use]
+    pub const fn new(config: SamplePeakBallisticsConfig) -> Self {
+        Self {
+            config,
+            channel_id: None,
+            last_frame_end: None,
+            slot_count: 0,
+            strips: [[DisplayChannelState::at_floor(config.floor_dbfs); 2]; MAX_MAIN_MIXER_SLOTS],
+        }
+    }
+
+    /// Clears accumulated display and frame-clock state.
+    pub const fn reset(&mut self) {
+        self.channel_id = None;
+        self.clear_display();
+    }
+
+    const fn clear_display(&mut self) {
+        self.last_frame_end = None;
+        self.slot_count = 0;
+        self.strips =
+            [[DisplayChannelState::at_floor(self.config.floor_dbfs); 2]; MAX_MAIN_MIXER_SLOTS];
+    }
+
+    #[must_use]
+    pub(crate) fn update(
+        &mut self,
+        channel_id: u64,
+        snapshot: &OutputMeterSnapshot,
+    ) -> MixerStripSamplePeakBallisticsSnapshot {
+        let frame_end = snapshot.processed_frame_end();
+        let raw = snapshot.strip_meters();
+        let slot_count = raw.slot_count();
+        debug_assert!(slot_count <= MAX_MAIN_MIXER_SLOTS);
+        let channel_changed = self
+            .channel_id
+            .is_some_and(|previous| channel_id != previous);
+        let frame_clock_regressed = self
+            .last_frame_end
+            .is_some_and(|previous| !channel_changed && frame_end < previous);
+        if channel_changed || frame_clock_regressed || slot_count != self.slot_count {
+            self.clear_display();
+        }
+        self.channel_id = Some(channel_id);
+        let previous_frame_end = self.last_frame_end.unwrap_or(frame_end);
+        let mut strips =
+            [StereoSamplePeakDisplay::at_floor(self.config.floor_dbfs); MAX_MAIN_MIXER_SLOTS];
+        for (slot, display_strip) in strips.iter_mut().enumerate().take(slot_count) {
+            let Some(raw_strip) = raw.slot(slot) else {
+                continue;
+            };
+            let [left_state, right_state] = &mut self.strips[slot];
+            let left = left_state.update(
+                raw_strip.left_sample_peak(),
+                previous_frame_end,
+                frame_end,
+                self.config,
+            );
+            let right = right_state.update(
+                raw_strip.right_sample_peak(),
+                previous_frame_end,
+                frame_end,
+                self.config,
+            );
+            *display_strip = StereoSamplePeakDisplay { left, right };
+        }
+        self.last_frame_end = Some(frame_end);
+        self.slot_count = slot_count;
+        MixerStripSamplePeakBallisticsSnapshot {
+            processed_frame_end: frame_end,
+            slot_count,
+            strips,
+        }
+    }
+}
+
 fn sample_peak_dbfs(sample_peak: f32, floor_dbfs: f32) -> f32 {
     if sample_peak <= 0.0 {
         floor_dbfs
@@ -342,7 +562,10 @@ mod tests {
     use hyper_audio_engine::InterleavedStereoCallback;
 
     use super::*;
-    use crate::{MixerStripMeterSnapshot, SceneLaunchState, TransportCycle, TransportState};
+    use crate::{
+        MAX_MAIN_MIXER_SLOTS, MixerStripMeterSnapshot, MixerStripSamplePeak, SceneLaunchState,
+        TransportCycle, TransportState,
+    };
 
     const EPSILON: f32 = 1.0e-5;
 
@@ -391,6 +614,26 @@ mod tests {
             applied_loudness_command_count: 0,
             loudness_command_sender_disconnected: false,
         }
+    }
+
+    fn snapshot_with_strip_peaks(
+        processed_frame_end: u64,
+        peaks: &[(Option<f32>, Option<f32>)],
+    ) -> OutputMeterSnapshot {
+        assert!(peaks.len() <= MAX_MAIN_MIXER_SLOTS);
+        let mut snapshot = snapshot(processed_frame_end, 10, 0.0, 0.0);
+        let mut strips = [MixerStripSamplePeak::SILENCE; MAX_MAIN_MIXER_SLOTS];
+        for (slot, (left_sample_peak, right_sample_peak)) in peaks.iter().copied().enumerate() {
+            strips[slot] = MixerStripSamplePeak {
+                left_sample_peak,
+                right_sample_peak,
+            };
+        }
+        snapshot.strip_meters = MixerStripMeterSnapshot {
+            slot_count: peaks.len(),
+            strips,
+        };
+        snapshot
     }
 
     fn config(falloff_db_per_second: f32, peak_hold_frames: u64) -> SamplePeakBallisticsConfig {
@@ -512,6 +755,72 @@ mod tests {
     }
 
     #[test]
+    fn strip_ballistics_follow_frame_time_and_never_cross_a_changed_layout() {
+        let mut ballistics = MixerStripSamplePeakBallistics::new(config(20.0, 0));
+        let initial = ballistics.update(
+            1,
+            &snapshot_with_strip_peaks(10, &[(Some(1.0), Some(0.1)), (Some(0.1), Some(0.01))]),
+        );
+        assert_eq!(initial.processed_frame_end(), 10);
+        assert_eq!(initial.slot_count(), 2);
+        assert_near(initial.slot(0).unwrap().left().level_dbfs(), 0.0);
+        assert_near(initial.slot(0).unwrap().right().level_dbfs(), -20.0);
+        assert_near(initial.slot(1).unwrap().left().level_dbfs(), -20.0);
+        assert_near(initial.slot(1).unwrap().right().level_dbfs(), -40.0);
+
+        let decayed = ballistics.update(
+            1,
+            &snapshot_with_strip_peaks(60, &[(Some(0.0), Some(0.0)), (Some(0.0), None)]),
+        );
+        assert_near(decayed.slot(0).unwrap().left().level_dbfs(), -10.0);
+        assert_near(decayed.slot(0).unwrap().right().level_dbfs(), -30.0);
+        assert_near(decayed.slot(1).unwrap().left().level_dbfs(), -30.0);
+        assert!(!decayed.slot(1).unwrap().right().measurement_available());
+
+        let changed_layout = ballistics.update(
+            1,
+            &snapshot_with_strip_peaks(70, &[(Some(0.1), Some(0.01))]),
+        );
+        assert_eq!(changed_layout.slot_count(), 1);
+        assert_near(changed_layout.slot(0).unwrap().left().level_dbfs(), -20.0);
+        assert_near(changed_layout.slot(0).unwrap().right().level_dbfs(), -40.0);
+        assert_eq!(changed_layout.slot(1), None);
+    }
+
+    #[test]
+    fn strip_ballistics_reset_when_a_new_meter_channel_reuses_the_display() {
+        let mut ballistics = MixerStripSamplePeakBallistics::new(config(20.0, 0));
+        let _ = ballistics.update(1, &snapshot_with_strip_peaks(10, &[(Some(1.0), Some(1.0))]));
+
+        let reset = ballistics.update(
+            2,
+            &snapshot_with_strip_peaks(1_000, &[(Some(0.1), Some(0.01))]),
+        );
+
+        assert_eq!(reset.processed_frame_end(), 1_000);
+        assert_near(reset.slot(0).unwrap().left().level_dbfs(), -20.0);
+        assert_near(reset.slot(0).unwrap().right().level_dbfs(), -40.0);
+    }
+
+    #[test]
+    fn strip_ballistics_reset_when_the_frame_clock_regresses() {
+        let mut ballistics = MixerStripSamplePeakBallistics::new(config(20.0, 0));
+        let _ = ballistics.update(
+            1,
+            &snapshot_with_strip_peaks(100, &[(Some(1.0), Some(1.0))]),
+        );
+
+        let reset = ballistics.update(
+            1,
+            &snapshot_with_strip_peaks(10, &[(Some(0.1), Some(0.01))]),
+        );
+
+        assert_eq!(reset.processed_frame_end(), 10);
+        assert_near(reset.slot(0).unwrap().left().level_dbfs(), -20.0);
+        assert_near(reset.slot(0).unwrap().right().level_dbfs(), -40.0);
+    }
+
+    #[test]
     fn receiver_channel_identity_resets_reused_ballistics() {
         let mut ballistics = StereoSamplePeakBallistics::new(config(20.0, 50));
         let (mut first_sender, mut first_receiver) = crate::output_meter_channel();
@@ -519,6 +828,7 @@ mod tests {
         let first = first_receiver.read_ballistics(&mut ballistics);
         assert!(!first.ballistics_reset());
         assert_near(first.ballistics().unwrap().left().level_dbfs(), 0.0);
+        assert!(first.strip_ballistics().is_none());
 
         let (mut second_sender, mut second_receiver) = crate::output_meter_channel();
         second_sender
@@ -528,5 +838,6 @@ mod tests {
 
         assert!(second.ballistics_reset());
         assert_near(second.ballistics().unwrap().left().level_dbfs(), -20.0);
+        assert!(second.strip_ballistics().is_none());
     }
 }
