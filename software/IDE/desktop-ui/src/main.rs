@@ -13,12 +13,12 @@ use hyper_desktop_ide::{
     AUDIO_IMPORT_FILE_FILTER_LABEL, AutomationChannelParameter, AutomationInterpolation,
     AutomationMainParameter, AutomationPoint, AutomationSendParameter, AutomationTarget,
     AutomationValue, ControlScope, ControlSource, ControlTarget, ControlTransform,
-    DesktopAudioPreviewState, DesktopIdeWorker, Edge, IdeApplicationConfig, IdeAudioClip,
-    IdeAudioClipWaveform, IdeAudioInputInventory, IdeAudioOutputInventory,
-    IdeAudioPreviewControlCommand, IdeAutomationTakeRequest, IdeAutomationTarget,
-    IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
-    IdeControlMappingEdit, IdeInputMeterObservation, IdeInputSelection, IdeLoopRangeFrames,
-    IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
+    DesktopAudioPreviewState, DesktopIdeWorker, Edge, IDE_AUDIO_CLIP_WAVEFORM_BINS,
+    IdeApplicationConfig, IdeAudioClip, IdeAudioClipWaveform, IdeAudioInputInventory,
+    IdeAudioOutputInventory, IdeAudioPreviewControlCommand, IdeAutomationTakeRequest,
+    IdeAutomationTarget, IdeControlBindingRequest, IdeControlChannelParameter,
+    IdeControlMainParameter, IdeControlMappingEdit, IdeInputMeterObservation, IdeInputSelection,
+    IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
     IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
     IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerChannelKind,
     IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice,
@@ -4527,6 +4527,7 @@ fn bind_audio_clip_callback(
     bind_audio_clip_source_slip_callback(ui, worker, project_state);
     bind_audio_clip_source_trim_callback(ui, worker, project_state);
     bind_audio_clip_waveform_callback(ui, worker, project_state);
+    bind_audio_clip_waveform_selection_callbacks(ui, project_state);
     bind_audio_clip_preview_callback(ui, worker, project_state);
 
     bind_arrangement_placement_addition_callback(ui, worker, project_state);
@@ -4603,6 +4604,298 @@ fn bind_audio_clip_waveform_callback(
                 clip_id: owned_clip_id,
             },
         );
+    });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WaveformTrimSelection {
+    source_start_frame: usize,
+    source_frame_count: usize,
+    start_percent: f32,
+    width_percent: f32,
+    displayed_bin_count: usize,
+    selected_bin_count: usize,
+}
+
+#[derive(Debug)]
+struct WaveformTrimSourceView {
+    clip_id: String,
+    clip_name: String,
+    source_start_frame: usize,
+    source_frame_count: usize,
+    bin_count: usize,
+}
+
+fn waveform_trim_selection(
+    source_start_frame: usize,
+    source_frame_count: usize,
+    bin_count: usize,
+    first_fraction: f32,
+    second_fraction: f32,
+) -> Option<WaveformTrimSelection> {
+    if source_frame_count == 0
+        || bin_count == 0
+        || bin_count > source_frame_count
+        || bin_count > IDE_AUDIO_CLIP_WAVEFORM_BINS
+        || !first_fraction.is_finite()
+        || !second_fraction.is_finite()
+        || !(0.0..=1.0).contains(&first_fraction)
+        || !(0.0..=1.0).contains(&second_fraction)
+    {
+        return None;
+    }
+    source_start_frame.checked_add(source_frame_count)?;
+    let fraction_denominator = f32::from(u16::try_from(bin_count).ok()?);
+    let bin_at = |fraction: f32| -> Option<usize> {
+        let mut selected_bin = 0;
+        for candidate_bin in 1..bin_count {
+            let candidate_threshold =
+                f32::from(u16::try_from(candidate_bin).ok()?) / fraction_denominator;
+            if fraction < candidate_threshold {
+                break;
+            }
+            selected_bin = candidate_bin;
+        }
+        Some(selected_bin)
+    };
+    let first_bin = bin_at(first_fraction)?;
+    let second_bin = bin_at(second_fraction)?;
+    let selected_first_bin = first_bin.min(second_bin);
+    let selected_last_bin = first_bin.max(second_bin);
+    let selected_end_bin = selected_last_bin.checked_add(1)?;
+    let relative_start = selected_first_bin.checked_mul(source_frame_count)? / bin_count;
+    let relative_end = selected_end_bin.checked_mul(source_frame_count)? / bin_count;
+    let selected_frame_count = relative_end.checked_sub(relative_start)?;
+    if selected_frame_count == 0 || relative_end > source_frame_count {
+        return None;
+    }
+    let selected_start_frame = source_start_frame.checked_add(relative_start)?;
+    let selected_bin_count = selected_end_bin.checked_sub(selected_first_bin)?;
+    let first_bin_numerator = f32::from(u16::try_from(selected_first_bin).ok()?);
+    let selection_width_numerator = f32::from(u16::try_from(selected_bin_count).ok()?);
+    Some(WaveformTrimSelection {
+        source_start_frame: selected_start_frame,
+        source_frame_count: selected_frame_count,
+        start_percent: (first_bin_numerator / fraction_denominator) * 100.0,
+        width_percent: (selection_width_numerator / fraction_denominator) * 100.0,
+        displayed_bin_count: bin_count,
+        selected_bin_count,
+    })
+}
+
+fn resolve_waveform_trim_source_view(
+    ui: &MainWindow,
+    project_state: &ProjectUiState,
+) -> Result<WaveformTrimSourceView, &'static str> {
+    if ui.get_app_mode() != AppMode::Running
+        || !ui.get_clip_waveform_visible()
+        || ui.get_clip_waveform_loading()
+    {
+        return Err("Waveform selection is not available in the current state");
+    }
+    let displayed_start = ui
+        .get_clip_waveform_source_start_frame()
+        .parse::<usize>()
+        .map_err(|_| "The displayed waveform source view is unavailable; reopen it")?;
+    let displayed_frame_count = ui
+        .get_clip_waveform_source_frame_count()
+        .parse::<usize>()
+        .map_err(|_| "The displayed waveform source view is unavailable; reopen it")?;
+    let bin_count = ui
+        .get_clip_waveform_bin_count()
+        .parse::<usize>()
+        .map_err(|_| "The displayed waveform resolution is unavailable; reopen it")?;
+    let clips = project_state.audio_clips.borrow();
+    let clip = clips
+        .iter()
+        .find(|clip| clip.id() == ui.get_clip_waveform_id().as_str())
+        .ok_or("The selected audio clip is no longer available")?;
+    if clip.source_start_frame() != displayed_start
+        || clip.source_frame_count() != displayed_frame_count
+    {
+        return Err("The waveform source view changed; reopen it before selecting a trim");
+    }
+    Ok(WaveformTrimSourceView {
+        clip_id: clip.id().to_owned(),
+        clip_name: clip.name().to_owned(),
+        source_start_frame: displayed_start,
+        source_frame_count: displayed_frame_count,
+        bin_count,
+    })
+}
+
+fn resolve_waveform_trim_selection(
+    ui: &MainWindow,
+    project_state: &ProjectUiState,
+    first_fraction: f32,
+    second_fraction: f32,
+) -> Result<WaveformTrimSelection, &'static str> {
+    let source_view = resolve_waveform_trim_source_view(ui, project_state)?;
+    waveform_trim_selection(
+        source_view.source_start_frame,
+        source_view.source_frame_count,
+        source_view.bin_count,
+        first_fraction,
+        second_fraction,
+    )
+    .ok_or("The waveform selection is unavailable; reopen the waveform and try again")
+}
+
+fn clear_waveform_trim_selection(ui: &MainWindow) {
+    ui.set_clip_waveform_selection_visible(false);
+    ui.set_clip_waveform_selection_start_percent(0.0);
+    ui.set_clip_waveform_selection_width_percent(0.0);
+    ui.set_clip_waveform_selection_start_frame(SharedString::default());
+    ui.set_clip_waveform_selection_frame_count(SharedString::default());
+    ui.set_clip_waveform_selection_bin_count("0".into());
+}
+
+fn apply_waveform_trim_selection(ui: &MainWindow, selection: WaveformTrimSelection) {
+    ui.set_clip_waveform_selection_visible(true);
+    ui.set_clip_waveform_selection_start_percent(selection.start_percent);
+    ui.set_clip_waveform_selection_width_percent(selection.width_percent);
+    ui.set_clip_waveform_selection_start_frame(selection.source_start_frame.to_string().into());
+    ui.set_clip_waveform_selection_frame_count(selection.source_frame_count.to_string().into());
+    ui.set_clip_waveform_selection_bin_count(selection.selected_bin_count.to_string().into());
+    ui.set_error_text(SharedString::default());
+}
+
+fn prepare_waveform_trim(
+    ui: &MainWindow,
+    project_state: &ProjectUiState,
+    selection: WaveformTrimSelection,
+) -> Result<(), &'static str> {
+    let source_view = resolve_waveform_trim_source_view(ui, project_state)?;
+    if !ui.get_clip_waveform_selection_visible()
+        || ui
+            .get_clip_waveform_selection_start_frame()
+            .parse::<usize>()
+            .ok()
+            != Some(selection.source_start_frame)
+        || ui
+            .get_clip_waveform_selection_frame_count()
+            .parse::<usize>()
+            .ok()
+            != Some(selection.source_frame_count)
+        || ui
+            .get_clip_waveform_selection_bin_count()
+            .parse::<usize>()
+            .ok()
+            != Some(selection.selected_bin_count)
+        || source_view.bin_count != selection.displayed_bin_count
+    {
+        return Err("The waveform selection is no longer current; select it again");
+    }
+    let selection_end = selection
+        .source_start_frame
+        .checked_add(selection.source_frame_count)
+        .ok_or("The waveform selection is no longer current; select it again")?;
+    let source_end = source_view
+        .source_start_frame
+        .checked_add(source_view.source_frame_count)
+        .ok_or("The waveform source view changed; reopen it before selecting a trim")?;
+    if selection.source_start_frame < source_view.source_start_frame || selection_end > source_end {
+        return Err("The waveform selection is no longer within the committed source view");
+    }
+
+    reset_audio_clip_waveform_dialog(ui);
+    ui.set_clip_source_trim_id(source_view.clip_id.into());
+    ui.set_clip_source_trim_name(source_view.clip_name.into());
+    ui.set_clip_source_trim_original_start(source_view.source_start_frame.to_string().into());
+    ui.set_clip_source_trim_original_frame_count(source_view.source_frame_count.to_string().into());
+    ui.set_clip_source_trim_start(selection.source_start_frame.to_string().into());
+    ui.set_clip_source_trim_frame_count(selection.source_frame_count.to_string().into());
+    ui.set_clip_source_trim_visible(true);
+    ui.set_error_text(SharedString::default());
+    Ok(())
+}
+
+fn bind_audio_clip_waveform_selection_callbacks(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let project_state_for_begin = Rc::clone(project_state);
+    let anchor = Rc::new(Cell::new(None));
+    let anchor_for_begin = Rc::clone(&anchor);
+    let selection = Rc::new(Cell::new(None));
+    let selection_for_begin = Rc::clone(&selection);
+    actions.on_begin_audio_clip_waveform_selection(move |fraction| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        match resolve_waveform_trim_selection(&ui, &project_state_for_begin, fraction, fraction) {
+            Ok(selection) => {
+                anchor_for_begin.set(Some(fraction));
+                selection_for_begin.set(Some(selection));
+                apply_waveform_trim_selection(&ui, selection);
+            }
+            Err(message) => {
+                anchor_for_begin.set(None);
+                selection_for_begin.set(None);
+                clear_waveform_trim_selection(&ui);
+                ui.set_error_text(message.into());
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let project_state_for_complete = Rc::clone(project_state);
+    let anchor_for_complete = Rc::clone(&anchor);
+    let selection_for_complete = Rc::clone(&selection);
+    actions.on_complete_audio_clip_waveform_selection(move |fraction| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let Some(anchor) = anchor_for_complete.take() else {
+            return;
+        };
+        match resolve_waveform_trim_selection(&ui, &project_state_for_complete, anchor, fraction) {
+            Ok(selection) => {
+                selection_for_complete.set(Some(selection));
+                apply_waveform_trim_selection(&ui, selection);
+            }
+            Err(message) => {
+                selection_for_complete.set(None);
+                clear_waveform_trim_selection(&ui);
+                ui.set_error_text(message.into());
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let project_state_for_prepare = Rc::clone(project_state);
+    let selection_for_prepare = Rc::clone(&selection);
+    actions.on_prepare_audio_clip_waveform_trim(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let Some(selected_trim) = selection_for_prepare.get() else {
+            clear_waveform_trim_selection(&ui);
+            ui.set_error_text("Select waveform bins before preparing a trim".into());
+            return;
+        };
+        match prepare_waveform_trim(&ui, &project_state_for_prepare, selected_trim) {
+            Ok(()) => selection_for_prepare.set(None),
+            Err(message) => {
+                selection_for_prepare.set(None);
+                clear_waveform_trim_selection(&ui);
+                ui.set_error_text(message.into());
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let anchor_for_cancel = Rc::clone(&anchor);
+    let selection_for_cancel = Rc::clone(&selection);
+    actions.on_cancel_audio_clip_waveform_selection(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        anchor_for_cancel.set(None);
+        selection_for_cancel.set(None);
+        clear_waveform_trim_selection(&ui);
     });
 }
 
@@ -8309,6 +8602,7 @@ fn apply_audio_clip_waveform(ui: &MainWindow, waveform: &IdeAudioClipWaveform) {
     }
     ui.set_clip_waveform_commands(waveform_path_commands(waveform).into());
     ui.set_clip_waveform_bin_count(waveform.bins().len().to_string().into());
+    clear_waveform_trim_selection(ui);
     ui.set_clip_waveform_loading(false);
     ui.set_status_text("Audio-clip source waveform ready".into());
     ui.set_error_text(SharedString::default());
@@ -8346,8 +8640,11 @@ fn reset_audio_clip_waveform_dialog(ui: &MainWindow) {
     ui.set_clip_waveform_loading(false);
     ui.set_clip_waveform_id(SharedString::default());
     ui.set_clip_waveform_name(SharedString::default());
+    ui.set_clip_waveform_source_start_frame(SharedString::default());
+    ui.set_clip_waveform_source_frame_count(SharedString::default());
     ui.set_clip_waveform_commands(SharedString::default());
     ui.set_clip_waveform_bin_count("0".into());
+    clear_waveform_trim_selection(ui);
 }
 
 fn apply_recording_clip_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -14741,7 +15038,7 @@ impl Error for DesktopUiExitError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use i_slint_backend_testing::ElementHandle;
+    use i_slint_backend_testing::{ElementHandle, ElementRoot};
     use slint::platform::{Key, PointerEventButton, WindowEvent};
 
     #[test]
@@ -21502,6 +21799,157 @@ mod tests {
         assert!(parse_audio_clip_source_frame_count("-1").is_err());
         assert!(parse_audio_clip_source_frame_count("1.5").is_err());
         assert!(parse_audio_clip_source_frame_count("9007199254740992").is_err());
+    }
+
+    #[test]
+    fn waveform_trim_selection_is_exact_bin_aligned_and_bounded() {
+        let selection = waveform_trim_selection(100, 1_280, 128, 0.25, 0.75)
+            .expect("a valid displayed waveform range maps to a source trim");
+        assert_eq!(selection.source_start_frame, 420);
+        assert_eq!(selection.source_frame_count, 650);
+        assert_eq!(selection.displayed_bin_count, 128);
+        assert_eq!(selection.selected_bin_count, 65);
+        assert_eq!(selection.start_percent.to_bits(), 25.0_f32.to_bits());
+        assert_eq!(selection.width_percent.to_bits(), 50.78125_f32.to_bits());
+        assert_eq!(
+            waveform_trim_selection(100, 1_280, 128, 0.75, 0.25),
+            Some(selection),
+            "drag direction must not change the selected source range"
+        );
+
+        let final_bin = waveform_trim_selection(100, 3, 3, 1.0, 1.0)
+            .expect("the right edge selects the final displayed bin");
+        assert_eq!(final_bin.source_start_frame, 102);
+        assert_eq!(final_bin.source_frame_count, 1);
+        assert_eq!(final_bin.selected_bin_count, 1);
+
+        assert!(waveform_trim_selection(0, 0, 0, 0.0, 0.0).is_none());
+        assert!(waveform_trim_selection(0, 2, 3, 0.0, 0.0).is_none());
+        assert!(
+            waveform_trim_selection(
+                0,
+                IDE_AUDIO_CLIP_WAVEFORM_BINS + 1,
+                IDE_AUDIO_CLIP_WAVEFORM_BINS + 1,
+                0.0,
+                0.0,
+            )
+            .is_none()
+        );
+        assert!(waveform_trim_selection(0, 128, 128, f32::NAN, 0.0).is_none());
+        assert!(waveform_trim_selection(0, 128, 128, -0.01, 0.0).is_none());
+        assert!(waveform_trim_selection(0, 128, 128, 0.0, 1.01).is_none());
+        assert!(waveform_trim_selection(usize::MAX, 1, 1, 0.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn waveform_selection_revalidates_the_source_view_before_preparing_a_trim() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let project_state = Rc::new(ProjectUiState::default());
+        project_state
+            .audio_clips
+            .borrow_mut()
+            .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
+        bind_audio_clip_waveform_selection_callbacks(&ui, &project_state);
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_clips_visible(true);
+        ui.set_clip_waveform_visible(true);
+        ui.set_clip_waveform_loading(false);
+        ui.set_clip_waveform_id("clip-a".into());
+        ui.set_clip_waveform_name("Clip A".into());
+        ui.set_clip_waveform_source_start_frame("100".into());
+        ui.set_clip_waveform_source_frame_count("1280".into());
+        ui.set_clip_waveform_bin_count("128".into());
+
+        ui.global::<IdeActions>()
+            .invoke_complete_audio_clip_waveform_selection(0.75);
+        assert!(
+            !ui.get_clip_waveform_selection_visible(),
+            "a pointer release without a preceding press cannot create a trim"
+        );
+        ui.global::<IdeActions>()
+            .invoke_begin_audio_clip_waveform_selection(0.25);
+        assert!(ui.get_clip_waveform_selection_visible());
+        ui.global::<IdeActions>()
+            .invoke_cancel_audio_clip_waveform_selection();
+        assert!(
+            !ui.get_clip_waveform_selection_visible(),
+            "a canceled gesture must discard its provisional selection"
+        );
+        ui.global::<IdeActions>()
+            .invoke_complete_audio_clip_waveform_selection(0.75);
+        assert!(
+            !ui.get_clip_waveform_selection_visible(),
+            "a canceled gesture cannot be completed later"
+        );
+
+        ui.global::<IdeActions>()
+            .invoke_begin_audio_clip_waveform_selection(0.25);
+        ui.global::<IdeActions>()
+            .invoke_complete_audio_clip_waveform_selection(0.75);
+        assert!(ui.get_clip_waveform_selection_visible());
+        assert_eq!(ui.get_clip_waveform_selection_start_frame(), "420");
+        assert_eq!(ui.get_clip_waveform_selection_frame_count(), "650");
+        assert_eq!(ui.get_clip_waveform_selection_bin_count(), "65");
+
+        ui.show().unwrap();
+        let prepare = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Prepare selected waveform bins as an exact reusable source trim",
+        )
+        .next()
+        .expect("the waveform panel exposes its explicit trim-preparation action");
+        assert_eq!(prepare.accessible_enabled(), Some(true));
+        let prepare_position = prepare.absolute_position();
+        let prepare_size = prepare.size();
+        let window_size = ui.root_element().size();
+        assert!(
+            prepare_position.x >= 0.0
+                && prepare_position.y >= 0.0
+                && prepare_position.x + prepare_size.width <= window_size.width
+                && prepare_position.y + prepare_size.height <= window_size.height,
+            "the explicit trim-preparation action must remain inside the visible window: position={prepare_position:?}, size={prepare_size:?}, window={window_size:?}"
+        );
+
+        *project_state.audio_clips.borrow_mut() = vec![IdeAudioClip::for_ui_test(
+            "clip-a",
+            "Renamed Clip",
+            110,
+            1_280,
+        )];
+        prepare.mock_single_click(PointerEventButton::Left);
+        assert!(ui.get_clip_waveform_visible());
+        assert!(!ui.get_clip_waveform_selection_visible());
+        assert!(!ui.get_clip_source_trim_visible());
+        assert!(ui.get_error_text().contains("source view changed"));
+        assert_eq!(prepare.accessible_enabled(), Some(false));
+
+        ui.set_clip_waveform_name("Renamed Clip".into());
+        ui.set_clip_waveform_source_start_frame("110".into());
+        ui.set_clip_waveform_source_frame_count("1280".into());
+        ui.set_clip_waveform_bin_count("128".into());
+        ui.global::<IdeActions>()
+            .invoke_begin_audio_clip_waveform_selection(0.25);
+        ui.global::<IdeActions>()
+            .invoke_complete_audio_clip_waveform_selection(0.75);
+        assert_eq!(ui.get_clip_waveform_selection_start_frame(), "430");
+        assert_eq!(ui.get_clip_waveform_selection_frame_count(), "650");
+        assert_eq!(prepare.accessible_enabled(), Some(true));
+
+        prepare.mock_single_click(PointerEventButton::Left);
+        assert!(!ui.get_clip_waveform_visible());
+        assert!(!ui.get_clip_waveform_selection_visible());
+        assert!(ui.get_clip_source_trim_visible());
+        assert_eq!(ui.get_clip_source_trim_id(), "clip-a");
+        assert_eq!(ui.get_clip_source_trim_name(), "Renamed Clip");
+        assert_eq!(ui.get_clip_source_trim_original_start(), "110");
+        assert_eq!(ui.get_clip_source_trim_original_frame_count(), "1280");
+        assert_eq!(ui.get_clip_source_trim_start(), "430");
+        assert_eq!(ui.get_clip_source_trim_frame_count(), "650");
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(ui.get_error_text().is_empty());
+        ui.hide().unwrap();
     }
 
     #[test]

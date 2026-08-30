@@ -1217,6 +1217,33 @@ pub struct IdeAudioClip {
 }
 
 impl IdeAudioClip {
+    #[cfg(feature = "ui-test-support")]
+    #[must_use]
+    pub fn for_ui_test(
+        id: &str,
+        name: &str,
+        source_start_frame: usize,
+        source_frame_count: usize,
+    ) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            track_id: "ui-test-track".to_owned(),
+            track_name: "UI test track".to_owned(),
+            duration_ticks: 960,
+            source_start_frame,
+            source_frame_count,
+            active: true,
+            gain_decibels: 0.0,
+            loop_enabled: false,
+            loop_start_tick: 0,
+            loop_end_tick: 960,
+            reverse: false,
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
+        }
+    }
+
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
