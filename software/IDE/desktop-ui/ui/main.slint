@@ -415,6 +415,7 @@ export global IdeActions {
     callback remove-control-binding(string);
     callback export-project();
     callback export-loop-project();
+    callback export-marked-range-project();
     callback export-track-stems(bool);
     callback prepare-runtime();
     callback undo-edit();
@@ -1009,6 +1010,7 @@ export component MainWindow inherits Window {
     in property <bool> loop-marking-available: false;
     in property <bool> loop-toggle-available: false;
     in property <bool> loop-export-available: false;
+    in property <bool> marked-range-export-available: false;
     in property <bool> loop-engaged: false;
     in property <bool> metronome-available: false;
     in property <bool> metronome-enabled: false;
@@ -1798,6 +1800,12 @@ export component MainWindow inherits Window {
                             enabled: root.app-mode == AppMode.running && root.export-available && root.loop-export-available;
                             accessible-label: "Export the persisted loop range as a WAV or FLAC file";
                             clicked => { IdeActions.export-loop-project(); }
+                        }
+                        if !root.new-project-visible && !root.new-track-visible : Button {
+                            text: root.app-mode == AppMode.exporting-project ? "Exporting…" : "Export marked range";
+                            enabled: root.app-mode == AppMode.running && root.export-available && root.marked-range-export-available;
+                            accessible-label: "Export the current marked range as a WAV or FLAC file without saving or changing the project loop";
+                            clicked => { IdeActions.export-marked-range-project(); }
                         }
                         if !root.new-project-visible && !root.new-track-visible : Button {
                             text: root.app-mode == AppMode.exporting-project ? "Exporting…" : "Export WAV stems";

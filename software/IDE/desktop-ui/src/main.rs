@@ -10099,6 +10099,7 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_loop_marking_available(false);
     ui.set_loop_toggle_available(false);
     ui.set_loop_export_available(false);
+    ui.set_marked_range_export_available(false);
     ui.set_loop_engaged(false);
     ui.set_metronome_available(false);
     ui.set_metronome_enabled(false);
@@ -12856,6 +12857,18 @@ fn offline_export_range_from_frames(
     OfflineExportRange::new(start_frame, end_frame).ok()
 }
 
+/// The current user marks are a transient export selection only when they
+/// independently form a nonempty offline-render window. This does not consult
+/// or change the persisted arrangement loop.
+fn marked_range_export_range(marks: LoopMarks) -> Option<OfflineExportRange> {
+    let range = marks.range()?;
+    offline_export_range_from_frames(range.start_frame(), range.end_frame())
+}
+
+fn marked_range_export_available(mode: AppMode, marks: LoopMarks) -> bool {
+    loop_marking_available(mode) && marked_range_export_range(marks).is_some()
+}
+
 fn current_persisted_loop_export_range(state: &ProjectUiStateCell) -> Option<OfflineExportRange> {
     state
         .arrangement
@@ -12902,6 +12915,7 @@ fn refresh_loop_controls(ui: &MainWindow, state: &ProjectUiStateCell, sample_rat
     ui.set_loop_summary(marks.summary(sample_rate_hz).into());
     ui.set_loop_marking_available(loop_marking_available(mode));
     ui.set_loop_toggle_available(loop_toggle_available(mode, marks));
+    ui.set_marked_range_export_available(marked_range_export_available(mode, marks));
     if marks.range().is_none() {
         ui.set_loop_engaged(false);
         state.loop_engaged.set(false);
@@ -13711,6 +13725,10 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
             state.loop_marks.set(marks);
             ui.set_loop_summary(marks.summary(state.sample_rate_hz.get()).into());
             ui.set_loop_toggle_available(loop_toggle_available(ui.get_app_mode(), marks));
+            ui.set_marked_range_export_available(marked_range_export_available(
+                ui.get_app_mode(),
+                marks,
+            ));
             submit_to_ui(
                 &ui,
                 &worker,
@@ -13760,6 +13778,7 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
         clear_state.loop_engaged.set(false);
         ui.set_loop_summary(SharedString::default());
         ui.set_loop_toggle_available(false);
+        ui.set_marked_range_export_available(false);
         ui.set_loop_engaged(false);
         submit_to_ui(
             &ui,
@@ -13817,6 +13836,60 @@ fn bind_undo_callbacks_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
     actions.on_redo_edit(restore(true));
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectExportScope {
+    FullProject,
+    PersistedLoop(OfflineExportRange),
+    MarkedRange(OfflineExportRange),
+}
+
+impl ProjectExportScope {
+    const fn range(self) -> Option<OfflineExportRange> {
+        match self {
+            Self::FullProject => None,
+            Self::PersistedLoop(range) | Self::MarkedRange(range) => Some(range),
+        }
+    }
+
+    fn destination_picker_details(
+        self,
+    ) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Self::FullProject => (
+                "Export project audio",
+                "export.wav",
+                "Waiting for export destination…",
+                "Export cancelled",
+            ),
+            Self::PersistedLoop(_) => (
+                "Export persisted loop range",
+                "loop-export.wav",
+                "Waiting for loop export destination…",
+                "Loop export cancelled",
+            ),
+            Self::MarkedRange(_) => (
+                "Export marked range",
+                "marked-range.wav",
+                "Waiting for marked-range export destination…",
+                "Marked-range export cancelled",
+            ),
+        }
+    }
+}
+
+fn marked_range_export_scope(
+    mode: AppMode,
+    export_available: bool,
+    marks: LoopMarks,
+) -> Option<ProjectExportScope> {
+    if mode != AppMode::Running || !export_available {
+        return None;
+    }
+    Some(ProjectExportScope::MarkedRange(marked_range_export_range(
+        marks,
+    )?))
+}
+
 fn bind_project_export_callback(
     ui: &MainWindow,
     worker: &WorkerCell,
@@ -13829,7 +13902,11 @@ fn bind_project_export_callback(
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        begin_project_export_destination_selection(&ui, &worker_for_export, None);
+        begin_project_export_destination_selection(
+            &ui,
+            &worker_for_export,
+            ProjectExportScope::FullProject,
+        );
     });
 
     let weak = ui.as_weak();
@@ -13843,33 +13920,47 @@ fn bind_project_export_callback(
             ui.set_error_text("Save a nonempty loop range before exporting it".into());
             return;
         };
-        begin_project_export_destination_selection(&ui, &worker_for_loop_export, Some(range));
+        begin_project_export_destination_selection(
+            &ui,
+            &worker_for_loop_export,
+            ProjectExportScope::PersistedLoop(range),
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_marked_range_export = Rc::clone(worker);
+    let state_for_marked_range_export = Rc::clone(project_state);
+    actions.on_export_marked_range_project(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let mode = ui.get_app_mode();
+        let export_available = ui.get_export_available();
+        if mode != AppMode::Running || !export_available {
+            return;
+        }
+        let Some(scope) = marked_range_export_scope(
+            mode,
+            export_available,
+            state_for_marked_range_export.loop_marks.get(),
+        ) else {
+            ui.set_error_text("Set a nonempty marked range before exporting it".into());
+            return;
+        };
+        begin_project_export_destination_selection(&ui, &worker_for_marked_range_export, scope);
     });
 }
 
 fn begin_project_export_destination_selection(
     ui: &MainWindow,
     worker: &WorkerCell,
-    range: Option<OfflineExportRange>,
+    scope: ProjectExportScope,
 ) {
     if ui.get_app_mode() != AppMode::Running || !ui.get_export_available() {
         return;
     }
-    let (title, file_name, waiting, cancelled) = if range.is_some() {
-        (
-            "Export persisted loop range",
-            "loop-export.wav",
-            "Waiting for loop export destination…",
-            "Loop export cancelled",
-        )
-    } else {
-        (
-            "Export project audio",
-            "export.wav",
-            "Waiting for export destination…",
-            "Export cancelled",
-        )
-    };
+    let (title, file_name, waiting, cancelled) = scope.destination_picker_details();
+    let range = scope.range();
     ui.set_error_text(SharedString::default());
     ui.set_status_text(waiting.into());
     let weak = ui.as_weak();
@@ -15266,6 +15357,44 @@ mod tests {
     }
 
     #[test]
+    fn project_export_scopes_preserve_range_authority_and_destination_copy() {
+        let range = OfflineExportRange::new(480, 960).unwrap();
+        assert_eq!(ProjectExportScope::FullProject.range(), None);
+        assert_eq!(
+            ProjectExportScope::FullProject.destination_picker_details(),
+            (
+                "Export project audio",
+                "export.wav",
+                "Waiting for export destination…",
+                "Export cancelled",
+            )
+        );
+        assert_eq!(
+            ProjectExportScope::PersistedLoop(range).range(),
+            Some(range)
+        );
+        assert_eq!(
+            ProjectExportScope::PersistedLoop(range).destination_picker_details(),
+            (
+                "Export persisted loop range",
+                "loop-export.wav",
+                "Waiting for loop export destination…",
+                "Loop export cancelled",
+            )
+        );
+        assert_eq!(ProjectExportScope::MarkedRange(range).range(), Some(range));
+        assert_eq!(
+            ProjectExportScope::MarkedRange(range).destination_picker_details(),
+            (
+                "Export marked range",
+                "marked-range.wav",
+                "Waiting for marked-range export destination…",
+                "Marked-range export cancelled",
+            )
+        );
+    }
+
+    #[test]
     fn track_stem_export_buttons_preserve_format_and_running_authority() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();
@@ -15386,6 +15515,67 @@ mod tests {
         assert_eq!(export_loop.accessible_enabled(), Some(false));
         export_loop.mock_single_click(PointerEventButton::Left);
         assert_eq!(exports.get(), 1);
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn marked_range_export_button_follows_live_mark_authority_not_persisted_loop() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_export_available(true);
+        ui.set_loop_toggle_available(true);
+        ui.set_loop_export_available(false);
+        ui.set_marked_range_export_available(true);
+        let loop_exports = Rc::new(Cell::new(0_usize));
+        let loop_exports_by_callback = Rc::clone(&loop_exports);
+        ui.global::<IdeActions>().on_export_loop_project(move || {
+            loop_exports_by_callback.set(loop_exports_by_callback.get() + 1);
+        });
+        let marked_exports = Rc::new(Cell::new(0_usize));
+        let marked_exports_by_callback = Rc::clone(&marked_exports);
+        ui.global::<IdeActions>()
+            .on_export_marked_range_project(move || {
+                marked_exports_by_callback.set(marked_exports_by_callback.get() + 1);
+            });
+        ui.show().unwrap();
+
+        let export_loop = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Export the persisted loop range as a WAV or FLAC file",
+        )
+        .next()
+        .expect("the persisted-loop action is visible for a running verified project");
+        let export_marks = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Export the current marked range as a WAV or FLAC file without saving or changing the project loop",
+        )
+        .next()
+        .expect("the transient marked-range action is visible for a running verified project");
+        assert_eq!(export_loop.accessible_enabled(), Some(false));
+        assert_eq!(export_marks.accessible_enabled(), Some(true));
+        export_loop.mock_single_click(PointerEventButton::Left);
+        export_marks.mock_single_click(PointerEventButton::Left);
+        assert_eq!(loop_exports.get(), 0);
+        assert_eq!(marked_exports.get(), 1);
+
+        ui.set_loop_toggle_available(false);
+        ui.set_loop_export_available(true);
+        ui.set_marked_range_export_available(false);
+        assert_eq!(export_loop.accessible_enabled(), Some(true));
+        assert_eq!(export_marks.accessible_enabled(), Some(false));
+        export_loop.mock_single_click(PointerEventButton::Left);
+        export_marks.mock_single_click(PointerEventButton::Left);
+        assert_eq!(loop_exports.get(), 1);
+        assert_eq!(marked_exports.get(), 1);
+
+        ui.set_export_available(false);
+        assert_eq!(export_loop.accessible_enabled(), Some(false));
+        assert_eq!(export_marks.accessible_enabled(), Some(false));
+        export_loop.mock_single_click(PointerEventButton::Left);
+        export_marks.mock_single_click(PointerEventButton::Left);
+        assert_eq!(loop_exports.get(), 1);
+        assert_eq!(marked_exports.get(), 1);
         ui.hide().unwrap();
     }
 
@@ -18212,6 +18402,62 @@ mod tests {
             Some(OfflineExportRange::new(480, 960).unwrap())
         );
         assert_eq!(offline_export_range_from_frames(960, 960), None);
+    }
+
+    #[test]
+    fn marked_range_export_requires_valid_live_marks_while_running() {
+        let usable = LoopMarks {
+            start: Some(480),
+            end: Some(960),
+        };
+        let expected = OfflineExportRange::new(480, 960).unwrap();
+        assert_eq!(marked_range_export_range(usable), Some(expected));
+        assert!(marked_range_export_available(AppMode::Running, usable));
+        assert_eq!(
+            marked_range_export_scope(AppMode::Running, true, usable),
+            Some(ProjectExportScope::MarkedRange(expected))
+        );
+        assert!(
+            !marked_range_export_available(AppMode::Saving, usable),
+            "a valid range waits for the project to become idle"
+        );
+        assert_eq!(
+            marked_range_export_scope(AppMode::Saving, true, usable),
+            None
+        );
+        assert_eq!(
+            marked_range_export_scope(AppMode::Running, false, usable),
+            None,
+            "revoked export authority prevents a live-range request"
+        );
+
+        for unusable in [
+            LoopMarks::default(),
+            LoopMarks {
+                start: Some(480),
+                end: None,
+            },
+            LoopMarks {
+                start: Some(960),
+                end: Some(480),
+            },
+            LoopMarks {
+                start: Some(960),
+                end: Some(960),
+            },
+        ] {
+            assert_eq!(
+                marked_range_export_range(unusable),
+                None,
+                "the marked-range path refuses every window the offline exporter would refuse"
+            );
+            assert!(!marked_range_export_available(AppMode::Running, unusable));
+            assert_eq!(
+                marked_range_export_scope(AppMode::Running, true, unusable),
+                None,
+                "the UI-to-worker path cannot turn invalid marks into an export scope"
+            );
+        }
     }
 
     #[test]
