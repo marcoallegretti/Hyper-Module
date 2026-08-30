@@ -258,6 +258,124 @@ struct ArrangementBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct ArrangementPlacementPosition {
+    id: String,
+    start_tick: u64,
+    duration_ticks: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArrangementSceneLaunchPosition {
+    id: String,
+    tick: u64,
+    target_tick_occupied: bool,
+}
+
+fn resolve_arrangement_placement_position(
+    project_state: &ProjectUiStateCell,
+    placement_id: &str,
+) -> Result<ArrangementPlacementPosition, &'static str> {
+    let state = project_state.arrangement.borrow();
+    let binding = state
+        .as_ref()
+        .ok_or("Arrangement placement authority is no longer available")?;
+    let placement = binding
+        .owner
+        .placements()
+        .iter()
+        .find(|placement| placement.id() == placement_id)
+        .ok_or("The selected arrangement placement is no longer available")?;
+    Ok(ArrangementPlacementPosition {
+        id: placement.id().to_owned(),
+        start_tick: placement.start_tick(),
+        duration_ticks: placement.duration_ticks(),
+    })
+}
+
+fn validate_arrangement_scene_launch_addition(
+    project_state: &ProjectUiStateCell,
+    scene_id: &str,
+    tick: u64,
+) -> Result<(), &'static str> {
+    if !project_state
+        .scenes
+        .borrow()
+        .iter()
+        .any(|scene| scene.id() == scene_id)
+    {
+        return Err("The selected scene is no longer available");
+    }
+    if project_state
+        .arrangement
+        .borrow()
+        .as_ref()
+        .is_some_and(|binding| {
+            binding
+                .owner
+                .scene_launches()
+                .iter()
+                .any(|launch| launch.tick() == tick)
+        })
+    {
+        return Err("The arrangement already has a scene marker at that tick");
+    }
+    Ok(())
+}
+
+fn resolve_arrangement_scene_launch_position(
+    project_state: &ProjectUiStateCell,
+    launch_id: &str,
+    target_tick: u64,
+) -> Result<ArrangementSceneLaunchPosition, &'static str> {
+    let state = project_state.arrangement.borrow();
+    let binding = state
+        .as_ref()
+        .ok_or("Arrangement scene-marker authority is no longer available")?;
+    let launch = binding
+        .owner
+        .scene_launches()
+        .iter()
+        .find(|launch| launch.id() == launch_id)
+        .ok_or("The selected scene marker is no longer available")?;
+    Ok(ArrangementSceneLaunchPosition {
+        id: launch.id().to_owned(),
+        tick: launch.tick(),
+        target_tick_occupied: binding
+            .owner
+            .scene_launches()
+            .iter()
+            .any(|candidate| candidate.id() != launch.id() && candidate.tick() == target_tick),
+    })
+}
+
+fn resolve_audio_clip_id(
+    project_state: &ProjectUiStateCell,
+    clip_id: &str,
+) -> Result<String, &'static str> {
+    project_state
+        .audio_clips
+        .borrow()
+        .iter()
+        .find(|clip| clip.id() == clip_id)
+        .map(|clip| clip.id().to_owned())
+        .ok_or("The selected audio clip is no longer available")
+}
+
+fn resolve_navigation_marker_position(
+    project_state: &ProjectUiStateCell,
+    marker_id: &str,
+) -> Result<(String, u64), &'static str> {
+    project_state
+        .timeline
+        .borrow()
+        .navigation_markers
+        .iter()
+        .find(|marker| marker.id() == marker_id)
+        .map(|marker| (marker.id().to_owned(), marker.tick()))
+        .ok_or("The selected navigation marker is no longer available")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum InputRoute {
     Disabled,
     SystemDefault,
@@ -755,10 +873,30 @@ fn bind_arrangement_front_trim_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    let project_state_for_position = Rc::clone(project_state);
+    let project_state_for_placement = Rc::clone(project_state);
+    let worker = Rc::clone(worker);
+    bind_arrangement_front_trim_callback_with(
+        ui,
+        move |value| {
+            let timeline = project_state_for_position.timeline.borrow();
+            parse_arrangement_start_tick(value, &timeline.meter_events)
+        },
+        move |placement_id| {
+            resolve_arrangement_placement_position(&project_state_for_placement, placement_id)
+        },
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_arrangement_front_trim_callback_with(
+    ui: &MainWindow,
+    parse_start_tick: impl Fn(&str) -> Result<u64, String> + 'static,
+    resolve_placement: impl Fn(&str) -> Result<ArrangementPlacementPosition, &'static str> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker_for_trim = Rc::clone(worker);
-    let project_state_for_trim = Rc::clone(project_state);
     actions.on_trim_arrangement_placement_front(move |placement_id, start_tick| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -769,42 +907,29 @@ fn bind_arrangement_front_trim_callback(
             );
             return;
         }
-        let start_tick = {
-            let timeline = project_state_for_trim.timeline.borrow();
-            match parse_arrangement_start_tick(start_tick.as_str(), &timeline.meter_events) {
-                Ok(start_tick) => start_tick,
-                Err(message) => {
-                    ui.set_error_text(message.into());
-                    return;
-                }
+        let start_tick = match parse_start_tick(start_tick.as_str()) {
+            Ok(start_tick) => start_tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
             }
         };
-        let state = project_state_for_trim.arrangement.borrow();
-        let Some(binding) = state.as_ref() else {
-            ui.set_error_text("Arrangement placement authority is no longer available".into());
-            return;
+        let placement = match resolve_placement(placement_id.as_str()) {
+            Ok(placement) => placement,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
         };
-        let Some(placement) = binding
-            .owner
-            .placements()
-            .iter()
-            .find(|placement| placement.id() == placement_id.as_str())
-        else {
-            ui.set_error_text("The selected arrangement placement is no longer available".into());
-            return;
-        };
-        if placement.start_tick() == start_tick {
+        if placement.start_tick == start_tick {
             ui.set_status_text("Arrangement placement already starts at that tick".into());
             ui.set_error_text(SharedString::default());
             return;
         }
-        let owned_placement_id = placement.id().to_owned();
-        drop(state);
-        submit_to_ui(
+        submit(
             &ui,
-            &worker_for_trim,
             IdeWorkerCommand::TrimArrangementPlacementFront {
-                placement_id: owned_placement_id,
+                placement_id: placement.id,
                 start_tick,
             },
         );
@@ -3814,10 +3939,34 @@ fn bind_arrangement_scene_launch_addition_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    let project_state_for_position = Rc::clone(project_state);
+    let project_state_for_validation = Rc::clone(project_state);
+    let worker = Rc::clone(worker);
+    bind_arrangement_scene_launch_addition_callback_with(
+        ui,
+        move |value| {
+            let timeline = project_state_for_position.timeline.borrow();
+            parse_arrangement_scene_launch_tick(value, &timeline.meter_events)
+        },
+        move |scene_id, tick| {
+            validate_arrangement_scene_launch_addition(
+                &project_state_for_validation,
+                scene_id,
+                tick,
+            )
+        },
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_arrangement_scene_launch_addition_callback_with(
+    ui: &MainWindow,
+    parse_tick: impl Fn(&str) -> Result<u64, String> + 'static,
+    validate_addition: impl Fn(&str, u64) -> Result<(), &'static str> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker_for_addition = Rc::clone(worker);
-    let project_state_for_addition = Rc::clone(project_state);
     actions.on_add_arrangement_scene_launch(move |scene_id, tick| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -3829,43 +3978,19 @@ fn bind_arrangement_scene_launch_addition_callback(
             ui.set_error_text("Scene-marker request is no longer current".into());
             return;
         }
-        let tick = {
-            let timeline = project_state_for_addition.timeline.borrow();
-            match parse_arrangement_scene_launch_tick(tick.as_str(), &timeline.meter_events) {
-                Ok(tick) => tick,
-                Err(message) => {
-                    ui.set_error_text(message.into());
-                    return;
-                }
+        let tick = match parse_tick(tick.as_str()) {
+            Ok(tick) => tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
             }
         };
-        if !project_state_for_addition
-            .scenes
-            .borrow()
-            .iter()
-            .any(|scene| scene.id() == scene_id.as_str())
-        {
-            ui.set_error_text("The selected scene is no longer available".into());
+        if let Err(message) = validate_addition(scene_id.as_str(), tick) {
+            ui.set_error_text(message.into());
             return;
         }
-        if project_state_for_addition
-            .arrangement
-            .borrow()
-            .as_ref()
-            .is_some_and(|binding| {
-                binding
-                    .owner
-                    .scene_launches()
-                    .iter()
-                    .any(|launch| launch.tick() == tick)
-            })
-        {
-            ui.set_error_text("The arrangement already has a scene marker at that tick".into());
-            return;
-        }
-        submit_to_ui(
+        submit(
             &ui,
-            &worker_for_addition,
             IdeWorkerCommand::AddArrangementSceneLaunch {
                 scene_id: scene_id.to_string(),
                 tick,
@@ -3879,10 +4004,34 @@ fn bind_arrangement_scene_launch_move_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    let project_state_for_position = Rc::clone(project_state);
+    let project_state_for_launch = Rc::clone(project_state);
+    let worker = Rc::clone(worker);
+    bind_arrangement_scene_launch_move_callback_with(
+        ui,
+        move |value| {
+            let timeline = project_state_for_position.timeline.borrow();
+            parse_arrangement_scene_launch_tick(value, &timeline.meter_events)
+        },
+        move |launch_id, target_tick| {
+            resolve_arrangement_scene_launch_position(
+                &project_state_for_launch,
+                launch_id,
+                target_tick,
+            )
+        },
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_arrangement_scene_launch_move_callback_with(
+    ui: &MainWindow,
+    parse_tick: impl Fn(&str) -> Result<u64, String> + 'static,
+    resolve_launch: impl Fn(&str, u64) -> Result<ArrangementSceneLaunchPosition, &'static str> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker_for_move = Rc::clone(worker);
-    let project_state_for_move = Rc::clone(project_state);
     actions.on_move_arrangement_scene_launch(move |launch_id, tick| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -3896,14 +4045,11 @@ fn bind_arrangement_scene_launch_move_callback(
             ui.set_error_text("Scene-marker move request is no longer current".into());
             return;
         }
-        let tick = {
-            let timeline = project_state_for_move.timeline.borrow();
-            match parse_arrangement_scene_launch_tick(tick.as_str(), &timeline.meter_events) {
-                Ok(tick) => tick,
-                Err(message) => {
-                    ui.set_error_text(message.into());
-                    return;
-                }
+        let tick = match parse_tick(tick.as_str()) {
+            Ok(tick) => tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
             }
         };
         let Ok(original_tick) = parse_stored_arrangement_scene_launch_tick(
@@ -3913,44 +4059,32 @@ fn bind_arrangement_scene_launch_move_callback(
             ui.set_error_text("Scene-marker move request is no longer current".into());
             return;
         };
-        let state = project_state_for_move.arrangement.borrow();
-        let Some(binding) = state.as_ref() else {
-            ui.set_error_text("Arrangement scene-marker authority is no longer available".into());
-            return;
+        let launch = match resolve_launch(launch_id.as_str(), tick) {
+            Ok(launch) => launch,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
         };
-        let Some(launch) = binding
-            .owner
-            .scene_launches()
-            .iter()
-            .find(|launch| launch.id() == launch_id.as_str())
-        else {
-            ui.set_error_text("The selected scene marker is no longer available".into());
-            return;
-        };
-        if launch.tick() != original_tick {
+        if launch.tick != original_tick {
             ui.set_error_text("The selected scene marker has changed since it was opened".into());
             return;
         }
-        if launch.tick() == tick {
+        if launch.tick == tick {
             ui.set_status_text("Scene marker already uses that project tick".into());
             ui.set_error_text(SharedString::default());
             return;
         }
-        if binding
-            .owner
-            .scene_launches()
-            .iter()
-            .any(|candidate| candidate.id() != launch.id() && candidate.tick() == tick)
-        {
+        if launch.target_tick_occupied {
             ui.set_error_text("The arrangement already has a scene marker at that tick".into());
             return;
         }
-        let launch_id = launch.id().to_owned();
-        drop(state);
-        submit_to_ui(
+        submit(
             &ui,
-            &worker_for_move,
-            IdeWorkerCommand::MoveArrangementSceneLaunch { launch_id, tick },
+            IdeWorkerCommand::MoveArrangementSceneLaunch {
+                launch_id: launch.id,
+                tick,
+            },
         );
     });
 }
@@ -4101,10 +4235,30 @@ fn bind_arrangement_split_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    let project_state_for_position = Rc::clone(project_state);
+    let project_state_for_placement = Rc::clone(project_state);
+    let worker = Rc::clone(worker);
+    bind_arrangement_split_callback_with(
+        ui,
+        move |value| {
+            let timeline = project_state_for_position.timeline.borrow();
+            parse_arrangement_start_tick(value, &timeline.meter_events)
+        },
+        move |placement_id| {
+            resolve_arrangement_placement_position(&project_state_for_placement, placement_id)
+        },
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_arrangement_split_callback_with(
+    ui: &MainWindow,
+    parse_split_tick: impl Fn(&str) -> Result<u64, String> + 'static,
+    resolve_placement: impl Fn(&str) -> Result<ArrangementPlacementPosition, &'static str> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker_for_split = Rc::clone(worker);
-    let project_state_for_split = Rc::clone(project_state);
     actions.on_split_arrangement_placement(move |placement_id, split_tick| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -4115,55 +4269,39 @@ fn bind_arrangement_split_callback(
             );
             return;
         }
-        let split_tick = {
-            let timeline = project_state_for_split.timeline.borrow();
-            match parse_arrangement_start_tick(split_tick.as_str(), &timeline.meter_events) {
-                Ok(split_tick) => split_tick,
-                Err(message) => {
-                    ui.set_error_text(message.into());
-                    return;
-                }
+        let split_tick = match parse_split_tick(split_tick.as_str()) {
+            Ok(split_tick) => split_tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
             }
         };
-        let state = project_state_for_split.arrangement.borrow();
-        let Some(binding) = state.as_ref() else {
-            ui.set_error_text("Arrangement placement authority is no longer available".into());
-            return;
+        let placement = match resolve_placement(placement_id.as_str()) {
+            Ok(placement) => placement,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
         };
-        let Some(placement) = binding
-            .owner
-            .placements()
-            .iter()
-            .find(|placement| placement.id() == placement_id.as_str())
-        else {
-            ui.set_error_text("The selected arrangement placement is no longer available".into());
-            return;
-        };
-        let Some(end_tick) = placement
-            .start_tick()
-            .checked_add(placement.duration_ticks())
-        else {
+        let Some(end_tick) = placement.start_tick.checked_add(placement.duration_ticks) else {
             ui.set_error_text("The selected placement end is outside the exact tick domain".into());
             return;
         };
-        if split_tick <= placement.start_tick() || split_tick >= end_tick {
+        if split_tick <= placement.start_tick || split_tick >= end_tick {
             ui.set_error_text(
                 format!(
                     "Split tick must be strictly inside the placement ({} through {})",
-                    placement.start_tick() + 1,
+                    placement.start_tick + 1,
                     end_tick - 1
                 )
                 .into(),
             );
             return;
         }
-        let owned_placement_id = placement.id().to_owned();
-        drop(state);
-        submit_to_ui(
+        submit(
             &ui,
-            &worker_for_split,
             IdeWorkerCommand::SplitArrangementPlacement {
-                placement_id: owned_placement_id,
+                placement_id: placement.id,
                 split_tick,
             },
         );
@@ -4237,10 +4375,30 @@ fn bind_arrangement_move_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    let project_state_for_position = Rc::clone(project_state);
+    let project_state_for_placement = Rc::clone(project_state);
+    let worker = Rc::clone(worker);
+    bind_arrangement_move_callback_with(
+        ui,
+        move |value| {
+            let timeline = project_state_for_position.timeline.borrow();
+            parse_arrangement_start_tick(value, &timeline.meter_events)
+        },
+        move |placement_id| {
+            resolve_arrangement_placement_position(&project_state_for_placement, placement_id)
+        },
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_arrangement_move_callback_with(
+    ui: &MainWindow,
+    parse_start_tick: impl Fn(&str) -> Result<u64, String> + 'static,
+    resolve_placement: impl Fn(&str) -> Result<ArrangementPlacementPosition, &'static str> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker_for_move = Rc::clone(worker);
-    let project_state_for_move = Rc::clone(project_state);
     actions.on_move_arrangement_placement(move |placement_id, start_tick| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -4251,42 +4409,29 @@ fn bind_arrangement_move_callback(
             );
             return;
         }
-        let start_tick = {
-            let timeline = project_state_for_move.timeline.borrow();
-            match parse_arrangement_start_tick(start_tick.as_str(), &timeline.meter_events) {
-                Ok(start_tick) => start_tick,
-                Err(message) => {
-                    ui.set_error_text(message.into());
-                    return;
-                }
+        let start_tick = match parse_start_tick(start_tick.as_str()) {
+            Ok(start_tick) => start_tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
             }
         };
-        let state = project_state_for_move.arrangement.borrow();
-        let Some(binding) = state.as_ref() else {
-            ui.set_error_text("Arrangement placement authority is no longer available".into());
-            return;
+        let placement = match resolve_placement(placement_id.as_str()) {
+            Ok(placement) => placement,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
         };
-        let Some(placement) = binding
-            .owner
-            .placements()
-            .iter()
-            .find(|placement| placement.id() == placement_id.as_str())
-        else {
-            ui.set_error_text("The selected arrangement placement is no longer available".into());
-            return;
-        };
-        if placement.start_tick() == start_tick {
+        if placement.start_tick == start_tick {
             ui.set_status_text("Arrangement placement already starts at that tick".into());
             ui.set_error_text(SharedString::default());
             return;
         }
-        let owned_placement_id = placement.id().to_owned();
-        drop(state);
-        submit_to_ui(
+        submit(
             &ui,
-            &worker_for_move,
             IdeWorkerCommand::MoveArrangementPlacement {
-                placement_id: owned_placement_id,
+                placement_id: placement.id,
                 start_tick,
             },
         );
@@ -4930,10 +5075,28 @@ fn bind_arrangement_placement_addition_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    let project_state_for_position = Rc::clone(project_state);
+    let project_state_for_clip = Rc::clone(project_state);
+    let worker = Rc::clone(worker);
+    bind_arrangement_placement_addition_callback_with(
+        ui,
+        move |value| {
+            let timeline = project_state_for_position.timeline.borrow();
+            parse_arrangement_start_tick(value, &timeline.meter_events)
+        },
+        move |clip_id| resolve_audio_clip_id(&project_state_for_clip, clip_id),
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_arrangement_placement_addition_callback_with(
+    ui: &MainWindow,
+    parse_start_tick: impl Fn(&str) -> Result<u64, String> + 'static,
+    resolve_clip: impl Fn(&str) -> Result<String, &'static str> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker_for_placement = Rc::clone(worker);
-    let project_state_for_placement = Rc::clone(project_state);
     actions.on_add_arrangement_placement(move |clip_id, start_tick| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -4945,26 +5108,22 @@ fn bind_arrangement_placement_addition_callback(
             ui.set_error_text("Audio-clip placement selection is no longer current".into());
             return;
         }
-        let start_tick = {
-            let timeline = project_state_for_placement.timeline.borrow();
-            match parse_arrangement_start_tick(start_tick.as_str(), &timeline.meter_events) {
-                Ok(start_tick) => start_tick,
-                Err(message) => {
-                    ui.set_error_text(message.into());
-                    return;
-                }
+        let start_tick = match parse_start_tick(start_tick.as_str()) {
+            Ok(start_tick) => start_tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
             }
         };
-        let clips = project_state_for_placement.audio_clips.borrow();
-        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
-            ui.set_error_text("The selected audio clip is no longer available".into());
-            return;
+        let owned_clip_id = match resolve_clip(clip_id.as_str()) {
+            Ok(clip_id) => clip_id,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
         };
-        let owned_clip_id = clip.id().to_owned();
-        drop(clips);
-        submit_to_ui(
+        submit(
             &ui,
-            &worker_for_placement,
             IdeWorkerCommand::AddArrangementPlacement {
                 clip_id: owned_clip_id,
                 start_tick,
@@ -13350,10 +13509,25 @@ fn bind_timeline_marker_addition_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    let project_state_for_position = Rc::clone(project_state);
+    let worker = Rc::clone(worker);
+    bind_timeline_marker_addition_callback_with(
+        ui,
+        move |value| {
+            let timeline = project_state_for_position.timeline.borrow();
+            parse_project_position_tick(value, &timeline.meter_events)
+        },
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_timeline_marker_addition_callback_with(
+    ui: &MainWindow,
+    parse_tick: impl Fn(&str) -> Result<u64, String> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker_for_addition = Rc::clone(worker);
-    let timeline_for_addition = Rc::clone(project_state);
     actions.on_add_timeline_marker(move |tick, name| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -13362,14 +13536,11 @@ fn bind_timeline_marker_addition_callback(
             ui.set_error_text("Navigation-marker request is no longer current".into());
             return;
         }
-        let tick = {
-            let timeline = timeline_for_addition.timeline.borrow();
-            match parse_project_position_tick(tick.as_str(), &timeline.meter_events) {
-                Ok(tick) => tick,
-                Err(message) => {
-                    ui.set_error_text(message.into());
-                    return;
-                }
+        let tick = match parse_tick(tick.as_str()) {
+            Ok(tick) => tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
             }
         };
         let name = match normalize_timeline_marker_name(name.as_str()) {
@@ -13379,9 +13550,8 @@ fn bind_timeline_marker_addition_callback(
                 return;
             }
         };
-        submit_to_ui(
+        submit(
             &ui,
-            &worker_for_addition,
             IdeWorkerCommand::EditTimelineMarker {
                 edit: IdeTimelineMarkerEdit::Add { tick, name },
             },
@@ -13461,10 +13631,28 @@ fn bind_timeline_marker_move_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    let project_state_for_position = Rc::clone(project_state);
+    let project_state_for_marker = Rc::clone(project_state);
+    let worker = Rc::clone(worker);
+    bind_timeline_marker_move_callback_with(
+        ui,
+        move |value| {
+            let timeline = project_state_for_position.timeline.borrow();
+            parse_project_position_tick(value, &timeline.meter_events)
+        },
+        move |marker_id| resolve_navigation_marker_position(&project_state_for_marker, marker_id),
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_timeline_marker_move_callback_with(
+    ui: &MainWindow,
+    parse_tick: impl Fn(&str) -> Result<u64, String> + 'static,
+    resolve_marker: impl Fn(&str) -> Result<(String, u64), &'static str> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker_for_move = Rc::clone(worker);
-    let timeline_for_move = Rc::clone(project_state);
     actions.on_move_timeline_marker(move |marker_id, tick| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -13482,40 +13670,36 @@ fn bind_timeline_marker_move_callback(
             ui.set_error_text("Navigation-marker move request is no longer current".into());
             return;
         };
-        let timeline = timeline_for_move.timeline.borrow();
-        let tick = match parse_project_position_tick(tick.as_str(), &timeline.meter_events) {
+        let tick = match parse_tick(tick.as_str()) {
             Ok(tick) => tick,
             Err(message) => {
                 ui.set_error_text(message.into());
                 return;
             }
         };
-        let Some(marker) = timeline
-            .navigation_markers
-            .iter()
-            .find(|marker| marker.id() == marker_id.as_str())
-        else {
-            ui.set_error_text("The selected navigation marker is no longer available".into());
-            return;
+        let (owned_marker_id, current_tick) = match resolve_marker(marker_id.as_str()) {
+            Ok(marker) => marker,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
         };
-        if marker.tick() != source_tick {
+        if current_tick != source_tick {
             ui.set_error_text(
                 "The selected navigation marker has changed since it was opened".into(),
             );
             return;
         }
-        if marker.tick() == tick {
+        if current_tick == tick {
             ui.set_status_text("Navigation marker already uses that project tick".into());
             ui.set_error_text(SharedString::default());
             return;
         }
-        drop(timeline);
-        submit_to_ui(
+        submit(
             &ui,
-            &worker_for_move,
             IdeWorkerCommand::EditTimelineMarker {
                 edit: IdeTimelineMarkerEdit::Move {
-                    marker_id: marker_id.to_string(),
+                    marker_id: owned_marker_id,
                     tick,
                 },
             },
@@ -19548,6 +19732,291 @@ mod tests {
         )
         .expect_err("off-bar meter changes must not choose an edit tick");
         assert!(ambiguity.contains("ambiguous"));
+
+        let later_segment = [
+            MeterEvent {
+                tick: 0,
+                numerator: 255,
+                denominator: 1,
+            },
+            MeterEvent {
+                tick: 1,
+                numerator: 1,
+                denominator: 256,
+            },
+        ];
+        assert_eq!(
+            parse_project_position_tick("300000000000000|1|0", &later_segment),
+            Ok(8_999_999_999_999_971),
+            "a safe position in a later meter segment remains editable"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one callback contract must bind and assert every supported position route together"
+    )]
+    fn musical_positions_reach_every_supported_arrangement_and_navigation_command() {
+        fn four_four_arrangement_position(value: &str) -> Result<u64, String> {
+            parse_arrangement_start_tick(
+                value,
+                &[MeterEvent {
+                    tick: 0,
+                    numerator: 4,
+                    denominator: 4,
+                }],
+            )
+        }
+
+        fn four_four_scene_position(value: &str) -> Result<u64, String> {
+            parse_arrangement_scene_launch_tick(
+                value,
+                &[MeterEvent {
+                    tick: 0,
+                    numerator: 4,
+                    denominator: 4,
+                }],
+            )
+        }
+
+        fn four_four_project_position(value: &str) -> Result<u64, String> {
+            parse_project_position_tick(
+                value,
+                &[MeterEvent {
+                    tick: 0,
+                    numerator: 4,
+                    denominator: 4,
+                }],
+            )
+        }
+
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_add_arrangement_scene_launch_visible(true);
+        ui.set_add_arrangement_scene_launch_id("scene-a".into());
+        ui.set_move_arrangement_scene_launch_visible(true);
+        ui.set_move_arrangement_scene_launch_id("launch-a".into());
+        ui.set_move_arrangement_scene_launch_original_tick("480".into());
+        ui.set_add_arrangement_placement_visible(true);
+        ui.set_add_arrangement_placement_clip_id("clip-a".into());
+        ui.set_timeline_marker_add_visible(true);
+        ui.set_timeline_marker_move_visible(true);
+        ui.set_timeline_marker_id("marker-a".into());
+        ui.set_timeline_marker_source_tick("480".into());
+
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+
+        let submitted_for_trim = Rc::clone(&submitted);
+        bind_arrangement_front_trim_callback_with(
+            &ui,
+            four_four_arrangement_position,
+            |placement_id| {
+                (placement_id == "placement-a")
+                    .then(|| ArrangementPlacementPosition {
+                        id: placement_id.to_owned(),
+                        start_tick: 480,
+                        duration_ticks: 3_840,
+                    })
+                    .ok_or("The selected arrangement placement is no longer available")
+            },
+            move |_, command| submitted_for_trim.borrow_mut().push(command),
+        );
+
+        let submitted_for_split = Rc::clone(&submitted);
+        bind_arrangement_split_callback_with(
+            &ui,
+            four_four_arrangement_position,
+            |placement_id| {
+                (placement_id == "placement-a")
+                    .then(|| ArrangementPlacementPosition {
+                        id: placement_id.to_owned(),
+                        start_tick: 0,
+                        duration_ticks: 3_840,
+                    })
+                    .ok_or("The selected arrangement placement is no longer available")
+            },
+            move |_, command| submitted_for_split.borrow_mut().push(command),
+        );
+
+        let submitted_for_move = Rc::clone(&submitted);
+        bind_arrangement_move_callback_with(
+            &ui,
+            four_four_arrangement_position,
+            |placement_id| {
+                (placement_id == "placement-a")
+                    .then(|| ArrangementPlacementPosition {
+                        id: placement_id.to_owned(),
+                        start_tick: 480,
+                        duration_ticks: 3_840,
+                    })
+                    .ok_or("The selected arrangement placement is no longer available")
+            },
+            move |_, command| submitted_for_move.borrow_mut().push(command),
+        );
+
+        let submitted_for_copy = Rc::clone(&submitted);
+        bind_arrangement_duplication_callback_with(
+            &ui,
+            four_four_arrangement_position,
+            |placement_id| {
+                (placement_id == "placement-a")
+                    .then(|| placement_id.to_owned())
+                    .ok_or("The selected arrangement placement is no longer available")
+            },
+            move |_, command| submitted_for_copy.borrow_mut().push(command),
+        );
+
+        let submitted_for_scene_add = Rc::clone(&submitted);
+        bind_arrangement_scene_launch_addition_callback_with(
+            &ui,
+            four_four_scene_position,
+            |scene_id, tick| {
+                (scene_id == "scene-a" && tick == 1_920)
+                    .then_some(())
+                    .ok_or("The selected scene is no longer available")
+            },
+            move |_, command| submitted_for_scene_add.borrow_mut().push(command),
+        );
+
+        let submitted_for_scene_move = Rc::clone(&submitted);
+        bind_arrangement_scene_launch_move_callback_with(
+            &ui,
+            four_four_scene_position,
+            |launch_id, target_tick| {
+                (launch_id == "launch-a" && target_tick == 1_920)
+                    .then(|| ArrangementSceneLaunchPosition {
+                        id: launch_id.to_owned(),
+                        tick: 480,
+                        target_tick_occupied: false,
+                    })
+                    .ok_or("The selected scene marker is no longer available")
+            },
+            move |_, command| submitted_for_scene_move.borrow_mut().push(command),
+        );
+
+        let submitted_for_placement_add = Rc::clone(&submitted);
+        bind_arrangement_placement_addition_callback_with(
+            &ui,
+            four_four_arrangement_position,
+            |clip_id| {
+                (clip_id == "clip-a")
+                    .then(|| clip_id.to_owned())
+                    .ok_or("The selected audio clip is no longer available")
+            },
+            move |_, command| submitted_for_placement_add.borrow_mut().push(command),
+        );
+
+        let submitted_for_marker_add = Rc::clone(&submitted);
+        bind_timeline_marker_addition_callback_with(
+            &ui,
+            four_four_project_position,
+            move |_, command| submitted_for_marker_add.borrow_mut().push(command),
+        );
+
+        let submitted_for_marker_move = Rc::clone(&submitted);
+        bind_timeline_marker_move_callback_with(
+            &ui,
+            four_four_project_position,
+            |marker_id| {
+                (marker_id == "marker-a")
+                    .then(|| (marker_id.to_owned(), 480))
+                    .ok_or("The selected navigation marker is no longer available")
+            },
+            move |_, command| submitted_for_marker_move.borrow_mut().push(command),
+        );
+
+        let actions = ui.global::<IdeActions>();
+        actions.invoke_trim_arrangement_placement_front("placement-a".into(), "1|2|0".into());
+        actions.invoke_split_arrangement_placement("placement-a".into(), "1|2|0".into());
+        actions.invoke_move_arrangement_placement("placement-a".into(), "1|2|0".into());
+        actions.invoke_duplicate_arrangement_placement("placement-a".into(), "1|2|0".into());
+        actions.invoke_add_arrangement_scene_launch("scene-a".into(), "1|2|0".into());
+        actions.invoke_move_arrangement_scene_launch("launch-a".into(), "1|2|0".into());
+        actions.invoke_add_arrangement_placement("clip-a".into(), "1|2|0".into());
+        actions.invoke_add_timeline_marker("1|2|0".into(), "Verse".into());
+        actions.invoke_move_timeline_marker("marker-a".into(), "1|2|0".into());
+
+        let commands = submitted.borrow();
+        let [
+            trimmed,
+            split,
+            moved,
+            copied,
+            scene_added,
+            scene_moved,
+            placement_added,
+            marker_added,
+            marker_moved,
+        ] = commands.as_slice()
+        else {
+            panic!("every supported position callback must submit one command");
+        };
+        assert!(matches!(
+            trimmed,
+            IdeWorkerCommand::TrimArrangementPlacementFront {
+                placement_id,
+                start_tick: 1_920,
+            } if placement_id == "placement-a"
+        ));
+        assert!(matches!(
+            split,
+            IdeWorkerCommand::SplitArrangementPlacement {
+                placement_id,
+                split_tick: 1_920,
+            } if placement_id == "placement-a"
+        ));
+        assert!(matches!(
+            moved,
+            IdeWorkerCommand::MoveArrangementPlacement {
+                placement_id,
+                start_tick: 1_920,
+            } if placement_id == "placement-a"
+        ));
+        assert!(matches!(
+            copied,
+            IdeWorkerCommand::DuplicateArrangementPlacement {
+                placement_id,
+                start_tick: 1_920,
+            } if placement_id == "placement-a"
+        ));
+        assert!(matches!(
+            scene_added,
+            IdeWorkerCommand::AddArrangementSceneLaunch {
+                scene_id,
+                tick: 1_920,
+            } if scene_id == "scene-a"
+        ));
+        assert!(matches!(
+            scene_moved,
+            IdeWorkerCommand::MoveArrangementSceneLaunch {
+                launch_id,
+                tick: 1_920,
+            } if launch_id == "launch-a"
+        ));
+        assert!(matches!(
+            placement_added,
+            IdeWorkerCommand::AddArrangementPlacement {
+                clip_id,
+                start_tick: 1_920,
+            } if clip_id == "clip-a"
+        ));
+        assert!(matches!(
+            marker_added,
+            IdeWorkerCommand::EditTimelineMarker {
+                edit: IdeTimelineMarkerEdit::Add { tick: 1_920, name },
+            } if name == "Verse"
+        ));
+        assert!(matches!(
+            marker_moved,
+            IdeWorkerCommand::EditTimelineMarker {
+                edit: IdeTimelineMarkerEdit::Move {
+                    marker_id,
+                    tick: 1_920,
+                },
+            } if marker_id == "marker-a"
+        ));
     }
 
     #[test]
