@@ -13,7 +13,11 @@ const NO_PREVIEW_INDEX: usize = usize::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreviewCommand {
-    Start(usize),
+    Start {
+        index: usize,
+        source_start_frame: usize,
+        source_frame_count: usize,
+    },
     Stop,
 }
 
@@ -70,6 +74,7 @@ pub enum DesktopAudioPreviewCommandError {
     ProjectUnavailable,
     RecordingUnavailable,
     ClipUnavailable,
+    SourceRangeUnavailable,
     PreviewBusy,
     PreviewInactive,
     SequenceExhausted,
@@ -81,6 +86,7 @@ impl fmt::Display for DesktopAudioPreviewCommandError {
             Self::ProjectUnavailable => "audio preview requires a verified project",
             Self::RecordingUnavailable => "audio preview target is not a verified recording",
             Self::ClipUnavailable => "audio preview target is not a verified audio clip",
+            Self::SourceRangeUnavailable => "audio preview source range is unavailable",
             Self::PreviewBusy => "another audio preview is active",
             Self::PreviewInactive => "no audio preview is active",
             Self::SequenceExhausted => "audio preview command sequence is exhausted",
@@ -180,6 +186,8 @@ impl Error for DesktopAudioPreviewBuildError {}
 struct PreviewControlState {
     generation: AtomicU64,
     requested_index: AtomicUsize,
+    requested_source_start_frame: AtomicUsize,
+    requested_source_frame_count: AtomicUsize,
     active_index: AtomicUsize,
     state: AtomicU8,
     played_frames: AtomicU64,
@@ -199,6 +207,8 @@ impl DesktopAudioPreviewControl {
             state: Arc::new(PreviewControlState {
                 generation: AtomicU64::new(0),
                 requested_index: AtomicUsize::new(NO_PREVIEW_INDEX),
+                requested_source_start_frame: AtomicUsize::new(0),
+                requested_source_frame_count: AtomicUsize::new(0),
                 active_index: AtomicUsize::new(NO_PREVIEW_INDEX),
                 state: AtomicU8::new(DesktopAudioPreviewState::Idle as u8),
                 played_frames: AtomicU64::new(0),
@@ -211,19 +221,31 @@ impl DesktopAudioPreviewControl {
 
     pub(crate) fn request_start(
         &self,
-        recording_index: usize,
-        total_frames: u64,
+        source_index: usize,
+        source_start_frame: usize,
+        source_frame_count: usize,
     ) -> Result<(), DesktopAudioPreviewCommandError> {
         if self.snapshot().state().is_active() {
             return Err(DesktopAudioPreviewCommandError::PreviewBusy);
         }
+        if source_frame_count == 0 || source_start_frame.checked_add(source_frame_count).is_none() {
+            return Err(DesktopAudioPreviewCommandError::SourceRangeUnavailable);
+        }
+        let total_frames = u64::try_from(source_frame_count)
+            .map_err(|_| DesktopAudioPreviewCommandError::SourceRangeUnavailable)?;
         let next = self.next_generation()?;
         self.state
             .requested_index
-            .store(recording_index, Ordering::Relaxed);
+            .store(source_index, Ordering::Relaxed);
+        self.state
+            .requested_source_start_frame
+            .store(source_start_frame, Ordering::Relaxed);
+        self.state
+            .requested_source_frame_count
+            .store(source_frame_count, Ordering::Relaxed);
         self.state
             .active_index
-            .store(recording_index, Ordering::Relaxed);
+            .store(source_index, Ordering::Relaxed);
         self.state.played_frames.store(0, Ordering::Relaxed);
         self.state
             .total_frames
@@ -318,7 +340,17 @@ impl DesktopAudioPreviewControl {
         *observed_generation = generation;
         Some(match self.state.requested_index.load(Ordering::Relaxed) {
             NO_PREVIEW_INDEX => PreviewCommand::Stop,
-            index => PreviewCommand::Start(index),
+            index => PreviewCommand::Start {
+                index,
+                source_start_frame: self
+                    .state
+                    .requested_source_start_frame
+                    .load(Ordering::Relaxed),
+                source_frame_count: self
+                    .state
+                    .requested_source_frame_count
+                    .load(Ordering::Relaxed),
+            },
         })
     }
 
@@ -420,6 +452,17 @@ impl StereoPreviewSource<'_> {
         match self {
             Self::Mono(samples) => (samples[index], samples[index]),
             Self::Stereo { left, right } => (left[index], right[index]),
+        }
+    }
+
+    fn range(self, start_frame: usize, frame_count: usize) -> Option<Self> {
+        let end_frame = start_frame.checked_add(frame_count)?;
+        match self {
+            Self::Mono(samples) => samples.get(start_frame..end_frame).map(Self::Mono),
+            Self::Stereo { left, right } => Some(Self::Stereo {
+                left: left.get(start_frame..end_frame)?,
+                right: right.get(start_frame..end_frame)?,
+            }),
         }
     }
 }
@@ -591,7 +634,7 @@ pub(crate) struct DesktopAudioPreviewProcessor<'a> {
     sources: Vec<StereoPreviewSource<'a>>,
     control: DesktopAudioPreviewControl,
     observed_generation: u64,
-    current: Option<(usize, StereoPreviewProcessor)>,
+    current: Option<(StereoPreviewSource<'a>, StereoPreviewProcessor)>,
     stopping: bool,
 }
 
@@ -713,14 +756,18 @@ impl<'a> DesktopAudioPreviewProcessor<'a> {
     pub(crate) fn process(&mut self, output: &mut StereoOutput<'_>) -> bool {
         if let Some(command) = self.control.take_command(&mut self.observed_generation) {
             match command {
-                PreviewCommand::Start(index) => self.start(index),
+                PreviewCommand::Start {
+                    index,
+                    source_start_frame,
+                    source_frame_count,
+                } => self.start(index, source_start_frame, source_frame_count),
                 PreviewCommand::Stop if self.current.is_some() => self.stopping = true,
                 PreviewCommand::Stop => self
                     .control
                     .publish_terminal(DesktopAudioPreviewState::Idle),
             }
         }
-        let Some((index, processor)) = self.current.as_mut() else {
+        let Some((source, processor)) = self.current.as_mut() else {
             if self.stopping {
                 self.stopping = false;
                 self.control
@@ -728,9 +775,8 @@ impl<'a> DesktopAudioPreviewProcessor<'a> {
             }
             return false;
         };
-        let source = self.sources[*index];
         if let Ok(rendered) = processor.render(
-            source,
+            *source,
             output,
             self.control.gain_linear(),
             self.stopping || self.control.muted(),
@@ -760,18 +806,22 @@ impl<'a> DesktopAudioPreviewProcessor<'a> {
         }
     }
 
-    fn start(&mut self, index: usize) {
+    fn start(&mut self, index: usize, source_start_frame: usize, source_frame_count: usize) {
         let Some(source) = self.sources.get(index).copied() else {
             self.fail();
             return;
         };
-        let Some(frame_count) = source.frame_count() else {
+        let Some(source) = source.range(source_start_frame, source_frame_count) else {
             self.fail();
             return;
         };
-        match StereoPreviewProcessor::try_new(self.sample_rate_hz, frame_count) {
+        if source.frame_count() != Some(source_frame_count) {
+            self.fail();
+            return;
+        }
+        match StereoPreviewProcessor::try_new(self.sample_rate_hz, source_frame_count) {
             Ok(processor) => {
-                self.current = Some((index, processor));
+                self.current = Some((source, processor));
                 self.stopping = false;
             }
             Err(_) => self.fail(),
@@ -864,9 +914,59 @@ mod tests {
     }
 
     #[test]
+    fn selected_preview_renders_only_the_requested_prepared_source_range() {
+        let control = DesktopAudioPreviewControl::new();
+        control.request_start(0, 2, 3).unwrap();
+        let source = [0.0_f32, 0.0, 0.8, 0.4, -0.6, 0.2];
+        let mut processor = DesktopAudioPreviewProcessor {
+            sample_rate_hz: 48_000,
+            sources: vec![StereoPreviewSource::Mono(&source)],
+            control: control.clone(),
+            observed_generation: 0,
+            current: None,
+            stopping: false,
+        };
+        let mut left = [9.0_f32; 4];
+        let mut right = [9.0_f32; 4];
+
+        assert!(processor.process(&mut StereoOutput {
+            left: &mut left,
+            right: &mut right,
+        }));
+        assert_eq!(control.snapshot().total_frames(), 3);
+        assert_eq!(control.snapshot().played_frames(), 3);
+        assert_eq!(
+            control.snapshot().state(),
+            DesktopAudioPreviewState::Complete
+        );
+        assert!(left[0] > 0.0 && left[1] > 0.0 && left[2] < 0.0);
+        assert_eq!(left[3].to_bits(), 0.0_f32.to_bits());
+        assert!(
+            left.iter()
+                .zip(right.iter())
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+        );
+    }
+
+    #[test]
+    fn preview_rejects_empty_or_unrepresentable_requested_ranges_without_starting() {
+        let control = DesktopAudioPreviewControl::new();
+        assert_eq!(
+            control.request_start(0, 0, 0),
+            Err(DesktopAudioPreviewCommandError::SourceRangeUnavailable)
+        );
+        assert_eq!(
+            control.request_start(0, usize::MAX, 1),
+            Err(DesktopAudioPreviewCommandError::SourceRangeUnavailable)
+        );
+        assert_eq!(control.snapshot().state(), DesktopAudioPreviewState::Idle);
+        assert_eq!(control.snapshot().target_index(), None);
+    }
+
+    #[test]
     fn stop_command_is_ramped_before_preview_becomes_idle() {
         let control = DesktopAudioPreviewControl::new();
-        control.request_start(0, 1_000).unwrap();
+        control.request_start(0, 0, 1_000).unwrap();
         let source = [1.0_f32; 1_000];
         let mut processor = DesktopAudioPreviewProcessor {
             sample_rate_hz: 48_000,
@@ -901,7 +1001,7 @@ mod tests {
     #[test]
     fn stop_before_first_callback_does_not_leave_a_stopping_ghost() {
         let control = DesktopAudioPreviewControl::new();
-        control.request_start(0, 1_000).unwrap();
+        control.request_start(0, 0, 1_000).unwrap();
         control.request_stop().unwrap();
         let source = [1.0_f32; 1_000];
         let mut processor = DesktopAudioPreviewProcessor {

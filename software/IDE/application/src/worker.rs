@@ -256,6 +256,7 @@ pub enum IdeWorkerCommandKind {
     CaptureMixerAutomation,
     StartAudioPreview,
     StartAudioClipPreview,
+    StartAudioClipSourcePreview,
     StopAudioPreview,
     AudioPreviewControl,
     Observe,
@@ -597,6 +598,11 @@ pub enum IdeWorkerCommand {
     StartAudioClipPreview {
         clip_id: String,
     },
+    StartAudioClipSourcePreview {
+        clip_id: String,
+        source_start_frame: usize,
+        source_frame_count: usize,
+    },
     StopAudioPreview,
     AudioPreviewControl(IdeAudioPreviewControlCommand),
     Observe,
@@ -750,6 +756,9 @@ impl IdeWorkerCommand {
             }
             Self::StartAudioPreview { .. } => IdeWorkerCommandKind::StartAudioPreview,
             Self::StartAudioClipPreview { .. } => IdeWorkerCommandKind::StartAudioClipPreview,
+            Self::StartAudioClipSourcePreview { .. } => {
+                IdeWorkerCommandKind::StartAudioClipSourcePreview
+            }
             Self::StopAudioPreview => IdeWorkerCommandKind::StopAudioPreview,
             Self::AudioPreviewControl(_) => IdeWorkerCommandKind::AudioPreviewControl,
             Self::Observe => IdeWorkerCommandKind::Observe,
@@ -2700,6 +2709,11 @@ impl Error for IdeProjectCloseError {
 enum IdeAudioPreviewTarget {
     RecordingAsset(String),
     Clip(String),
+    ClipSourceRange {
+        clip_id: String,
+        source_start_frame: usize,
+        source_frame_count: usize,
+    },
 }
 
 #[allow(
@@ -5206,6 +5220,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::AbortRecording
         | IdeWorkerCommandKind::StartAudioPreview
         | IdeWorkerCommandKind::StartAudioClipPreview
+        | IdeWorkerCommandKind::StartAudioClipSourcePreview
         | IdeWorkerCommandKind::StopAudioPreview
         | IdeWorkerCommandKind::AudioPreviewControl
         | IdeWorkerCommandKind::InspectAudioClipWaveform
@@ -5621,6 +5636,7 @@ fn process_command(
         }
         command @ (IdeWorkerCommand::StartAudioPreview { .. }
         | IdeWorkerCommand::StartAudioClipPreview { .. }
+        | IdeWorkerCommand::StartAudioClipSourcePreview { .. }
         | IdeWorkerCommand::StopAudioPreview
         | IdeWorkerCommand::AudioPreviewControl(_)) => {
             process_audio_preview_command(state, command, events)
@@ -6747,6 +6763,17 @@ fn process_audio_preview_command(
         IdeWorkerCommand::StartAudioClipPreview { clip_id } => {
             start_audio_clip_preview(state, clip_id, events)
         }
+        IdeWorkerCommand::StartAudioClipSourcePreview {
+            clip_id,
+            source_start_frame,
+            source_frame_count,
+        } => start_audio_clip_source_preview(
+            state,
+            clip_id,
+            source_start_frame,
+            source_frame_count,
+            events,
+        ),
         IdeWorkerCommand::StopAudioPreview => stop_audio_preview(state, events),
         IdeWorkerCommand::AudioPreviewControl(command) => {
             process_audio_preview_control(state, command, events)
@@ -6823,6 +6850,24 @@ fn start_audio_clip_preview(
     start_audio_preview_target(state, IdeAudioPreviewTarget::Clip(clip_id), events)
 }
 
+fn start_audio_clip_source_preview(
+    state: &mut WorkerState,
+    clip_id: String,
+    source_start_frame: usize,
+    source_frame_count: usize,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    start_audio_preview_target(
+        state,
+        IdeAudioPreviewTarget::ClipSourceRange {
+            clip_id,
+            source_start_frame,
+            source_frame_count,
+        },
+        events,
+    )
+}
+
 fn start_audio_preview_target(
     state: &mut WorkerState,
     target: IdeAudioPreviewTarget,
@@ -6841,6 +6886,15 @@ fn start_audio_preview_target(
             application.validate_audio_preview_asset(asset_id)
         }
         IdeAudioPreviewTarget::Clip(clip_id) => application.validate_audio_clip_preview(clip_id),
+        IdeAudioPreviewTarget::ClipSourceRange {
+            clip_id,
+            source_start_frame,
+            source_frame_count,
+        } => application.validate_audio_clip_source_preview(
+            clip_id,
+            *source_start_frame,
+            *source_frame_count,
+        ),
     };
     if let Err(reason) = validation {
         return publish_failure(
@@ -6887,6 +6941,9 @@ const fn audio_preview_command_kind(target: &IdeAudioPreviewTarget) -> IdeWorker
     match target {
         IdeAudioPreviewTarget::RecordingAsset(_) => IdeWorkerCommandKind::StartAudioPreview,
         IdeAudioPreviewTarget::Clip(_) => IdeWorkerCommandKind::StartAudioClipPreview,
+        IdeAudioPreviewTarget::ClipSourceRange { .. } => {
+            IdeWorkerCommandKind::StartAudioClipSourcePreview
+        }
     }
 }
 
@@ -17709,6 +17766,15 @@ fn poll_audio_preview_fence(
             IdeAudioPreviewTarget::Clip(clip_id) => {
                 application.try_start_audio_clip_preview(clip_id)
             }
+            IdeAudioPreviewTarget::ClipSourceRange {
+                clip_id,
+                source_start_frame,
+                source_frame_count,
+            } => application.try_start_audio_clip_source_preview(
+                clip_id,
+                *source_start_frame,
+                *source_frame_count,
+            ),
         };
         *state = WorkerState::Running(application);
         let mut no_native_failure = None;

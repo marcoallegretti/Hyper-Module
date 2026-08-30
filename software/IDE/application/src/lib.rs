@@ -16355,6 +16355,25 @@ impl RunningDesktopIdeApplication {
             ))
     }
 
+    #[allow(
+        clippy::infallible_destructuring_match,
+        reason = "the test-only session variant makes this match fallible in test builds"
+    )]
+    pub(crate) fn validate_audio_clip_source_preview(
+        &self,
+        clip_id: &str,
+        source_start_frame: usize,
+        source_frame_count: usize,
+    ) -> Result<(), IdeAudioPreviewError> {
+        match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session
+                .validate_audio_clip_source_preview(clip_id, source_start_frame, source_frame_count)
+                .map_err(IdeAudioPreviewError::Command),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => Err(IdeAudioPreviewError::Unavailable),
+        }
+    }
+
     /// Starts one verified recorded take on the session's dry audition path.
     ///
     /// # Errors
@@ -16381,6 +16400,33 @@ impl RunningDesktopIdeApplication {
         match &self.session {
             IdePlaybackSessionOwner::Native(session) => session
                 .try_start_audio_clip_preview(clip_id)
+                .map_err(IdeAudioPreviewError::Command),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => Err(IdeAudioPreviewError::Unavailable),
+        }
+    }
+
+    /// Starts dry audition of one exact range inside a reusable audio clip's
+    /// current source view.
+    ///
+    /// # Errors
+    ///
+    /// Rejects test-only/non-project sessions, unknown clips, source ranges
+    /// outside the current committed view, and overlapping previews without
+    /// changing callback state.
+    pub fn try_start_audio_clip_source_preview(
+        &self,
+        clip_id: &str,
+        source_start_frame: usize,
+        source_frame_count: usize,
+    ) -> Result<(), IdeAudioPreviewError> {
+        match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session
+                .try_start_audio_clip_source_preview(
+                    clip_id,
+                    source_start_frame,
+                    source_frame_count,
+                )
                 .map_err(IdeAudioPreviewError::Command),
             #[cfg(test)]
             IdePlaybackSessionOwner::Test(_) => Err(IdeAudioPreviewError::Unavailable),

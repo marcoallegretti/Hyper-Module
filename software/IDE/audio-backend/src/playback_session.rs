@@ -730,6 +730,97 @@ pub struct DesktopPlaybackSession {
     project_open_recovery: Option<ProjectTransactionRecoveryReport>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AudioClipPreviewSource {
+    source_index: usize,
+    view_start_frame: usize,
+    view_frame_count: usize,
+}
+
+impl AudioClipPreviewSource {
+    fn full_range(self) -> Result<(usize, usize), super::DesktopAudioPreviewCommandError> {
+        selected_audio_clip_preview_range(
+            self.view_start_frame,
+            self.view_frame_count,
+            self.view_start_frame,
+            self.view_frame_count,
+        )
+    }
+
+    fn selected_range(
+        self,
+        source_start_frame: usize,
+        source_frame_count: usize,
+    ) -> Result<(usize, usize), super::DesktopAudioPreviewCommandError> {
+        selected_audio_clip_preview_range(
+            self.view_start_frame,
+            self.view_frame_count,
+            source_start_frame,
+            source_frame_count,
+        )
+    }
+}
+
+fn selected_audio_clip_preview_range(
+    committed_start_frame: usize,
+    committed_frame_count: usize,
+    requested_start_frame: usize,
+    requested_frame_count: usize,
+) -> Result<(usize, usize), super::DesktopAudioPreviewCommandError> {
+    if committed_frame_count == 0 || requested_frame_count == 0 {
+        return Err(super::DesktopAudioPreviewCommandError::SourceRangeUnavailable);
+    }
+    let committed_end = committed_start_frame
+        .checked_add(committed_frame_count)
+        .ok_or(super::DesktopAudioPreviewCommandError::SourceRangeUnavailable)?;
+    let requested_end = requested_start_frame
+        .checked_add(requested_frame_count)
+        .ok_or(super::DesktopAudioPreviewCommandError::SourceRangeUnavailable)?;
+    if requested_start_frame < committed_start_frame || requested_end > committed_end {
+        return Err(super::DesktopAudioPreviewCommandError::SourceRangeUnavailable);
+    }
+    let relative_start_frame = requested_start_frame
+        .checked_sub(committed_start_frame)
+        .ok_or(super::DesktopAudioPreviewCommandError::SourceRangeUnavailable)?;
+    Ok((relative_start_frame, requested_frame_count))
+}
+
+fn resolve_audio_clip_preview_source(
+    project: &PreparedProjectPlayback,
+    clip_id: &str,
+) -> Result<AudioClipPreviewSource, super::DesktopAudioPreviewCommandError> {
+    let loaded = project.session().parts().0;
+    resolve_audio_clip_preview_source_from_loaded(
+        loaded,
+        project.recording_metadata().len(),
+        clip_id,
+    )
+}
+
+fn resolve_audio_clip_preview_source_from_loaded(
+    loaded: &LoadedPlaybackProject,
+    recording_count: usize,
+    clip_id: &str,
+) -> Result<AudioClipPreviewSource, super::DesktopAudioPreviewCommandError> {
+    let clip_index = (0..loaded.clip_count())
+        .find(|&index| loaded.clip_id_at(index) == Some(clip_id))
+        .ok_or(super::DesktopAudioPreviewCommandError::ClipUnavailable)?;
+    let source_start_frame = loaded
+        .clip_source_start_frame_at(clip_index)
+        .ok_or(super::DesktopAudioPreviewCommandError::ClipUnavailable)?;
+    let source_frame_count = loaded
+        .clip_source_frame_count_at(clip_index)
+        .ok_or(super::DesktopAudioPreviewCommandError::ClipUnavailable)?;
+    let source_index = recording_count
+        .checked_add(clip_index)
+        .ok_or(super::DesktopAudioPreviewCommandError::SequenceExhausted)?;
+    Ok(AudioClipPreviewSource {
+        source_index,
+        view_start_frame: source_start_frame,
+        view_frame_count: source_frame_count,
+    })
+}
+
 #[derive(Debug)]
 struct PlaybackMonitoringSession {
     input: NativeInputStream,
@@ -1672,8 +1763,55 @@ impl DesktopPlaybackSession {
             .enumerate()
             .find(|(_, recording)| recording.asset_id() == asset_id)
             .ok_or(super::DesktopAudioPreviewCommandError::RecordingUnavailable)?;
+        let source_frame_count = usize::try_from(recording.frame_count())
+            .map_err(|_| super::DesktopAudioPreviewCommandError::SourceRangeUnavailable)?;
         self.preview
-            .request_start(recording_index, recording.frame_count())
+            .request_start(recording_index, 0, source_frame_count)
+    }
+
+    /// Validates dry audition of one reusable audio clip's current source view.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-project session, unknown clip, or active audition without
+    /// changing callback state.
+    pub fn validate_audio_clip_preview(
+        &self,
+        clip_id: &str,
+    ) -> Result<(), super::DesktopAudioPreviewCommandError> {
+        let project = self
+            .prepared_project()
+            .ok_or(super::DesktopAudioPreviewCommandError::ProjectUnavailable)?;
+        let source = resolve_audio_clip_preview_source(project, clip_id)?;
+        let _ = source.full_range()?;
+        if self.audio_preview_snapshot().state().is_active() {
+            return Err(super::DesktopAudioPreviewCommandError::PreviewBusy);
+        }
+        Ok(())
+    }
+
+    /// Validates dry audition of one exact range inside a reusable audio clip's
+    /// current source view.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-project session, unknown clip, empty/overflowing/outside
+    /// source range, or active audition without changing callback state.
+    pub fn validate_audio_clip_source_preview(
+        &self,
+        clip_id: &str,
+        source_start_frame: usize,
+        source_frame_count: usize,
+    ) -> Result<(), super::DesktopAudioPreviewCommandError> {
+        let project = self
+            .prepared_project()
+            .ok_or(super::DesktopAudioPreviewCommandError::ProjectUnavailable)?;
+        let source = resolve_audio_clip_preview_source(project, clip_id)?;
+        let _ = source.selected_range(source_start_frame, source_frame_count)?;
+        if self.audio_preview_snapshot().state().is_active() {
+            return Err(super::DesktopAudioPreviewCommandError::PreviewBusy);
+        }
+        Ok(())
     }
 
     /// Starts dry audition of one reusable audio clip's current source view.
@@ -1692,21 +1830,43 @@ impl DesktopPlaybackSession {
         let project = self
             .prepared_project()
             .ok_or(super::DesktopAudioPreviewCommandError::ProjectUnavailable)?;
-        let loaded = project.session().parts().0;
-        let clip_index = (0..loaded.clip_count())
-            .find(|&index| loaded.clip_id_at(index) == Some(clip_id))
-            .ok_or(super::DesktopAudioPreviewCommandError::ClipUnavailable)?;
-        let source_frame_count = loaded
-            .clip_source_frame_count_at(clip_index)
-            .ok_or(super::DesktopAudioPreviewCommandError::ClipUnavailable)?;
-        let target_index = project
-            .recording_metadata()
-            .len()
-            .checked_add(clip_index)
-            .ok_or(super::DesktopAudioPreviewCommandError::SequenceExhausted)?;
-        let total_frames = u64::try_from(source_frame_count)
-            .map_err(|_| super::DesktopAudioPreviewCommandError::SequenceExhausted)?;
-        self.preview.request_start(target_index, total_frames)
+        let source = resolve_audio_clip_preview_source(project, clip_id)?;
+        let (relative_start_frame, source_frame_count) = source.full_range()?;
+        self.preview.request_start(
+            source.source_index,
+            relative_start_frame,
+            source_frame_count,
+        )
+    }
+
+    /// Starts dry audition of one exact range inside a reusable audio clip's
+    /// current source view.
+    ///
+    /// Track processing, transport state, clip gain, fades, direction, and
+    /// looping deliberately remain outside this dedicated audition path.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-project sessions, unknown clips, empty/overflowing/outside
+    /// source ranges, active audition, or exhausted command sequencing without
+    /// changing callback state.
+    pub fn try_start_audio_clip_source_preview(
+        &self,
+        clip_id: &str,
+        source_start_frame: usize,
+        source_frame_count: usize,
+    ) -> Result<(), super::DesktopAudioPreviewCommandError> {
+        let project = self
+            .prepared_project()
+            .ok_or(super::DesktopAudioPreviewCommandError::ProjectUnavailable)?;
+        let source = resolve_audio_clip_preview_source(project, clip_id)?;
+        let (relative_start_frame, source_frame_count) =
+            source.selected_range(source_start_frame, source_frame_count)?;
+        self.preview.request_start(
+            source.source_index,
+            relative_start_frame,
+            source_frame_count,
+        )
     }
 
     /// Requests a five-millisecond ramp to silence for the active audition.
@@ -2720,7 +2880,9 @@ mod tests {
     use super::*;
     use crate::monitoring_session::realtime_allocator::HeapMeasurement;
     use crate::{BoundedBackendThread, acquire_backend_thread_permit};
-    use crate::{DesktopAudioPreviewControl, DesktopMonitoringConfigError};
+    use crate::{
+        DesktopAudioPreviewCommandError, DesktopAudioPreviewControl, DesktopMonitoringConfigError,
+    };
     use hyper_audio_source::DecodeLimits;
     use hyper_audio_source::DecodedAudio;
     use hyper_control_mappings::{
@@ -3159,11 +3321,28 @@ mod tests {
         })
         .unwrap();
         let (project, _, _, media) = session.parts();
+        let preview_source = resolve_audio_clip_preview_source_from_loaded(
+            project,
+            0,
+            "018f47a2-6b2d-7c11-8a44-001122337503",
+        )
+        .unwrap();
+        assert_eq!(preview_source.source_index, 0);
+        assert_eq!(preview_source.view_start_frame, 600);
+        assert_eq!(preview_source.view_frame_count, 500);
+        assert_eq!(preview_source.selected_range(725, 125), Ok((125, 125)));
         let control = DesktopAudioPreviewControl::new();
         let mut preview =
             DesktopAudioPreviewProcessor::try_new(media, &[], project, 48_000, control.clone())
                 .unwrap();
-        control.request_start(0, 500).unwrap();
+        let (relative_start_frame, source_frame_count) = preview_source.full_range().unwrap();
+        control
+            .request_start(
+                preview_source.source_index,
+                relative_start_frame,
+                source_frame_count,
+            )
+            .unwrap();
         let mut left = [0.0_f32; 400];
         let mut right = [0.0_f32; 400];
 
@@ -3176,6 +3355,30 @@ mod tests {
             "audition must begin at the clip source offset"
         );
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn selected_clip_preview_range_requires_one_exact_current_source_subrange() {
+        assert_eq!(
+            selected_audio_clip_preview_range(600, 500, 725, 125),
+            Ok((125, 125))
+        );
+        assert_eq!(
+            selected_audio_clip_preview_range(600, 500, 600, 500),
+            Ok((0, 500))
+        );
+        for (start, count) in [(599, 1), (600, 0), (1_099, 2), (usize::MAX, 1)] {
+            assert_eq!(
+                selected_audio_clip_preview_range(600, 500, start, count),
+                Err(DesktopAudioPreviewCommandError::SourceRangeUnavailable),
+                "selected source range {start}..{} must be refused",
+                start.saturating_add(count)
+            );
+        }
+        assert_eq!(
+            selected_audio_clip_preview_range(usize::MAX, 1, usize::MAX, 1),
+            Err(DesktopAudioPreviewCommandError::SourceRangeUnavailable)
+        );
     }
 
     #[test]

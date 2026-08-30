@@ -374,6 +374,7 @@ export global IdeActions {
     callback cancel-audio-clip-waveform-selection();
     callback prepare-audio-clip-waveform-trim();
     callback toggle-audio-clip-preview(string);
+    callback toggle-audio-clip-waveform-selection-preview();
     callback loudness-run();
     callback loudness-standby();
     callback loudness-reset();
@@ -4898,7 +4899,7 @@ export component MainWindow inherits Window {
 
                         if !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible : Text {
                             height: 36px;
-                            text: "Placement and scene-marker forms accept exact raw ticks or uniquely resolvable bar|beat|tick positions. Grid-scene capture, non-ripple placement edits, and bounded linear crossfades are durable. Drag, snap, waveform editing, and arbitrary live timing are unavailable.";
+                            text: "Placement and scene-marker forms accept exact raw ticks or uniquely resolvable bar|beat|tick positions. Grid-scene capture, non-ripple placement edits, and bounded linear crossfades are durable. Arrangement drag, snap, direct waveform editing, and arbitrary live timing are unavailable.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
@@ -5976,7 +5977,7 @@ export component MainWindow inherits Window {
                         }
                         Text {
                             text: root.clip-waveform-selection-visible
-                                ? "Selected " + root.clip-waveform-selection-frame-count + " exact frames across " + root.clip-waveform-selection-bin-count + " displayed waveform bins. Review the resulting reusable source trim before applying it."
+                                ? "Selected " + root.clip-waveform-selection-frame-count + " exact frames across " + root.clip-waveform-selection-bin-count + " displayed waveform bins. Audition the dry source range or review the resulting reusable source trim before applying it."
                                 : "Drag across one or more displayed waveform bins to prepare a shorter source view. The selection is bin-aligned; use the exact frame fields for finer trimming.";
                             color: #aebccc;
                             font-size: 10px;
@@ -6010,6 +6011,21 @@ export component MainWindow inherits Window {
                                 }
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: root.preview-active && root.preview-clip-id == root.clip-waveform-id ? "Stop audition" : "Audition selection";
+                                accessible-label: root.preview-active && root.preview-clip-id == root.clip-waveform-id
+                                    ? "Stop selected source audition of " + root.clip-waveform-name
+                                    : "Audition selected source frames of " + root.clip-waveform-name;
+                                enabled: (root.app-mode == AppMode.running
+                                        && root.clip-waveform-selection-visible
+                                        && root.clip-waveform-id != ""
+                                        && root.clip-waveform-selection-start-frame != ""
+                                        && root.clip-waveform-selection-frame-count != "")
+                                    || (root.app-mode == AppMode.previewing
+                                        && root.preview-active
+                                        && root.preview-clip-id == root.clip-waveform-id);
+                                clicked => { IdeActions.toggle-audio-clip-waveform-selection-preview(); }
+                            }
                             Button {
                                 text: "Prepare trim";
                                 accessible-label: "Prepare selected waveform bins as an exact reusable source trim";

@@ -4527,7 +4527,7 @@ fn bind_audio_clip_callback(
     bind_audio_clip_source_slip_callback(ui, worker, project_state);
     bind_audio_clip_source_trim_callback(ui, worker, project_state);
     bind_audio_clip_waveform_callback(ui, worker, project_state);
-    bind_audio_clip_waveform_selection_callbacks(ui, project_state);
+    bind_audio_clip_waveform_selection_callbacks(ui, worker, project_state);
     bind_audio_clip_preview_callback(ui, worker, project_state);
 
     bind_arrangement_placement_addition_callback(ui, worker, project_state);
@@ -4615,6 +4615,12 @@ struct WaveformTrimSelection {
     width_percent: f32,
     displayed_bin_count: usize,
     selected_bin_count: usize,
+}
+
+#[derive(Default)]
+struct WaveformTrimSelectionState {
+    anchor: Cell<Option<f32>>,
+    current: Cell<Option<WaveformTrimSelection>>,
 }
 
 #[derive(Debug)]
@@ -4760,11 +4766,11 @@ fn apply_waveform_trim_selection(ui: &MainWindow, selection: WaveformTrimSelecti
     ui.set_error_text(SharedString::default());
 }
 
-fn prepare_waveform_trim(
+fn validate_waveform_trim_selection(
     ui: &MainWindow,
     project_state: &ProjectUiState,
     selection: WaveformTrimSelection,
-) -> Result<(), &'static str> {
+) -> Result<WaveformTrimSourceView, &'static str> {
     let source_view = resolve_waveform_trim_source_view(ui, project_state)?;
     if !ui.get_clip_waveform_selection_visible()
         || ui
@@ -4798,6 +4804,16 @@ fn prepare_waveform_trim(
         return Err("The waveform selection is no longer within the committed source view");
     }
 
+    Ok(source_view)
+}
+
+fn prepare_waveform_trim(
+    ui: &MainWindow,
+    project_state: &ProjectUiState,
+    selection: WaveformTrimSelection,
+) -> Result<(), &'static str> {
+    let source_view = validate_waveform_trim_selection(ui, project_state, selection)?;
+
     reset_audio_clip_waveform_dialog(ui);
     ui.set_clip_source_trim_id(source_view.clip_id.into());
     ui.set_clip_source_trim_name(source_view.clip_name.into());
@@ -4812,28 +4828,59 @@ fn prepare_waveform_trim(
 
 fn bind_audio_clip_waveform_selection_callbacks(
     ui: &MainWindow,
+    worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
+) {
+    let worker = Rc::clone(worker);
+    bind_audio_clip_waveform_selection_callbacks_with(
+        ui,
+        project_state,
+        Some(Rc::new(move |ui, command| {
+            submit_to_ui(ui, &worker, command);
+        })),
+    );
+}
+
+fn bind_audio_clip_waveform_selection_callbacks_with(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    selected_preview_submitter: Option<UiCommandSubmitter>,
+) {
+    let selection_state = Rc::new(WaveformTrimSelectionState::default());
+    bind_audio_clip_waveform_selection_drag_callbacks(ui, project_state, &selection_state);
+    bind_audio_clip_waveform_trim_callbacks(ui, project_state, &selection_state);
+    if let Some(selected_preview_submitter) = selected_preview_submitter {
+        bind_audio_clip_waveform_selected_preview_callback(
+            ui,
+            project_state,
+            &selection_state,
+            selected_preview_submitter,
+        );
+    }
+}
+
+fn bind_audio_clip_waveform_selection_drag_callbacks(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    selection_state: &Rc<WaveformTrimSelectionState>,
 ) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let project_state_for_begin = Rc::clone(project_state);
-    let anchor = Rc::new(Cell::new(None));
-    let anchor_for_begin = Rc::clone(&anchor);
-    let selection = Rc::new(Cell::new(None));
-    let selection_for_begin = Rc::clone(&selection);
+    let selection_state_for_begin = Rc::clone(selection_state);
     actions.on_begin_audio_clip_waveform_selection(move |fraction| {
         let Some(ui) = weak.upgrade() else {
             return;
         };
         match resolve_waveform_trim_selection(&ui, &project_state_for_begin, fraction, fraction) {
             Ok(selection) => {
-                anchor_for_begin.set(Some(fraction));
-                selection_for_begin.set(Some(selection));
+                selection_state_for_begin.anchor.set(Some(fraction));
+                selection_state_for_begin.current.set(Some(selection));
                 apply_waveform_trim_selection(&ui, selection);
             }
             Err(message) => {
-                anchor_for_begin.set(None);
-                selection_for_begin.set(None);
+                selection_state_for_begin.anchor.set(None);
+                selection_state_for_begin.current.set(None);
                 clear_waveform_trim_selection(&ui);
                 ui.set_error_text(message.into());
             }
@@ -4842,46 +4889,51 @@ fn bind_audio_clip_waveform_selection_callbacks(
 
     let weak = ui.as_weak();
     let project_state_for_complete = Rc::clone(project_state);
-    let anchor_for_complete = Rc::clone(&anchor);
-    let selection_for_complete = Rc::clone(&selection);
+    let selection_state_for_complete = Rc::clone(selection_state);
     actions.on_complete_audio_clip_waveform_selection(move |fraction| {
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        let Some(anchor) = anchor_for_complete.take() else {
+        let Some(anchor) = selection_state_for_complete.anchor.take() else {
             return;
         };
         match resolve_waveform_trim_selection(&ui, &project_state_for_complete, anchor, fraction) {
             Ok(selection) => {
-                selection_for_complete.set(Some(selection));
+                selection_state_for_complete.current.set(Some(selection));
                 apply_waveform_trim_selection(&ui, selection);
             }
             Err(message) => {
-                selection_for_complete.set(None);
+                selection_state_for_complete.current.set(None);
                 clear_waveform_trim_selection(&ui);
                 ui.set_error_text(message.into());
             }
         }
     });
+}
 
+fn bind_audio_clip_waveform_trim_callbacks(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    selection_state: &Rc<WaveformTrimSelectionState>,
+) {
+    let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let project_state_for_prepare = Rc::clone(project_state);
-    let anchor_for_prepare = Rc::clone(&anchor);
-    let selection_for_prepare = Rc::clone(&selection);
+    let selection_state_for_prepare = Rc::clone(selection_state);
     actions.on_prepare_audio_clip_waveform_trim(move || {
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        anchor_for_prepare.set(None);
-        let Some(selected_trim) = selection_for_prepare.get() else {
+        selection_state_for_prepare.anchor.set(None);
+        let Some(selected_trim) = selection_state_for_prepare.current.get() else {
             clear_waveform_trim_selection(&ui);
             ui.set_error_text("Select waveform bins before preparing a trim".into());
             return;
         };
         match prepare_waveform_trim(&ui, &project_state_for_prepare, selected_trim) {
-            Ok(()) => selection_for_prepare.set(None),
+            Ok(()) => selection_state_for_prepare.current.set(None),
             Err(message) => {
-                selection_for_prepare.set(None);
+                selection_state_for_prepare.current.set(None);
                 clear_waveform_trim_selection(&ui);
                 ui.set_error_text(message.into());
             }
@@ -4889,15 +4941,68 @@ fn bind_audio_clip_waveform_selection_callbacks(
     });
 
     let weak = ui.as_weak();
-    let anchor_for_cancel = Rc::clone(&anchor);
-    let selection_for_cancel = Rc::clone(&selection);
+    let selection_state_for_cancel = Rc::clone(selection_state);
     actions.on_cancel_audio_clip_waveform_selection(move || {
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        anchor_for_cancel.set(None);
-        selection_for_cancel.set(None);
+        selection_state_for_cancel.anchor.set(None);
+        selection_state_for_cancel.current.set(None);
         clear_waveform_trim_selection(&ui);
+    });
+}
+
+fn bind_audio_clip_waveform_selected_preview_callback(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    selection_state: &Rc<WaveformTrimSelectionState>,
+    selected_preview_submitter: UiCommandSubmitter,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let project_state_for_selected_preview = Rc::clone(project_state);
+    let selection_state_for_selected_preview = Rc::clone(selection_state);
+    actions.on_toggle_audio_clip_waveform_selection_preview(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        selection_state_for_selected_preview.anchor.set(None);
+        let waveform_clip_id = ui.get_clip_waveform_id();
+        if ui.get_app_mode() == AppMode::Previewing
+            && ui.get_preview_active()
+            && !waveform_clip_id.is_empty()
+            && ui.get_preview_clip_id() == waveform_clip_id
+        {
+            selected_preview_submitter(&ui, IdeWorkerCommand::StopAudioPreview);
+            return;
+        }
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        let Some(selected_range) = selection_state_for_selected_preview.current.get() else {
+            clear_waveform_trim_selection(&ui);
+            ui.set_error_text("Select waveform bins before auditioning them".into());
+            return;
+        };
+        match validate_waveform_trim_selection(
+            &ui,
+            &project_state_for_selected_preview,
+            selected_range,
+        ) {
+            Ok(source_view) => selected_preview_submitter(
+                &ui,
+                IdeWorkerCommand::StartAudioClipSourcePreview {
+                    clip_id: source_view.clip_id,
+                    source_start_frame: selected_range.source_start_frame,
+                    source_frame_count: selected_range.source_frame_count,
+                },
+            ),
+            Err(message) => {
+                selection_state_for_selected_preview.current.set(None);
+                clear_waveform_trim_selection(&ui);
+                ui.set_error_text(message.into());
+            }
+        }
     });
 }
 
@@ -5928,9 +6033,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::CaptureMixerAutomation => {
             mixer_automation_capture_submission_mode(current)
         }
-        IdeWorkerCommandKind::StartAudioPreview | IdeWorkerCommandKind::StartAudioClipPreview => {
-            AppMode::PreparingPreview
-        }
+        IdeWorkerCommandKind::StartAudioPreview
+        | IdeWorkerCommandKind::StartAudioClipPreview
+        | IdeWorkerCommandKind::StartAudioClipSourcePreview => AppMode::PreparingPreview,
         _ => current,
     }
 }
@@ -6234,6 +6339,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::StartAudioClipPreview => {
             "Stopping transport and preparing dry clip audition…"
+        }
+        IdeWorkerCommandKind::StartAudioClipSourcePreview => {
+            "Stopping transport and preparing dry selected-source audition…"
         }
         IdeWorkerCommandKind::StopAudioPreview => "Stopping audio audition…",
         IdeWorkerCommandKind::AudioPreviewControl => "Applying audio audition control…",
@@ -10920,7 +11028,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         {
             AppMode::CapturingMixerAutomation
         }
-        IdeWorkerCommandKind::StartAudioPreview | IdeWorkerCommandKind::StartAudioClipPreview
+        IdeWorkerCommandKind::StartAudioPreview
+        | IdeWorkerCommandKind::StartAudioClipPreview
+        | IdeWorkerCommandKind::StartAudioClipSourcePreview
             if current == AppMode::PreparingPreview =>
         {
             AppMode::Running
@@ -21869,7 +21979,7 @@ mod tests {
             .audio_clips
             .borrow_mut()
             .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
-        bind_audio_clip_waveform_selection_callbacks(&ui, &project_state);
+        bind_audio_clip_waveform_selection_callbacks_with(&ui, &project_state, None);
 
         configure_waveform_selection_test_view(&ui, "Clip A", 100);
 
@@ -21969,7 +22079,7 @@ mod tests {
             .audio_clips
             .borrow_mut()
             .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
-        bind_audio_clip_waveform_selection_callbacks(&ui, &project_state);
+        bind_audio_clip_waveform_selection_callbacks_with(&ui, &project_state, None);
         configure_waveform_selection_test_view(&ui, "Clip A", 100);
 
         ui.show().unwrap();
@@ -22016,6 +22126,170 @@ mod tests {
     }
 
     #[test]
+    fn waveform_selected_range_audition_uses_real_drag_and_submits_exact_source_frames() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let project_state = Rc::new(ProjectUiState::default());
+        project_state
+            .audio_clips
+            .borrow_mut()
+            .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_audio_clip_waveform_selection_callbacks_with(
+            &ui,
+            &project_state,
+            Some(Rc::new(move |_, command| {
+                submitted_by_callback.borrow_mut().push(command);
+            })),
+        );
+        configure_waveform_selection_test_view(&ui, "Clip A", 100);
+
+        ui.show().unwrap();
+        let selection_surface =
+            ElementHandle::find_by_element_id(&ui, "MainWindow::waveform-selection")
+                .next()
+                .expect("the waveform panel exposes its pointer selection surface");
+        let position = selection_surface.absolute_position();
+        let size = selection_surface.size();
+        selection_surface.mock_drag(
+            LogicalPosition::new(
+                position.x + size.width * 0.75,
+                position.y + size.height / 2.0,
+            ),
+            PointerEventButton::Left,
+        );
+        let audition = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Audition selected source frames of Clip A",
+        )
+        .next()
+        .expect("the waveform panel exposes an explicit selected-range audition action");
+        assert_eq!(audition.accessible_enabled(), Some(true));
+        audition.mock_single_click(PointerEventButton::Left);
+
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::StartAudioClipSourcePreview {
+                clip_id,
+                source_start_frame: 740,
+                source_frame_count: 330,
+            }] if clip_id == "clip-a"
+        ));
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(ui.get_clip_waveform_selection_visible());
+        assert!(!ui.get_preview_active());
+        assert!(!ui.get_clip_source_trim_visible());
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn waveform_selected_range_audition_discards_a_pending_selection_anchor() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let project_state = Rc::new(ProjectUiState::default());
+        project_state
+            .audio_clips
+            .borrow_mut()
+            .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_audio_clip_waveform_selection_callbacks_with(
+            &ui,
+            &project_state,
+            Some(Rc::new(move |_, command| {
+                submitted_by_callback.borrow_mut().push(command);
+            })),
+        );
+        configure_waveform_selection_test_view(&ui, "Clip A", 100);
+
+        ui.show().unwrap();
+        ui.global::<IdeActions>()
+            .invoke_begin_audio_clip_waveform_selection(0.25);
+        let selected_start = ui.get_clip_waveform_selection_start_frame();
+        let selected_count = ui.get_clip_waveform_selection_frame_count();
+        let audition = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Audition selected source frames of Clip A",
+        )
+        .next()
+        .expect("a pending waveform selection exposes its audition action");
+        audition.mock_single_click(PointerEventButton::Left);
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::StartAudioClipSourcePreview { clip_id, .. }] if clip_id == "clip-a"
+        ));
+
+        ui.global::<IdeActions>()
+            .invoke_complete_audio_clip_waveform_selection(0.75);
+        assert_eq!(ui.get_clip_waveform_selection_start_frame(), selected_start);
+        assert_eq!(ui.get_clip_waveform_selection_frame_count(), selected_count);
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn waveform_selected_range_audition_stops_same_clip_and_refuses_visible_drift() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let project_state = Rc::new(ProjectUiState::default());
+        project_state
+            .audio_clips
+            .borrow_mut()
+            .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_audio_clip_waveform_selection_callbacks_with(
+            &ui,
+            &project_state,
+            Some(Rc::new(move |_, command| {
+                submitted_by_callback.borrow_mut().push(command);
+            })),
+        );
+        configure_waveform_selection_test_view(&ui, "Clip A", 100);
+        ui.global::<IdeActions>()
+            .invoke_begin_audio_clip_waveform_selection(0.25);
+        ui.global::<IdeActions>()
+            .invoke_complete_audio_clip_waveform_selection(0.75);
+
+        ui.show().unwrap();
+        ui.set_app_mode(AppMode::Previewing);
+        ui.set_preview_active(true);
+        ui.set_preview_clip_id("clip-a".into());
+        let stop =
+            ElementHandle::find_by_accessible_label(&ui, "Stop selected source audition of Clip A")
+                .next()
+                .expect("a same-clip selected-range audition exposes its stop action");
+        assert_eq!(stop.accessible_enabled(), Some(true));
+        stop.mock_single_click(PointerEventButton::Left);
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::StopAudioPreview]
+        ));
+        assert!(ui.get_clip_waveform_selection_visible());
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_preview_active(false);
+        ui.set_preview_clip_id(SharedString::default());
+        ui.set_clip_waveform_selection_start_frame("421".into());
+        let audition = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Audition selected source frames of Clip A",
+        )
+        .next()
+        .expect("the selected-range audition action returns after preview recovery");
+        audition.mock_single_click(PointerEventButton::Left);
+
+        assert_eq!(submitted.borrow().len(), 1);
+        assert!(!ui.get_clip_waveform_selection_visible());
+        assert!(
+            ui.get_error_text()
+                .contains("selection is no longer current")
+        );
+        assert!(!ui.get_clip_source_trim_visible());
+        ui.hide().unwrap();
+    }
+
+    #[test]
     fn waveform_prepare_discards_a_pending_selection_anchor() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();
@@ -22024,7 +22298,7 @@ mod tests {
             .audio_clips
             .borrow_mut()
             .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
-        bind_audio_clip_waveform_selection_callbacks(&ui, &project_state);
+        bind_audio_clip_waveform_selection_callbacks_with(&ui, &project_state, None);
 
         configure_waveform_selection_test_view(&ui, "Clip A", 100);
 
