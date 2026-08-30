@@ -1786,6 +1786,7 @@ pub enum AudioClipSourceStartSerializationError {
 pub enum AudioClipSourceViewSerializationError {
     SourceFrameCountZero,
     SourceFrameCountExceedsCurrentView,
+    SourceRangeExceedsCurrentView,
     SourceFrameCountOutOfRange,
     DurationArithmeticOverflow,
     DurationIsNotExact,
@@ -2512,6 +2513,9 @@ impl fmt::Display for AudioClipSourceViewSerializationError {
             Self::SourceFrameCountExceedsCurrentView => formatter.write_str(
                 "an audio-clip source-view trim cannot extend the committed source view",
             ),
+            Self::SourceRangeExceedsCurrentView => formatter.write_str(
+                "an audio-clip source-view trim must remain inside the committed source view",
+            ),
             Self::SourceFrameCountOutOfRange => {
                 formatter.write_str("audio-clip source frame count exceeds the platform range")
             }
@@ -2543,6 +2547,7 @@ impl Error for AudioClipSourceViewSerializationError {
             Self::ProjectCompilation(source) => Some(source),
             Self::SourceFrameCountZero
             | Self::SourceFrameCountExceedsCurrentView
+            | Self::SourceRangeExceedsCurrentView
             | Self::SourceFrameCountOutOfRange
             | Self::DurationArithmeticOverflow
             | Self::DurationIsNotExact
@@ -8790,19 +8795,9 @@ pub fn serialize_audio_clip_source_view(
             AudioClipDocumentSerializationError::ClipMissing,
         ))?;
     let committed = &project.clips[clip_index];
-    let requested_frame_count = usize::try_from(source_frame_count)
-        .map_err(|_| AudioClipSourceViewSerializationError::SourceFrameCountOutOfRange)?;
-
-    if requested_frame_count == 0 {
-        return Err(AudioClipSourceViewSerializationError::SourceFrameCountZero);
-    }
-    if requested_frame_count > committed.source_frame_count {
-        return Err(AudioClipSourceViewSerializationError::SourceFrameCountExceedsCurrentView);
-    }
-
-    if requested_frame_count == committed.source_frame_count
-        && usize::try_from(source_start_frame).ok() == Some(committed.source_start_frame)
-    {
+    let Some(duration_ticks) =
+        source_view_edit_duration(committed, source_start_frame, source_frame_count)?
+    else {
         let output =
             serialize_audio_clip_document_edit(project, source_clip, clip_id, limits, |_| Ok(()))
                 .map_err(AudioClipSourceViewSerializationError::Document)?;
@@ -8810,36 +8805,7 @@ pub fn serialize_audio_clip_source_view(
             .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
             .map_err(AudioClipSourceViewSerializationError::ProjectCompilation)?;
         return Ok(output);
-    }
-
-    if !audio_clip_warp_is_exactly_linear(committed) {
-        return Err(AudioClipSourceViewSerializationError::NonLinearWarp);
-    }
-
-    let duration_numerator = u128::from(committed.duration_ticks)
-        .checked_mul(
-            u128::try_from(requested_frame_count)
-                .map_err(|_| AudioClipSourceViewSerializationError::DurationArithmeticOverflow)?,
-        )
-        .ok_or(AudioClipSourceViewSerializationError::DurationArithmeticOverflow)?;
-    let committed_frame_count = u128::try_from(committed.source_frame_count)
-        .map_err(|_| AudioClipSourceViewSerializationError::DurationArithmeticOverflow)?;
-    if duration_numerator % committed_frame_count != 0 {
-        return Err(AudioClipSourceViewSerializationError::DurationIsNotExact);
-    }
-    let duration_ticks = u64::try_from(duration_numerator / committed_frame_count)
-        .map_err(|_| AudioClipSourceViewSerializationError::DurationArithmeticOverflow)?;
-    if duration_ticks == 0 {
-        return Err(AudioClipSourceViewSerializationError::DurationIsNotExact);
-    }
-    if committed.loop_range.end > duration_ticks {
-        return Err(AudioClipSourceViewSerializationError::RetainedLoopOutOfRange);
-    }
-    if committed.fade_in_ticks > duration_ticks
-        || committed.fade_out_ticks > duration_ticks - committed.fade_in_ticks
-    {
-        return Err(AudioClipSourceViewSerializationError::RetainedFadesExceedDuration);
-    }
+    };
 
     let output =
         serialize_audio_clip_document_edit(project, source_clip, clip_id, limits, |document| {
@@ -8876,6 +8842,68 @@ pub fn serialize_audio_clip_source_view(
         .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
         .map_err(AudioClipSourceViewSerializationError::ProjectCompilation)?;
     Ok(output)
+}
+
+fn source_view_edit_duration(
+    committed: &LoadedClip,
+    source_start_frame: u64,
+    source_frame_count: u64,
+) -> Result<Option<u64>, AudioClipSourceViewSerializationError> {
+    let requested_frame_count = usize::try_from(source_frame_count)
+        .map_err(|_| AudioClipSourceViewSerializationError::SourceFrameCountOutOfRange)?;
+    let requested_start_frame = usize::try_from(source_start_frame)
+        .map_err(|_| AudioClipSourceViewSerializationError::SourceRangeExceedsCurrentView)?;
+    if requested_frame_count == 0 {
+        return Err(AudioClipSourceViewSerializationError::SourceFrameCountZero);
+    }
+    if requested_frame_count > committed.source_frame_count {
+        return Err(AudioClipSourceViewSerializationError::SourceFrameCountExceedsCurrentView);
+    }
+    let requested_end_frame = requested_start_frame
+        .checked_add(requested_frame_count)
+        .ok_or(AudioClipSourceViewSerializationError::SourceRangeExceedsCurrentView)?;
+    let committed_end_frame = committed
+        .source_start_frame
+        .checked_add(committed.source_frame_count)
+        .ok_or(AudioClipSourceViewSerializationError::SourceRangeExceedsCurrentView)?;
+    if requested_start_frame < committed.source_start_frame
+        || requested_end_frame > committed_end_frame
+    {
+        return Err(AudioClipSourceViewSerializationError::SourceRangeExceedsCurrentView);
+    }
+    if requested_frame_count == committed.source_frame_count
+        && requested_start_frame == committed.source_start_frame
+    {
+        return Ok(None);
+    }
+    if !audio_clip_warp_is_exactly_linear(committed) {
+        return Err(AudioClipSourceViewSerializationError::NonLinearWarp);
+    }
+    let duration_numerator = u128::from(committed.duration_ticks)
+        .checked_mul(
+            u128::try_from(requested_frame_count)
+                .map_err(|_| AudioClipSourceViewSerializationError::DurationArithmeticOverflow)?,
+        )
+        .ok_or(AudioClipSourceViewSerializationError::DurationArithmeticOverflow)?;
+    let committed_frame_count = u128::try_from(committed.source_frame_count)
+        .map_err(|_| AudioClipSourceViewSerializationError::DurationArithmeticOverflow)?;
+    if duration_numerator % committed_frame_count != 0 {
+        return Err(AudioClipSourceViewSerializationError::DurationIsNotExact);
+    }
+    let duration_ticks = u64::try_from(duration_numerator / committed_frame_count)
+        .map_err(|_| AudioClipSourceViewSerializationError::DurationArithmeticOverflow)?;
+    if duration_ticks == 0 {
+        return Err(AudioClipSourceViewSerializationError::DurationIsNotExact);
+    }
+    if committed.loop_range.end > duration_ticks {
+        return Err(AudioClipSourceViewSerializationError::RetainedLoopOutOfRange);
+    }
+    if committed.fade_in_ticks > duration_ticks
+        || committed.fade_out_ticks > duration_ticks - committed.fade_in_ticks
+    {
+        return Err(AudioClipSourceViewSerializationError::RetainedFadesExceedDuration);
+    }
+    Ok(Some(duration_ticks))
 }
 
 fn audio_clip_warp_is_exactly_linear(clip: &LoadedClip) -> bool {
@@ -19237,9 +19265,41 @@ mod tests {
                 50,
                 LoaderLimits::VERSION_1,
             ),
-            Err(AudioClipSourceViewSerializationError::ProjectCompilation(
-                AdapterCompileError::Graph(GraphError::SourceOutsideAsset { clip_index: 0 })
-            ))
+            Err(AudioClipSourceViewSerializationError::SourceRangeExceedsCurrentView)
+        ));
+
+        let mut slipped_source: Value = serde_json::from_slice(&canonical).unwrap();
+        slipped_source["source"]["start_frame"] = 25.into();
+        let slipped_source = serde_json_canonicalizer::to_vec(&slipped_source).unwrap();
+        let slipped_clips: [&[u8]; 1] = [&slipped_source];
+        let slipped_project = load(
+            input(TIMELINE, &tracks, &slipped_clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_audio_clip_source_view(
+                &slipped_project,
+                &assets,
+                &slipped_source,
+                clip_id,
+                0,
+                100,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceViewSerializationError::SourceRangeExceedsCurrentView)
+        ));
+        assert!(matches!(
+            serialize_audio_clip_source_view(
+                &loaded,
+                &assets,
+                &canonical,
+                clip_id,
+                24,
+                100,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceViewSerializationError::SourceRangeExceedsCurrentView)
         ));
 
         let mut loop_source = source.clone();

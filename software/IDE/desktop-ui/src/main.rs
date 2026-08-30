@@ -5169,6 +5169,30 @@ fn bind_audio_clip_source_trim_callback_with(
             );
             return;
         }
+        let Some(committed_end) = committed_start.checked_add(committed_frame_count) else {
+            ui.set_error_text("The committed source view is no longer valid; reopen it".into());
+            return;
+        };
+        let Ok(requested_start) = usize::try_from(source_start_frame) else {
+            ui.set_error_text("Source trim start frame exceeds the supported range".into());
+            return;
+        };
+        let Ok(requested_frame_count) = usize::try_from(source_frame_count) else {
+            ui.set_error_text("Source trim frame count exceeds the supported range".into());
+            return;
+        };
+        let Some(requested_end) = requested_start.checked_add(requested_frame_count) else {
+            ui.set_error_text(
+                "Source trim range is outside the committed reusable source view".into(),
+            );
+            return;
+        };
+        if requested_start < committed_start || requested_end > committed_end {
+            ui.set_error_text(
+                "Source trim must remain inside the committed reusable source view".into(),
+            );
+            return;
+        }
         if usize::try_from(source_start_frame).ok() == Some(committed_start)
             && usize::try_from(source_frame_count).ok() == Some(committed_frame_count)
         {
@@ -23130,7 +23154,7 @@ mod tests {
             ui,
             move |clip_id| {
                 (available_for_callback.get() && clip_id == "clip-a")
-                    .then(|| ("clip-a".to_owned(), 0, 100))
+                    .then(|| ("clip-a".to_owned(), 25, 100))
             },
             move |_, command| submitted_by_callback.borrow_mut().push(command),
         );
@@ -23139,7 +23163,7 @@ mod tests {
         ui.set_clip_source_trim_visible(true);
         ui.set_clip_source_trim_id("clip-a".into());
         ui.set_clip_source_trim_name("Clip A".into());
-        ui.set_clip_source_trim_original_start("0".into());
+        ui.set_clip_source_trim_original_start("25".into());
         ui.set_clip_source_trim_original_frame_count("100".into());
         ui.set_clip_source_trim_start("25".into());
         ui.set_clip_source_trim_frame_count("50".into());
@@ -23189,6 +23213,19 @@ mod tests {
         assert_eq!(ui.get_clip_source_trim_id(), "clip-a");
         assert_eq!(ui.get_clip_source_trim_start(), "25");
         assert_eq!(ui.get_clip_source_trim_frame_count(), "50");
+
+        submitted.borrow_mut().clear();
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>().invoke_trim_audio_clip_source(
+            "clip-a".into(),
+            "24".into(),
+            "100".into(),
+        );
+        assert!(submitted.borrow().is_empty());
+        assert!(
+            ui.get_error_text()
+                .contains("must remain inside the committed reusable source view")
+        );
     }
 
     fn assert_unused_sample_cleanup_window_contract(ui: &MainWindow) {
