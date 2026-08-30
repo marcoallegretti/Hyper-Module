@@ -373,6 +373,8 @@ export global IdeActions {
     callback complete-audio-clip-waveform-selection(float);
     callback cancel-audio-clip-waveform-selection();
     callback prepare-audio-clip-waveform-trim();
+    callback prepare-audio-clip-waveform-range-duplication();
+    callback duplicate-audio-clip-source-range(string, string, string, string);
     callback toggle-audio-clip-preview(string);
     callback toggle-audio-clip-waveform-selection-preview();
     callback loudness-run();
@@ -750,6 +752,12 @@ export component MainWindow inherits Window {
     in-out property <string> clip-duplicate-id: "";
     in-out property <string> clip-duplicate-source-name: "";
     in-out property <string> clip-duplicate-name: "";
+    in-out property <bool> clip-source-range-duplicate-visible: false;
+    in-out property <string> clip-source-range-duplicate-id: "";
+    in-out property <string> clip-source-range-duplicate-source-name: "";
+    in-out property <string> clip-source-range-duplicate-start: "";
+    in-out property <string> clip-source-range-duplicate-frame-count: "";
+    in-out property <string> clip-source-range-duplicate-name: "";
     in-out property <bool> clip-remove-visible: false;
     in-out property <string> clip-remove-id: "";
     in-out property <string> clip-remove-name: "";
@@ -834,6 +842,7 @@ export component MainWindow inherits Window {
         || root.remove-arrangement-placement-visible
         || root.clip-rename-visible
         || root.clip-duplicate-visible
+        || root.clip-source-range-duplicate-visible
         || root.clip-remove-visible
         || root.clip-gain-visible
         || root.clip-fades-visible
@@ -861,6 +870,7 @@ export component MainWindow inherits Window {
         && root.clips-visible
         && !root.clip-rename-visible
         && !root.clip-duplicate-visible
+        && !root.clip-source-range-duplicate-visible
         && !root.clip-remove-visible
         && !root.clip-gain-visible
         && !root.clip-fades-visible
@@ -1423,10 +1433,12 @@ export component MainWindow inherits Window {
 
                 Panel {
                     vertical-stretch: 1;
-                    VerticalLayout {
-                        padding: 14px;
-                        spacing: 8px;
-                        Text { text: "PROJECT"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                    project-sidebar-scroll := ScrollView {
+                        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                        VerticalLayout {
+                            padding: 14px;
+                            spacing: 8px;
+                            Text { text: "PROJECT"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
                         if root.new-project-visible : VerticalLayout {
                             vertical-stretch: 1;
                             spacing: 6px;
@@ -1887,6 +1899,7 @@ export component MainWindow inherits Window {
                             color: root.app-mode == AppMode.recording ? #ffaaa6 : #728196;
                             font-size: 9px;
                             wrap: word-wrap;
+                        }
                         }
                         }
                     }
@@ -5156,7 +5169,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-remove-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && !root.clip-source-slip-visible && !root.clip-source-trim-visible && !root.clip-waveform-visible && !root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-source-range-duplicate-visible && !root.clip-remove-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && !root.clip-source-slip-visible && !root.clip-source-trim-visible && !root.clip-waveform-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -5547,6 +5560,63 @@ export component MainWindow inherits Window {
                                     && root.clip-duplicate-id != ""
                                     && root.clip-duplicate-name != "";
                                 clicked => { IdeActions.duplicate-audio-clip(root.clip-duplicate-id, root.clip-duplicate-name); }
+                            }
+                        }
+                    }
+                }
+
+                if root.clips-visible && root.clip-source-range-duplicate-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 16px;
+                        Text { text: "CREATE CLIP FROM SELECTED SOURCE RANGE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.clip-source-range-duplicate-source-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Text {
+                            text: "Start frame " + root.clip-source-range-duplicate-start + " · " + root.clip-source-range-duplicate-frame-count + " exact frames";
+                            color: #aebccc;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: "Enter a name from 1 to 120 characters for an independent reusable clip. The original clip, source media, and arrangement placements remain unchanged.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        IdeLineEdit {
+                            text <=> root.clip-source-range-duplicate-name;
+                            placeholder-text: "New audio clip name";
+                            accessible-label: "New clip name for the selected waveform source range";
+                        }
+                        Text {
+                            text: "Before publication, the current native project validates this exact source range and decoded-audio gain again. It refuses ranges that cannot retain exact timing, warp, loop, or fade semantics.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; clicked => { root.clip-source-range-duplicate-visible = false; } }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: root.app-mode == AppMode.duplicating-clip ? "Creating range clip..." : "Create range clip";
+                                accessible-label: "Create an independent reusable clip from the selected waveform source range";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.clip-source-range-duplicate-id != ""
+                                    && root.clip-source-range-duplicate-start != ""
+                                    && root.clip-source-range-duplicate-frame-count != ""
+                                    && root.clip-source-range-duplicate-name != "";
+                                clicked => {
+                                    IdeActions.duplicate-audio-clip-source-range(
+                                        root.clip-source-range-duplicate-id,
+                                        root.clip-source-range-duplicate-name,
+                                        root.clip-source-range-duplicate-start,
+                                        root.clip-source-range-duplicate-frame-count
+                                    );
+                                }
                             }
                         }
                     }
@@ -5977,8 +6047,8 @@ export component MainWindow inherits Window {
                         }
                         Text {
                             text: root.clip-waveform-selection-visible
-                                ? "Selected " + root.clip-waveform-selection-frame-count + " exact frames across " + root.clip-waveform-selection-bin-count + " displayed waveform bins. Audition the dry source range or review the resulting reusable source trim before applying it."
-                                : "Drag across one or more displayed waveform bins to prepare a shorter source view. The selection is bin-aligned; use the exact frame fields for finer trimming.";
+                                ? "Selected " + root.clip-waveform-selection-frame-count + " exact frames across " + root.clip-waveform-selection-bin-count + " displayed waveform bins. Audition the dry source range, create an independent reusable range clip, or review the resulting reusable source trim before applying it."
+                                : "Drag across one or more displayed waveform bins to create an independent range clip or prepare a shorter source view. The selection is bin-aligned; use the exact frame fields for finer trimming.";
                             color: #aebccc;
                             font-size: 10px;
                             wrap: word-wrap;
@@ -6035,6 +6105,16 @@ export component MainWindow inherits Window {
                                     && root.clip-waveform-selection-start-frame != ""
                                     && root.clip-waveform-selection-frame-count != "";
                                 clicked => { IdeActions.prepare-audio-clip-waveform-trim(); }
+                            }
+                            Button {
+                                text: "Create range clip";
+                                accessible-label: "Create an independent reusable clip from the selected waveform source range";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.clip-waveform-selection-visible
+                                    && root.clip-waveform-id != ""
+                                    && root.clip-waveform-selection-start-frame != ""
+                                    && root.clip-waveform-selection-frame-count != "";
+                                clicked => { IdeActions.prepare-audio-clip-waveform-range-duplication(); }
                             }
                         }
                     }

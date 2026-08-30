@@ -14,28 +14,28 @@ use hyper_desktop_ide::{
     AutomationMainParameter, AutomationPoint, AutomationSendParameter, AutomationTarget,
     AutomationValue, ControlScope, ControlSource, ControlTarget, ControlTransform,
     DesktopAudioPreviewState, DesktopIdeWorker, Edge, IDE_AUDIO_CLIP_WAVEFORM_BINS,
-    IdeApplicationConfig, IdeAudioClip, IdeAudioClipWaveform, IdeAudioInputInventory,
-    IdeAudioOutputInventory, IdeAudioPreviewControlCommand, IdeAutomationTakeRequest,
-    IdeAutomationTarget, IdeControlBindingRequest, IdeControlChannelParameter,
-    IdeControlMainParameter, IdeControlMappingEdit, IdeInputMeterObservation, IdeInputSelection,
-    IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
-    IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
-    IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerChannelKind,
-    IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice,
-    IdeNativeFilterEdit, IdeOutputMeterObservation, IdeOutputSelection, IdeOutputTestState,
-    IdePlaybackArrangement, IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent,
-    IdeProjectExportFormat, IdeRecordingAbortOutcome, IdeRecordingCaptureKind,
-    IdeRecordingImportOutcome, IdeRecordingTake, IdeResourceRestoreError, IdeRoutingBusKind,
-    IdeRunningObservation, IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability,
-    IdeSceneLaunchQuantization, IdeSceneLaunchState, IdeSceneSlotEdit, IdeSceneTrackAction,
-    IdeTimelineMarker, IdeTimelineMarkerEdit, IdeUnusedSampleCleanupSummary, IdeWorkerCommand,
-    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
-    IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState,
-    MAX_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
-    MAX_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RELEASE_MICROSECONDS,
-    MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MAX_FILTER_CUTOFF_MILLIHERTZ,
-    MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL, MAX_IDE_SCENES,
-    MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    IdeApplicationConfig, IdeAudioClip, IdeAudioClipSourceRange, IdeAudioClipWaveform,
+    IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
+    IdeAutomationTakeRequest, IdeAutomationTarget, IdeControlBindingRequest,
+    IdeControlChannelParameter, IdeControlMainParameter, IdeControlMappingEdit,
+    IdeInputMeterObservation, IdeInputSelection, IdeLoopRangeFrames, IdeLoudnessCommand,
+    IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState, IdeLoudnessPresentationConfig,
+    IdeLoudnessScale, IdeLoudnessScaleRegion, IdeMaximumTruePeakDisplay, IdeMixerChannel,
+    IdeMixerChannelDestination, IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap,
+    IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice, IdeNativeFilterEdit,
+    IdeOutputMeterObservation, IdeOutputSelection, IdeOutputTestState, IdePlaybackArrangement,
+    IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeProjectExportFormat,
+    IdeRecordingAbortOutcome, IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake,
+    IdeResourceRestoreError, IdeRoutingBusKind, IdeRunningObservation, IdeScaledLoudnessValue,
+    IdeScene, IdeSceneAvailability, IdeSceneLaunchQuantization, IdeSceneLaunchState,
+    IdeSceneSlotEdit, IdeSceneTrackAction, IdeTimelineMarker, IdeTimelineMarkerEdit,
+    IdeUnusedSampleCleanupSummary, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
+    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeWorkerShutdownReport, LocateState, MAX_COMPRESSOR_ATTACK_MICROSECONDS,
+    MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS, MAX_COMPRESSOR_RATIO_MILLIONTHS,
+    MAX_COMPRESSOR_RELEASE_MICROSECONDS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
+    MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL,
+    MAX_IDE_SCENES, MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
     MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
     MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MIN_FILTER_CUTOFF_MILLIHERTZ,
     MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, MetronomeGain, MusicalPositionResolveError,
@@ -4826,18 +4826,38 @@ fn prepare_waveform_trim(
     Ok(())
 }
 
+fn prepare_waveform_source_range_duplication(
+    ui: &MainWindow,
+    project_state: &ProjectUiState,
+    selection: WaveformTrimSelection,
+) -> Result<(), &'static str> {
+    let source_view = validate_waveform_trim_selection(ui, project_state, selection)?;
+
+    reset_audio_clip_waveform_dialog(ui);
+    ui.set_clip_source_range_duplicate_id(source_view.clip_id.into());
+    ui.set_clip_source_range_duplicate_source_name(source_view.clip_name.into());
+    ui.set_clip_source_range_duplicate_start(selection.source_start_frame.to_string().into());
+    ui.set_clip_source_range_duplicate_frame_count(selection.source_frame_count.to_string().into());
+    ui.set_clip_source_range_duplicate_name(SharedString::default());
+    ui.set_clip_source_range_duplicate_visible(true);
+    ui.set_error_text(SharedString::default());
+    Ok(())
+}
+
 fn bind_audio_clip_waveform_selection_callbacks(
     ui: &MainWindow,
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
     let worker = Rc::clone(worker);
+    let submitter: UiCommandSubmitter = Rc::new(move |ui, command| {
+        submit_to_ui(ui, &worker, command);
+    });
     bind_audio_clip_waveform_selection_callbacks_with(
         ui,
         project_state,
-        Some(Rc::new(move |ui, command| {
-            submit_to_ui(ui, &worker, command);
-        })),
+        Some(Rc::clone(&submitter)),
+        Some(submitter),
     );
 }
 
@@ -4845,10 +4865,17 @@ fn bind_audio_clip_waveform_selection_callbacks_with(
     ui: &MainWindow,
     project_state: &ProjectUiStateCell,
     selected_preview_submitter: Option<UiCommandSubmitter>,
+    source_range_duplicate_submitter: Option<UiCommandSubmitter>,
 ) {
     let selection_state = Rc::new(WaveformTrimSelectionState::default());
     bind_audio_clip_waveform_selection_drag_callbacks(ui, project_state, &selection_state);
     bind_audio_clip_waveform_trim_callbacks(ui, project_state, &selection_state);
+    bind_audio_clip_waveform_source_range_duplication_callbacks(
+        ui,
+        project_state,
+        &selection_state,
+        source_range_duplicate_submitter,
+    );
     if let Some(selected_preview_submitter) = selected_preview_submitter {
         bind_audio_clip_waveform_selected_preview_callback(
             ui,
@@ -4949,6 +4976,106 @@ fn bind_audio_clip_waveform_trim_callbacks(
         selection_state_for_cancel.anchor.set(None);
         selection_state_for_cancel.current.set(None);
         clear_waveform_trim_selection(&ui);
+    });
+}
+
+fn bind_audio_clip_waveform_source_range_duplication_callbacks(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    selection_state: &Rc<WaveformTrimSelectionState>,
+    source_range_duplicate_submitter: Option<UiCommandSubmitter>,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let project_state_for_prepare = Rc::clone(project_state);
+    let selection_state_for_prepare = Rc::clone(selection_state);
+    actions.on_prepare_audio_clip_waveform_range_duplication(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        selection_state_for_prepare.anchor.set(None);
+        let Some(selected_range) = selection_state_for_prepare.current.get() else {
+            clear_waveform_trim_selection(&ui);
+            ui.set_error_text("Select waveform bins before creating a range clip".into());
+            return;
+        };
+        match prepare_waveform_source_range_duplication(
+            &ui,
+            &project_state_for_prepare,
+            selected_range,
+        ) {
+            Ok(()) => selection_state_for_prepare.current.set(None),
+            Err(message) => {
+                selection_state_for_prepare.current.set(None);
+                clear_waveform_trim_selection(&ui);
+                ui.set_error_text(message.into());
+            }
+        }
+    });
+
+    let Some(source_range_duplicate_submitter) = source_range_duplicate_submitter else {
+        return;
+    };
+    let weak = ui.as_weak();
+    let project_state_for_duplicate = Rc::clone(project_state);
+    actions.on_duplicate_audio_clip_source_range(move |clip_id, name, start, frame_count| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_clip_source_range_duplicate_visible()
+            || ui.get_clip_source_range_duplicate_id() != clip_id
+        {
+            ui.set_error_text("Selected source range is no longer current".into());
+            return;
+        }
+        let source_start_frame = match parse_audio_clip_source_start(start.as_str()) {
+            Ok(source_start_frame) => source_start_frame,
+            Err(message) => {
+                reset_audio_clip_source_range_duplication_form(&ui);
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let source_frame_count = match parse_audio_clip_source_frame_count(frame_count.as_str()) {
+            Ok(source_frame_count) => source_frame_count,
+            Err(message) => {
+                reset_audio_clip_source_range_duplication_form(&ui);
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let clips = project_state_for_duplicate.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            drop(clips);
+            reset_audio_clip_source_range_duplication_form(&ui);
+            ui.set_error_text("The selected audio clip is no longer available".into());
+            return;
+        };
+        if let Err(message) = validate_audio_clip_source_range_duplication(
+            clip,
+            source_start_frame,
+            source_frame_count,
+        ) {
+            drop(clips);
+            reset_audio_clip_source_range_duplication_form(&ui);
+            ui.set_error_text(message.into());
+            return;
+        }
+        let command = match audio_clip_source_range_duplication_command(
+            clip.id(),
+            name.as_str(),
+            source_start_frame,
+            source_frame_count,
+        ) {
+            Ok(command) => command,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        drop(clips);
+        source_range_duplicate_submitter(&ui, command);
     });
 }
 
@@ -5587,7 +5714,46 @@ fn audio_clip_duplication_command(
     Ok(IdeWorkerCommand::DuplicateAudioClip {
         clip_id: source_clip_id.to_owned(),
         name: name.to_owned(),
+        source_range: None,
     })
+}
+
+fn audio_clip_source_range_duplication_command(
+    source_clip_id: &str,
+    proposed_name: &str,
+    source_start_frame: u64,
+    source_frame_count: u64,
+) -> Result<IdeWorkerCommand, &'static str> {
+    let name = normalize_audio_clip_name(proposed_name)?;
+    Ok(IdeWorkerCommand::DuplicateAudioClip {
+        clip_id: source_clip_id.to_owned(),
+        name: name.to_owned(),
+        source_range: Some(IdeAudioClipSourceRange {
+            source_start_frame,
+            source_frame_count,
+        }),
+    })
+}
+
+fn validate_audio_clip_source_range_duplication(
+    clip: &IdeAudioClip,
+    source_start_frame: u64,
+    source_frame_count: u64,
+) -> Result<(), &'static str> {
+    let source_end_frame = source_start_frame
+        .checked_add(source_frame_count)
+        .ok_or("Selected source range is outside the supported frame domain")?;
+    let committed_start_frame = u64::try_from(clip.source_start_frame())
+        .map_err(|_| "The committed source view is outside the supported frame domain")?;
+    let committed_frame_count = u64::try_from(clip.source_frame_count())
+        .map_err(|_| "The committed source view is outside the supported frame domain")?;
+    let committed_end_frame = committed_start_frame
+        .checked_add(committed_frame_count)
+        .ok_or("The committed source view is outside the supported frame domain")?;
+    if source_start_frame < committed_start_frame || source_end_frame > committed_end_frame {
+        return Err("The selected source range is no longer within the committed source view");
+    }
+    Ok(())
 }
 
 fn parse_audio_clip_gain(value: &str) -> Result<f64, &'static str> {
@@ -8253,6 +8419,7 @@ fn apply_audio_clip_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             name,
         } => {
             reset_audio_clip_duplication_form(ui);
+            reset_audio_clip_source_range_duplication_form(ui);
             ui.set_status_text(
                 format!(
                     "Reusable audio clip {name} ({clip_id}) duplicated in project revision {revision}; no media or arrangement placement was created"
@@ -8266,6 +8433,7 @@ fn apply_audio_clip_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
                 .committed_clip_id()
                 .expect("committed duplication warning must retain its clip identity");
             reset_audio_clip_duplication_form(ui);
+            reset_audio_clip_source_range_duplication_form(ui);
             ui.set_status_text(
                 committed_warning_status(
                     ui.get_app_mode(),
@@ -8291,6 +8459,15 @@ fn reset_audio_clip_duplication_form(ui: &MainWindow) {
     ui.set_clip_duplicate_id(SharedString::default());
     ui.set_clip_duplicate_source_name(SharedString::default());
     ui.set_clip_duplicate_name(SharedString::default());
+}
+
+fn reset_audio_clip_source_range_duplication_form(ui: &MainWindow) {
+    ui.set_clip_source_range_duplicate_visible(false);
+    ui.set_clip_source_range_duplicate_id(SharedString::default());
+    ui.set_clip_source_range_duplicate_source_name(SharedString::default());
+    ui.set_clip_source_range_duplicate_start(SharedString::default());
+    ui.set_clip_source_range_duplicate_frame_count(SharedString::default());
+    ui.set_clip_source_range_duplicate_name(SharedString::default());
 }
 
 fn apply_audio_clip_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -9764,6 +9941,7 @@ fn set_audio_clips(
         return false;
     }
     reset_audio_clip_waveform_dialog(ui);
+    reset_audio_clip_source_range_duplication_form(ui);
     let rows: Vec<ClipRow> = clips
         .iter()
         .map(|clip| ClipRow {
@@ -10647,6 +10825,7 @@ fn reset_project(
     ui.set_clip_rename_original(SharedString::default());
     ui.set_clip_rename_name(SharedString::default());
     reset_audio_clip_duplication_form(ui);
+    reset_audio_clip_source_range_duplication_form(ui);
     reset_audio_clip_removal_form(ui);
     ui.set_clip_gain_visible(false);
     ui.set_clip_gain_id(SharedString::default());
@@ -16169,6 +16348,12 @@ mod tests {
         ui.global::<IdeActions>()
             .on_export_track_stems(move |flac| submitted_by_callback.borrow_mut().push(flac));
         ui.show().unwrap();
+
+        let project_sidebar =
+            ElementHandle::find_by_element_id(&ui, "MainWindow::project-sidebar-scroll")
+                .next()
+                .expect("the constrained project sidebar exposes a scroll surface");
+        project_sidebar.scroll(0.0, -600.0);
 
         let wav = ElementHandle::find_by_accessible_label(
             &ui,
@@ -22003,7 +22188,7 @@ mod tests {
             .audio_clips
             .borrow_mut()
             .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
-        bind_audio_clip_waveform_selection_callbacks_with(&ui, &project_state, None);
+        bind_audio_clip_waveform_selection_callbacks_with(&ui, &project_state, None, None);
 
         configure_waveform_selection_test_view(&ui, "Clip A", 100);
 
@@ -22103,7 +22288,7 @@ mod tests {
             .audio_clips
             .borrow_mut()
             .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
-        bind_audio_clip_waveform_selection_callbacks_with(&ui, &project_state, None);
+        bind_audio_clip_waveform_selection_callbacks_with(&ui, &project_state, None, None);
         configure_waveform_selection_test_view(&ui, "Clip A", 100);
 
         ui.show().unwrap();
@@ -22166,6 +22351,7 @@ mod tests {
             Some(Rc::new(move |_, command| {
                 submitted_by_callback.borrow_mut().push(command);
             })),
+            None,
         );
         configure_waveform_selection_test_view(&ui, "Clip A", 100);
 
@@ -22224,6 +22410,7 @@ mod tests {
             Some(Rc::new(move |_, command| {
                 submitted_by_callback.borrow_mut().push(command);
             })),
+            None,
         );
         configure_waveform_selection_test_view(&ui, "Clip A", 100);
 
@@ -22268,6 +22455,7 @@ mod tests {
             Some(Rc::new(move |_, command| {
                 submitted_by_callback.borrow_mut().push(command);
             })),
+            None,
         );
         configure_waveform_selection_test_view(&ui, "Clip A", 100);
         ui.global::<IdeActions>()
@@ -22322,7 +22510,7 @@ mod tests {
             .audio_clips
             .borrow_mut()
             .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
-        bind_audio_clip_waveform_selection_callbacks_with(&ui, &project_state, None);
+        bind_audio_clip_waveform_selection_callbacks_with(&ui, &project_state, None, None);
 
         configure_waveform_selection_test_view(&ui, "Clip A", 100);
 
@@ -22348,6 +22536,143 @@ mod tests {
             "a completion without a new begin must not reopen a source trim"
         );
         assert!(ui.get_error_text().is_empty());
+    }
+
+    #[test]
+    fn waveform_selected_range_duplication_submits_one_exact_independent_clip_request() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let project_state = Rc::new(ProjectUiState::default());
+        project_state
+            .audio_clips
+            .borrow_mut()
+            .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_audio_clip_waveform_selection_callbacks_with(
+            &ui,
+            &project_state,
+            None,
+            Some(Rc::new(move |_, command| {
+                submitted_by_callback.borrow_mut().push(command);
+            })),
+        );
+        configure_waveform_selection_test_view(&ui, "Clip A", 100);
+
+        ui.show().unwrap();
+        ui.global::<IdeActions>()
+            .invoke_begin_audio_clip_waveform_selection(0.25);
+        ui.global::<IdeActions>()
+            .invoke_complete_audio_clip_waveform_selection(0.75);
+        let create_range = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Create an independent reusable clip from the selected waveform source range",
+        )
+        .next()
+        .expect("the waveform panel exposes an explicit selected-range clip action");
+        assert_eq!(create_range.accessible_enabled(), Some(true));
+        let create_range_position = create_range.absolute_position();
+        let create_range_size = create_range.size();
+        let window_size = ui.root_element().size();
+        assert!(
+            create_range_position.x >= 0.0
+                && create_range_position.y >= 0.0
+                && create_range_position.x + create_range_size.width <= window_size.width
+                && create_range_position.y + create_range_size.height <= window_size.height,
+            "the selected-range clip action must remain inside the visible window: position={create_range_position:?}, size={create_range_size:?}, window={window_size:?}"
+        );
+        create_range.mock_single_click(PointerEventButton::Left);
+
+        assert!(!ui.get_clip_waveform_visible());
+        assert!(!ui.get_clip_waveform_selection_visible());
+        assert!(ui.get_clip_source_range_duplicate_visible());
+        assert_eq!(ui.get_clip_source_range_duplicate_id(), "clip-a");
+        assert_eq!(ui.get_clip_source_range_duplicate_source_name(), "Clip A");
+        assert_eq!(ui.get_clip_source_range_duplicate_start(), "420");
+        assert_eq!(ui.get_clip_source_range_duplicate_frame_count(), "650");
+        assert!(ui.get_clip_source_range_duplicate_name().is_empty());
+
+        ui.set_clip_source_range_duplicate_name("Selected clip".into());
+        let submit = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Create an independent reusable clip from the selected waveform source range",
+        )
+        .next()
+        .expect("the selected-range form exposes its explicit creation action");
+        assert_eq!(submit.accessible_enabled(), Some(true));
+        let submit_position = submit.absolute_position();
+        let submit_size = submit.size();
+        let window_size = ui.root_element().size();
+        assert!(
+            submit_position.x >= 0.0
+                && submit_position.y >= 0.0
+                && submit_position.x + submit_size.width <= window_size.width
+                && submit_position.y + submit_size.height <= window_size.height,
+            "the selected-range creation action must remain inside the visible window: position={submit_position:?}, size={submit_size:?}, window={window_size:?}"
+        );
+        submit.mock_single_click(PointerEventButton::Left);
+
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::DuplicateAudioClip {
+                clip_id,
+                name,
+                source_range: Some(IdeAudioClipSourceRange {
+                    source_start_frame: 420,
+                    source_frame_count: 650,
+                }),
+            }] if clip_id == "clip-a" && name == "Selected clip"
+        ));
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(ui.get_error_text().is_empty());
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn waveform_selected_range_duplication_refuses_a_source_view_that_changed_before_submit() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let project_state = Rc::new(ProjectUiState::default());
+        project_state
+            .audio_clips
+            .borrow_mut()
+            .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_audio_clip_waveform_selection_callbacks_with(
+            &ui,
+            &project_state,
+            None,
+            Some(Rc::new(move |_, command| {
+                submitted_by_callback.borrow_mut().push(command);
+            })),
+        );
+        configure_waveform_selection_test_view(&ui, "Clip A", 100);
+        ui.global::<IdeActions>()
+            .invoke_begin_audio_clip_waveform_selection(0.25);
+        ui.global::<IdeActions>()
+            .invoke_complete_audio_clip_waveform_selection(0.75);
+        ui.global::<IdeActions>()
+            .invoke_prepare_audio_clip_waveform_range_duplication();
+        assert!(ui.get_clip_source_range_duplicate_visible());
+        ui.set_clip_source_range_duplicate_name("Selected clip".into());
+
+        *project_state.audio_clips.borrow_mut() =
+            vec![IdeAudioClip::for_ui_test("clip-a", "Clip A", 500, 1_280)];
+        ui.global::<IdeActions>()
+            .invoke_duplicate_audio_clip_source_range(
+                "clip-a".into(),
+                "Selected clip".into(),
+                "420".into(),
+                "650".into(),
+            );
+
+        assert!(submitted.borrow().is_empty());
+        assert!(!ui.get_clip_source_range_duplicate_visible());
+        assert!(
+            ui.get_error_text()
+                .contains("no longer within the committed source view")
+        );
     }
 
     #[test]
@@ -22377,7 +22702,11 @@ mod tests {
     fn audio_clip_duplication_command_normalizes_name_and_preserves_source_identity() {
         assert!(matches!(
             audio_clip_duplication_command("clip-a", " Verse copy "),
-            Ok(IdeWorkerCommand::DuplicateAudioClip { clip_id, name })
+            Ok(IdeWorkerCommand::DuplicateAudioClip {
+                clip_id,
+                name,
+                source_range: None,
+            })
                 if clip_id == "clip-a" && name == "Verse copy"
         ));
         assert!(audio_clip_duplication_command("clip-a", "").is_err());
@@ -22386,9 +22715,35 @@ mod tests {
         let unicode_boundary = "\u{00e9}".repeat(120);
         assert!(matches!(
             audio_clip_duplication_command("clip-a", &unicode_boundary),
-            Ok(IdeWorkerCommand::DuplicateAudioClip { clip_id, name })
+            Ok(IdeWorkerCommand::DuplicateAudioClip {
+                clip_id,
+                name,
+                source_range: None,
+            })
                 if clip_id == "clip-a" && name == unicode_boundary
         ));
+    }
+
+    #[test]
+    fn audio_clip_source_range_duplication_command_retains_exact_range_and_checks_current_view() {
+        assert!(matches!(
+            audio_clip_source_range_duplication_command("clip-a", " Range clip ", 420, 650),
+            Ok(IdeWorkerCommand::DuplicateAudioClip {
+                clip_id,
+                name,
+                source_range: Some(IdeAudioClipSourceRange {
+                    source_start_frame: 420,
+                    source_frame_count: 650,
+                }),
+            }) if clip_id == "clip-a" && name == "Range clip"
+        ));
+        assert!(audio_clip_source_range_duplication_command("clip-a", "", 420, 650).is_err());
+
+        let clip = IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280);
+        assert!(validate_audio_clip_source_range_duplication(&clip, 100, 1_280).is_ok());
+        assert!(validate_audio_clip_source_range_duplication(&clip, 99, 1).is_err());
+        assert!(validate_audio_clip_source_range_duplication(&clip, 1_380, 1).is_err());
+        assert!(validate_audio_clip_source_range_duplication(&clip, u64::MAX, 1).is_err());
     }
 
     #[test]

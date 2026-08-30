@@ -158,11 +158,12 @@ use hyper_playback_json::{
     serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
     serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_removal,
     serialize_audio_clip_rename, serialize_audio_clip_reverse, serialize_audio_clip_source_start,
-    serialize_audio_clip_source_view, serialize_audio_primary_route_change,
-    serialize_audio_track_activation, serialize_audio_track_addition,
-    serialize_audio_track_content_removal, serialize_audio_track_duplication,
-    serialize_audio_track_freeze, serialize_audio_track_freeze_reactivation,
-    serialize_audio_track_removal, serialize_audio_track_rename, serialize_audio_track_unfreeze,
+    serialize_audio_clip_source_view, serialize_audio_clip_source_view_duplication,
+    serialize_audio_primary_route_change, serialize_audio_track_activation,
+    serialize_audio_track_addition, serialize_audio_track_content_removal,
+    serialize_audio_track_duplication, serialize_audio_track_freeze,
+    serialize_audio_track_freeze_reactivation, serialize_audio_track_removal,
+    serialize_audio_track_rename, serialize_audio_track_unfreeze,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_automation_take_replacement, serialize_mixer_base_state,
     serialize_mixer_strip_reorder, serialize_recording_audio_clip_addition,
@@ -5093,6 +5094,13 @@ impl Error for IdeAudioClipRemovalError {
     }
 }
 
+/// One exact immutable-media subrange retained when deriving a reusable clip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdeAudioClipSourceRange {
+    pub source_start_frame: u64,
+    pub source_frame_count: u64,
+}
+
 #[derive(Debug)]
 pub enum IdeAudioClipDuplicationError {
     InvalidSourceClipIdentity,
@@ -5104,6 +5112,7 @@ pub enum IdeAudioClipDuplicationError {
     TrackResourceRoleMismatch,
     Storage(StorageError),
     Serialization(AudioClipDuplicationSerializationError),
+    NativeValidation(AudioClipSourceSlipValidationError),
     CapacityUnavailable,
     Publication {
         clip_id: String,
@@ -5172,6 +5181,7 @@ impl fmt::Display for IdeAudioClipDuplicationError {
             }
             Self::Storage(source) => source.fmt(formatter),
             Self::Serialization(source) => source.fmt(formatter),
+            Self::NativeValidation(source) => source.fmt(formatter),
             Self::CapacityUnavailable => {
                 formatter.write_str("audio-clip duplication capacity is unavailable")
             }
@@ -5233,6 +5243,7 @@ impl Error for IdeAudioClipDuplicationError {
             Self::MixerSave(source) => Some(source.as_ref()),
             Self::Storage(source) => Some(source),
             Self::Serialization(source) => Some(source),
+            Self::NativeValidation(source) => Some(source),
             Self::Publication { source, .. } => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
@@ -5248,6 +5259,22 @@ impl Error for IdeAudioClipDuplicationError {
             | Self::NativeClose(_) => None,
         }
     }
+}
+
+fn audio_clip_source_range_native_frames(
+    source_range: IdeAudioClipSourceRange,
+) -> Result<(usize, usize), IdeAudioClipDuplicationError> {
+    let source_start_frame = usize::try_from(source_range.source_start_frame).map_err(|_| {
+        IdeAudioClipDuplicationError::NativeValidation(
+            AudioClipSourceSlipValidationError::SourceRangeOverflow,
+        )
+    })?;
+    let source_frame_count = usize::try_from(source_range.source_frame_count).map_err(|_| {
+        IdeAudioClipDuplicationError::NativeValidation(
+            AudioClipSourceSlipValidationError::SourceRangeOverflow,
+        )
+    })?;
+    Ok((source_start_frame, source_frame_count))
 }
 
 #[derive(Debug)]
@@ -12698,6 +12725,7 @@ impl RunningDesktopIdeApplication {
         recovery: &DesktopPlaybackRecovery,
         source_clip_id: &str,
         clip_name: &str,
+        source_range: Option<IdeAudioClipSourceRange>,
     ) -> Result<IdeAudioClipCreationPlan, IdeAudioClipDuplicationError> {
         let mixer = Self::prepare_mixer_save(application, recovery)
             .map_err(|source| IdeAudioClipDuplicationError::MixerSave(Box::new(source)))?;
@@ -12712,6 +12740,7 @@ impl RunningDesktopIdeApplication {
             prepared,
             source_clip_id,
             clip_name,
+            source_range,
         )
     }
 
@@ -12867,6 +12896,7 @@ impl RunningDesktopIdeApplication {
         prepared: &PreparedProjectPlayback,
         source_clip_id: &str,
         clip_name: &str,
+        source_range: Option<IdeAudioClipSourceRange>,
     ) -> Result<IdeAudioClipCreationPlan, IdeAudioClipDuplicationError> {
         let package = prepared.package();
         let clip_descriptor = package
@@ -12906,16 +12936,42 @@ impl RunningDesktopIdeApplication {
             .map_err(|_| IdeAudioClipDuplicationError::CapacityUnavailable)?;
         assets.extend(media.media_asset_facts());
         let clip_id = uuid::Uuid::new_v4().to_string();
-        let documents = serialize_audio_clip_duplication(
-            project,
-            &assets,
-            &source_clip,
-            &source_track,
-            source_clip_id,
-            &clip_id,
-            clip_name,
-            application.config.project_limits.session.documents,
-        )
+        let documents = match source_range {
+            Some(source_range) => {
+                let (source_start_frame, source_frame_count) =
+                    audio_clip_source_range_native_frames(source_range)?;
+                prepared
+                    .session()
+                    .validate_audio_clip_source_view(
+                        source_clip_id,
+                        source_start_frame,
+                        source_frame_count,
+                    )
+                    .map_err(IdeAudioClipDuplicationError::NativeValidation)?;
+                serialize_audio_clip_source_view_duplication(
+                    project,
+                    &assets,
+                    &source_clip,
+                    &source_track,
+                    source_clip_id,
+                    &clip_id,
+                    clip_name,
+                    source_range.source_start_frame,
+                    source_range.source_frame_count,
+                    application.config.project_limits.session.documents,
+                )
+            }
+            None => serialize_audio_clip_duplication(
+                project,
+                &assets,
+                &source_clip,
+                &source_track,
+                source_clip_id,
+                &clip_id,
+                clip_name,
+                application.config.project_limits.session.documents,
+            ),
+        }
         .map_err(|source| match source {
             AudioClipDuplicationSerializationError::InvalidClipName => {
                 IdeAudioClipDuplicationError::InvalidClipName
@@ -20110,6 +20166,7 @@ mod tests {
             &prepared,
             ARRANGEMENT_TEST_CLIP_ID,
             "Disabled Clip copy",
+            None,
         )
         .unwrap();
         let duplicated_clip_id = plan.clip_id.clone();
@@ -20165,6 +20222,111 @@ mod tests {
     }
 
     #[test]
+    fn audio_clip_source_range_duplication_publishes_a_trimmed_independent_clip_without_mutating_its_source()
+     {
+        let fixture = ArrangementProjectFixture::new().with_trim_compatible_source();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let source_clip_bytes = package.read_resource(ARRANGEMENT_TEST_CLIP_ID).unwrap();
+        let arrangement_bytes = package.read_resource(ARRANGEMENT_TEST_RESOURCE_ID).unwrap();
+        let source_audio = std::fs::read(project_path.join("assets/samples/sample.wav")).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let application = DesktopIdeApplication::from_inventories(
+            desktop_ide_application_config().unwrap(),
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let plan = RunningDesktopIdeApplication::prepare_audio_clip_duplication_from_project(
+            &application,
+            IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256,
+                resource_id: mixer_id.clone(),
+                resource_bytes: mixer_bytes.clone(),
+            },
+            &prepared,
+            ARRANGEMENT_TEST_CLIP_ID,
+            "Selected range",
+            Some(IdeAudioClipSourceRange {
+                source_start_frame: 25,
+                source_frame_count: 50,
+            }),
+        )
+        .unwrap();
+        let duplicated_clip_id = plan.clip_id.clone();
+        drop(prepared);
+
+        let outcome = plan.publish().unwrap();
+        assert_eq!(outcome.project_revision(), 2);
+        assert_eq!(outcome.clip_id(), duplicated_clip_id);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = reopened.package();
+        let (project, _, _, _) = reopened.session().parts();
+        assert_eq!(project.clip_count(), 2);
+        assert_eq!(project.placement_count(), 1);
+        assert_eq!(project.clip_id_at(0), Some(ARRANGEMENT_TEST_CLIP_ID));
+        assert_eq!(project.clip_id_at(1), Some(duplicated_clip_id.as_str()));
+        assert_eq!(project.clip_source_start_frame_at(0), Some(0));
+        assert_eq!(project.clip_source_frame_count_at(0), Some(100));
+        assert_eq!(project.clip_duration_ticks_at(0), Some(4));
+        assert_eq!(project.clip_source_start_frame_at(1), Some(25));
+        assert_eq!(project.clip_source_frame_count_at(1), Some(50));
+        assert_eq!(project.clip_duration_ticks_at(1), Some(2));
+        assert_eq!(
+            reopened.session().arrangement().placements()[0].clip_index(),
+            0,
+            "deriving a clip must not create or retarget an arrangement placement"
+        );
+        assert_eq!(
+            package.read_resource(ARRANGEMENT_TEST_CLIP_ID).unwrap(),
+            source_clip_bytes
+        );
+        assert_eq!(
+            package.read_resource(ARRANGEMENT_TEST_RESOURCE_ID).unwrap(),
+            arrangement_bytes
+        );
+        assert_eq!(package.read_resource(&mixer_id).unwrap(), mixer_bytes);
+        assert_eq!(
+            std::fs::read(project_path.join("assets/samples/sample.wav")).unwrap(),
+            source_audio
+        );
+
+        let duplicate: Value =
+            serde_json::from_slice(&package.read_resource(outcome.clip_id()).unwrap()).unwrap();
+        assert_eq!(duplicate["name"], "Selected range");
+        assert_eq!(duplicate["duration_ticks"], 2);
+        assert_eq!(duplicate["source"]["start_frame"], 25);
+        assert_eq!(duplicate["source"]["frame_count"], 50);
+        assert_eq!(
+            duplicate["warp_markers"],
+            json!([
+                {"tick": 0, "source_frame_offset": 0},
+                {"tick": 2, "source_frame_offset": 50}
+            ])
+        );
+        let track: Value =
+            serde_json::from_slice(&package.read_resource(ARRANGEMENT_TEST_TRACK_ID).unwrap())
+                .unwrap();
+        assert_eq!(
+            track["clip_ids"],
+            json!([ARRANGEMENT_TEST_CLIP_ID, outcome.clip_id()])
+        );
+    }
+
+    #[test]
     fn unused_audio_clip_removal_refuses_playback_use_then_retains_media() {
         let fixture = ArrangementProjectFixture::new();
         let project_path = fixture.root().to_path_buf();
@@ -20209,6 +20371,7 @@ mod tests {
                 &prepared,
                 ARRANGEMENT_TEST_CLIP_ID,
                 "Unused copy",
+                None,
             )
             .unwrap();
         let duplicate_id = duplication.clip_id.clone();

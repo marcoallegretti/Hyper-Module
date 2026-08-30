@@ -49,32 +49,32 @@ use super::{
     IdeArrangementPlacementEditError, IdeAudioClipActivationEditError,
     IdeAudioClipDuplicationError, IdeAudioClipFadeEditError, IdeAudioClipGainEditError,
     IdeAudioClipLoopEditError, IdeAudioClipRemovalError, IdeAudioClipRenameEditError,
-    IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError, IdeAudioClipSourceTrimEditError,
-    IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome, IdeAudioImportError,
-    IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
-    IdeAudioPreviewError, IdeAudioPrimaryRouteError, IdeAudioTrackAdditionError,
-    IdeAudioTrackContentRemovalError, IdeAudioTrackDuplicationError, IdeAudioTrackEditError,
-    IdeAudioTrackFlattenError, IdeAudioTrackFreezeError, IdeAudioTrackRemovalError,
-    IdeAudioTrackUnfreezeError, IdeAutomationTakeCreationError, IdeAutomationTakeEditError,
-    IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome, IdeControlMappingEdit,
-    IdeControlMappingEditError, IdeHistoryOperation, IdeInputDiscoveryError, IdeInputSelection,
-    IdeInputSelectionError, IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessCommandError,
-    IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
-    IdeMixerMainState, IdeMixerPrimaryDestination, IdeMixerStripReorderError, IdeMonitoringCommand,
-    IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure, IdeNativeFilterEdit,
-    IdeNativeFilterEditError, IdeOutputDiscoveryError, IdeOutputMeterObservation,
-    IdeOutputSelection, IdeOutputSelectionError, IdeOutputTestError, IdeOutputTestSnapshot,
-    IdeOutputTestStartOutcome, IdeOutputTestStopOutcome, IdePendingCloseWait,
-    IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait, IdePendingSaveCloseWait,
-    IdeProjectExportError, IdeProjectExportFormat, IdeProjectOpenError, IdeProjectSaveError,
-    IdeRecordingAbortError, IdeRecordingAbortOutcome, IdeRecordingClipCreationError,
-    IdeRecordingDiscardError, IdeRecordingError, IdeRecordingImportOutcome,
-    IdeRecordingObservation, IdeResourceRestoreError, IdeReturnSendEditError,
-    IdeRoutingBusCreationError, IdeRoutingBusKind, IdeRoutingBusRemovalError,
-    IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability, IdeSceneCreationError,
-    IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRemovalError,
-    IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError, IdeTempoEditError,
-    IdeTimelineMarker, IdeTimelineMarkerEdit, IdeTimelineMarkerLocateError,
+    IdeAudioClipReverseEditError, IdeAudioClipSourceRange, IdeAudioClipSourceSlipEditError,
+    IdeAudioClipSourceTrimEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
+    IdeAudioImportError, IdeAudioInputInventory, IdeAudioOutputInventory,
+    IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioPrimaryRouteError,
+    IdeAudioTrackAdditionError, IdeAudioTrackContentRemovalError, IdeAudioTrackDuplicationError,
+    IdeAudioTrackEditError, IdeAudioTrackFlattenError, IdeAudioTrackFreezeError,
+    IdeAudioTrackRemovalError, IdeAudioTrackUnfreezeError, IdeAutomationTakeCreationError,
+    IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
+    IdeControlMappingEdit, IdeControlMappingEditError, IdeHistoryOperation, IdeInputDiscoveryError,
+    IdeInputSelection, IdeInputSelectionError, IdeLoopRangeFrames, IdeLoudnessCommand,
+    IdeLoudnessCommandError, IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand,
+    IdeMixerCommandError, IdeMixerMainState, IdeMixerPrimaryDestination, IdeMixerStripReorderError,
+    IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure,
+    IdeNativeFilterEdit, IdeNativeFilterEditError, IdeOutputDiscoveryError,
+    IdeOutputMeterObservation, IdeOutputSelection, IdeOutputSelectionError, IdeOutputTestError,
+    IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
+    IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
+    IdePendingSaveCloseWait, IdeProjectExportError, IdeProjectExportFormat, IdeProjectOpenError,
+    IdeProjectSaveError, IdeRecordingAbortError, IdeRecordingAbortOutcome,
+    IdeRecordingClipCreationError, IdeRecordingDiscardError, IdeRecordingError,
+    IdeRecordingImportOutcome, IdeRecordingObservation, IdeResourceRestoreError,
+    IdeReturnSendEditError, IdeRoutingBusCreationError, IdeRoutingBusKind,
+    IdeRoutingBusRemovalError, IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability,
+    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization,
+    IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError,
+    IdeTempoEditError, IdeTimelineMarker, IdeTimelineMarkerEdit, IdeTimelineMarkerLocateError,
     IdeTrackFreezeHistoryAuthority, IdeTransportSeekError, IdeUnusedSampleCleanupError,
     IdeUnusedSampleCleanupSummary, InputInventoryError, LocateState, MAX_DEVICES_PER_CHAIN,
     NativeFilterMode, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
@@ -395,6 +395,7 @@ pub enum IdeWorkerCommand {
     DuplicateAudioClip {
         clip_id: String,
         name: String,
+        source_range: Option<IdeAudioClipSourceRange>,
     },
     RemoveAudioClip {
         clip_id: String,
@@ -4519,6 +4520,7 @@ enum ProjectMutation {
     DuplicateAudioClip {
         clip_id: String,
         name: String,
+        source_range: Option<IdeAudioClipSourceRange>,
     },
     RemoveAudioClip {
         clip_id: String,
@@ -5821,9 +5823,11 @@ fn process_project_mutation_command(
         IdeWorkerCommand::CreateAndPlaceAudioClipFromTake { recording_id, name } => {
             create_and_place_audio_clip_from_take(state, events, &recording_id, &name)
         }
-        IdeWorkerCommand::DuplicateAudioClip { clip_id, name } => {
-            duplicate_audio_clip(state, events, &clip_id, &name)
-        }
+        IdeWorkerCommand::DuplicateAudioClip {
+            clip_id,
+            name,
+            source_range,
+        } => duplicate_audio_clip(state, events, &clip_id, &name, source_range),
         IdeWorkerCommand::RemoveAudioClip { clip_id } => remove_audio_clip(state, events, &clip_id),
         IdeWorkerCommand::CleanUnusedSamples { confirmation } => begin_project_mutation_request(
             state,
@@ -8973,6 +8977,7 @@ fn duplicate_audio_clip(
     events: &SyncSender<IdeWorkerEvent>,
     clip_id: &str,
     name: &str,
+    source_range: Option<IdeAudioClipSourceRange>,
 ) -> bool {
     let name = name.trim();
     if clip_id.is_empty() {
@@ -9014,6 +9019,7 @@ fn duplicate_audio_clip(
         ProjectMutation::DuplicateAudioClip {
             clip_id: owned_clip_id,
             name: normalized_name,
+            source_range,
         },
     )
 }
@@ -14500,22 +14506,25 @@ fn attempt_project_mutation(
                 },
             )
         }
-        ProjectMutation::DuplicateAudioClip { clip_id, name } => {
-            ProjectMutationAttempt::DuplicateAudioClip {
-                name: name.clone(),
-                result: if let Some(failure) = native_failure {
-                    Err(IdeAudioClipDuplicationError::NativeClose(failure))
-                } else {
-                    RunningDesktopIdeApplication::prepare_audio_clip_duplication(
-                        application,
-                        recovery,
-                        &clip_id,
-                        &name,
-                    )
-                    .and_then(publish_audio_clip_duplication_plan)
-                },
-            }
-        }
+        ProjectMutation::DuplicateAudioClip {
+            clip_id,
+            name,
+            source_range,
+        } => ProjectMutationAttempt::DuplicateAudioClip {
+            name: name.clone(),
+            result: if let Some(failure) = native_failure {
+                Err(IdeAudioClipDuplicationError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_audio_clip_duplication(
+                    application,
+                    recovery,
+                    &clip_id,
+                    &name,
+                    source_range,
+                )
+                .and_then(publish_audio_clip_duplication_plan)
+            },
+        },
         ProjectMutation::RemoveAudioClip { clip_id } => {
             ProjectMutationAttempt::RemoveAudioClip(if let Some(failure) = native_failure {
                 Err(IdeAudioClipRemovalError::NativeClose(failure))
@@ -30231,6 +30240,7 @@ mod tests {
             .try_send(IdeWorkerCommand::DuplicateAudioClip {
                 clip_id: String::new(),
                 name: "Copy".to_owned(),
+                source_range: None,
             })
             .unwrap();
         assert!(matches!(
@@ -30244,6 +30254,7 @@ mod tests {
             .try_send(IdeWorkerCommand::DuplicateAudioClip {
                 clip_id: "018f47a2-6b2d-7c11-8a44-001122334460".to_owned(),
                 name: "   ".to_owned(),
+                source_range: None,
             })
             .unwrap();
         assert!(matches!(
@@ -30257,6 +30268,7 @@ mod tests {
             .try_send(IdeWorkerCommand::DuplicateAudioClip {
                 clip_id: "018f47a2-6b2d-7c11-8a44-001122334460".to_owned(),
                 name: "\u{00e9}".repeat(121),
+                source_range: None,
             })
             .unwrap();
         assert!(matches!(
@@ -30271,6 +30283,10 @@ mod tests {
             .try_send(IdeWorkerCommand::DuplicateAudioClip {
                 clip_id: "018f47a2-6b2d-7c11-8a44-001122334460".to_owned(),
                 name: format!(" {} ", "\u{00e9}".repeat(120)),
+                source_range: Some(IdeAudioClipSourceRange {
+                    source_start_frame: 0,
+                    source_frame_count: 1,
+                }),
             })
             .unwrap();
         assert!(matches!(
