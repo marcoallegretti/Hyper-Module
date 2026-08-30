@@ -949,6 +949,43 @@ mod tests {
     }
 
     #[test]
+    fn selected_stereo_preview_renders_the_same_bounded_range_from_each_plane() {
+        let control = DesktopAudioPreviewControl::new();
+        control.request_start(0, 2, 3).unwrap();
+        let left_source = [0.0_f32, 0.0, 0.8, 0.4, -0.6, 0.2];
+        let right_source = [0.0_f32, 0.0, -0.7, 0.3, 0.5, -0.2];
+        let mut processor = DesktopAudioPreviewProcessor {
+            sample_rate_hz: 48_000,
+            sources: vec![StereoPreviewSource::Stereo {
+                left: &left_source,
+                right: &right_source,
+            }],
+            control: control.clone(),
+            observed_generation: 0,
+            current: None,
+            stopping: false,
+        };
+        let mut left = [9.0_f32; 4];
+        let mut right = [9.0_f32; 4];
+
+        assert!(processor.process(&mut StereoOutput {
+            left: &mut left,
+            right: &mut right,
+        }));
+        assert_eq!(control.snapshot().total_frames(), 3);
+        assert_eq!(control.snapshot().played_frames(), 3);
+        assert_eq!(
+            control.snapshot().state(),
+            DesktopAudioPreviewState::Complete
+        );
+        assert!(left[0] > 0.0 && left[1] > 0.0 && left[2] < 0.0);
+        assert!(right[0] < 0.0 && right[1] > 0.0 && right[2] > 0.0);
+        assert_ne!(left[0].to_bits(), right[0].to_bits());
+        assert_eq!(left[3].to_bits(), 0.0_f32.to_bits());
+        assert_eq!(right[3].to_bits(), 0.0_f32.to_bits());
+    }
+
+    #[test]
     fn preview_rejects_empty_or_unrepresentable_requested_ranges_without_starting() {
         let control = DesktopAudioPreviewControl::new();
         assert_eq!(
