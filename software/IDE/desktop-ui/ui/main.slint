@@ -4417,10 +4417,10 @@ export component MainWindow inherits Window {
                         if root.timeline-marker-add-visible : VerticalLayout {
                             spacing: 10px;
                             Text { text: "ADD NAVIGATION MARKER"; color: #7fd6a2; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                            Text { text: "A navigation marker is a named point in the timeline. It does not launch a scene or change playback until you choose Locate or Play."; color: #aebccc; font-size: 12px; wrap: word-wrap; }
+                            Text { text: "A navigation marker is a named point in the timeline. Enter an exact project tick or bar|beat|tick; an ambiguous coordinate must use a raw tick."; color: #aebccc; font-size: 12px; wrap: word-wrap; }
                             HorizontalLayout {
                                 spacing: 8px;
-                                marker-add-tick-input := IdeLineEdit { width: 130px; text: root.timeline-marker-tick; placeholder-text: "Tick"; input-type: number; accessible-label: "Navigation marker project tick"; enabled: root.app-mode == AppMode.running; accepted => { IdeActions.add-timeline-marker(self.text, marker-add-name-input.text); } }
+                                marker-add-tick-input := IdeLineEdit { width: 130px; text: root.timeline-marker-tick; placeholder-text: "Tick or 1|1|000"; accessible-label: "Navigation marker project tick or bar beat tick"; enabled: root.app-mode == AppMode.running; accepted => { IdeActions.add-timeline-marker(self.text, marker-add-name-input.text); } }
                                 marker-add-name-input := IdeLineEdit { horizontal-stretch: 1; text: root.timeline-marker-name; placeholder-text: "Marker name"; accessible-label: "Navigation marker name"; enabled: root.app-mode == AppMode.running; accepted => { IdeActions.add-timeline-marker(marker-add-tick-input.text, self.text); } }
                                 Button { text: "Add"; enabled: root.app-mode == AppMode.running; clicked => { IdeActions.add-timeline-marker(marker-add-tick-input.text, marker-add-name-input.text); } }
                                 Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-marker-add-visible = false; root.timeline-marker-tick = ""; root.timeline-marker-name = ""; } }
@@ -4440,8 +4440,9 @@ export component MainWindow inherits Window {
                         if root.timeline-marker-move-visible : VerticalLayout {
                             spacing: 10px;
                             Text { text: "MOVE NAVIGATION MARKER · FROM TICK " + root.timeline-marker-source-tick; color: #7fd6a2; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: "Enter an exact project tick or bar|beat|tick; an ambiguous coordinate must use a raw tick."; color: #aebccc; font-size: 12px; wrap: word-wrap; }
                             HorizontalLayout {
-                                marker-move-tick-input := IdeLineEdit { width: 130px; text: root.timeline-marker-tick; placeholder-text: "Destination tick"; input-type: number; accessible-label: "New navigation marker project tick"; enabled: root.app-mode == AppMode.running; accepted => { IdeActions.move-timeline-marker(root.timeline-marker-id, self.text); } }
+                                marker-move-tick-input := IdeLineEdit { width: 130px; text: root.timeline-marker-tick; placeholder-text: "Tick or 1|1|000"; accessible-label: "New navigation marker project tick or bar beat tick"; enabled: root.app-mode == AppMode.running; accepted => { IdeActions.move-timeline-marker(root.timeline-marker-id, self.text); } }
                                 Button { text: "Move"; enabled: root.app-mode == AppMode.running; clicked => { IdeActions.move-timeline-marker(root.timeline-marker-id, marker-move-tick-input.text); } }
                                 Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-marker-move-visible = false; root.timeline-marker-id = ""; root.timeline-marker-source-tick = ""; root.timeline-marker-tick = ""; } }
                             }
@@ -4547,19 +4548,19 @@ export component MainWindow inherits Window {
                             Text { text: "ADD SCENE MARKER"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
                             Text { text: root.add-arrangement-scene-launch-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
                             Text {
-                                text: "This writes a durable scene launch at one exact project tick. It does not capture a live performance, move existing events, or bypass the single-authority playback rules.";
+                                text: "This writes a durable scene launch at one exact project position. Enter a raw tick or uniquely resolvable bar|beat|tick; it does not capture a live performance, move existing events, or bypass the single-authority playback rules.";
                                 color: #aebccc;
                                 font-size: 11px;
                                 wrap: word-wrap;
                             }
                             GridLayout {
                                 spacing: 8px;
-                                Text { row: 0; col: 0; text: "Project tick"; color: #8fa0b4; vertical-alignment: center; }
+                                Text { row: 0; col: 0; text: "Position"; color: #8fa0b4; vertical-alignment: center; }
                                 IdeLineEdit {
                                     row: 0; col: 1;
                                     text <=> root.add-arrangement-scene-launch-tick;
-                                    input-type: number;
-                                    accessible-label: "Exact project tick for scene marker";
+                                    placeholder-text: "0 or 1|1|000";
+                                    accessible-label: "Project tick or bar beat tick for scene marker";
                                     accepted => {
                                         IdeActions.add-arrangement-scene-launch(root.add-arrangement-scene-launch-id, self.text);
                                     }
@@ -4595,7 +4596,7 @@ export component MainWindow inherits Window {
                             Text { text: "MOVE SCENE MARKER"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
                             Text { text: root.move-arrangement-scene-launch-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
                             Text {
-                                text: "Move this durable launch from tick " + root.move-arrangement-scene-launch-original-tick + " to one exact project tick.";
+                                text: "Move this durable launch from tick " + root.move-arrangement-scene-launch-original-tick + " to an exact raw tick or uniquely resolvable bar|beat|tick.";
                                 color: #aebccc;
                                 font-size: 11px;
                                 wrap: word-wrap;
@@ -4608,12 +4609,12 @@ export component MainWindow inherits Window {
                             }
                             GridLayout {
                                 spacing: 8px;
-                                Text { row: 0; col: 0; text: "Project tick"; color: #8fa0b4; vertical-alignment: center; }
+                                Text { row: 0; col: 0; text: "Position"; color: #8fa0b4; vertical-alignment: center; }
                                 IdeLineEdit {
                                     row: 0; col: 1;
                                     text <=> root.move-arrangement-scene-launch-tick;
-                                    input-type: number;
-                                    accessible-label: "New exact project tick for " + root.move-arrangement-scene-launch-name + " scene marker";
+                                    placeholder-text: "0 or 1|1|000";
+                                    accessible-label: "New project tick or bar beat tick for " + root.move-arrangement-scene-launch-name + " scene marker";
                                     accepted => {
                                         IdeActions.move-arrangement-scene-launch(root.move-arrangement-scene-launch-id, self.text);
                                     }
@@ -4884,8 +4885,8 @@ export component MainWindow inherits Window {
                         }
 
                         if !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible : Text {
-                            height: 24px;
-                            text: "Grid-scene capture, scene markers, non-ripple placement edits, and bounded linear crossfades are durable. Crossfades require a compatible active same-track overlap. Drag, snap, waveform editing, and arbitrary live timing are unavailable.";
+                            height: 36px;
+                            text: "Placement and scene-marker forms accept exact raw ticks or uniquely resolvable bar|beat|tick positions. Grid-scene capture, non-ripple placement edits, and bounded linear crossfades are durable. Drag, snap, waveform editing, and arbitrary live timing are unavailable.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
@@ -4963,39 +4964,40 @@ export component MainWindow inherits Window {
                                             height: 44px;
                                             spacing: 4px;
                                             VerticalLayout {
-                                                width: 82px;
+                                                width: 100px;
                                                 spacing: 2px;
                                                 Text {
-                                                    text: "START TICK";
+                                                    text: "START POSITION";
                                                     color: #6f8197;
                                                     font-size: 8px;
                                                 }
                                                 start-tick-input := IdeLineEdit {
-                                                    width: 82px;
+                                                    width: 100px;
                                                     horizontal-stretch: 0;
                                                     text: placement.start-tick;
-                                                    accessible-label: "Start tick for " + placement.clip-name + " on " + placement.track-name;
+                                                    placeholder-text: "Tick or 1|1|000";
+                                                    accessible-label: "Start project tick or bar beat tick for " + placement.clip-name + " on " + placement.track-name;
                                                     accepted => { IdeActions.move-arrangement-placement(placement.id, self.text); }
                                                 }
                                             }
                                             Button {
                                                 width: 50px;
                                                 text: "Move";
-                                                accessible-label: "Move " + placement.clip-name + " on " + placement.track-name + " to entered start tick";
+                                                accessible-label: "Move " + placement.clip-name + " on " + placement.track-name + " to entered project position";
                                                 enabled: root.app-mode == AppMode.running && start-tick-input.text != placement.start-tick;
                                                 clicked => { IdeActions.move-arrangement-placement(placement.id, start-tick-input.text); }
                                             }
                                             Button {
                                                 width: 50px;
                                                 text: "Left";
-                                                accessible-label: "Trim the left edge of " + placement.clip-name + " on " + placement.track-name + " to entered start tick while preserving its right edge";
+                                                accessible-label: "Trim the left edge of " + placement.clip-name + " on " + placement.track-name + " to entered project position while preserving its right edge";
                                                 enabled: root.app-mode == AppMode.running && start-tick-input.text != placement.start-tick;
                                                 clicked => { IdeActions.trim-arrangement-placement-front(placement.id, start-tick-input.text); }
                                             }
                                             Button {
                                                 width: 50px;
                                                 text: "Split";
-                                                accessible-label: "Split " + placement.clip-name + " on " + placement.track-name + " at the entered project tick without ripple";
+                                                accessible-label: "Split " + placement.clip-name + " on " + placement.track-name + " at the entered project position without ripple";
                                                 enabled: root.app-mode == AppMode.running && start-tick-input.text != placement.start-tick;
                                                 clicked => { IdeActions.split-arrangement-placement(placement.id, start-tick-input.text); }
                                             }
@@ -5111,7 +5113,7 @@ export component MainWindow inherits Window {
                                         }
                                         Button {
                                             text: "Copy";
-                                            accessible-label: "Copy the exact source view of " + placement.clip-name + " on " + placement.track-name + " to the entered start tick without ripple";
+                                            accessible-label: "Copy the exact source view of " + placement.clip-name + " on " + placement.track-name + " to the entered project position without ripple";
                                             enabled: root.app-mode == AppMode.running;
                                             clicked => { IdeActions.duplicate-arrangement-placement(placement.id, start-tick-input.text); }
                                         }
@@ -5288,7 +5290,7 @@ export component MainWindow inherits Window {
                                             Button {
                                                 width: 88px;
                                                 text: "Place";
-                                                accessible-label: "Place the full " + clip.name + " clip at an exact project tick";
+                                                accessible-label: "Place the full " + clip.name + " clip at an exact project position";
                                                 enabled: root.app-mode == AppMode.running;
                                                 clicked => {
                                                     root.add-arrangement-placement-clip-id = clip.id;
@@ -5578,15 +5580,15 @@ export component MainWindow inherits Window {
                             overflow: elide;
                         }
                         Text {
-                            text: "Enter the exact project start tick. This creates one new, enabled placement of the complete reusable clip on its owning track.";
+                            text: "Enter an exact raw project tick or uniquely resolvable bar|beat|tick position. This creates one new, enabled placement of the complete reusable clip on its owning track.";
                             color: #aebccc;
                             font-size: 11px;
                             wrap: word-wrap;
                         }
                         IdeLineEdit {
                             text <=> root.add-arrangement-placement-start-tick;
-                            placeholder-text: "0";
-                            accessible-label: "Arrangement placement start tick";
+                            placeholder-text: "0 or 1|1|000";
+                            accessible-label: "Arrangement placement start project tick or bar beat tick";
                         }
                         Text {
                             text: "The edit is non-ripple: existing placements keep their exact ticks. The reusable clip and immutable source audio are unchanged. A track may carry at most two concurrent placements; a third overlap or conflicting scene authority is rejected.";

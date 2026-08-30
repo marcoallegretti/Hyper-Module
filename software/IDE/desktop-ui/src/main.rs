@@ -38,13 +38,14 @@ use hyper_desktop_ide::{
     MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
     MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
     MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MIN_FILTER_CUTOFF_MILLIHERTZ,
-    MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, MetronomeGain, NativeFilterMode,
-    OfflineExportRange, OfflineExportReport, OfflineTrackStemExportFormat,
+    MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, MetronomeGain, MusicalPositionResolveError,
+    NativeFilterMode, OfflineExportRange, OfflineExportReport, OfflineTrackStemExportFormat,
     PlaybackRecoveryTransportState, ProjectHistory, RecentProject, SceneAction, TempoEvent,
     TimelineMapEdit, TransportAction, TransportCommand, TransportLoopRange, TriggerBehavior,
     audio_import_file_extensions, bpm_for_microseconds_per_quarter, desktop_ide_application_config,
     ide_audio_clip_gain_is_supported, meter_is_in_version_one_domain,
     microseconds_per_quarter_for_bpm, musical_position, musical_position_at_frame,
+    tick_at_musical_position,
 };
 #[cfg(test)]
 use hyper_desktop_ide::{
@@ -768,11 +769,14 @@ fn bind_arrangement_front_trim_callback(
             );
             return;
         }
-        let start_tick = match parse_arrangement_start_tick(start_tick.as_str()) {
-            Ok(start_tick) => start_tick,
-            Err(message) => {
-                ui.set_error_text(message.into());
-                return;
+        let start_tick = {
+            let timeline = project_state_for_trim.timeline.borrow();
+            match parse_arrangement_start_tick(start_tick.as_str(), &timeline.meter_events) {
+                Ok(start_tick) => start_tick,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
             }
         };
         let state = project_state_for_trim.arrangement.borrow();
@@ -3709,7 +3713,7 @@ fn bind_arrangement_scene_launch_scene_callback(
             ui.set_error_text("Scene-marker scene request is no longer current".into());
             return;
         }
-        let Ok(confirmed_tick) = parse_arrangement_scene_launch_tick(
+        let Ok(confirmed_tick) = parse_stored_arrangement_scene_launch_tick(
             ui.get_set_arrangement_scene_launch_scene_tick().as_str(),
         ) else {
             ui.set_error_text("Scene-marker scene request is no longer current".into());
@@ -3825,11 +3829,14 @@ fn bind_arrangement_scene_launch_addition_callback(
             ui.set_error_text("Scene-marker request is no longer current".into());
             return;
         }
-        let tick = match parse_arrangement_scene_launch_tick(tick.as_str()) {
-            Ok(tick) => tick,
-            Err(message) => {
-                ui.set_error_text(message.into());
-                return;
+        let tick = {
+            let timeline = project_state_for_addition.timeline.borrow();
+            match parse_arrangement_scene_launch_tick(tick.as_str(), &timeline.meter_events) {
+                Ok(tick) => tick,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
             }
         };
         if !project_state_for_addition
@@ -3889,14 +3896,17 @@ fn bind_arrangement_scene_launch_move_callback(
             ui.set_error_text("Scene-marker move request is no longer current".into());
             return;
         }
-        let tick = match parse_arrangement_scene_launch_tick(tick.as_str()) {
-            Ok(tick) => tick,
-            Err(message) => {
-                ui.set_error_text(message.into());
-                return;
+        let tick = {
+            let timeline = project_state_for_move.timeline.borrow();
+            match parse_arrangement_scene_launch_tick(tick.as_str(), &timeline.meter_events) {
+                Ok(tick) => tick,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
             }
         };
-        let Ok(original_tick) = parse_arrangement_scene_launch_tick(
+        let Ok(original_tick) = parse_stored_arrangement_scene_launch_tick(
             ui.get_move_arrangement_scene_launch_original_tick()
                 .as_str(),
         ) else {
@@ -3967,7 +3977,7 @@ fn bind_arrangement_scene_launch_removal_callback(
             ui.set_error_text("Scene-marker removal confirmation is no longer current".into());
             return;
         }
-        let Ok(confirmed_tick) = parse_arrangement_scene_launch_tick(
+        let Ok(confirmed_tick) = parse_stored_arrangement_scene_launch_tick(
             ui.get_remove_arrangement_scene_launch_tick().as_str(),
         ) else {
             ui.set_error_text("Scene-marker removal confirmation is no longer current".into());
@@ -4018,12 +4028,17 @@ fn bind_arrangement_duplication_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
-    let project_state = Rc::clone(project_state);
+    let project_state_for_position = Rc::clone(project_state);
+    let project_state_for_placement = Rc::clone(project_state);
     let worker = Rc::clone(worker);
     bind_arrangement_duplication_callback_with(
         ui,
+        move |value| {
+            let timeline = project_state_for_position.timeline.borrow();
+            parse_arrangement_start_tick(value, &timeline.meter_events)
+        },
         move |placement_id| {
-            let state = project_state.arrangement.borrow();
+            let state = project_state_for_placement.arrangement.borrow();
             let binding = state
                 .as_ref()
                 .ok_or("Arrangement placement authority is no longer available")?;
@@ -4041,6 +4056,7 @@ fn bind_arrangement_duplication_callback(
 
 fn bind_arrangement_duplication_callback_with(
     ui: &MainWindow,
+    parse_start_tick: impl Fn(&str) -> Result<u64, String> + 'static,
     resolve_placement: impl Fn(&str) -> Result<String, &'static str> + 'static,
     submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
 ) {
@@ -4056,7 +4072,7 @@ fn bind_arrangement_duplication_callback_with(
             );
             return;
         }
-        let start_tick = match parse_arrangement_start_tick(start_tick.as_str()) {
+        let start_tick = match parse_start_tick(start_tick.as_str()) {
             Ok(start_tick) => start_tick,
             Err(message) => {
                 ui.set_error_text(message.into());
@@ -4099,11 +4115,14 @@ fn bind_arrangement_split_callback(
             );
             return;
         }
-        let split_tick = match parse_arrangement_start_tick(split_tick.as_str()) {
-            Ok(split_tick) => split_tick,
-            Err(message) => {
-                ui.set_error_text(message.into());
-                return;
+        let split_tick = {
+            let timeline = project_state_for_split.timeline.borrow();
+            match parse_arrangement_start_tick(split_tick.as_str(), &timeline.meter_events) {
+                Ok(split_tick) => split_tick,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
             }
         };
         let state = project_state_for_split.arrangement.borrow();
@@ -4232,11 +4251,14 @@ fn bind_arrangement_move_callback(
             );
             return;
         }
-        let start_tick = match parse_arrangement_start_tick(start_tick.as_str()) {
-            Ok(start_tick) => start_tick,
-            Err(message) => {
-                ui.set_error_text(message.into());
-                return;
+        let start_tick = {
+            let timeline = project_state_for_move.timeline.borrow();
+            match parse_arrangement_start_tick(start_tick.as_str(), &timeline.meter_events) {
+                Ok(start_tick) => start_tick,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
             }
         };
         let state = project_state_for_move.arrangement.borrow();
@@ -4923,11 +4945,14 @@ fn bind_arrangement_placement_addition_callback(
             ui.set_error_text("Audio-clip placement selection is no longer current".into());
             return;
         }
-        let start_tick = match parse_arrangement_start_tick(start_tick.as_str()) {
-            Ok(start_tick) => start_tick,
-            Err(message) => {
-                ui.set_error_text(message.into());
-                return;
+        let start_tick = {
+            let timeline = project_state_for_placement.timeline.borrow();
+            match parse_arrangement_start_tick(start_tick.as_str(), &timeline.meter_events) {
+                Ok(start_tick) => start_tick,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
             }
         };
         let clips = project_state_for_placement.audio_clips.borrow();
@@ -5109,22 +5134,82 @@ fn parse_audio_clip_source_frame_count(value: &str) -> Result<u64, &'static str>
     Ok(frame_count)
 }
 
-fn parse_arrangement_start_tick(value: &str) -> Result<u64, &'static str> {
-    parse_exact_arrangement_tick(
-        value,
-        "Arrangement start tick must be a non-negative whole number",
-        "Arrangement start tick is outside the supported range",
-        "Arrangement start tick exceeds the exact project range",
-    )
+fn parse_arrangement_start_tick(value: &str, meter_events: &[MeterEvent]) -> Result<u64, String> {
+    parse_project_position_tick(value, meter_events)
 }
 
-fn parse_arrangement_scene_launch_tick(value: &str) -> Result<u64, &'static str> {
+fn parse_arrangement_scene_launch_tick(
+    value: &str,
+    meter_events: &[MeterEvent],
+) -> Result<u64, String> {
+    parse_project_position_tick(value, meter_events)
+}
+
+fn parse_stored_arrangement_scene_launch_tick(value: &str) -> Result<u64, &'static str> {
     parse_exact_arrangement_tick(
         value,
         "Scene-marker tick must be a non-negative whole number",
         "Scene-marker tick is outside the supported range",
         "Scene-marker tick exceeds the exact project range",
     )
+}
+
+fn parse_project_position_tick(value: &str, meter_events: &[MeterEvent]) -> Result<u64, String> {
+    let value = value.trim();
+    if !value.contains('|') {
+        return parse_exact_arrangement_tick(
+            value,
+            "Enter a non-negative project tick or bar|beat|tick",
+            "Position is outside the supported range",
+            "Position exceeds the exact project range",
+        )
+        .map_err(str::to_owned);
+    }
+
+    let mut components = value.split('|');
+    let bar = parse_musical_position_component(components.next())?;
+    let beat = parse_musical_position_component(components.next())?;
+    let tick = parse_musical_position_component(components.next())?;
+    if components.next().is_some() {
+        return Err("Enter a project tick or bar|beat|tick".to_owned());
+    }
+
+    let resolved_tick = tick_at_musical_position(meter_events, bar, beat, tick)
+        .map_err(musical_position_resolution_message)?;
+    if resolved_tick > MAX_SAFE_TIMELINE_TICK {
+        return Err("Position exceeds the exact project range".to_owned());
+    }
+    Ok(resolved_tick)
+}
+
+fn parse_musical_position_component(component: Option<&str>) -> Result<u64, String> {
+    let Some(component) = component else {
+        return Err("Enter a project tick or bar|beat|tick".to_owned());
+    };
+    let component = component.trim();
+    if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Enter a project tick or bar|beat|tick".to_owned());
+    }
+    component
+        .parse::<u64>()
+        .map_err(|_| "Position is outside the supported range".to_owned())
+}
+
+fn musical_position_resolution_message(error: MusicalPositionResolveError) -> String {
+    match error {
+        MusicalPositionResolveError::EmptyMeterMap | MusicalPositionResolveError::InvalidMeterMap => {
+            "The current project meter map cannot resolve bar|beat|tick positions".to_owned()
+        }
+        MusicalPositionResolveError::InvalidPosition => {
+            "That bar|beat|tick position is not represented by the current meter map".to_owned()
+        }
+        MusicalPositionResolveError::AmbiguousPosition => {
+            "That bar|beat|tick position is ambiguous after an off-bar meter change; enter an exact project tick".to_owned()
+        }
+        MusicalPositionResolveError::ArithmeticOverflow => {
+            "That bar|beat|tick position exceeds the exact project range".to_owned()
+        }
+    }
 }
 
 fn parse_arrangement_duration_ticks(value: &str) -> Result<u64, &'static str> {
@@ -13253,17 +13338,22 @@ fn bind_timeline_marker_callbacks(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
-    bind_timeline_marker_addition_callback(ui, worker);
+    bind_timeline_marker_addition_callback(ui, worker, project_state);
     bind_timeline_marker_rename_callback(ui, worker, project_state);
     bind_timeline_marker_move_callback(ui, worker, project_state);
     bind_timeline_marker_removal_callback(ui, worker, project_state);
     bind_timeline_marker_locate_callback(ui, worker, project_state);
 }
 
-fn bind_timeline_marker_addition_callback(ui: &MainWindow, worker: &WorkerCell) {
+fn bind_timeline_marker_addition_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_addition = Rc::clone(worker);
+    let timeline_for_addition = Rc::clone(project_state);
     actions.on_add_timeline_marker(move |tick, name| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -13272,11 +13362,14 @@ fn bind_timeline_marker_addition_callback(ui: &MainWindow, worker: &WorkerCell) 
             ui.set_error_text("Navigation-marker request is no longer current".into());
             return;
         }
-        let tick = match timeline_tick(tick.as_str()) {
-            Ok(tick) => tick,
-            Err(message) => {
-                ui.set_error_text(message.into());
-                return;
+        let tick = {
+            let timeline = timeline_for_addition.timeline.borrow();
+            match parse_project_position_tick(tick.as_str(), &timeline.meter_events) {
+                Ok(tick) => tick,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
             }
         };
         let name = match normalize_timeline_marker_name(name.as_str()) {
@@ -13389,14 +13482,14 @@ fn bind_timeline_marker_move_callback(
             ui.set_error_text("Navigation-marker move request is no longer current".into());
             return;
         };
-        let tick = match timeline_tick(tick.as_str()) {
+        let timeline = timeline_for_move.timeline.borrow();
+        let tick = match parse_project_position_tick(tick.as_str(), &timeline.meter_events) {
             Ok(tick) => tick,
             Err(message) => {
                 ui.set_error_text(message.into());
                 return;
             }
         };
-        let timeline = timeline_for_move.timeline.borrow();
         let Some(marker) = timeline
             .navigation_markers
             .iter()
@@ -14696,6 +14789,16 @@ mod tests {
         let submitted_by_callback = Rc::clone(&submitted);
         bind_arrangement_duplication_callback_with(
             &ui,
+            |value| {
+                parse_arrangement_start_tick(
+                    value,
+                    &[MeterEvent {
+                        tick: 0,
+                        numerator: 4,
+                        denominator: 4,
+                    }],
+                )
+            },
             |placement_id| {
                 if placement_id == "placement-a" {
                     Ok(placement_id.to_owned())
@@ -14709,7 +14812,7 @@ mod tests {
         ui.show().unwrap();
         let copy = ElementHandle::find_by_accessible_label(
             &ui,
-            "Copy the exact source view of Lead on Audio to the entered start tick without ripple",
+            "Copy the exact source view of Lead on Audio to the entered project position without ripple",
         )
         .next()
         .expect("the generated arrangement row exposes copy");
@@ -14723,6 +14826,21 @@ mod tests {
             }] if placement_id == "placement-a"
         ));
         assert!(ui.get_error_text().is_empty());
+        ui.global::<IdeActions>()
+            .invoke_duplicate_arrangement_placement("placement-a".into(), "1|2|0".into());
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [
+                IdeWorkerCommand::DuplicateArrangementPlacement {
+                    start_tick: 480,
+                    ..
+                },
+                IdeWorkerCommand::DuplicateArrangementPlacement {
+                    start_tick: 1_920,
+                    ..
+                },
+            ]
+        ));
         ui.hide().unwrap();
     }
 
@@ -19364,26 +19482,72 @@ mod tests {
     }
 
     #[test]
-    fn arrangement_edit_input_preserves_the_exact_project_tick_domain() {
-        assert_eq!(parse_arrangement_start_tick(" 1920 "), Ok(1_920));
+    fn arrangement_edit_input_accepts_exact_ticks_and_unique_musical_positions() {
+        let four_four = [MeterEvent {
+            tick: 0,
+            numerator: 4,
+            denominator: 4,
+        }];
         assert_eq!(
-            parse_arrangement_start_tick("9007199254740991"),
+            parse_arrangement_start_tick(" 1920 ", &four_four),
+            Ok(1_920)
+        );
+        assert_eq!(
+            parse_arrangement_start_tick("9007199254740991", &four_four),
             Ok(MAX_SAFE_TIMELINE_TICK)
         );
-        assert!(parse_arrangement_start_tick("").is_err());
-        assert!(parse_arrangement_start_tick("-1").is_err());
-        assert!(parse_arrangement_start_tick("1.5").is_err());
-        assert!(parse_arrangement_start_tick("9007199254740992").is_err());
-        assert!(parse_arrangement_start_tick("18446744073709551616").is_err());
-        assert_eq!(parse_arrangement_scene_launch_tick(" 960 "), Ok(960));
         assert_eq!(
-            parse_arrangement_scene_launch_tick("9007199254740991"),
+            parse_arrangement_start_tick("2|2|960", &four_four),
+            Ok(10_560)
+        );
+        assert!(parse_arrangement_start_tick("", &four_four).is_err());
+        assert!(parse_arrangement_start_tick("-1", &four_four).is_err());
+        assert!(parse_arrangement_start_tick("1.5", &four_four).is_err());
+        assert!(parse_arrangement_start_tick("1|2", &four_four).is_err());
+        assert!(parse_arrangement_start_tick("1|5|0", &four_four).is_err());
+        assert!(parse_arrangement_start_tick("9007199254740992", &four_four).is_err());
+        assert!(parse_arrangement_start_tick("18446744073709551616", &four_four).is_err());
+        assert_eq!(
+            parse_arrangement_scene_launch_tick(" 960 ", &four_four),
+            Ok(960)
+        );
+        assert_eq!(
+            parse_arrangement_scene_launch_tick("9007199254740991", &four_four),
             Ok(MAX_SAFE_TIMELINE_TICK)
         );
-        assert!(parse_arrangement_scene_launch_tick("").is_err());
-        assert!(parse_arrangement_scene_launch_tick("-1").is_err());
-        assert!(parse_arrangement_scene_launch_tick("1.5").is_err());
-        assert!(parse_arrangement_scene_launch_tick("9007199254740992").is_err());
+        assert_eq!(
+            parse_arrangement_scene_launch_tick(
+                "1|6|0",
+                &[MeterEvent {
+                    tick: 0,
+                    numerator: 6,
+                    denominator: 8,
+                }]
+            ),
+            Ok(4_800)
+        );
+        assert!(parse_arrangement_scene_launch_tick("", &four_four).is_err());
+        assert!(parse_arrangement_scene_launch_tick("-1", &four_four).is_err());
+        assert!(parse_arrangement_scene_launch_tick("1.5", &four_four).is_err());
+        assert!(parse_arrangement_scene_launch_tick("9007199254740992", &four_four).is_err());
+
+        let ambiguity = parse_project_position_tick(
+            "1|1|0",
+            &[
+                MeterEvent {
+                    tick: 0,
+                    numerator: 4,
+                    denominator: 4,
+                },
+                MeterEvent {
+                    tick: 3_840,
+                    numerator: 3,
+                    denominator: 4,
+                },
+            ],
+        )
+        .expect_err("off-bar meter changes must not choose an edit tick");
+        assert!(ambiguity.contains("ambiguous"));
     }
 
     #[test]
