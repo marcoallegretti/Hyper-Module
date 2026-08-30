@@ -4866,11 +4866,13 @@ fn bind_audio_clip_waveform_selection_callbacks(
 
     let weak = ui.as_weak();
     let project_state_for_prepare = Rc::clone(project_state);
+    let anchor_for_prepare = Rc::clone(&anchor);
     let selection_for_prepare = Rc::clone(&selection);
     actions.on_prepare_audio_clip_waveform_trim(move || {
         let Some(ui) = weak.upgrade() else {
             return;
         };
+        anchor_for_prepare.set(None);
         let Some(selected_trim) = selection_for_prepare.get() else {
             clear_waveform_trim_selection(&ui);
             ui.set_error_text("Select waveform bins before preparing a trim".into());
@@ -15039,7 +15041,24 @@ impl Error for DesktopUiExitError {
 mod tests {
     use super::*;
     use i_slint_backend_testing::{ElementHandle, ElementRoot};
+    use slint::LogicalPosition;
     use slint::platform::{Key, PointerEventButton, WindowEvent};
+
+    fn configure_waveform_selection_test_view(
+        ui: &MainWindow,
+        clip_name: &str,
+        source_start_frame: usize,
+    ) {
+        ui.set_app_mode(AppMode::Running);
+        ui.set_clips_visible(true);
+        ui.set_clip_waveform_visible(true);
+        ui.set_clip_waveform_loading(false);
+        ui.set_clip_waveform_id("clip-a".into());
+        ui.set_clip_waveform_name(clip_name.into());
+        ui.set_clip_waveform_source_start_frame(source_start_frame.to_string().into());
+        ui.set_clip_waveform_source_frame_count("1280".into());
+        ui.set_clip_waveform_bin_count("128".into());
+    }
 
     #[test]
     fn metronome_toggle_callback_submits_only_the_authoritative_next_state() {
@@ -21852,15 +21871,7 @@ mod tests {
             .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
         bind_audio_clip_waveform_selection_callbacks(&ui, &project_state);
 
-        ui.set_app_mode(AppMode::Running);
-        ui.set_clips_visible(true);
-        ui.set_clip_waveform_visible(true);
-        ui.set_clip_waveform_loading(false);
-        ui.set_clip_waveform_id("clip-a".into());
-        ui.set_clip_waveform_name("Clip A".into());
-        ui.set_clip_waveform_source_start_frame("100".into());
-        ui.set_clip_waveform_source_frame_count("1280".into());
-        ui.set_clip_waveform_bin_count("128".into());
+        configure_waveform_selection_test_view(&ui, "Clip A", 100);
 
         ui.global::<IdeActions>()
             .invoke_complete_audio_clip_waveform_selection(0.75);
@@ -21925,10 +21936,7 @@ mod tests {
         assert!(ui.get_error_text().contains("source view changed"));
         assert_eq!(prepare.accessible_enabled(), Some(false));
 
-        ui.set_clip_waveform_name("Renamed Clip".into());
-        ui.set_clip_waveform_source_start_frame("110".into());
-        ui.set_clip_waveform_source_frame_count("1280".into());
-        ui.set_clip_waveform_bin_count("128".into());
+        configure_waveform_selection_test_view(&ui, "Renamed Clip", 110);
         ui.global::<IdeActions>()
             .invoke_begin_audio_clip_waveform_selection(0.25);
         ui.global::<IdeActions>()
@@ -21950,6 +21958,98 @@ mod tests {
         assert_eq!(ui.get_app_mode(), AppMode::Running);
         assert!(ui.get_error_text().is_empty());
         ui.hide().unwrap();
+    }
+
+    #[test]
+    fn waveform_selection_pointer_surface_dispatches_drag_and_rejects_visible_drift() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let project_state = Rc::new(ProjectUiState::default());
+        project_state
+            .audio_clips
+            .borrow_mut()
+            .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
+        bind_audio_clip_waveform_selection_callbacks(&ui, &project_state);
+        configure_waveform_selection_test_view(&ui, "Clip A", 100);
+
+        ui.show().unwrap();
+        let waveform_selection =
+            ElementHandle::find_by_element_id(&ui, "MainWindow::waveform-selection")
+                .next()
+                .expect("the waveform panel exposes its pointer selection surface");
+        let waveform_selection_position = waveform_selection.absolute_position();
+        let waveform_selection_size = waveform_selection.size();
+        assert!(
+            waveform_selection_size.width > 0.0 && waveform_selection_size.height > 0.0,
+            "the waveform selection surface must have a usable visible area"
+        );
+        waveform_selection.mock_drag(
+            LogicalPosition::new(
+                waveform_selection_position.x + waveform_selection_size.width * 0.75,
+                waveform_selection_position.y + waveform_selection_size.height / 2.0,
+            ),
+            PointerEventButton::Left,
+        );
+        assert!(ui.get_clip_waveform_selection_visible());
+        assert_eq!(ui.get_clip_waveform_selection_start_frame(), "740");
+        assert_eq!(ui.get_clip_waveform_selection_frame_count(), "330");
+        assert_eq!(ui.get_clip_waveform_selection_bin_count(), "33");
+
+        let prepare = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Prepare selected waveform bins as an exact reusable source trim",
+        )
+        .next()
+        .expect("the waveform panel exposes its explicit trim-preparation action");
+        assert_eq!(prepare.accessible_enabled(), Some(true));
+        ui.set_clip_waveform_selection_start_frame("741".into());
+        prepare.mock_single_click(PointerEventButton::Left);
+        assert!(ui.get_clip_waveform_visible());
+        assert!(!ui.get_clip_waveform_selection_visible());
+        assert!(!ui.get_clip_source_trim_visible());
+        assert!(
+            ui.get_error_text()
+                .contains("selection is no longer current")
+        );
+        assert_eq!(prepare.accessible_enabled(), Some(false));
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn waveform_prepare_discards_a_pending_selection_anchor() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let project_state = Rc::new(ProjectUiState::default());
+        project_state
+            .audio_clips
+            .borrow_mut()
+            .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
+        bind_audio_clip_waveform_selection_callbacks(&ui, &project_state);
+
+        configure_waveform_selection_test_view(&ui, "Clip A", 100);
+
+        ui.global::<IdeActions>()
+            .invoke_begin_audio_clip_waveform_selection(0.25);
+        assert!(ui.get_clip_waveform_selection_visible());
+        ui.global::<IdeActions>()
+            .invoke_prepare_audio_clip_waveform_trim();
+        assert!(!ui.get_clip_waveform_visible());
+        assert!(ui.get_clip_source_trim_visible());
+
+        reset_audio_clip_source_trim_form(&ui);
+        configure_waveform_selection_test_view(&ui, "Clip A", 100);
+        ui.global::<IdeActions>()
+            .invoke_complete_audio_clip_waveform_selection(0.75);
+
+        assert!(
+            !ui.get_clip_waveform_selection_visible(),
+            "a completion after prepare must not reuse a prior gesture anchor"
+        );
+        assert!(
+            !ui.get_clip_source_trim_visible(),
+            "a completion without a new begin must not reopen a source trim"
+        );
+        assert!(ui.get_error_text().is_empty());
     }
 
     #[test]
