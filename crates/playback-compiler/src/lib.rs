@@ -239,9 +239,32 @@ fn tick_in_meter_segment(
         .and_then(|beat_offset| beat_offset.checked_mul(ticks_per_beat))
         .and_then(|beat_offset| beat_offset.checked_add(tick))
         .ok_or(MusicalPositionResolveError::ArithmeticOverflow)?;
-    let relative = bar
+    let bar_offset = bar
         .checked_sub(first_bar)
-        .and_then(|bar_offset| bar_offset.checked_mul(meter.ticks_per_bar()))
+        .ok_or(MusicalPositionResolveError::ArithmeticOverflow)?;
+    let ticks_per_bar = meter.ticks_per_bar();
+    let segment_span = segment_end
+        .map(|segment_end| {
+            segment_end
+                .checked_sub(meter.tick)
+                .ok_or(MusicalPositionResolveError::InvalidMeterMap)
+        })
+        .transpose()?;
+    if let Some(span) = segment_span {
+        let final_segment_relative = span
+            .checked_sub(1)
+            .ok_or(MusicalPositionResolveError::InvalidMeterMap)?;
+        let maximum_bar_offset = final_segment_relative / ticks_per_bar;
+        if bar_offset > maximum_bar_offset {
+            return Ok(None);
+        }
+        let final_bar_tick_limit = final_segment_relative % ticks_per_bar;
+        if bar_offset == maximum_bar_offset && within_bar > final_bar_tick_limit {
+            return Ok(None);
+        }
+    }
+    let relative = bar_offset
+        .checked_mul(ticks_per_bar)
         .and_then(|bar_offset| bar_offset.checked_add(within_bar))
         .ok_or(MusicalPositionResolveError::ArithmeticOverflow)?;
     let candidate = meter
@@ -1689,6 +1712,57 @@ mod tests {
         assert_eq!(
             tick_at_musical_position(&six_eight, 1, 1, 960),
             Err(MusicalPositionResolveError::InvalidPosition)
+        );
+    }
+
+    #[test]
+    fn musical_position_resolution_skips_finite_nonowners_before_checked_arithmetic() {
+        let events = [
+            MeterEvent {
+                tick: 0,
+                numerator: 255,
+                denominator: 1,
+            },
+            MeterEvent {
+                tick: 1,
+                numerator: 1,
+                denominator: 256,
+            },
+        ];
+
+        assert_eq!(
+            tick_at_musical_position(&events, 300_000_000_000_000, 1, 0),
+            Ok(8_999_999_999_999_971),
+            "a finite earlier segment must not overflow while rejecting a later segment's valid position"
+        );
+
+        let final_partial_bar = [
+            MeterEvent {
+                tick: 0,
+                numerator: 255,
+                denominator: 1,
+            },
+            MeterEvent {
+                tick: u64::MAX - 10_000,
+                numerator: 255,
+                denominator: 256,
+            },
+        ];
+        let expected_tick = u64::MAX - 2_351;
+        let later_position = musical_position(&final_partial_bar, expected_tick)
+            .expect("the later segment remains within the exact tick domain");
+        assert_eq!(
+            (
+                later_position.bar(),
+                later_position.beat(),
+                later_position.tick()
+            ),
+            (9_419_293_338_292, 255, 29)
+        );
+        assert_eq!(
+            tick_at_musical_position(&final_partial_bar, 9_419_293_338_292, 255, 29),
+            Ok(expected_tick),
+            "a finite final partial bar must be rejected before its non-owning coordinate can overflow"
         );
     }
 
