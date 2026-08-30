@@ -16,6 +16,7 @@ pub mod scene;
 pub const TICKS_PER_QUARTER: u64 = 1_920;
 const MICROSECONDS_PER_SECOND: u128 = 1_000_000;
 const MAX_TEMPO_MICROSECONDS_PER_QUARTER: u32 = 16_777_215;
+const VERSION_1_METER_DENOMINATORS: [u16; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TempoEvent {
@@ -142,6 +143,117 @@ pub fn musical_position(
     })
 }
 
+/// Resolves an exact one-based bar and beat plus zero-based tick remainder to
+/// its unique project tick through the verified meter map.
+///
+/// A meter change may occur inside a bar. In that case the forward
+/// [`musical_position`] conversion can produce the same displayed coordinate
+/// for multiple project ticks. This function refuses that ambiguity rather
+/// than choosing a durable edit position implicitly.
+///
+/// # Errors
+///
+/// Returns [`MusicalPositionResolveError::InvalidPosition`] when the supplied
+/// components do not describe a position in the map,
+/// [`MusicalPositionResolveError::AmbiguousPosition`] when more than one
+/// meter-map segment describes them, and a named error for an invalid map or
+/// checked arithmetic failure.
+pub fn tick_at_musical_position(
+    meter_events: &[MeterEvent],
+    bar: u64,
+    beat: u64,
+    tick: u64,
+) -> Result<u64, MusicalPositionResolveError> {
+    if bar == 0 || beat == 0 {
+        return Err(MusicalPositionResolveError::InvalidPosition);
+    }
+    validate_meter_events_for_position_resolution(meter_events)?;
+
+    let mut bars_before = 0_u64;
+    let mut found = None;
+    for (index, current) in meter_events.iter().copied().enumerate() {
+        let segment_end = meter_events.get(index + 1).map(|event| event.tick);
+        if let Some(candidate) =
+            tick_in_meter_segment(current, bars_before, segment_end, bar, beat, tick)?
+            && found.replace(candidate).is_some()
+        {
+            return Err(MusicalPositionResolveError::AmbiguousPosition);
+        }
+
+        if let Some(segment_end) = segment_end {
+            let completed_bars = segment_end
+                .checked_sub(current.tick)
+                .ok_or(MusicalPositionResolveError::InvalidMeterMap)?
+                / current.ticks_per_bar();
+            bars_before = bars_before
+                .checked_add(completed_bars)
+                .ok_or(MusicalPositionResolveError::ArithmeticOverflow)?;
+        }
+    }
+
+    found.ok_or(MusicalPositionResolveError::InvalidPosition)
+}
+
+fn validate_meter_events_for_position_resolution(
+    meter_events: &[MeterEvent],
+) -> Result<(), MusicalPositionResolveError> {
+    let Some(first) = meter_events.first() else {
+        return Err(MusicalPositionResolveError::EmptyMeterMap);
+    };
+    if first.tick != 0 {
+        return Err(MusicalPositionResolveError::InvalidMeterMap);
+    }
+
+    let mut previous_tick = None;
+    for event in meter_events {
+        if event.numerator == 0
+            || event.numerator > 255
+            || !VERSION_1_METER_DENOMINATORS.contains(&event.denominator)
+            || previous_tick.is_some_and(|previous| event.tick <= previous)
+        {
+            return Err(MusicalPositionResolveError::InvalidMeterMap);
+        }
+        previous_tick = Some(event.tick);
+    }
+    Ok(())
+}
+
+fn tick_in_meter_segment(
+    meter: MeterEvent,
+    bars_before: u64,
+    segment_end: Option<u64>,
+    bar: u64,
+    beat: u64,
+    tick: u64,
+) -> Result<Option<u64>, MusicalPositionResolveError> {
+    let first_bar = bars_before
+        .checked_add(1)
+        .ok_or(MusicalPositionResolveError::ArithmeticOverflow)?;
+    let ticks_per_beat = meter.ticks_per_beat();
+    if bar < first_bar || beat > u64::from(meter.numerator) || tick >= ticks_per_beat {
+        return Ok(None);
+    }
+
+    let within_bar = beat
+        .checked_sub(1)
+        .and_then(|beat_offset| beat_offset.checked_mul(ticks_per_beat))
+        .and_then(|beat_offset| beat_offset.checked_add(tick))
+        .ok_or(MusicalPositionResolveError::ArithmeticOverflow)?;
+    let relative = bar
+        .checked_sub(first_bar)
+        .and_then(|bar_offset| bar_offset.checked_mul(meter.ticks_per_bar()))
+        .and_then(|bar_offset| bar_offset.checked_add(within_bar))
+        .ok_or(MusicalPositionResolveError::ArithmeticOverflow)?;
+    let candidate = meter
+        .tick
+        .checked_add(relative)
+        .ok_or(MusicalPositionResolveError::ArithmeticOverflow)?;
+    if segment_end.is_some_and(|end| candidate >= end) {
+        return Ok(None);
+    }
+    Ok(Some(candidate))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimelineError {
     EmptyMeterMap,
@@ -172,6 +284,38 @@ impl fmt::Display for TimelineError {
 }
 
 impl Error for TimelineError {}
+
+/// Failure while resolving a displayed musical position back to a project tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MusicalPositionResolveError {
+    EmptyMeterMap,
+    InvalidMeterMap,
+    InvalidPosition,
+    AmbiguousPosition,
+    ArithmeticOverflow,
+}
+
+impl fmt::Display for MusicalPositionResolveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyMeterMap => formatter.write_str("meter map must not be empty"),
+            Self::InvalidMeterMap => {
+                formatter.write_str("meter map is outside the supported position domain")
+            }
+            Self::InvalidPosition => {
+                formatter.write_str("musical position is not represented by the meter map")
+            }
+            Self::AmbiguousPosition => {
+                formatter.write_str("musical position is ambiguous in the meter map")
+            }
+            Self::ArithmeticOverflow => {
+                formatter.write_str("musical position exceeds the supported timeline domain")
+            }
+        }
+    }
+}
+
+impl Error for MusicalPositionResolveError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameTimelineError {
@@ -1479,6 +1623,166 @@ mod tests {
             (after.bar(), after.beat()),
             (2, 1),
             "the first 3/4 bar completes three quarters after the change"
+        );
+    }
+
+    #[test]
+    fn musical_positions_resolve_back_to_unique_project_ticks() {
+        let events = [
+            MeterEvent {
+                tick: 0,
+                numerator: 4,
+                denominator: 4,
+            },
+            MeterEvent {
+                tick: 15_360,
+                numerator: 3,
+                denominator: 4,
+            },
+        ];
+
+        assert_eq!(
+            tick_at_musical_position(&events, 1, 1, 0),
+            Ok(0),
+            "the one-based origin round trips"
+        );
+        assert_eq!(
+            tick_at_musical_position(&events, 2, 2, 960),
+            Ok(10_560),
+            "the 4/4 segment resolves its beat-local remainder"
+        );
+        assert_eq!(
+            tick_at_musical_position(&events, 3, 1, 0),
+            Ok(15_360),
+            "a bar-boundary meter change has one exact owner"
+        );
+        assert_eq!(
+            tick_at_musical_position(&events, 4, 3, 0),
+            Ok(24_960),
+            "the following 3/4 bar retains its own beat width"
+        );
+
+        for tick in [0, 1_920, 10_560, 15_360, 24_960] {
+            let position = musical_position(&events, tick).unwrap();
+            assert_eq!(
+                tick_at_musical_position(&events, position.bar(), position.beat(), position.tick(),),
+                Ok(tick),
+                "every unambiguous displayed position round trips"
+            );
+        }
+    }
+
+    #[test]
+    fn musical_position_resolution_observes_compound_meters() {
+        let six_eight = [MeterEvent {
+            tick: 0,
+            numerator: 6,
+            denominator: 8,
+        }];
+
+        assert_eq!(tick_at_musical_position(&six_eight, 1, 6, 0), Ok(4_800));
+        assert_eq!(tick_at_musical_position(&six_eight, 2, 1, 0), Ok(5_760));
+        assert_eq!(
+            tick_at_musical_position(&six_eight, 1, 7, 0),
+            Err(MusicalPositionResolveError::InvalidPosition)
+        );
+        assert_eq!(
+            tick_at_musical_position(&six_eight, 1, 1, 960),
+            Err(MusicalPositionResolveError::InvalidPosition)
+        );
+    }
+
+    #[test]
+    fn musical_position_resolution_refuses_off_bar_meter_ambiguity() {
+        let events = [
+            MeterEvent {
+                tick: 0,
+                numerator: 4,
+                denominator: 4,
+            },
+            MeterEvent {
+                tick: 3_840,
+                numerator: 3,
+                denominator: 4,
+            },
+        ];
+
+        assert_eq!(
+            tick_at_musical_position(&events, 1, 1, 0),
+            Err(MusicalPositionResolveError::AmbiguousPosition),
+            "the origin label is reused at the off-bar change and cannot choose a tick"
+        );
+        assert_eq!(
+            tick_at_musical_position(&events, 1, 3, 0),
+            Ok(7_680),
+            "a coordinate present only after the change remains usable"
+        );
+    }
+
+    #[test]
+    fn musical_position_resolution_refuses_invalid_maps_and_checked_overflow() {
+        let valid = [MeterEvent {
+            tick: 0,
+            numerator: 4,
+            denominator: 4,
+        }];
+        assert_eq!(
+            tick_at_musical_position(&[], 1, 1, 0),
+            Err(MusicalPositionResolveError::EmptyMeterMap)
+        );
+        assert_eq!(
+            tick_at_musical_position(
+                &[MeterEvent {
+                    tick: 1,
+                    numerator: 4,
+                    denominator: 4,
+                }],
+                1,
+                1,
+                0,
+            ),
+            Err(MusicalPositionResolveError::InvalidMeterMap)
+        );
+        assert_eq!(
+            tick_at_musical_position(
+                &[
+                    MeterEvent {
+                        tick: 0,
+                        numerator: 4,
+                        denominator: 4,
+                    },
+                    MeterEvent {
+                        tick: 0,
+                        numerator: 3,
+                        denominator: 4,
+                    },
+                ],
+                1,
+                1,
+                0,
+            ),
+            Err(MusicalPositionResolveError::InvalidMeterMap)
+        );
+        assert_eq!(
+            tick_at_musical_position(
+                &[MeterEvent {
+                    tick: 0,
+                    numerator: 4,
+                    denominator: 3,
+                }],
+                1,
+                1,
+                0,
+            ),
+            Err(MusicalPositionResolveError::InvalidMeterMap)
+        );
+        assert_eq!(
+            tick_at_musical_position(&valid, 0, 1, 0),
+            Err(MusicalPositionResolveError::InvalidPosition)
+        );
+        assert_eq!(
+            tick_at_musical_position(&valid, u64::MAX, 1, 0),
+            Err(MusicalPositionResolveError::ArithmeticOverflow)
         );
     }
 
