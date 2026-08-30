@@ -17,24 +17,25 @@ use hyper_desktop_ide::{
     IdeAudioClipWaveform, IdeAudioInputInventory, IdeAudioOutputInventory,
     IdeAudioPreviewControlCommand, IdeAutomationTakeRequest, IdeAutomationTarget,
     IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
-    IdeControlMappingEdit, IdeInputSelection, IdeLoopRangeFrames, IdeLoudnessCommand,
-    IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState, IdeLoudnessPresentationConfig,
-    IdeLoudnessScale, IdeLoudnessScaleRegion, IdeMaximumTruePeakDisplay, IdeMixerChannel,
-    IdeMixerChannelDestination, IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap,
-    IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice, IdeNativeFilterEdit,
-    IdeOutputMeterObservation, IdeOutputSelection, IdeOutputTestState, IdePlaybackArrangement,
-    IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeProjectExportFormat,
-    IdeRecordingAbortOutcome, IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake,
-    IdeResourceRestoreError, IdeRoutingBusKind, IdeRunningObservation, IdeScaledLoudnessValue,
-    IdeScene, IdeSceneAvailability, IdeSceneLaunchQuantization, IdeSceneLaunchState,
-    IdeSceneSlotEdit, IdeSceneTrackAction, IdeTimelineMarker, IdeTimelineMarkerEdit,
-    IdeUnusedSampleCleanupSummary, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
-    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
-    IdeWorkerShutdownReport, LocateState, MAX_COMPRESSOR_ATTACK_MICROSECONDS,
-    MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS, MAX_COMPRESSOR_RATIO_MILLIONTHS,
-    MAX_COMPRESSOR_RELEASE_MICROSECONDS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
-    MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL,
-    MAX_IDE_SCENES, MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    IdeControlMappingEdit, IdeInputMeterObservation, IdeInputSelection, IdeLoopRangeFrames,
+    IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
+    IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
+    IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerChannelKind,
+    IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice,
+    IdeNativeFilterEdit, IdeOutputMeterObservation, IdeOutputSelection, IdeOutputTestState,
+    IdePlaybackArrangement, IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent,
+    IdeProjectExportFormat, IdeRecordingAbortOutcome, IdeRecordingCaptureKind,
+    IdeRecordingImportOutcome, IdeRecordingTake, IdeResourceRestoreError, IdeRoutingBusKind,
+    IdeRunningObservation, IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability,
+    IdeSceneLaunchQuantization, IdeSceneLaunchState, IdeSceneSlotEdit, IdeSceneTrackAction,
+    IdeTimelineMarker, IdeTimelineMarkerEdit, IdeUnusedSampleCleanupSummary, IdeWorkerCommand,
+    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
+    IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState,
+    MAX_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    MAX_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RELEASE_MICROSECONDS,
+    MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MAX_FILTER_CUTOFF_MILLIHERTZ,
+    MAX_FILTER_RESONANCE_MILLIONTHS, MAX_IDE_MIXER_SENDS_PER_CHANNEL, MAX_IDE_SCENES,
+    MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
     MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
     MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MIN_FILTER_CUTOFF_MILLIHERTZ,
     MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, MetronomeGain, NativeFilterMode,
@@ -75,6 +76,7 @@ const MAX_VISIBLE_MIXER_NAME_CHARS: usize = 10;
 const MAX_VISIBLE_RECENT_PROJECT_NAME_CHARS: usize = 28;
 const MAX_SAFE_TIMELINE_TICK: u64 = 9_007_199_254_740_991;
 const FINAL_OUTPUT_METER_FLOOR_DBFS: f32 = -60.0;
+const INPUT_METER_FLOOR_DBFS: f32 = -60.0;
 const MIXER_STRIP_METER_FLOOR_DBFS: f32 = -60.0;
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
@@ -8406,6 +8408,7 @@ fn apply_running_event(
             .saturating_add(monitoring.bridge.consumer_closed_frame_count);
         ui.set_monitoring_drop_count(dropped_frames.to_string().into());
         ui.set_monitoring_underflow_count(monitoring.bridge.underflow_count.to_string().into());
+        apply_input_meter_observation(ui, observation.input_meter_observation());
     } else {
         reset_monitoring(ui);
     }
@@ -8517,6 +8520,33 @@ fn apply_output_meter_observation(ui: &MainWindow, observation: &IdeRunningObser
     apply_final_output_meter_observation(ui, observation.output_meter_observation());
     apply_mixer_strip_meter_observation(ui, observation);
     apply_loudness_observation(ui, observation);
+}
+
+fn apply_input_meter_observation(ui: &MainWindow, observation: &IdeInputMeterObservation) {
+    let (left_level, left_reading, right_level, right_reading) =
+        observation.sample_peak_display().map_or_else(
+            || (0.0, "— dBFS".to_owned(), 0.0, "— dBFS".to_owned()),
+            |snapshot| {
+                let left = snapshot.left();
+                let right = snapshot.right();
+                let (left_level, left_reading) =
+                    input_meter_presentation(left.measurement_available(), left.level_dbfs());
+                let (right_level, right_reading) =
+                    input_meter_presentation(right.measurement_available(), right.level_dbfs());
+                (left_level, left_reading, right_level, right_reading)
+            },
+        );
+    ui.set_input_meter_left_level(left_level);
+    ui.set_input_meter_right_level(right_level);
+    ui.set_input_meter_left_reading(left_reading.into());
+    ui.set_input_meter_right_reading(right_reading.into());
+}
+
+fn reset_input_meter_observation(ui: &MainWindow) {
+    ui.set_input_meter_left_level(0.0);
+    ui.set_input_meter_right_level(0.0);
+    ui.set_input_meter_left_reading("— dBFS".into());
+    ui.set_input_meter_right_reading("— dBFS".into());
 }
 
 fn apply_final_output_meter_observation(ui: &MainWindow, observation: &IdeOutputMeterObservation) {
@@ -9200,6 +9230,7 @@ fn apply_recording_event(ui: &MainWindow, state: &hyper_desktop_ide::IdeRecordin
         .saturating_add(observation.monitoring().consumer_closed_frame_count);
     ui.set_monitoring_drop_count(monitoring_drops.to_string().into());
     ui.set_monitoring_underflow_count(observation.monitoring().underflow_count.to_string().into());
+    apply_input_meter_observation(ui, &observation.input_meter());
     ui.set_xrun_count(
         observation
             .output()
@@ -10086,6 +10117,7 @@ fn reset_monitoring(ui: &MainWindow) {
     ui.set_monitoring_frame_count("0".into());
     ui.set_monitoring_drop_count("0".into());
     ui.set_monitoring_underflow_count("0".into());
+    reset_input_meter_observation(ui);
 }
 
 #[allow(
@@ -14130,13 +14162,24 @@ fn mode_after_submission_failure(
 }
 
 fn meter_presentation(measurement_available: bool, dbfs: f32) -> (f32, String) {
+    sample_peak_meter_presentation(measurement_available, dbfs, FINAL_OUTPUT_METER_FLOOR_DBFS)
+}
+
+fn input_meter_presentation(measurement_available: bool, dbfs: f32) -> (f32, String) {
+    sample_peak_meter_presentation(measurement_available, dbfs, INPUT_METER_FLOOR_DBFS)
+}
+
+fn sample_peak_meter_presentation(
+    measurement_available: bool,
+    dbfs: f32,
+    floor_dbfs: f32,
+) -> (f32, String) {
     if !measurement_available || !dbfs.is_finite() {
         return (0.0, "— dBFS".to_owned());
     }
-    let level =
-        ((dbfs - FINAL_OUTPUT_METER_FLOOR_DBFS) / -FINAL_OUTPUT_METER_FLOOR_DBFS).clamp(0.0, 1.0);
-    let reading = if dbfs <= FINAL_OUTPUT_METER_FLOOR_DBFS {
-        format!("≤ {FINAL_OUTPUT_METER_FLOOR_DBFS:.1} dBFS")
+    let level = ((dbfs - floor_dbfs) / -floor_dbfs).clamp(0.0, 1.0);
+    let reading = if dbfs <= floor_dbfs {
+        format!("≤ {floor_dbfs:.1} dBFS")
     } else {
         format!("{dbfs:.1} dBFS")
     };
@@ -17123,6 +17166,28 @@ mod tests {
             output_peak_hold_presentation(true, 0.0),
             ("hold 0.0".to_owned(), true)
         );
+    }
+
+    #[test]
+    fn accepted_input_meter_binding_presents_raw_capture_values_and_clears_with_monitoring() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let observation = IdeInputMeterObservation::display_for_ui_test(Some(0.5), Some(0.25));
+
+        apply_input_meter_observation(&ui, &observation);
+        assert!((ui.get_input_meter_left_level() - 0.899_657).abs() < 0.000_1);
+        assert!((ui.get_input_meter_right_level() - 0.799_313).abs() < 0.000_1);
+        assert_eq!(ui.get_input_meter_left_reading().as_str(), "-6.0 dBFS");
+        assert_eq!(ui.get_input_meter_right_reading().as_str(), "-12.0 dBFS");
+
+        reset_monitoring(&ui);
+        assert_eq!(ui.get_input_meter_left_level().to_bits(), 0.0_f32.to_bits());
+        assert_eq!(
+            ui.get_input_meter_right_level().to_bits(),
+            0.0_f32.to_bits()
+        );
+        assert_eq!(ui.get_input_meter_left_reading().as_str(), "— dBFS");
+        assert_eq!(ui.get_input_meter_right_reading().as_str(), "— dBFS");
     }
 
     #[test]

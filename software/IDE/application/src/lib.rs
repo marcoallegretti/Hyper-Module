@@ -33,12 +33,13 @@ use hyper_desktop_audio::{
     DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackRecovery,
     DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopWait,
     DesktopPlaybackSession, DesktopProjectOpenError, DesktopTestToneConfig, DesktopTestToneSession,
-    MonitoringSnapshot, OfflineExportError, OfflineExportSpec, OutputStreamSnapshot,
-    OutputStreamState, PendingNativeShutdown, PendingNativeShutdownWait, StreamState,
-    discover_desktop_input_targets, discover_desktop_output_targets,
-    export_prepared_project_flac_with_mixer, export_prepared_project_range_flac_with_mixer,
-    export_prepared_project_range_wav_with_mixer, export_prepared_project_track_stems_with_mixer,
-    export_prepared_project_wav_with_mixer, render_prepared_audio_track_pre_fader_for_freeze,
+    InputMeterReceiver, LatestInputMeterSnapshot, MonitoringSnapshot, OfflineExportError,
+    OfflineExportSpec, OutputStreamSnapshot, OutputStreamState, PendingNativeShutdown,
+    PendingNativeShutdownWait, StreamState, discover_desktop_input_targets,
+    discover_desktop_output_targets, export_prepared_project_flac_with_mixer,
+    export_prepared_project_range_flac_with_mixer, export_prepared_project_range_wav_with_mixer,
+    export_prepared_project_track_stems_with_mixer, export_prepared_project_wav_with_mixer,
+    render_prepared_audio_track_pre_fader_for_freeze,
 };
 pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
@@ -50,6 +51,10 @@ pub use hyper_desktop_audio::{
 
 /// Version-1 maximum number of return sends authored by one source channel.
 pub const MAX_IDE_MIXER_SENDS_PER_CHANNEL: usize = hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT;
+#[cfg(test)]
+use hyper_desktop_audio::{
+    InputMeterTestPublication, InputMeterTestPublisher, input_meter_channel_for_test,
+};
 use hyper_fs_authority::{
     StableFileEvidence, confirm_stable_absolute_file, read_stable_absolute_file,
 };
@@ -71,7 +76,8 @@ pub use hyper_mixer_runtime::{
     MixerStripSamplePeakBallisticsSnapshot as IdeMixerStripPeakBallisticsSnapshot,
     PlaybackCycleObservation, PlaybackRecoveryTransportState,
     ScaledLoudnessValue as IdeScaledLoudnessValue, SceneLaunchState as IdeSceneLaunchState,
-    StereoSamplePeakBallisticsSnapshot as IdeOutputPeakBallisticsSnapshot, TransportCommand,
+    StereoSamplePeakBallisticsSnapshot as IdeOutputPeakBallisticsSnapshot,
+    StereoSamplePeakDisplayBallisticsSnapshot as IdeInputPeakDisplaySnapshot, TransportCommand,
     TransportLoopRange, TransportLoopRangeError,
 };
 use hyper_mixer_runtime::{
@@ -80,6 +86,7 @@ use hyper_mixer_runtime::{
     LoudnessCommandSendError, MixerParameterCommand, MixerParameterResolveError,
     MixerStripSamplePeakBallistics, OutputMeterReceiver, PlaybackRecoverySnapshot,
     SamplePeakBallisticsConfig, SamplePeakBallisticsConfigError, StereoSamplePeakBallistics,
+    StereoSamplePeakDisplayBallistics,
 };
 #[cfg(test)]
 use hyper_mixer_runtime::{
@@ -1186,6 +1193,114 @@ impl IdeOutputMeterObserver {
     }
 }
 
+/// One running-session read of the raw accepted desktop input meter.
+///
+/// The raw snapshot describes one validated capture block before cue gain,
+/// mute, bridge admission, resampling, or output mixing. The display snapshot
+/// is consumer-side sample-peak presentation only; it carries no held peak.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IdeInputMeterObservation {
+    latest: LatestInputMeterSnapshot,
+    sample_peak_display: Option<IdeInputPeakDisplaySnapshot>,
+}
+
+impl IdeInputMeterObservation {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            latest: LatestInputMeterSnapshot::empty(),
+            sample_peak_display: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn latest(self) -> LatestInputMeterSnapshot {
+        self.latest
+    }
+
+    /// Returns the persistent decaying stereo sample-peak display while the
+    /// matching accepted-input authority remains live.
+    #[must_use]
+    pub const fn sample_peak_display(self) -> Option<IdeInputPeakDisplaySnapshot> {
+        self.sample_peak_display
+    }
+
+    /// Builds display-only input evidence for a generated IDE UI test.
+    ///
+    /// This helper is feature-gated so production callers cannot manufacture
+    /// accepted-capture authority.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixed desktop input-meter display policy is changed to an
+    /// invalid sample-peak configuration.
+    #[cfg(feature = "ui-test-support")]
+    #[must_use]
+    pub fn display_for_ui_test(
+        left_sample_peak: Option<f32>,
+        right_sample_peak: Option<f32>,
+    ) -> Self {
+        let config = SamplePeakBallisticsConfig::try_new(
+            DESKTOP_SAMPLE_RATE_HZ,
+            IDE_OUTPUT_METER_FLOOR_DBFS,
+            IDE_OUTPUT_METER_FALLOFF_DB_PER_SECOND,
+            0,
+        )
+        .expect("fixed desktop input-meter display policy must remain valid");
+        let snapshot = StereoSamplePeakDisplayBallistics::new(config)
+            .update(1, 1, left_sample_peak, right_sample_peak)
+            .snapshot();
+        Self {
+            latest: LatestInputMeterSnapshot::empty(),
+            sample_peak_display: Some(snapshot),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IdeInputMeterObserver {
+    ballistics: StereoSamplePeakDisplayBallistics,
+    latest: Option<IdeInputPeakDisplaySnapshot>,
+}
+
+impl IdeInputMeterObserver {
+    const fn new(config: SamplePeakBallisticsConfig) -> Self {
+        Self {
+            ballistics: StereoSamplePeakDisplayBallistics::new(config),
+            latest: None,
+        }
+    }
+
+    fn observe(&mut self, receiver: &mut InputMeterReceiver) -> IdeInputMeterObservation {
+        let read = receiver.read_display(&mut self.ballistics);
+        let latest = read.latest();
+        if latest.sender_disconnected() {
+            self.reset();
+            return IdeInputMeterObservation {
+                latest,
+                sample_peak_display: None,
+            };
+        }
+        if let Some(snapshot) = read.display() {
+            self.latest = Some(snapshot);
+        }
+        IdeInputMeterObservation {
+            latest,
+            sample_peak_display: self.latest,
+        }
+    }
+
+    fn unavailable(&mut self) -> IdeInputMeterObservation {
+        self.reset();
+        IdeInputMeterObservation::empty()
+    }
+
+    fn reset(&mut self) {
+        self.ballistics.reset();
+        self.latest = None;
+    }
+}
+
 #[derive(Debug)]
 pub struct DesktopIdeApplication {
     config: IdeApplicationConfig,
@@ -1195,6 +1310,7 @@ pub struct DesktopIdeApplication {
     input_selection: IdeInputSelection,
     playback_session_generation: u64,
     output_meter_observer: IdeOutputMeterObserver,
+    input_meter_observer: IdeInputMeterObserver,
 }
 
 #[derive(Debug)]
@@ -1245,6 +1361,7 @@ impl DesktopIdeApplication {
                 output_meter_observer: IdeOutputMeterObserver::new(
                     config.output_meter_ballistics(),
                 ),
+                input_meter_observer: IdeInputMeterObserver::new(config.output_meter_ballistics()),
             },
             input_failure,
         })
@@ -1263,6 +1380,7 @@ impl DesktopIdeApplication {
             input_selection: IdeInputSelection::Disabled,
             playback_session_generation: 0,
             output_meter_observer: IdeOutputMeterObserver::new(config.output_meter_ballistics()),
+            input_meter_observer: IdeInputMeterObserver::new(config.output_meter_ballistics()),
         }
     }
 
@@ -1280,6 +1398,7 @@ impl DesktopIdeApplication {
             input_selection: IdeInputSelection::Disabled,
             playback_session_generation: 0,
             output_meter_observer: IdeOutputMeterObserver::new(config.output_meter_ballistics()),
+            input_meter_observer: IdeInputMeterObserver::new(config.output_meter_ballistics()),
         }
     }
 
@@ -1305,6 +1424,20 @@ impl DesktopIdeApplication {
         let inputs = IdeAudioInputInventory::discover()?;
         self.inputs = Some(inputs);
         Ok(())
+    }
+
+    fn observe_input_meter(
+        &mut self,
+        receiver: Option<&mut InputMeterReceiver>,
+    ) -> IdeInputMeterObservation {
+        match receiver {
+            Some(receiver) => self.input_meter_observer.observe(receiver),
+            None => self.input_meter_observer.unavailable(),
+        }
+    }
+
+    pub(crate) fn reset_input_meter_observer(&mut self) {
+        self.input_meter_observer.reset();
     }
 
     #[must_use]
@@ -1441,6 +1574,7 @@ impl DesktopIdeApplication {
             Ok(session) => {
                 self.playback_session_generation = next_playback_session_generation;
                 self.output_meter_observer.reset();
+                self.input_meter_observer.reset();
                 let running = RunningDesktopIdeApplication {
                     application: self,
                     session: IdePlaybackSessionOwner::Native(session),
@@ -10243,6 +10377,8 @@ struct TestPlaybackSession {
     mixer_commands: Vec<IdeMixerCommand>,
     meter_publisher: OutputMeterSender,
     meters: OutputMeterReceiver,
+    input_meter_publisher: InputMeterTestPublisher,
+    input_meter_receiver: InputMeterReceiver,
     mixer_parameter_observations: InteractiveMixerParameterReceiver,
     _mixer_parameter_publisher: InteractiveMixerParameterPublisher,
     scene_launches: InteractiveSceneLaunchReceiver,
@@ -10266,6 +10402,8 @@ struct TestPlaybackSession {
 impl Default for TestPlaybackSession {
     fn default() -> Self {
         let (meter_publisher, meters) = output_meter_channel();
+        let (input_meter_publisher, input_meter_receiver) = input_meter_channel_for_test()
+            .expect("test input-meter transport allocation must succeed");
         let (mixer_parameter_publisher, mixer_parameter_observations) =
             interactive_mixer_parameter_channel();
         let (scene_launch_publisher, scene_launches) = interactive_scene_launch_channel();
@@ -10275,6 +10413,8 @@ impl Default for TestPlaybackSession {
             mixer_commands: Vec::new(),
             meter_publisher,
             meters,
+            input_meter_publisher,
+            input_meter_receiver,
             mixer_parameter_observations,
             _mixer_parameter_publisher: mixer_parameter_publisher,
             scene_launches,
@@ -16362,6 +16502,26 @@ impl RunningDesktopIdeApplication {
             IdePlaybackSessionOwner::Test(session) => application
                 .output_meter_observer
                 .observe(&mut session.meters),
+        }
+    }
+
+    /// Drains the accepted desktop-input receiver through display-only
+    /// sample-peak state. The values remain raw capture evidence, before cue
+    /// gain, mute, bridge admission, resampling, and output mixing.
+    #[must_use]
+    pub fn observe_input_meter(&mut self) -> IdeInputMeterObservation {
+        let Self {
+            application,
+            session,
+        } = self;
+        match session {
+            IdePlaybackSessionOwner::Native(session) => {
+                application.observe_input_meter(session.monitoring_input_meter_receiver())
+            }
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => {
+                application.observe_input_meter(Some(&mut session.input_meter_receiver))
+            }
         }
     }
 
@@ -22997,6 +23157,89 @@ mod tests {
         assert!(terminal.sample_peak_ballistics().is_none());
         assert!(terminal.mixer_strip_ballistics().is_none());
         assert!(!terminal.peak_hold_available());
+    }
+
+    #[test]
+    fn input_meter_observer_clears_terminal_or_unavailable_state_and_resets_between_sessions() {
+        let mut observer =
+            IdeInputMeterObserver::new(config(256).unwrap().output_meter_ballistics());
+        let (mut first_publisher, mut first_receiver) = input_meter_channel_for_test()
+            .expect("test input-meter transport allocation must succeed");
+        assert_eq!(
+            first_publisher.publish(&[1.0, 0.5]),
+            InputMeterTestPublication::Published
+        );
+
+        let first = observer.observe(&mut first_receiver);
+        let first_display = first
+            .sample_peak_display()
+            .expect("accepted input must produce a display update");
+        assert!(first.latest().snapshot().is_some());
+        assert_eq!(first_display.frame_end(), 1);
+        assert!(first_display.left().measurement_available());
+        assert!((first_display.left().level_dbfs() - 0.0).abs() < f32::EPSILON);
+        assert!((first_display.right().level_dbfs() + 6.0206).abs() < 0.001);
+
+        drop(first_publisher);
+        let terminal = observer.observe(&mut first_receiver);
+        assert!(terminal.latest().sender_disconnected());
+        assert!(terminal.sample_peak_display().is_none());
+
+        let unavailable = observer.unavailable();
+        assert!(unavailable.latest().snapshot().is_none());
+        assert!(unavailable.sample_peak_display().is_none());
+
+        let (mut next_publisher, mut next_receiver) = input_meter_channel_for_test()
+            .expect("test input-meter transport allocation must succeed");
+        assert_eq!(
+            next_publisher.publish(&[0.25, 0.125]),
+            InputMeterTestPublication::Published
+        );
+        let next = observer.observe(&mut next_receiver);
+        let next_display = next
+            .sample_peak_display()
+            .expect("new capture authority must produce its own display update");
+        assert_eq!(next_display.frame_end(), 1);
+        assert!(
+            (next_display.left().level_dbfs() + 12.0412).abs() < 0.001,
+            "the prior source must not leave a held 0 dBFS input reading"
+        );
+        assert!((next_display.right().level_dbfs() + 18.0618).abs() < 0.001);
+    }
+
+    #[test]
+    fn running_owner_publishes_accepted_input_meter_evidence_separately_from_output() {
+        let application = DesktopIdeApplication::from_inventory(
+            config(256).unwrap(),
+            IdeAudioOutputInventory::default(),
+        );
+        let mut running = RunningDesktopIdeApplication {
+            application,
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let IdePlaybackSessionOwner::Test(session) = &mut running.session else {
+            unreachable!("test constructed the deterministic session owner");
+        };
+        assert_eq!(
+            session.input_meter_publisher.publish(&[-0.25, 0.5]),
+            InputMeterTestPublication::Published
+        );
+
+        let observation = running.observe_input_meter();
+        let display = observation
+            .sample_peak_display()
+            .expect("accepted input must reach the running owner");
+        assert_eq!(
+            observation
+                .latest()
+                .snapshot()
+                .unwrap()
+                .accepted_frame_end(),
+            1
+        );
+        assert!((display.left().level_dbfs() + 12.0412).abs() < 0.001);
+        assert!((display.right().level_dbfs() + 6.0206).abs() < 0.001);
+        assert!(running.observe_output_meter().latest().snapshot().is_none());
     }
 
     #[test]

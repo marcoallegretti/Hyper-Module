@@ -29,9 +29,9 @@ use super::{
     DESKTOP_MONITORING_TRANSPORT_FRAMES, DESKTOP_RECORDING_COMPLETION_TIMEOUT,
     DESKTOP_RECORDING_DIRECTORY, DESKTOP_RECORDING_DRAIN_FRAMES, DESKTOP_RECORDING_MAXIMUM_FRAMES,
     DESKTOP_RECORDING_TRANSPORT_FRAMES, DesktopDirectControlError, DesktopIdeApplication,
-    IdeMixerChannelKind, IdeMonitoringCommand, IdeMonitoringCommandError, IdeNativeCloseFailure,
-    IdeProjectOpenError, IdeProjectSaveError, MONITOR_GAIN_MILLIONTHS_MAXIMUM,
-    RunningDesktopIdeApplication,
+    IdeInputMeterObservation, IdeMixerChannelKind, IdeMonitoringCommand, IdeMonitoringCommandError,
+    IdeNativeCloseFailure, IdeProjectOpenError, IdeProjectSaveError,
+    MONITOR_GAIN_MILLIONTHS_MAXIMUM, RunningDesktopIdeApplication,
 };
 
 const BACKUPS_DIRECTORY: &str = "backups";
@@ -347,6 +347,7 @@ pub struct IdeRecordingObservation {
     output_state: StreamState,
     output: OutputStreamSnapshot,
     monitoring: MonitoringSnapshot,
+    input_meter: IdeInputMeterObservation,
 }
 
 impl IdeRecordingObservation {
@@ -393,6 +394,13 @@ impl IdeRecordingObservation {
     #[must_use]
     pub const fn monitoring(self) -> MonitoringSnapshot {
         self.monitoring
+    }
+
+    /// Returns raw accepted-input sample-peak presentation for this active
+    /// monitored recording session. It is not evidence of finalized file data.
+    #[must_use]
+    pub const fn input_meter(self) -> IdeInputMeterObservation {
+        self.input_meter
     }
 }
 
@@ -677,9 +685,12 @@ impl RecordingDesktopIdeApplication {
     }
 
     #[must_use]
-    pub(crate) fn observation(&self) -> IdeRecordingObservation {
+    pub(crate) fn observation(&mut self) -> IdeRecordingObservation {
         let recording = self.session.recording_snapshot();
         let control = self.session.control();
+        let input_meter = self
+            .application
+            .observe_input_meter(Some(self.session.input_meter_receiver()));
         IdeRecordingObservation {
             accepted_frames: recording.accepted_frame_count,
             rejected_frames: recording.rejected_frame_count,
@@ -690,6 +701,7 @@ impl RecordingDesktopIdeApplication {
             output_state: self.session.output_status().state(),
             output: self.session.output_counters().snapshot(),
             monitoring: self.session.monitoring_snapshot(),
+            input_meter,
         }
     }
 
@@ -850,7 +862,7 @@ impl RecordingDesktopIdeApplication {
 }
 
 fn start_recording(
-    application: DesktopIdeApplication,
+    mut application: DesktopIdeApplication,
     plan: IdeRecordingPlan,
 ) -> Result<RecordingDesktopIdeApplication, Box<(DesktopIdeApplication, IdeRecordingStartError)>> {
     let output = match application.output_config() {
@@ -938,6 +950,7 @@ fn start_recording(
             )));
         }
     };
+    application.reset_input_meter_observer();
     Ok(RecordingDesktopIdeApplication {
         application,
         session,

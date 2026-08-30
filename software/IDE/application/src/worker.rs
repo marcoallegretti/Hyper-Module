@@ -966,6 +966,7 @@ pub struct IdeRunningObservation {
     recovery: PlaybackRecoverySnapshot,
     transport_cycle: PlaybackCycleObservation,
     meter: IdeOutputMeterObservation,
+    input_meter: super::IdeInputMeterObservation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1698,6 +1699,7 @@ impl IdeRunningObservation {
             recovery,
             transport_cycle: PlaybackRecoveryCheckpoint::default().observe_cycle(),
             meter: IdeOutputMeterObservation::empty(),
+            input_meter: super::IdeInputMeterObservation::empty(),
         }
     }
 
@@ -1922,6 +1924,14 @@ impl IdeRunningObservation {
     #[must_use]
     pub const fn output_meter_observation(&self) -> &IdeOutputMeterObservation {
         &self.meter
+    }
+
+    /// Returns the raw accepted-input sample-peak observation for this
+    /// publication. It is separate from the final-output meter and has no
+    /// peak-hold state.
+    #[must_use]
+    pub const fn input_meter_observation(&self) -> &super::IdeInputMeterObservation {
+        &self.input_meter
     }
 
     #[must_use]
@@ -18174,11 +18184,12 @@ fn running_observation(
         recovery: snapshot.recovery,
         transport_cycle: snapshot.transport_cycle,
         meter: application.observe_output_meter(),
+        input_meter: application.observe_input_meter(),
     })
 }
 
 fn recording_observation(
-    application: &RecordingDesktopIdeApplication,
+    application: &mut RecordingDesktopIdeApplication,
 ) -> Result<IdeRecordingState, IdeWorkerCommandFailure> {
     Ok(IdeRecordingState {
         project_id: try_project_owned(application.project_id())?,

@@ -1,7 +1,8 @@
+use super::input_meter::{InputMeterSender, try_input_meter_channel};
 use super::{
     CaptureStreamCounters, DesktopInputConfig, DesktopOutputConfig, DesktopOutputStartError,
-    DesktopOutputStopError, OutputStreamCounters, OutputStreamStatus, PendingNativeShutdown,
-    STEREO_CHANNELS, StreamStatus,
+    DesktopOutputStopError, InputMeterReceiver, OutputStreamCounters, OutputStreamStatus,
+    PendingNativeShutdown, STEREO_CHANNELS, StreamStatus,
 };
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{
@@ -442,10 +443,12 @@ impl MonitoringCounters {
 pub(crate) struct MonitoringProducer {
     inner: HeapProd<f32>,
     counters: MonitoringCounters,
+    meter: InputMeterSender,
 }
 
 impl MonitoringProducer {
     pub(crate) fn push(&mut self, samples: &[f32]) {
+        let _ = self.meter.publish(samples);
         let frames = samples.len() / STEREO_CHANNELS;
         if !self.inner.read_is_held() {
             MonitoringCounters::add(&self.counters.state.consumer_closed_frames, frames);
@@ -653,6 +656,7 @@ impl MonitoringConsumer {
 pub(crate) enum MonitoringTransportBuildError {
     Allocation,
     RingAllocation,
+    MeterRingAllocation,
     Resampler,
 }
 
@@ -664,6 +668,7 @@ pub(crate) fn try_monitoring_transport(
         MonitoringConsumer,
         MonitoringCounters,
         DesktopMonitoringControl,
+        InputMeterReceiver,
     ),
     MonitoringTransportBuildError,
 > {
@@ -671,6 +676,8 @@ pub(crate) fn try_monitoring_transport(
     let ring = HeapRb::<f32>::try_new(sample_capacity)
         .map_err(|_| MonitoringTransportBuildError::RingAllocation)?;
     let (producer, consumer) = ring.split();
+    let (meter, meter_receiver) = try_input_meter_channel()
+        .map_err(|_| MonitoringTransportBuildError::MeterRingAllocation)?;
     let slip = Slip::new(
         config.processing_chunk_frames,
         STEREO_CHANNELS,
@@ -701,6 +708,7 @@ pub(crate) fn try_monitoring_transport(
         MonitoringProducer {
             inner: producer,
             counters: counters.clone(),
+            meter,
         },
         MonitoringConsumer {
             inner: consumer,
@@ -721,6 +729,7 @@ pub(crate) fn try_monitoring_transport(
         },
         counters,
         control,
+        meter_receiver,
     ))
 }
 
@@ -913,6 +922,7 @@ pub struct DesktopMonitoringSession {
     config: DesktopMonitoringConfig,
     counters: MonitoringCounters,
     control: DesktopMonitoringControl,
+    meter: InputMeterReceiver,
 }
 
 impl DesktopMonitoringSession {
@@ -930,8 +940,9 @@ impl DesktopMonitoringSession {
         config
             .validate()
             .map_err(DesktopMonitoringSessionStartError::Config)?;
-        let (mut producer, mut consumer, counters, control) = try_monitoring_transport(&config)
-            .map_err(|_| DesktopMonitoringSessionStartError::CapacityUnavailable)?;
+        let (mut producer, mut consumer, counters, control, meter) =
+            try_monitoring_transport(&config)
+                .map_err(|_| DesktopMonitoringSessionStartError::CapacityUnavailable)?;
         let input = NativeInputStream::start(
             NativeInputConfig::from(&config.input),
             move |samples: &[f32]| {
@@ -959,6 +970,7 @@ impl DesktopMonitoringSession {
             config,
             counters,
             control,
+            meter,
         })
     }
 
@@ -975,6 +987,12 @@ impl DesktopMonitoringSession {
     #[must_use]
     pub fn monitoring_snapshot(&self) -> MonitoringSnapshot {
         self.counters.snapshot()
+    }
+
+    /// Returns the accepted-input meter receiver for this live monitor owner.
+    #[must_use]
+    pub fn input_meter_receiver(&mut self) -> &mut InputMeterReceiver {
+        &mut self.meter
     }
 
     #[must_use]
@@ -1051,6 +1069,7 @@ mod tests {
         MonitoringConsumer,
         MonitoringCounters,
         DesktopMonitoringControl,
+        InputMeterReceiver,
     ) {
         try_monitoring_transport(&config()).unwrap()
     }
@@ -1115,7 +1134,7 @@ mod tests {
 
     #[test]
     fn output_stays_silent_until_target_latency_is_available() {
-        let (mut producer, mut consumer, counters, _) = transport();
+        let (mut producer, mut consumer, counters, _, _) = transport();
         producer.push(&vec![0.25; 128 * STEREO_CHANNELS]);
         let mut output = [1.0; 32];
         consumer.process(&mut output).unwrap();
@@ -1137,7 +1156,7 @@ mod tests {
 
     #[test]
     fn gain_and_mute_are_applied_without_touching_transport_data() {
-        let (mut producer, mut consumer, _, control) = transport();
+        let (mut producer, mut consumer, _, control, _) = transport();
         producer.push(&vec![0.5; 256 * STEREO_CHANNELS]);
         control.set_gain_linear(0.25).unwrap();
         let mut output = vec![0.0; 240 * STEREO_CHANNELS];
@@ -1162,7 +1181,7 @@ mod tests {
 
     #[test]
     fn saturation_is_nonterminal_and_observable() {
-        let (mut producer, _consumer, counters, _) = transport();
+        let (mut producer, _consumer, counters, _, _) = transport();
         producer.push(&vec![0.0; 900 * STEREO_CHANNELS]);
         producer.push(&vec![0.0; 128 * STEREO_CHANNELS]);
         let snapshot = counters.snapshot();
@@ -1172,13 +1191,31 @@ mod tests {
     }
 
     #[test]
+    fn accepted_input_meter_is_independent_from_monitoring_bridge_saturation() {
+        let (mut producer, _consumer, counters, _, mut meter) = transport();
+        producer.push(&vec![0.25; 900 * STEREO_CHANNELS]);
+        producer.push(&vec![0.75; 128 * STEREO_CHANNELS]);
+
+        let snapshot = meter
+            .read_latest()
+            .snapshot()
+            .expect("accepted capture meter snapshot");
+        assert_eq!(snapshot.accepted_frame_end(), 1_028);
+        assert_eq!(snapshot.frame_count(), 128);
+        assert_eq!(snapshot.left_sample_peak().to_bits(), 0.75_f32.to_bits());
+        assert_eq!(snapshot.right_sample_peak().to_bits(), 0.75_f32.to_bits());
+        assert_eq!(counters.snapshot().accepted_frame_count, 900);
+        assert_eq!(counters.snapshot().overflow_frame_count, 128);
+    }
+
+    #[test]
     fn peer_closure_is_fail_silent_for_ordered_shutdown() {
-        let (mut producer, consumer, counters, _) = transport();
+        let (mut producer, consumer, counters, _, _) = transport();
         drop(consumer);
         producer.push(&[0.25; 16]);
         assert_eq!(counters.snapshot().consumer_closed_frame_count, 8);
 
-        let (producer, mut consumer, _, _) = transport();
+        let (producer, mut consumer, _, _, _) = transport();
         drop(producer);
         let mut output = [1.0; 16];
         consumer.process(&mut output).unwrap();
@@ -1187,7 +1224,7 @@ mod tests {
 
     #[test]
     fn underflow_rebuffers_before_audio_resumes() {
-        let (mut producer, mut consumer, counters, _) = transport();
+        let (mut producer, mut consumer, counters, _, _) = transport();
         producer.push(&vec![0.5; 256 * STEREO_CHANNELS]);
         let mut output = vec![0.0; 256 * STEREO_CHANNELS];
         consumer.process(&mut output).unwrap();
@@ -1208,7 +1245,7 @@ mod tests {
 
     #[test]
     fn excessive_backlog_is_discarded_to_restore_latency() {
-        let (mut producer, mut consumer, counters, _) = transport();
+        let (mut producer, mut consumer, counters, _, _) = transport();
         producer.push(&vec![0.5; 900 * STEREO_CHANNELS]);
         let mut output = [0.0; 16];
         consumer.process(&mut output).unwrap();
@@ -1219,7 +1256,7 @@ mod tests {
 
     #[test]
     fn buffer_controller_corrects_in_the_required_direction() {
-        let (mut producer, mut consumer, counters, _) = transport();
+        let (mut producer, mut consumer, counters, _, _) = transport();
         producer.push(&vec![0.25; 320 * STEREO_CHANNELS]);
         let mut output = vec![0.0; 64 * STEREO_CHANNELS];
         consumer.process(&mut output).unwrap();
@@ -1233,7 +1270,7 @@ mod tests {
 
     #[test]
     fn monitoring_callbacks_perform_zero_heap_operations() {
-        let (mut producer, mut consumer, _, _) = transport();
+        let (mut producer, mut consumer, _, _, _) = transport();
         producer.push(&vec![0.25; 256 * STEREO_CHANNELS]);
         let input = [0.5; 64 * STEREO_CHANNELS];
         let mut output = [0.0; 64 * STEREO_CHANNELS];

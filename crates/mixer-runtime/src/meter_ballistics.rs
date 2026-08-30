@@ -18,8 +18,7 @@ pub struct SamplePeakBallisticsConfig {
 impl SamplePeakBallisticsConfig {
     /// Creates one frame-time sample-peak policy.
     ///
-    /// `sample_rate_hz` must match the output stream that produces the meter
-    /// snapshots.
+    /// `sample_rate_hz` must match the stream that produces the meter snapshots.
     ///
     /// A zero falloff keeps displayed peaks indefinitely. A zero hold duration
     /// makes the held marker begin falling on the next processed frame.
@@ -286,6 +285,142 @@ impl StereoSamplePeakDisplay {
     #[must_use]
     pub const fn right(self) -> ChannelSamplePeakDisplay {
         self.right
+    }
+}
+
+/// Display-only stereo sample-peak values after one source snapshot.
+///
+/// Unlike [`StereoSamplePeakBallisticsSnapshot`], this has no held maximum.
+/// The frame endpoint belongs to the producer stream supplied to
+/// [`StereoSamplePeakDisplayBallistics::update`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StereoSamplePeakDisplayBallisticsSnapshot {
+    frame_end: u64,
+    left: ChannelSamplePeakDisplay,
+    right: ChannelSamplePeakDisplay,
+}
+
+impl StereoSamplePeakDisplayBallisticsSnapshot {
+    /// Returns the producer frame endpoint used for this display update.
+    #[must_use]
+    pub const fn frame_end(self) -> u64 {
+        self.frame_end
+    }
+
+    #[must_use]
+    pub const fn left(self) -> ChannelSamplePeakDisplay {
+        self.left
+    }
+
+    #[must_use]
+    pub const fn right(self) -> ChannelSamplePeakDisplay {
+        self.right
+    }
+}
+
+/// Result of applying one generic stereo sample-peak snapshot to display state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StereoSamplePeakDisplayBallisticsUpdate {
+    snapshot: StereoSamplePeakDisplayBallisticsSnapshot,
+    display_reset: bool,
+}
+
+impl StereoSamplePeakDisplayBallisticsUpdate {
+    #[must_use]
+    pub const fn snapshot(self) -> StereoSamplePeakDisplayBallisticsSnapshot {
+        self.snapshot
+    }
+
+    /// True when a changed source identity or regressed frame endpoint cleared
+    /// prior display history before this snapshot was applied.
+    #[must_use]
+    pub const fn display_reset(self) -> bool {
+        self.display_reset
+    }
+}
+
+/// Frame-time display state for one identified stereo sample-peak source.
+///
+/// The opaque `source_id` passed to [`Self::update`] must change whenever a
+/// display is rebound to another producer. The state resets on that change or
+/// a regressed frame endpoint so a former source cannot contribute visual
+/// history to the next one. It derives display values only and carries no held
+/// peak or audio-thread authority.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StereoSamplePeakDisplayBallistics {
+    config: SamplePeakBallisticsConfig,
+    source_id: Option<u64>,
+    last_frame_end: Option<u64>,
+    left: DisplayChannelState,
+    right: DisplayChannelState,
+}
+
+impl StereoSamplePeakDisplayBallistics {
+    #[must_use]
+    pub const fn new(config: SamplePeakBallisticsConfig) -> Self {
+        Self {
+            config,
+            source_id: None,
+            last_frame_end: None,
+            left: DisplayChannelState::at_floor(config.floor_dbfs),
+            right: DisplayChannelState::at_floor(config.floor_dbfs),
+        }
+    }
+
+    #[must_use]
+    pub const fn config(self) -> SamplePeakBallisticsConfig {
+        self.config
+    }
+
+    /// Clears display and producer-identity state.
+    pub const fn reset(&mut self) {
+        self.source_id = None;
+        self.clear_display();
+    }
+
+    /// Applies one producer-frame snapshot to the live display state.
+    #[must_use]
+    pub fn update(
+        &mut self,
+        source_id: u64,
+        frame_end: u64,
+        left_sample_peak: Option<f32>,
+        right_sample_peak: Option<f32>,
+    ) -> StereoSamplePeakDisplayBallisticsUpdate {
+        let source_changed = self.source_id.is_some_and(|previous| source_id != previous);
+        let frame_clock_regressed = self
+            .last_frame_end
+            .is_some_and(|previous| !source_changed && frame_end < previous);
+        let display_reset = source_changed || frame_clock_regressed;
+        if display_reset {
+            self.clear_display();
+        }
+        self.source_id = Some(source_id);
+        let previous_frame_end = self.last_frame_end.unwrap_or(frame_end);
+        let left = self
+            .left
+            .update(left_sample_peak, previous_frame_end, frame_end, self.config);
+        let right = self.right.update(
+            right_sample_peak,
+            previous_frame_end,
+            frame_end,
+            self.config,
+        );
+        self.last_frame_end = Some(frame_end);
+        StereoSamplePeakDisplayBallisticsUpdate {
+            snapshot: StereoSamplePeakDisplayBallisticsSnapshot {
+                frame_end,
+                left,
+                right,
+            },
+            display_reset,
+        }
+    }
+
+    const fn clear_display(&mut self) {
+        self.last_frame_end = None;
+        self.left = DisplayChannelState::at_floor(self.config.floor_dbfs);
+        self.right = DisplayChannelState::at_floor(self.config.floor_dbfs);
     }
 }
 
@@ -694,6 +829,42 @@ mod tests {
             one_block_result.left().level_dbfs(),
             partitioned_result.left().level_dbfs(),
         );
+    }
+
+    #[test]
+    fn display_only_stereo_ballistics_follow_frame_time_and_preserve_unavailability() {
+        let mut ballistics = StereoSamplePeakDisplayBallistics::new(config(20.0, 0));
+        let initial = ballistics.update(7, 10, Some(1.0), Some(0.1)).snapshot();
+        assert_eq!(initial.frame_end(), 10);
+        assert!(initial.left().measurement_available());
+        assert!(initial.right().measurement_available());
+        assert_near(initial.left().level_dbfs(), 0.0);
+        assert_near(initial.right().level_dbfs(), -20.0);
+
+        let decayed = ballistics.update(7, 60, Some(0.0), None).snapshot();
+        assert_eq!(decayed.frame_end(), 60);
+        assert!(decayed.left().measurement_available());
+        assert!(!decayed.right().measurement_available());
+        assert_near(decayed.left().level_dbfs(), -10.0);
+        assert_near(decayed.right().level_dbfs(), -30.0);
+    }
+
+    #[test]
+    fn display_only_stereo_ballistics_reset_across_source_and_clock_epochs() {
+        let mut ballistics = StereoSamplePeakDisplayBallistics::new(config(20.0, 0));
+        let _ = ballistics.update(7, 100, Some(1.0), Some(1.0));
+
+        let source_reset = ballistics.update(8, 1_000, Some(0.1), Some(0.01));
+        assert!(source_reset.display_reset());
+        assert_eq!(source_reset.snapshot().frame_end(), 1_000);
+        assert_near(source_reset.snapshot().left().level_dbfs(), -20.0);
+        assert_near(source_reset.snapshot().right().level_dbfs(), -40.0);
+
+        let clock_reset = ballistics.update(8, 10, Some(0.5), Some(0.25));
+        assert!(clock_reset.display_reset());
+        assert_eq!(clock_reset.snapshot().frame_end(), 10);
+        assert_near(clock_reset.snapshot().left().level_dbfs(), -6.0206);
+        assert_near(clock_reset.snapshot().right().level_dbfs(), -12.0412);
     }
 
     #[test]

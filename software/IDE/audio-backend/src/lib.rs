@@ -142,6 +142,31 @@ pub use desktop_input::{
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
+mod input_meter;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+pub use input_meter::{
+    InputMeterDisplayRead, InputMeterReceiver, InputMeterSnapshot, LatestInputMeterSnapshot,
+    MAX_QUEUED_INPUT_METER_SNAPSHOTS,
+};
+#[cfg(all(
+    feature = "test-support",
+    any(
+        all(target_os = "linux", target_endian = "little"),
+        target_os = "windows"
+    )
+))]
+pub use input_meter::{
+    InputMeterTestPublication, InputMeterTestPublisher, InputMeterTestTransportError,
+    input_meter_channel_for_test,
+};
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
 mod monitoring_session;
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),

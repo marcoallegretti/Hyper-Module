@@ -8,8 +8,8 @@ use super::{
     CheckpointedOutputProcessor, DesktopControlMappingRuntime, DesktopControlSink,
     DesktopControlSinkError, DesktopDirectControlCommand, DesktopDirectControlError,
     DesktopInputStartError, DesktopInputStopError, DesktopMonitoringConfig,
-    DesktopMonitoringControl, DesktopOutputConfig, MonitoringSnapshot, OutputStreamCounters,
-    OutputStreamStatus, PendingNativeShutdown, PendingNativeShutdownWait,
+    DesktopMonitoringControl, DesktopOutputConfig, InputMeterReceiver, MonitoringSnapshot,
+    OutputStreamCounters, OutputStreamStatus, PendingNativeShutdown, PendingNativeShutdownWait,
     PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
 };
 #[cfg(all(target_os = "linux", target_endian = "little"))]
@@ -736,6 +736,7 @@ struct PlaybackMonitoringSession {
     config: DesktopMonitoringConfig,
     counters: MonitoringCounters,
     control: DesktopMonitoringControl,
+    meter: InputMeterReceiver,
 }
 
 fn recover_and_prepare_project(
@@ -1524,7 +1525,7 @@ impl DesktopPlaybackSession {
         let Some(monitoring_config) = monitoring else {
             return Self::start_output_source(config, source, initial_checkpoint, None);
         };
-        let (mut producer, consumer, counters, control) =
+        let (mut producer, consumer, counters, control, meter) =
             try_monitoring_transport(&monitoring_config)
                 .map_err(|_| DesktopPlaybackSessionStartError::MonitoringCapacityUnavailable)?;
         let input = NativeInputStream::start(
@@ -1542,6 +1543,7 @@ impl DesktopPlaybackSession {
                     config: monitoring_config,
                     counters,
                     control,
+                    meter,
                 });
                 Ok(session)
             }
@@ -2177,6 +2179,15 @@ impl DesktopPlaybackSession {
         self.monitoring
             .as_ref()
             .map(|monitoring| monitoring.counters.snapshot())
+    }
+
+    /// Returns the current accepted-input meter receiver when input cueing is
+    /// active for this playback session.
+    #[must_use]
+    pub fn monitoring_input_meter_receiver(&mut self) -> Option<&mut InputMeterReceiver> {
+        self.monitoring
+            .as_mut()
+            .map(|monitoring| &mut monitoring.meter)
     }
 
     #[must_use]
@@ -2941,7 +2952,7 @@ mod tests {
             64,
         )
         .unwrap();
-        let (producer, consumer, counters, _) = try_monitoring_transport(&config).unwrap();
+        let (producer, consumer, counters, _, _meter) = try_monitoring_transport(&config).unwrap();
         (producer, consumer, counters)
     }
 

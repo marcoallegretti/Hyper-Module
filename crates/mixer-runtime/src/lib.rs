@@ -53,7 +53,8 @@ pub use meter_ballistics::{
     ChannelSamplePeakBallistics, ChannelSamplePeakDisplay, MixerStripSamplePeakBallistics,
     MixerStripSamplePeakBallisticsSnapshot, SamplePeakBallisticsConfig,
     SamplePeakBallisticsConfigError, StereoSamplePeakBallistics,
-    StereoSamplePeakBallisticsSnapshot, StereoSamplePeakDisplay,
+    StereoSamplePeakBallisticsSnapshot, StereoSamplePeakDisplay, StereoSamplePeakDisplayBallistics,
+    StereoSamplePeakDisplayBallisticsSnapshot, StereoSamplePeakDisplayBallisticsUpdate,
 };
 pub use metronome::{
     MetronomeGain, MetronomeGainError, MetronomePlan, MetronomePlanError, MetronomeProcessError,

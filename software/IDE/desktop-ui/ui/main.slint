@@ -597,6 +597,10 @@ export component MainWindow inherits Window {
     in property <string> monitoring-frame-count: "0";
     in property <string> monitoring-drop-count: "0";
     in property <string> monitoring-underflow-count: "0";
+    in property <float> input-meter-left-level: 0;
+    in property <float> input-meter-right-level: 0;
+    in property <string> input-meter-left-reading: "— dBFS";
+    in property <string> input-meter-right-reading: "— dBFS";
     in property <string> project-location: "No project selected";
     in property <string> project-name: "No project open";
     in property <[string]> recent-project-names: [];
@@ -1367,7 +1371,38 @@ export component MainWindow inherits Window {
                                 clicked => { IdeActions.monitor-mute(); }
                             }
                         }
-                        Text { text: "Global post-main cue only; this does not arm or route a track."; color: #728196; font-size: 9px; wrap: word-wrap; }
+                        HorizontalLayout {
+                            height: 32px;
+                            spacing: 8px;
+                            Text {
+                                width: 72px;
+                                text: "RAW PRE-CUE";
+                                color: #8fa0b4;
+                                font-size: 9px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            StereoStripPeakMeter {
+                                height: 28px;
+                                left-level: root.input-meter-left-level;
+                                right-level: root.input-meter-right-level;
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 1px;
+                                Text {
+                                    text: "L  " + root.input-meter-left-reading;
+                                    color: #dce5ef;
+                                    font-size: 9px;
+                                }
+                                Text {
+                                    text: "R  " + root.input-meter-right-reading;
+                                    color: #dce5ef;
+                                    font-size: 9px;
+                                }
+                            }
+                        }
+                        Text { text: "Accepted capture; not a track, file, or calibrated level."; color: #728196; font-size: 8px; overflow: elide; }
                     }
                 }
 

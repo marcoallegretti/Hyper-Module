@@ -8,8 +8,8 @@ use super::{
     DesktopMonitoringControl, DesktopOutputConfig, DesktopOutputStartError, DesktopOutputStopError,
     DesktopPublishedRecording, DesktopRecordingSessionCommitError, DesktopRecordingSessionConfig,
     DesktopRecordingSessionConfigError, DesktopRecordingSessionStopError,
-    DesktopRecordingWriterSettlement, MonitoringSnapshot, OutputStreamCounters, OutputStreamStatus,
-    StreamStatus,
+    DesktopRecordingWriterSettlement, InputMeterReceiver, MonitoringSnapshot, OutputStreamCounters,
+    OutputStreamStatus, StreamStatus,
 };
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{
@@ -400,6 +400,7 @@ pub struct DesktopMonitoredRecordingSession {
     config: DesktopMonitoredRecordingConfig,
     monitoring_counters: MonitoringCounters,
     control: DesktopMonitoringControl,
+    meter: InputMeterReceiver,
 }
 
 impl DesktopMonitoredRecordingSession {
@@ -429,7 +430,7 @@ impl DesktopMonitoredRecordingSession {
         monitor_gain: f32,
         monitor_muted: bool,
     ) -> Result<Self, DesktopMonitoredRecordingStartError> {
-        let (monitoring_producer, mut monitoring_consumer, monitoring_counters, control) =
+        let (monitoring_producer, mut monitoring_consumer, monitoring_counters, control, meter) =
             try_monitoring_transport(&config.monitoring)
                 .map_err(|_| DesktopMonitoredRecordingStartError::MonitoringCapacityUnavailable)?;
         control
@@ -491,6 +492,7 @@ impl DesktopMonitoredRecordingSession {
             config,
             monitoring_counters,
             control,
+            meter,
         })
     }
 
@@ -507,6 +509,12 @@ impl DesktopMonitoredRecordingSession {
     #[must_use]
     pub fn monitoring_snapshot(&self) -> MonitoringSnapshot {
         self.monitoring_counters.snapshot()
+    }
+
+    /// Returns accepted-input meter evidence for this active recording owner.
+    #[must_use]
+    pub fn input_meter_receiver(&mut self) -> &mut InputMeterReceiver {
+        &mut self.meter
     }
 
     /// Returns authoritative lossless recording transport progress.
@@ -775,7 +783,7 @@ mod tests {
         )
         .unwrap();
         let (recording, _recording_consumer) = try_recording_transport(2).unwrap();
-        let (monitoring, _monitoring_consumer, counters, _control) =
+        let (monitoring, _monitoring_consumer, counters, _control, mut meter) =
             try_monitoring_transport(config.monitoring()).unwrap();
         let mut producer = MonitoredRecordingProducer {
             recording,
@@ -790,6 +798,12 @@ mod tests {
             Err(RecordingPushError::Saturated { .. })
         ));
         assert_eq!(counters.snapshot().accepted_frame_count, 2);
+        let meter = meter
+            .read_latest()
+            .snapshot()
+            .expect("recording-accepted input meter snapshot");
+        assert_eq!(meter.accepted_frame_end(), 2);
+        assert_eq!(meter.frame_count(), 2);
     }
 
     #[test]
@@ -803,7 +817,7 @@ mod tests {
         )
         .unwrap();
         let (recording, _recording_consumer) = try_recording_transport(256).unwrap();
-        let (monitoring, _monitoring_consumer, _counters, _control) =
+        let (monitoring, _monitoring_consumer, _counters, _control, _meter) =
             try_monitoring_transport(config.monitoring()).unwrap();
         let mut producer = MonitoredRecordingProducer {
             recording,
