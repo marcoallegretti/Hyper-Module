@@ -1050,6 +1050,8 @@ pub(crate) mod realtime_allocator;
 
 #[cfg(test)]
 mod tests {
+    use crate::{CaptureCallback, CaptureCallbackStatus};
+
     use super::realtime_allocator::HeapMeasurement;
     use super::*;
 
@@ -1206,6 +1208,50 @@ mod tests {
         assert_eq!(snapshot.right_sample_peak().to_bits(), 0.75_f32.to_bits());
         assert_eq!(counters.snapshot().accepted_frame_count, 900);
         assert_eq!(counters.snapshot().overflow_frame_count, 128);
+    }
+
+    #[test]
+    fn capture_validation_blocks_invalid_input_before_accepted_input_meter() {
+        let (mut producer, _consumer, counters, _, mut meter) = transport();
+        let mut callback = CaptureCallback::try_new(
+            move |samples: &[f32]| {
+                producer.push(samples);
+                Ok::<(), Infallible>(())
+            },
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            callback.process(&[0.25, -0.5]),
+            CaptureCallbackStatus::Captured
+        );
+        assert_eq!(
+            callback.process(&[0.75]),
+            CaptureCallbackStatus::SampleCountNotStereoAligned { samples: 1 }
+        );
+        assert_eq!(
+            callback.process(&[0.75, -0.5, 0.25, -0.125]),
+            CaptureCallbackStatus::BlockTooLarge {
+                frames: 2,
+                maximum: 1,
+            }
+        );
+        assert_eq!(
+            callback.process(&[f32::NAN, 0.0]),
+            CaptureCallbackStatus::NonFiniteInput
+        );
+
+        let snapshot = meter
+            .read_latest()
+            .snapshot()
+            .expect("only the validated input block reaches the meter");
+        assert_eq!(snapshot.accepted_frame_end(), 1);
+        assert_eq!(snapshot.frame_count(), 1);
+        assert_eq!(snapshot.left_sample_peak().to_bits(), 0.25_f32.to_bits());
+        assert_eq!(snapshot.right_sample_peak().to_bits(), 0.5_f32.to_bits());
+        assert_eq!(counters.snapshot().accepted_frame_count, 1);
+        assert_eq!(counters.snapshot().overflow_frame_count, 0);
     }
 
     #[test]

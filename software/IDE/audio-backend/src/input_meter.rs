@@ -560,4 +560,39 @@ mod tests {
                 .sender_disconnected()
         );
     }
+
+    #[test]
+    fn receiver_channel_identity_resets_reused_display_state() {
+        let config = SamplePeakBallisticsConfig::try_new(100, -60.0, 20.0, 0).unwrap();
+        let mut display = StereoSamplePeakDisplayBallistics::new(config);
+        let (mut first_sender, mut first_receiver) = channel();
+        assert_eq!(
+            first_sender.publish(&[1.0, 1.0]),
+            InputMeterPublication::Published
+        );
+
+        let first = first_receiver.read_display(&mut display);
+        assert!(!first.display_reset());
+        assert!(
+            first
+                .display()
+                .expect("first input-meter display update")
+                .left()
+                .level_dbfs()
+                .abs()
+                < 0.001
+        );
+
+        let (mut second_sender, mut second_receiver) = channel();
+        assert_eq!(
+            second_sender.publish(&[0.1, 0.01]),
+            InputMeterPublication::Published
+        );
+
+        let second = second_receiver.read_display(&mut display);
+        let snapshot = second.display().expect("second input-meter display update");
+        assert!(second.display_reset());
+        assert!((snapshot.left().level_dbfs() + 20.0).abs() < 0.001);
+        assert!((snapshot.right().level_dbfs() + 40.0).abs() < 0.001);
+    }
 }
