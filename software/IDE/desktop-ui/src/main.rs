@@ -13703,11 +13703,28 @@ fn bind_tempo_callback(ui: &MainWindow, worker: &WorkerCell) {
 }
 
 fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiStateCell) {
+    let worker = Rc::clone(worker);
+    bind_loop_callbacks_with(
+        ui,
+        state,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker, command)),
+    );
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "each generated callback retains the shared command submitter for the window lifetime"
+)]
+fn bind_loop_callbacks_with(
+    ui: &MainWindow,
+    state: &ProjectUiStateCell,
+    submitter: UiCommandSubmitter,
+) {
     let actions = ui.global::<IdeActions>();
     let mark = |end: bool| {
         let weak = ui.as_weak();
-        let worker = Rc::clone(worker);
         let state = Rc::clone(state);
+        let submitter = Rc::clone(&submitter);
         move || {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -13729,16 +13746,14 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
                 ui.get_app_mode(),
                 marks,
             ));
-            submit_to_ui(
+            submitter(
                 &ui,
-                &worker,
                 IdeWorkerCommand::Transport(TransportCommand::SetLoopRange(marks.range())),
             );
             if marks.range().is_none() && ui.get_loop_engaged() {
                 ui.set_loop_engaged(false);
-                submit_to_ui(
+                submitter(
                     &ui,
-                    &worker,
                     IdeWorkerCommand::Transport(TransportCommand::SetLoopEnabled(false)),
                 );
             }
@@ -13748,8 +13763,8 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
     actions.on_loop_mark_out(mark(true));
 
     let weak = ui.as_weak();
-    let toggle_worker = Rc::clone(worker);
     let toggle_state = Rc::clone(state);
+    let toggle_submitter = Rc::clone(&submitter);
     actions.on_loop_toggle(move || {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -13760,16 +13775,15 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
         let engaged = !ui.get_loop_engaged();
         ui.set_loop_engaged(engaged);
         toggle_state.loop_engaged.set(engaged);
-        submit_to_ui(
+        toggle_submitter(
             &ui,
-            &toggle_worker,
             IdeWorkerCommand::Transport(TransportCommand::SetLoopEnabled(engaged)),
         );
     });
 
     let weak = ui.as_weak();
-    let clear_worker = Rc::clone(worker);
     let clear_state = Rc::clone(state);
+    let clear_submitter = Rc::clone(&submitter);
     actions.on_loop_clear(move || {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -13780,14 +13794,12 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
         ui.set_loop_toggle_available(false);
         ui.set_marked_range_export_available(false);
         ui.set_loop_engaged(false);
-        submit_to_ui(
+        clear_submitter(
             &ui,
-            &clear_worker,
             IdeWorkerCommand::Transport(TransportCommand::SetLoopEnabled(false)),
         );
-        submit_to_ui(
+        clear_submitter(
             &ui,
-            &clear_worker,
             IdeWorkerCommand::Transport(TransportCommand::SetLoopRange(None)),
         );
     });
@@ -18458,6 +18470,71 @@ mod tests {
                 "the UI-to-worker path cannot turn invalid marks into an export scope"
             );
         }
+    }
+
+    #[test]
+    fn live_loop_marks_update_marked_range_export_without_persisting_them() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let state = Rc::new(ProjectUiState::default());
+        state.sample_rate_hz.set(48_000);
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_loop_callbacks_with(
+            &ui,
+            &state,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        state.playhead_frame.set(480);
+        ui.global::<IdeActions>().invoke_loop_mark_in();
+        assert_eq!(
+            state.loop_marks.get(),
+            LoopMarks {
+                start: Some(480),
+                end: None,
+            }
+        );
+        assert!(!ui.get_loop_toggle_available());
+        assert!(!ui.get_marked_range_export_available());
+
+        state.playhead_frame.set(960);
+        ui.global::<IdeActions>().invoke_loop_mark_out();
+        assert_eq!(
+            state.loop_marks.get(),
+            LoopMarks {
+                start: Some(480),
+                end: Some(960),
+            }
+        );
+        assert!(ui.get_loop_toggle_available());
+        assert!(ui.get_marked_range_export_available());
+
+        ui.global::<IdeActions>().invoke_loop_clear();
+        assert_eq!(state.loop_marks.get(), LoopMarks::default());
+        assert!(!ui.get_loop_toggle_available());
+        assert!(!ui.get_marked_range_export_available());
+
+        let submitted = submitted.borrow();
+        assert!(
+            matches!(
+                submitted.as_slice(),
+                [
+                    IdeWorkerCommand::Transport(TransportCommand::SetLoopRange(None)),
+                    IdeWorkerCommand::Transport(TransportCommand::SetLoopRange(Some(range))),
+                    IdeWorkerCommand::Transport(TransportCommand::SetLoopEnabled(false)),
+                    IdeWorkerCommand::Transport(TransportCommand::SetLoopRange(None)),
+                ] if range.start_frame() == 480 && range.end_frame() == 960
+            ),
+            "Loop In/Out and Clear submit only the expected transient transport updates"
+        );
+        assert!(
+            submitted
+                .iter()
+                .all(|command| matches!(command, IdeWorkerCommand::Transport(_))),
+            "live marks must not turn range export setup into a durable arrangement mutation"
+        );
     }
 
     #[test]
