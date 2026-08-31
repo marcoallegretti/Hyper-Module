@@ -5029,6 +5029,13 @@ fn bind_audio_clip_waveform_source_range_duplication_callbacks(
             ui.set_error_text("Selected source range is no longer current".into());
             return;
         }
+        if ui.get_clip_source_range_duplicate_start() != start
+            || ui.get_clip_source_range_duplicate_frame_count() != frame_count
+        {
+            reset_audio_clip_source_range_duplication_form(&ui);
+            ui.set_error_text("Selected source range is no longer current".into());
+            return;
+        }
         let source_start_frame = match parse_audio_clip_source_start(start.as_str()) {
             Ok(source_start_frame) => source_start_frame,
             Err(message) => {
@@ -22626,6 +22633,53 @@ mod tests {
         assert_eq!(ui.get_app_mode(), AppMode::Running);
         assert!(ui.get_error_text().is_empty());
         ui.hide().unwrap();
+    }
+
+    #[test]
+    fn waveform_selected_range_duplication_refuses_callback_bounds_that_differ_from_the_displayed_selection()
+     {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let project_state = Rc::new(ProjectUiState::default());
+        project_state
+            .audio_clips
+            .borrow_mut()
+            .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_audio_clip_waveform_selection_callbacks_with(
+            &ui,
+            &project_state,
+            None,
+            Some(Rc::new(move |_, command| {
+                submitted_by_callback.borrow_mut().push(command);
+            })),
+        );
+        configure_waveform_selection_test_view(&ui, "Clip A", 100);
+        ui.global::<IdeActions>()
+            .invoke_begin_audio_clip_waveform_selection(0.25);
+        ui.global::<IdeActions>()
+            .invoke_complete_audio_clip_waveform_selection(0.75);
+        ui.global::<IdeActions>()
+            .invoke_prepare_audio_clip_waveform_range_duplication();
+        assert_eq!(ui.get_clip_source_range_duplicate_start(), "420");
+        assert_eq!(ui.get_clip_source_range_duplicate_frame_count(), "650");
+        ui.set_clip_source_range_duplicate_name("Selected clip".into());
+
+        ui.global::<IdeActions>()
+            .invoke_duplicate_audio_clip_source_range(
+                "clip-a".into(),
+                "Selected clip".into(),
+                "421".into(),
+                "649".into(),
+            );
+
+        assert!(submitted.borrow().is_empty());
+        assert!(!ui.get_clip_source_range_duplicate_visible());
+        assert!(
+            ui.get_error_text()
+                .contains("Selected source range is no longer current")
+        );
     }
 
     #[test]
