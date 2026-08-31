@@ -554,6 +554,7 @@ export component OperatorWindow inherits Window {
     callback return-to-start-requested();
     callback locate-percent-requested(float);
     callback locate-timeline-marker-requested(string);
+    callback play-timeline-marker-requested(string);
     callback toggle-loop-requested();
     callback set-loop-in-requested();
     callback set-loop-out-requested();
@@ -723,6 +724,13 @@ export component OperatorWindow inherits Window {
                                 accessible-label: marker.available ? "Locate " + marker.name + " at " + marker.musical-position : marker.name + " is unavailable";
                                 enabled: marker.controls-enabled;
                                 clicked => { root.locate-timeline-marker-requested(marker.id); }
+                            }
+                            if marker.available : Button {
+                                width: 56px;
+                                text: "Play";
+                                accessible-label: "Play from " + marker.name + " at " + marker.musical-position;
+                                enabled: marker.controls-enabled;
+                                clicked => { root.play-timeline-marker-requested(marker.id); }
                             }
                         }
                     }

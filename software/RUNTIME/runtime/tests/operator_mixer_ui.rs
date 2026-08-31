@@ -361,27 +361,39 @@ fn generated_timeline_marker_controls_forward_identity_and_fail_closed() {
         },
     ]));
     ui.set_timeline_markers(ModelRc::from(Rc::clone(&markers)));
-    let requests = Rc::new(RefCell::new(Vec::new()));
-    let requested = Rc::clone(&requests);
+    let locate_requests = Rc::new(RefCell::new(Vec::new()));
+    let locate_requested = Rc::clone(&locate_requests);
     ui.on_locate_timeline_marker_requested(move |id| {
-        requested.borrow_mut().push(id.to_string());
+        locate_requested.borrow_mut().push(id.to_string());
+    });
+    let play_requests = Rc::new(RefCell::new(Vec::new()));
+    let play_requested = Rc::clone(&play_requests);
+    ui.on_play_timeline_marker_requested(move |id| {
+        play_requested.borrow_mut().push(id.to_string());
     });
     ui.show().unwrap();
 
     let locate = find_control(&ui, "Locate Intro at 1|1|960");
+    let play = find_control(&ui, "Play from Intro at 1|1|960");
     let unavailable = find_control(&ui, "Far away is unavailable");
     assert_eq!(locate.accessible_enabled(), Some(true));
+    assert_eq!(play.accessible_enabled(), Some(true));
     assert_eq!(unavailable.accessible_enabled(), Some(false));
     locate.mock_single_click(PointerEventButton::Left);
+    play.mock_single_click(PointerEventButton::Left);
     unavailable.mock_single_click(PointerEventButton::Left);
-    assert_eq!(requests.borrow().as_slice(), ["marker-intro"]);
+    assert_eq!(locate_requests.borrow().as_slice(), ["marker-intro"]);
+    assert_eq!(play_requests.borrow().as_slice(), ["marker-intro"]);
 
     let mut row = markers.row_data(0).unwrap();
     row.controls_enabled = false;
     markers.set_row_data(0, row);
     assert_eq!(locate.accessible_enabled(), Some(false));
+    assert_eq!(play.accessible_enabled(), Some(false));
     locate.mock_single_click(PointerEventButton::Left);
-    assert_eq!(requests.borrow().as_slice(), ["marker-intro"]);
+    play.mock_single_click(PointerEventButton::Left);
+    assert_eq!(locate_requests.borrow().as_slice(), ["marker-intro"]);
+    assert_eq!(play_requests.borrow().as_slice(), ["marker-intro"]);
 }
 
 #[test]

@@ -351,6 +351,7 @@ enum OperatorCommand {
     ReturnToStart,
     Locate {
         frame: usize,
+        state: LocateState,
     },
     LaunchScene {
         scene_index: usize,
@@ -815,13 +816,15 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
                 Ok(()) => diagnostic("transport return to start queued".to_owned()),
                 Err(error) => diagnostic(format!("transport return to start refused: {error}")),
             },
-            OperatorCommand::Locate { frame } => {
-                match host.queue_transport(TransportCommand::Locate {
-                    frame,
-                    state: LocateState::Preserve,
-                }) {
-                    Ok(()) => diagnostic(format!("transport locate to frame {frame} queued")),
-                    Err(error) => diagnostic(format!("transport locate refused: {error}")),
+            OperatorCommand::Locate { frame, state } => {
+                let action = match state {
+                    LocateState::Preserve => "transport locate",
+                    LocateState::Stopped => "transport locate-and-stop",
+                    LocateState::Rolling => "transport play",
+                };
+                match host.queue_transport(TransportCommand::Locate { frame, state }) {
+                    Ok(()) => diagnostic(format!("{action} to frame {frame} queued")),
+                    Err(error) => diagnostic(format!("{action} refused: {error}")),
                 }
             }
             OperatorCommand::LaunchScene { scene_index } => {
@@ -1825,7 +1828,14 @@ fn wire_operator_seek(
             );
             return;
         };
-        send_operator_command(&sender, OperatorCommand::Locate { frame }, &diagnostic);
+        send_operator_command(
+            &sender,
+            OperatorCommand::Locate {
+                frame,
+                state: LocateState::Preserve,
+            },
+            &diagnostic,
+        );
     });
 }
 
@@ -1835,42 +1845,69 @@ fn wire_operator_timeline_marker_navigation(
     diagnostic: &Arc<Mutex<String>>,
     authority: &Rc<RefCell<Option<Arc<[OperatorTimelineMarker]>>>>,
 ) {
-    let sender = sender.clone();
-    let diagnostic = Arc::clone(diagnostic);
-    let authority = Rc::clone(authority);
-    ui.on_locate_timeline_marker_requested(move |requested_id| {
-        let frame = {
-            let catalog = authority.borrow();
-            let Some(markers) = catalog.as_ref() else {
-                set_diagnostic(
-                    &diagnostic,
-                    "timeline marker locate refused: verified marker navigation is unavailable"
-                        .to_owned(),
-                );
-                return;
-            };
-            let Some(marker) = markers
-                .iter()
-                .find(|marker| marker.id.as_str() == requested_id.as_str())
-            else {
-                set_diagnostic(
-                    &diagnostic,
-                    "timeline marker locate refused: marker identity is not current".to_owned(),
-                );
-                return;
-            };
-            let Some(frame) = marker.frame else {
-                set_diagnostic(
-                    &diagnostic,
-                    "timeline marker locate refused: marker cannot be represented by this Runtime"
-                        .to_owned(),
-                );
-                return;
-            };
-            frame
+    let register = |state| {
+        let sender = sender.clone();
+        let diagnostic = Arc::clone(diagnostic);
+        let authority = Rc::clone(authority);
+        move |requested_id: slint::SharedString| {
+            queue_operator_timeline_marker_action(
+                &sender,
+                &diagnostic,
+                &authority,
+                requested_id.as_str(),
+                state,
+            );
+        }
+    };
+    ui.on_locate_timeline_marker_requested(register(LocateState::Preserve));
+    ui.on_play_timeline_marker_requested(register(LocateState::Rolling));
+}
+
+fn queue_operator_timeline_marker_action(
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Mutex<String>,
+    authority: &RefCell<Option<Arc<[OperatorTimelineMarker]>>>,
+    requested_id: &str,
+    state: LocateState,
+) {
+    let action = match state {
+        LocateState::Preserve => "locate",
+        LocateState::Stopped => "locate-and-stop",
+        LocateState::Rolling => "play",
+    };
+    let frame = {
+        let catalog = authority.borrow();
+        let Some(markers) = catalog.as_ref() else {
+            set_diagnostic(
+                diagnostic,
+                format!(
+                    "timeline marker {action} refused: verified marker navigation is unavailable"
+                ),
+            );
+            return;
         };
-        send_operator_command(&sender, OperatorCommand::Locate { frame }, &diagnostic);
-    });
+        let Some(marker) = markers
+            .iter()
+            .find(|marker| marker.id.as_str() == requested_id)
+        else {
+            set_diagnostic(
+                diagnostic,
+                format!("timeline marker {action} refused: marker identity is not current"),
+            );
+            return;
+        };
+        let Some(frame) = marker.frame else {
+            set_diagnostic(
+                diagnostic,
+                format!(
+                    "timeline marker {action} refused: marker cannot be represented by this Runtime"
+                ),
+            );
+            return;
+        };
+        frame
+    };
+    send_operator_command(sender, OperatorCommand::Locate { frame, state }, diagnostic);
 }
 
 fn wire_operator_quit(
@@ -3227,7 +3264,7 @@ fn operator_timeline_marker_navigation_state(
     } else if !markers.iter().any(|marker| marker.frame.is_some()) {
         "No named marker can be represented by this Runtime"
     } else if authority_active {
-        "Locate preserves the recovered transport state"
+        "Locate preserves recovered state · Play starts"
     } else {
         "Waiting for verified output recovery"
     }
@@ -5119,6 +5156,12 @@ mod tests {
         sender.send(OperatorCommand::Stop).unwrap();
         sender.send(OperatorCommand::ReturnToStart).unwrap();
         sender
+            .send(OperatorCommand::Locate {
+                frame: 960,
+                state: LocateState::Rolling,
+            })
+            .unwrap();
+        sender
             .send(OperatorCommand::LaunchScene { scene_index: 3 })
             .unwrap();
         sender.send(OperatorCommand::StopInteractiveScenes).unwrap();
@@ -5130,11 +5173,14 @@ mod tests {
                 state: LoudnessMeasurementState::Standby,
             })
             .unwrap();
-        sender.send(OperatorCommand::ResetLoudness).unwrap();
         let stop = AtomicBool::new(false);
         let mut owner = OperatorControl::default();
         let diagnostics = RefCell::new(Vec::new());
 
+        drain_operator_commands(&mut owner, &receiver, &stop, &|message| {
+            diagnostics.borrow_mut().push(message);
+        });
+        sender.send(OperatorCommand::ResetLoudness).unwrap();
         drain_operator_commands(&mut owner, &receiver, &stop, &|message| {
             diagnostics.borrow_mut().push(message);
         });
@@ -5147,6 +5193,10 @@ mod tests {
                 TransportCommand::Locate {
                     frame: 0,
                     state: LocateState::Preserve,
+                },
+                TransportCommand::Locate {
+                    frame: 960,
+                    state: LocateState::Rolling,
                 },
                 TransportCommand::LaunchScene { scene_index: 3 },
                 TransportCommand::StopInteractiveScenes,
@@ -5166,6 +5216,7 @@ mod tests {
                 "transport start queued",
                 "transport stop queued",
                 "transport return to start queued",
+                "transport play to frame 960 queued",
                 "scene 4 launch queued",
                 "interactive scene stop queued",
                 "session loop enable queued",
@@ -5196,7 +5247,12 @@ mod tests {
         assert_eq!(operator_seek_frame(0, 50.0), None);
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        sender.send(OperatorCommand::Locate { frame: 751 }).unwrap();
+        sender
+            .send(OperatorCommand::Locate {
+                frame: 751,
+                state: LocateState::Preserve,
+            })
+            .unwrap();
         let stop = AtomicBool::new(false);
         let mut owner = OperatorControl::default();
         let diagnostic = RefCell::new(String::new());
@@ -5250,12 +5306,11 @@ mod tests {
             diagnostic.lock().unwrap().as_str(),
             "timeline marker locate refused: verified marker navigation is unavailable"
         );
-        assert_eq!(ui.get_transport_frame().as_str(), "0");
 
         apply_operator_timeline_marker_observation(&ui, &model, &authority, &markers);
         assert_eq!(
             ui.get_timeline_marker_navigation_state().as_str(),
-            "Locate preserves the recovered transport state"
+            "Locate preserves recovered state · Play starts"
         );
         assert_eq!(model.row_data(0).unwrap().id.as_str(), "marker-intro");
         assert_eq!(model.row_data(0).unwrap().name.as_str(), "Intro");
@@ -5285,7 +5340,10 @@ mod tests {
         ui.invoke_locate_timeline_marker_requested("marker-intro".into());
         assert_eq!(
             receiver.try_recv(),
-            Ok(OperatorCommand::Locate { frame: 12_000 })
+            Ok(OperatorCommand::Locate {
+                frame: 12_000,
+                state: LocateState::Preserve,
+            })
         );
         assert_eq!(ui.get_transport_frame().as_str(), "0");
 
@@ -5321,6 +5379,95 @@ mod tests {
         assert_eq!(
             saturated_diagnostic.lock().unwrap().as_str(),
             "timeline marker locate refused: verified marker navigation is unavailable"
+        );
+    }
+
+    #[test]
+    fn operator_timeline_marker_play_uses_rolling_locate_and_fails_closed() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = OperatorWindow::new().unwrap();
+        let timeline = test_musical_timeline();
+        let markers: Arc<[OperatorTimelineMarker]> = Arc::from([
+            operator_timeline_marker(
+                "marker-intro".to_owned(),
+                "Intro".to_owned(),
+                960,
+                &timeline,
+            ),
+            OperatorTimelineMarker {
+                id: "marker-unavailable".to_owned(),
+                name: "Far away".to_owned(),
+                tick: u64::MAX,
+                musical_position: None,
+                frame: None,
+            },
+        ]);
+        let model = Rc::new(VecModel::from(operator_timeline_marker_rows(&markers)));
+        let authority = Rc::new(RefCell::new(None));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let diagnostic = Arc::new(Mutex::new(String::new()));
+        ui.set_timeline_markers(ModelRc::from(Rc::clone(&model)));
+        ui.set_transport_frame("0".into());
+        ui.set_transport_state("Stopped".into());
+        wire_operator_timeline_marker_navigation(&ui, &sender, &diagnostic, &authority);
+
+        ui.invoke_play_timeline_marker_requested("marker-intro".into());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "timeline marker play refused: verified marker navigation is unavailable"
+        );
+
+        apply_operator_timeline_marker_observation(&ui, &model, &authority, &markers);
+        ui.invoke_play_timeline_marker_requested("stale-marker".into());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "timeline marker play refused: marker identity is not current"
+        );
+        ui.invoke_play_timeline_marker_requested("marker-unavailable".into());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "timeline marker play refused: marker cannot be represented by this Runtime"
+        );
+
+        ui.invoke_play_timeline_marker_requested("marker-intro".into());
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::Locate {
+                frame: 12_000,
+                state: LocateState::Rolling,
+            })
+        );
+        assert_eq!(ui.get_transport_frame().as_str(), "0");
+        assert_eq!(ui.get_transport_state().as_str(), "Stopped");
+
+        let (saturated_sender, saturated_receiver) = std::sync::mpsc::sync_channel(1);
+        saturated_sender.send(OperatorCommand::Quit).unwrap();
+        let saturated_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_timeline_marker_navigation(
+            &ui,
+            &saturated_sender,
+            &saturated_diagnostic,
+            &authority,
+        );
+        ui.invoke_play_timeline_marker_requested("marker-intro".into());
+        assert_eq!(saturated_receiver.try_recv(), Ok(OperatorCommand::Quit));
+        assert_eq!(saturated_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert!(
+            saturated_diagnostic
+                .lock()
+                .unwrap()
+                .contains("operator command refused")
+        );
+
+        revoke_operator_timeline_marker_authority(&ui, &model, &authority);
+        ui.invoke_play_timeline_marker_requested("marker-intro".into());
+        assert_eq!(saturated_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            saturated_diagnostic.lock().unwrap().as_str(),
+            "timeline marker play refused: verified marker navigation is unavailable"
         );
     }
 
@@ -5393,7 +5540,7 @@ mod tests {
         assert!(!ui.get_transport_seek_enabled());
         assert_eq!(
             ui.get_timeline_marker_navigation_state().as_str(),
-            "Locate preserves the recovered transport state"
+            "Locate preserves recovered state · Play starts"
         );
 
         apply(observers.output_status.state(), true);
@@ -5418,11 +5565,11 @@ mod tests {
             ui.get_diagnostic().as_str(),
             "native audio ownership ended unexpectedly"
         );
-        ui.invoke_locate_timeline_marker_requested("marker-intro".into());
+        ui.invoke_play_timeline_marker_requested("marker-intro".into());
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(
             diagnostic.lock().unwrap().as_str(),
-            "timeline marker locate refused: verified marker navigation is unavailable"
+            "timeline marker play refused: verified marker navigation is unavailable"
         );
     }
 
@@ -7871,8 +8018,18 @@ mod tests {
         ui.invoke_locate_percent_requested(50.0);
         assert_operator_float(ui.get_transport_position_percent(), committed_percent);
         let locate = seek_receiver.try_recv().unwrap();
-        assert_eq!(locate, OperatorCommand::Locate { frame: 750 });
-        let OperatorCommand::Locate { frame } = locate else {
+        assert_eq!(
+            locate,
+            OperatorCommand::Locate {
+                frame: 750,
+                state: LocateState::Preserve,
+            }
+        );
+        let OperatorCommand::Locate {
+            frame,
+            state: LocateState::Preserve,
+        } = locate
+        else {
             unreachable!("the seek fixture emits one exact locate")
         };
         transport_sender.try_send(TransportCommand::Stop).unwrap();
@@ -7906,8 +8063,18 @@ mod tests {
 
         ui.invoke_locate_percent_requested(25.0);
         let rolling_locate = seek_receiver.try_recv().unwrap();
-        assert_eq!(rolling_locate, OperatorCommand::Locate { frame: 375 });
-        let OperatorCommand::Locate { frame } = rolling_locate else {
+        assert_eq!(
+            rolling_locate,
+            OperatorCommand::Locate {
+                frame: 375,
+                state: LocateState::Preserve,
+            }
+        );
+        let OperatorCommand::Locate {
+            frame,
+            state: LocateState::Preserve,
+        } = rolling_locate
+        else {
             unreachable!("the rolling seek fixture emits one exact locate")
         };
         transport_sender.try_send(TransportCommand::Start).unwrap();
@@ -8211,7 +8378,10 @@ mod tests {
         ui.invoke_locate_percent_requested(50.0);
         assert_eq!(
             receiver.try_recv(),
-            Ok(OperatorCommand::Locate { frame: 750 })
+            Ok(OperatorCommand::Locate {
+                frame: 750,
+                state: LocateState::Preserve,
+            })
         );
         assert_operator_float(ui.get_transport_position_percent(), 0.0);
         apply_operator_seek_observation(&ui, &seek_authority, facts.playback_extent, 375);
