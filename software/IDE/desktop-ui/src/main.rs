@@ -10935,6 +10935,7 @@ fn apply_transport_recovery_availability(ui: &MainWindow, state: PlaybackRecover
 
 fn apply_output_failure_observation(ui: &MainWindow) {
     ui.set_new_track_visible(false);
+    ui.set_stream_state("Failed".into());
     ui.set_transport_start_available(false);
     ui.set_transport_stop_available(false);
     ui.set_transport_seek_available(false);
@@ -16943,6 +16944,7 @@ mod tests {
 
         ui.set_app_mode(AppMode::Running);
         ui.set_close_unsaved_mixer_confirming(false);
+        ui.set_stream_state("Running".into());
         ui.set_transport_start_available(true);
         ui.set_transport_stop_available(true);
         ui.set_transport_seek_available(true);
@@ -16966,6 +16968,7 @@ mod tests {
             IdeWorkerEvent::CloseDiscardRequired,
         );
         assert_eq!(ui.get_app_mode(), AppMode::OutputFailed);
+        assert_eq!(ui.get_stream_state(), "Failed");
         assert!(ui.get_close_unsaved_mixer_confirming());
         assert!(!ui.get_transport_start_available());
         assert!(!ui.get_transport_stop_available());
@@ -16989,6 +16992,7 @@ mod tests {
             IdeWorkerEvent::CloseDiscardCancelled,
         );
         assert_eq!(ui.get_app_mode(), AppMode::OutputFailed);
+        assert_eq!(ui.get_stream_state(), "Failed");
         assert!(!ui.get_close_unsaved_mixer_confirming());
         assert!(ui.get_status_text().contains("output remains unavailable"));
         assert!(ui.get_error_text().contains("locked"));
@@ -17163,6 +17167,7 @@ mod tests {
     fn assert_terminal_output_failure_event_contract(ui: &MainWindow) {
         let project_state = Rc::new(ProjectUiState::default());
         ui.set_app_mode(AppMode::Running);
+        ui.set_stream_state("Running".into());
         ui.set_transport_start_available(true);
         ui.set_transport_stop_available(true);
         ui.set_transport_seek_available(true);
@@ -17177,6 +17182,7 @@ mod tests {
             },
         );
         assert_eq!(ui.get_app_mode(), AppMode::OutputFailed);
+        assert_eq!(ui.get_stream_state(), "Failed");
         assert!(!ui.get_transport_start_available());
         assert!(!ui.get_transport_stop_available());
         assert!(!ui.get_transport_seek_available());
