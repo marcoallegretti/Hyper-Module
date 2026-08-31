@@ -10412,6 +10412,7 @@ struct TestPlaybackSession {
     scene_launches: InteractiveSceneLaunchReceiver,
     _scene_launch_publisher: InteractiveSceneLaunchPublisher,
     close_failure: Option<IdeNativeCloseFailure>,
+    output_state: OutputStreamState,
     save_eligible: bool,
     commit_mixer_fences: bool,
     committed_mixer_fence: u64,
@@ -10448,6 +10449,7 @@ impl Default for TestPlaybackSession {
             scene_launches,
             _scene_launch_publisher: scene_launch_publisher,
             close_failure: None,
+            output_state: OutputStreamState::Running,
             save_eligible: false,
             commit_mixer_fences: false,
             committed_mixer_fence: 0,
@@ -10465,6 +10467,15 @@ impl Default for TestPlaybackSession {
 }
 
 impl RunningDesktopIdeApplication {
+    #[must_use]
+    pub(crate) fn output_state(&self) -> OutputStreamState {
+        match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session.output_status().state(),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => session.output_state,
+        }
+    }
+
     /// Returns whether a fenced live mixer checkpoint requires explicit discard
     /// before closing. `None` is an indeterminate checkpoint and must fail closed.
     pub(crate) fn mixer_close_requires_discard(&self) -> Option<bool> {

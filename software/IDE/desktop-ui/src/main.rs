@@ -29,8 +29,8 @@ use hyper_desktop_ide::{
     IdeResourceRestoreError, IdeRoutingBusKind, IdeRunningObservation, IdeScaledLoudnessValue,
     IdeScene, IdeSceneAvailability, IdeSceneLaunchQuantization, IdeSceneLaunchState,
     IdeSceneSlotEdit, IdeSceneTrackAction, IdeTimelineMarker, IdeTimelineMarkerEdit,
-    IdeUnusedSampleCleanupSummary, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
-    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeUnusedSampleCleanupSummary, IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind,
+    IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
     IdeWorkerShutdownReport, LocateState, MAX_COMPRESSOR_ATTACK_MICROSECONDS,
     MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS, MAX_COMPRESSOR_RATIO_MILLIONTHS,
     MAX_COMPRESSOR_RELEASE_MICROSECONDS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
@@ -54,7 +54,7 @@ use hyper_desktop_ide::{
     IdeAudioClipSourceTrimEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
     IdeAudioImportError, IdeAutomationTakeEditError, IdeSceneCreationError,
     IdeSceneDuplicationError, IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEditError,
-    IdeTempoEditError, IdeWorkerCommandFailure,
+    IdeTempoEditError,
 };
 #[cfg(test)]
 use hyper_mixer_runtime::PlaybackRecoverySnapshot;
@@ -1792,8 +1792,10 @@ fn bind_project_close_callback_with(ui: &MainWindow, submitter: UiCommandSubmitt
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        if !matches!(ui.get_app_mode(), AppMode::Running | AppMode::Previewing)
-            || !ui.get_close_unsaved_mixer_confirming()
+        if !matches!(
+            ui.get_app_mode(),
+            AppMode::Running | AppMode::Previewing | AppMode::OutputFailed
+        ) || !ui.get_close_unsaved_mixer_confirming()
         {
             return;
         }
@@ -1805,8 +1807,10 @@ fn bind_project_close_callback_with(ui: &MainWindow, submitter: UiCommandSubmitt
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        if !matches!(ui.get_app_mode(), AppMode::Running | AppMode::Previewing)
-            || !ui.get_close_unsaved_mixer_confirming()
+        if !matches!(
+            ui.get_app_mode(),
+            AppMode::Running | AppMode::Previewing | AppMode::OutputFailed
+        ) || !ui.get_close_unsaved_mixer_confirming()
         {
             return;
         }
@@ -1844,7 +1848,10 @@ fn bind_window_close_callback(ui: &MainWindow) {
 }
 
 fn window_close_response(ui: &MainWindow) -> CloseRequestResponse {
-    if matches!(ui.get_app_mode(), AppMode::Running | AppMode::Previewing) {
+    if matches!(
+        ui.get_app_mode(),
+        AppMode::Running | AppMode::Previewing | AppMode::OutputFailed
+    ) {
         ui.global::<IdeActions>().invoke_close_project();
         CloseRequestResponse::KeepWindowShown
     } else {
@@ -7202,7 +7209,11 @@ fn apply_event(
             if command == IdeWorkerCommandKind::ResetOutputPeakHold {
                 ui.set_output_peak_hold_reset_pending(false);
             }
-            ui.set_app_mode(mode_after_failure(ui.get_app_mode(), command));
+            if matches!(&reason, IdeWorkerCommandFailure::NativeOutputFailed) {
+                apply_output_failure_observation(ui);
+            } else {
+                ui.set_app_mode(mode_after_failure(ui.get_app_mode(), command));
+            }
             ui.set_error_text(format!("{}: {reason}", command_status(command)).into());
         }
     }
@@ -9314,6 +9325,10 @@ fn apply_running_event(
         .into(),
     );
     apply_output_meter_observation(ui, observation);
+    if observation.output_has_failed() {
+        apply_output_failure_observation(ui);
+        return;
+    }
     match observation.preview().state() {
         DesktopAudioPreviewState::Starting
         | DesktopAudioPreviewState::Playing
@@ -10892,6 +10907,20 @@ fn reset_project(
 fn apply_transport_recovery_availability(ui: &MainWindow, state: PlaybackRecoveryTransportState) {
     ui.set_transport_start_available(state == PlaybackRecoveryTransportState::Stopped);
     ui.set_transport_stop_available(state == PlaybackRecoveryTransportState::Rolling);
+}
+
+fn apply_output_failure_observation(ui: &MainWindow) {
+    ui.set_new_track_visible(false);
+    ui.set_transport_start_available(false);
+    ui.set_transport_stop_available(false);
+    ui.set_transport_seek_available(false);
+    ui.set_metronome_available(false);
+    ui.set_app_mode(AppMode::OutputFailed);
+    ui.set_status_text("Native audio output ended unexpectedly".into());
+    ui.set_error_text(
+        "Audio controls and project editing are locked. Close the project before reopening it."
+            .into(),
+    );
 }
 
 fn apply_metronome_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
@@ -16692,6 +16721,14 @@ mod tests {
             "the previewing state shares the visible Close action authority"
         );
 
+        ui.set_app_mode(AppMode::OutputFailed);
+        dispatch_ide_shortcut(ui, "w", false, false);
+        assert_eq!(
+            closed.get(),
+            3,
+            "terminal output loss retains only the explicit Close action"
+        );
+
         ui.set_app_mode(AppMode::Closing);
         dispatch_ide_shortcut(ui, "w", false, false);
         ui.set_app_mode(AppMode::Running);
@@ -16702,7 +16739,7 @@ mod tests {
         dispatch_ide_shortcut(ui, "w", false, false);
         assert_eq!(
             closed.get(),
-            2,
+            3,
             "pending work and local forms keep the close shortcut unavailable"
         );
         ui.set_new_track_visible(false);
@@ -17007,7 +17044,52 @@ mod tests {
             "a rolling recovery observation enables the existing Stop callback"
         );
 
+        apply_running_event(
+            ui,
+            &recording_routes,
+            &take_routes,
+            &audio_import_routes,
+            &project_state,
+            &IdeRunningObservation::for_ui_test(PlaybackRecoverySnapshot::for_test(
+                PlaybackRecoveryTransportState::Stopped,
+                256,
+            ))
+            .with_failed_output_for_ui_test(),
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::OutputFailed);
+        assert_eq!(ui.get_stream_state(), "Failed");
+        assert!(!ui.get_transport_start_available());
+        assert!(!ui.get_transport_stop_available());
+        assert!(!ui.get_transport_seek_available());
+        assert!(!ui.get_metronome_available());
+        dispatch_ide_space(ui, false, false, false, false, false);
+        assert_eq!(starts.get(), 1);
+        assert_eq!(stops.get(), 1);
+
         ui.set_transport_stop_available(false);
+    }
+
+    fn assert_terminal_output_failure_event_contract(ui: &MainWindow) {
+        let project_state = Rc::new(ProjectUiState::default());
+        ui.set_app_mode(AppMode::Running);
+        ui.set_transport_start_available(true);
+        ui.set_transport_stop_available(true);
+        ui.set_transport_seek_available(true);
+        ui.set_metronome_available(true);
+        apply_event(
+            ui,
+            &UiRoutes::default(),
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Transport,
+                reason: IdeWorkerCommandFailure::NativeOutputFailed,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::OutputFailed);
+        assert!(!ui.get_transport_start_available());
+        assert!(!ui.get_transport_stop_available());
+        assert!(!ui.get_transport_seek_available());
+        assert!(!ui.get_metronome_available());
     }
 
     fn assert_audio_import_shortcut_contract(ui: &MainWindow) {
@@ -23023,6 +23105,7 @@ mod tests {
         assert_unsaved_mixer_close_contract(&ui);
         assert_transport_space_shortcut_contract(&ui);
         assert_transport_running_observation_contract(&ui);
+        assert_terminal_output_failure_event_contract(&ui);
         assert_audio_import_shortcut_contract(&ui);
         assert_form_cancellation_shortcut_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);

@@ -1760,6 +1760,13 @@ impl IdeRunningObservation {
         self
     }
 
+    #[cfg(feature = "ui-test-support")]
+    #[must_use]
+    pub fn with_failed_output_for_ui_test(mut self) -> Self {
+        self.output_state = OutputStreamState::Failed;
+        self
+    }
+
     /// Adds coherent recorded-take rows to a generated UI test observation.
     #[cfg(feature = "ui-test-support")]
     #[must_use]
@@ -1933,6 +1940,11 @@ impl IdeRunningObservation {
     #[must_use]
     pub const fn output_state(&self) -> &OutputStreamState {
         &self.output_state
+    }
+
+    #[must_use]
+    pub fn output_has_failed(&self) -> bool {
+        self.output_state == OutputStreamState::Failed
     }
 
     #[must_use]
@@ -2653,6 +2665,7 @@ pub enum IdeWorkerCommandFailure {
     ScenePerformanceCapture(Box<IdeScenePerformanceCaptureError>),
     MixerAutomationCapture(Box<IdeMixerAutomationCaptureError>),
     AudioPreview(IdeAudioPreviewError),
+    NativeOutputFailed,
     InvalidState,
     Publication(OutputInventoryError),
     InputPublication(InputInventoryError),
@@ -2826,6 +2839,9 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::ScenePerformanceCapture(source) => source.fmt(formatter),
             Self::MixerAutomationCapture(source) => source.fmt(formatter),
             Self::AudioPreview(source) => source.fmt(formatter),
+            Self::NativeOutputFailed => formatter.write_str(
+                "native audio output ended unexpectedly; close the project before reopening it",
+            ),
             Self::InvalidState => {
                 formatter.write_str("command is invalid for the current IDE state")
             }
@@ -2930,7 +2946,8 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioPreview(source) => Some(source),
             Self::Publication(source) => Some(source),
             Self::InputPublication(source) => Some(source),
-            Self::InvalidState
+            Self::NativeOutputFailed
+            | Self::InvalidState
             | Self::RecentProjectMissing(_)
             | Self::ProjectPublicationCapacityUnavailable
             | Self::ProjectSnapshotUnavailable
@@ -4383,6 +4400,7 @@ enum WorkerState {
         command: IdeWorkerCommandKind,
     },
     Running(RunningDesktopIdeApplication),
+    OutputFailed(RunningDesktopIdeApplication),
     ScenePerformanceCapture {
         application: RunningDesktopIdeApplication,
         capture: ScenePerformanceCapture,
@@ -4419,7 +4437,10 @@ enum WorkerState {
         sequence: u64,
         deadline: Instant,
     },
-    AwaitingCloseDiscard(RunningDesktopIdeApplication),
+    AwaitingCloseDiscard {
+        application: RunningDesktopIdeApplication,
+        output_failed: bool,
+    },
     RecordingClosing {
         pending: DesktopIdePendingSaveClose,
         target: IdeRecordingTarget,
@@ -5435,7 +5456,11 @@ fn process_command(
     history: &mut UndoHistory,
     project_history: Option<&ProjectHistory>,
 ) -> bool {
+    transition_running_output_failure(state);
     let kind = command.kind();
+    if command_is_blocked_by_output_failure(state, &command) {
+        return publish_failure(events, kind, IdeWorkerCommandFailure::NativeOutputFailed);
+    }
     if matches!(
         command,
         IdeWorkerCommand::OpenProject(_)
@@ -5662,7 +5687,9 @@ fn process_command(
             block_frames,
         } => export_track_stems(state, events, &destination_directory, format, block_frames),
         IdeWorkerCommand::Observe => publish_state(state, events, unpublished_native_failure),
-        IdeWorkerCommand::CloseProject => request_project_close(state, events),
+        IdeWorkerCommand::CloseProject => {
+            request_project_close(state, events, unpublished_native_failure, history)
+        }
         IdeWorkerCommand::DiscardCloseProject => discard_project_close(
             state,
             events,
@@ -5675,6 +5702,29 @@ fn process_command(
         }
         IdeWorkerCommand::Shutdown => unreachable!("shutdown is handled by the worker loop"),
     }
+}
+
+fn transition_running_output_failure(state: &mut WorkerState) {
+    if !matches!(state, WorkerState::Running(application) if application.output_state() == OutputStreamState::Failed)
+    {
+        return;
+    }
+    let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("running state was checked before terminal output failure ownership transfer");
+    };
+    *state = WorkerState::OutputFailed(application);
+}
+
+fn command_is_blocked_by_output_failure(state: &WorkerState, command: &IdeWorkerCommand) -> bool {
+    matches!(state, WorkerState::OutputFailed(_))
+        && !matches!(
+            command,
+            IdeWorkerCommand::CloseProject
+                | IdeWorkerCommand::DiscardCloseProject
+                | IdeWorkerCommand::CancelCloseProject
+                | IdeWorkerCommand::Observe
+                | IdeWorkerCommand::Shutdown
+        )
 }
 
 fn process_output_setup_command(
@@ -8161,14 +8211,14 @@ fn discard_project_close(
     command: IdeWorkerCommandKind,
     history: &mut UndoHistory,
 ) -> bool {
-    if !matches!(state, WorkerState::AwaitingCloseDiscard(_)) {
+    if !matches!(state, WorkerState::AwaitingCloseDiscard { .. }) {
         return publish_failure(
             events,
             command,
             IdeWorkerCommandFailure::ProjectClose(IdeProjectCloseError::DiscardNotAuthorized),
         );
     }
-    let WorkerState::AwaitingCloseDiscard(application) =
+    let WorkerState::AwaitingCloseDiscard { application, .. } =
         std::mem::replace(state, WorkerState::Empty)
     else {
         unreachable!("the close-discard state was checked before ownership transfer");
@@ -8182,24 +8232,43 @@ fn cancel_project_close(
     events: &SyncSender<IdeWorkerEvent>,
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
 ) -> bool {
-    if !matches!(state, WorkerState::AwaitingCloseDiscard(_)) {
+    if !matches!(state, WorkerState::AwaitingCloseDiscard { .. }) {
         return publish_failure(
             events,
             IdeWorkerCommandKind::CloseProject,
             IdeWorkerCommandFailure::ProjectClose(IdeProjectCloseError::DiscardNotAuthorized),
         );
     }
-    let WorkerState::AwaitingCloseDiscard(application) =
-        std::mem::replace(state, WorkerState::Empty)
+    let WorkerState::AwaitingCloseDiscard {
+        application,
+        output_failed,
+    } = std::mem::replace(state, WorkerState::Empty)
     else {
         unreachable!("the close-discard state was checked before ownership transfer");
     };
-    *state = WorkerState::Running(application);
+    *state = if output_failed {
+        WorkerState::OutputFailed(application)
+    } else {
+        WorkerState::Running(application)
+    };
     publish_state(state, events, unpublished_native_failure)
         && send_event(events, IdeWorkerEvent::CloseDiscardCancelled)
 }
 
-fn request_project_close(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) -> bool {
+fn request_project_close(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    history: &mut UndoHistory,
+) -> bool {
+    if matches!(state, WorkerState::OutputFailed(_)) {
+        return request_output_failed_project_close(
+            state,
+            events,
+            unpublished_native_failure,
+            history,
+        );
+    }
     let WorkerState::Running(application) = state else {
         return publish_failure(
             events,
@@ -8235,6 +8304,34 @@ fn request_project_close(state: &mut WorkerState, events: &SyncSender<IdeWorkerE
         deadline: Instant::now() + MIXER_SAVE_COMMIT_TIMEOUT,
     };
     true
+}
+
+fn request_output_failed_project_close(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    history: &mut UndoHistory,
+) -> bool {
+    let WorkerState::OutputFailed(application) = std::mem::replace(state, WorkerState::Empty)
+    else {
+        unreachable!("terminal output failure was checked before ownership transfer");
+    };
+    if let Some(false) = application.mixer_close_requires_discard() {
+        *state = WorkerState::Running(application);
+        close_project(
+            state,
+            events,
+            unpublished_native_failure,
+            IdeWorkerCommandKind::CloseProject,
+            history,
+        )
+    } else {
+        *state = WorkerState::AwaitingCloseDiscard {
+            application,
+            output_failed: true,
+        };
+        send_event(events, IdeWorkerEvent::CloseDiscardRequired)
+    }
 }
 
 fn save_project(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) -> bool {
@@ -17522,6 +17619,7 @@ fn poll_pending_state(
             // A disconnected sender remains observable when capture begins.
             let _inactive_history = application.drain_interactive_mixer_parameter_changes(|_| {});
             *state = WorkerState::Running(application);
+            transition_running_output_failure(state);
             true
         }
         WorkerState::Closing(pending) => match pending.wait(Duration::ZERO) {
@@ -17680,7 +17778,10 @@ fn poll_pending_state(
             if application.committed_mixer_fence() >= sequence {
                 match application.mixer_close_requires_discard() {
                     Some(true) => {
-                        *state = WorkerState::AwaitingCloseDiscard(application);
+                        *state = WorkerState::AwaitingCloseDiscard {
+                            application,
+                            output_failed: false,
+                        };
                         let mut no_native_failure = None;
                         publish_state(state, events, &mut no_native_failure)
                             && send_event(events, IdeWorkerEvent::CloseDiscardRequired)
@@ -17837,12 +17938,14 @@ fn publish_state(
                 return delivered && unpublished_native_failure.is_none();
             }
         },
-        WorkerState::Running(application) => match running_observation(application) {
-            Ok(observation) => IdeWorkerEvent::Running(observation),
-            Err(reason) => {
-                return publish_failure(events, IdeWorkerCommandKind::Observe, reason);
+        WorkerState::Running(application) | WorkerState::OutputFailed(application) => {
+            match running_observation(application) {
+                Ok(observation) => IdeWorkerEvent::Running(observation),
+                Err(reason) => {
+                    return publish_failure(events, IdeWorkerCommandKind::Observe, reason);
+                }
             }
-        },
+        }
         WorkerState::OutputTesting(application) => {
             IdeWorkerEvent::OutputTest(application.snapshot())
         }
@@ -17877,7 +17980,7 @@ fn publish_state(
         WorkerState::Closing(_) => IdeWorkerEvent::Closing,
         WorkerState::AutosaveFence { application, .. }
         | WorkerState::CloseFence { application, .. }
-        | WorkerState::AwaitingCloseDiscard(application) => {
+        | WorkerState::AwaitingCloseDiscard { application, .. } => {
             match running_observation(application) {
                 Ok(observation) => IdeWorkerEvent::Running(observation),
                 Err(reason) => {
@@ -18373,10 +18476,12 @@ fn shutdown_state(
                     }
                 }
             }
-            WorkerState::Running(application) => match application.close() {
-                IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
-                IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
-            },
+            WorkerState::Running(application) | WorkerState::OutputFailed(application) => {
+                match application.close() {
+                    IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
+                    IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
+                }
+            }
             WorkerState::ScenePerformanceCapture { application, .. } => match application.close() {
                 IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
@@ -18397,7 +18502,7 @@ fn shutdown_state(
                 IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
             },
-            WorkerState::AwaitingCloseDiscard(application) => match application.close() {
+            WorkerState::AwaitingCloseDiscard { application, .. } => match application.close() {
                 IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
             },
@@ -28425,7 +28530,124 @@ mod tests {
             Ok(IdeWorkerEvent::CloseDiscardRequired)
         ));
         assert_eq!(history.undo.len(), 1);
-        assert!(matches!(state, WorkerState::AwaitingCloseDiscard(_)));
+        assert!(matches!(state, WorkerState::AwaitingCloseDiscard { .. }));
+    }
+
+    #[test]
+    fn terminal_output_failure_revokes_commands_until_explicit_discard_close() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                output_state: OutputStreamState::Failed,
+                close_requires_discard: Some(true),
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(16);
+        let mut state = WorkerState::Running(running);
+        let mut history = UndoHistory::default();
+        let mut native = None;
+        history.record_edit(labelled("scene", "scene rename"));
+        while receiver.try_recv().is_ok() {}
+
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::Transport(TransportCommand::Start),
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Transport,
+                reason: IdeWorkerCommandFailure::NativeOutputFailed,
+            })
+        ));
+        assert!(matches!(state, WorkerState::OutputFailed(_)));
+
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::CloseProject,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(
+            state,
+            WorkerState::AwaitingCloseDiscard {
+                output_failed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CloseDiscardRequired)
+        ));
+        assert_eq!(history.undo.len(), 1);
+
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::DiscardCloseProject,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(state, WorkerState::Closed(_)));
+        assert!(history.undo.is_empty() && history.redo.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::Closed { .. })
+        ));
+    }
+
+    #[test]
+    fn terminal_output_failure_closes_a_clean_mixer_without_a_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                output_state: OutputStreamState::Failed,
+                close_requires_discard: Some(false),
+                next_mixer_fence: 0,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(4);
+        let mut state = WorkerState::Running(running);
+        let mut history = UndoHistory::default();
+        let mut native = None;
+
+        assert!(poll_pending_state(
+            &mut state,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(state, WorkerState::OutputFailed(_)));
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::CloseProject,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(state, WorkerState::Closed(_)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::Closed { .. })
+        ));
     }
 
     #[test]

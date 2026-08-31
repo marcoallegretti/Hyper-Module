@@ -19,6 +19,7 @@ export enum AppMode {
     output-testing,
     stopping-output-test,
     running,
+    output-failed,
     adding-track,
     adding-routing-bus,
     duplicating-track,
@@ -1167,7 +1168,7 @@ export component MainWindow inherits Window {
                 return accept;
             }
             if event.modifiers.control && !event.modifiers.shift && !event.modifiers.alt && !event.modifiers.meta && !event.repeat && (event.text == "w" || event.text == "W") {
-                if (root.app-mode == AppMode.running || root.app-mode == AppMode.previewing) && !root.new-project-visible && !root.new-track-visible && !root.close-unsaved-mixer-confirming {
+                if (root.app-mode == AppMode.running || root.app-mode == AppMode.previewing || root.app-mode == AppMode.output-failed) && !root.new-project-visible && !root.new-track-visible && !root.close-unsaved-mixer-confirming {
                     IdeActions.close-project();
                 }
                 return accept;
@@ -1211,6 +1212,7 @@ export component MainWindow inherits Window {
                     : root.app-mode == AppMode.previewing ? #173447
                     : root.app-mode == AppMode.output-testing ? #4a3514
                     : root.app-mode == AppMode.running ? #173d31
+                    : root.app-mode == AppMode.output-failed ? #492323
                     : root.app-mode == AppMode.unavailable ? #492323 : #222b36;
                 Text {
                     text: root.app-mode == AppMode.recording ? "●  RECORDING"
@@ -1228,6 +1230,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.output-testing ? "●  OUTPUT TEST"
                         : root.app-mode == AppMode.stopping-output-test ? "◌  STOPPING TEST"
                         : root.app-mode == AppMode.running ? "●  RUNNING"
+                        : root.app-mode == AppMode.output-failed ? "●  OUTPUT FAILED"
                         : root.app-mode == AppMode.creating ? "◌  CREATING"
                         : root.app-mode == AppMode.opening ? "◌  OPENING"
                         : root.app-mode == AppMode.saving ? "◌  SAVING"
@@ -1271,11 +1274,40 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.previewing ? #7dcfff
                         : root.app-mode == AppMode.output-testing ? #ffd166
                         : root.app-mode == AppMode.running ? #63e6b5
+                        : root.app-mode == AppMode.output-failed ? #ff8b87
                         : root.app-mode == AppMode.unavailable ? #ff8b87 : #a9b5c4;
                     font-size: 11px;
                     font-weight: 600;
                     horizontal-alignment: center;
                     vertical-alignment: center;
+                }
+            }
+        }
+
+        if root.app-mode == AppMode.output-failed : Rectangle {
+            height: 52px;
+            border-radius: 5px;
+            border-color: #b75955;
+            border-width: 1px;
+            background: #442526;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 10px;
+                spacing: 10px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.mixer-unsaved-changes
+                        ? "Playback output ended. Close requires an explicit decision about unsaved live mixer changes."
+                        : "Playback output ended. Close the project before selecting an output and reopening it.";
+                    color: #ffd1cf;
+                    font-size: 10px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+                Button {
+                    text: "Close project";
+                    enabled: !root.close-unsaved-mixer-confirming;
+                    clicked => { IdeActions.close-project(); }
                 }
             }
         }
@@ -1772,7 +1804,7 @@ export component MainWindow inherits Window {
                                 }
                                 Button {
                                     text: "Close";
-                                    enabled: (root.app-mode == AppMode.running || root.app-mode == AppMode.previewing)
+                                    enabled: (root.app-mode == AppMode.running || root.app-mode == AppMode.previewing || root.app-mode == AppMode.output-failed)
                                         && !root.close-unsaved-mixer-confirming;
                                     clicked => { IdeActions.close-project(); }
                                 }
@@ -1788,12 +1820,12 @@ export component MainWindow inherits Window {
                             }
                             Button {
                                 text: "Keep editing";
-                                enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing;
+                                enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing || root.app-mode == AppMode.output-failed;
                                 clicked => { IdeActions.cancel-close-project(); }
                             }
                             Button {
                                 text: "Discard live mixer changes";
-                                enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing;
+                                enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing || root.app-mode == AppMode.output-failed;
                                 clicked => { IdeActions.confirm-close-project(); }
                             }
                         }
