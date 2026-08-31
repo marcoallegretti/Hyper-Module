@@ -6,12 +6,13 @@ mod duplication;
 
 pub use automation::{
     AutomationChannelParameter, AutomationCompileError, AutomationEvaluationError,
-    AutomationInterpolation, AutomationLane, AutomationMainParameter, AutomationPoint,
-    AutomationSendParameter, AutomationTake, AutomationTakeAddition,
+    AutomationInterpolation, AutomationLane, AutomationLaneReplacement, AutomationMainParameter,
+    AutomationPoint, AutomationSendParameter, AutomationTake, AutomationTakeAddition,
     AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
     AutomationTakeReplacement, AutomationTarget, AutomationTargetSelection, AutomationValue,
-    CompiledAutomation, LoadedAutomationSet, serialize_automation_take_activation,
-    serialize_automation_take_addition, serialize_automation_take_replacement,
+    CompiledAutomation, LoadedAutomationSet, serialize_automation_lane_replacement,
+    serialize_automation_take_activation, serialize_automation_take_addition,
+    serialize_automation_take_replacement,
 };
 pub use duplication::{
     AudioTrackContentRemovalDocument, AudioTrackContentRemovalDocuments,
@@ -21585,6 +21586,183 @@ mod tests {
         );
     }
 
+    #[test]
+    fn automation_lane_replacement_preserves_every_other_multilane_value() {
+        let (loaded, mixer, source) = automation_lane_replacement_fixture();
+        let source_value: Value = serde_json::from_slice(&source).unwrap();
+        let points = [
+            AutomationPoint::new(1, AutomationValue::Integer(250_000)),
+            AutomationPoint::new(7, AutomationValue::Integer(900_000)),
+        ];
+        let rewritten = serialize_automation_lane_replacement(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&source],
+            "018f47a2-6b2d-7c11-8a44-0011223344a0",
+            AutomationLaneReplacement {
+                lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a2",
+                target: AutomationTargetSelection::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+                interpolation: AutomationInterpolation::Linear,
+                points: &points,
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let rewritten_value: Value = serde_json::from_slice(&rewritten).unwrap();
+        for field in [
+            "id",
+            "project_id",
+            "format",
+            "format_version",
+            "name",
+            "enabled",
+            "captured_at_utc",
+            "start_tick",
+            "end_tick",
+            "extensions",
+        ] {
+            assert_eq!(
+                rewritten_value[field], source_value[field],
+                "{field} must be retained"
+            );
+        }
+        assert_eq!(rewritten_value["lanes"][0], source_value["lanes"][0]);
+        assert_eq!(
+            rewritten_value["lanes"][1]["id"],
+            source_value["lanes"][1]["id"]
+        );
+        assert_eq!(
+            rewritten_value["lanes"][1]["target"],
+            json!({"kind": "mixer-main", "parameter": "gain"})
+        );
+        assert_eq!(rewritten_value["lanes"][1]["interpolation"], "linear");
+        assert_eq!(
+            rewritten_value["lanes"][1]["points"],
+            json!([
+                {"tick": 1, "value": 250_000},
+                {"tick": 7, "value": 900_000}
+            ])
+        );
+
+        let reloaded = loaded
+            .load_automation_takes(
+                &mixer,
+                &asset_facts(),
+                &[&rewritten],
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+        let take = &reloaded.takes()[0];
+        assert_eq!(take.lanes().len(), 2);
+        assert_eq!(
+            take.lanes()[0].target(),
+            AutomationTarget::Channel {
+                slot: 0,
+                parameter: AutomationChannelParameter::Gain,
+            }
+        );
+        assert_eq!(
+            take.lanes()[1].target(),
+            AutomationTarget::Main {
+                parameter: AutomationMainParameter::Gain,
+            }
+        );
+        assert_eq!(
+            take.lanes()[1].interpolation(),
+            AutomationInterpolation::Linear
+        );
+        assert_eq!(take.lanes()[1].points(), points);
+    }
+
+    #[test]
+    fn automation_lane_replacement_refuses_invalid_stale_and_overlapping_requests() {
+        let (loaded, mixer, source) = automation_lane_replacement_fixture();
+        let points = [AutomationPoint::new(0, AutomationValue::Integer(500_000))];
+        let request = AutomationLaneReplacement {
+            lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a2",
+            target: AutomationTargetSelection::Main {
+                parameter: AutomationMainParameter::Gain,
+            },
+            interpolation: AutomationInterpolation::Linear,
+            points: &points,
+        };
+        for (request, expected) in [
+            (
+                AutomationLaneReplacement {
+                    lane_id: "lane",
+                    ..request
+                },
+                AutomationTakeEditSerializationError::InvalidLaneIdentity,
+            ),
+            (
+                AutomationLaneReplacement {
+                    lane_id: "018f47a2-6b2d-7c11-8a44-0011223344ff",
+                    ..request
+                },
+                AutomationTakeEditSerializationError::LaneMissing,
+            ),
+            (
+                AutomationLaneReplacement {
+                    points: &[],
+                    ..request
+                },
+                AutomationTakeEditSerializationError::EmptyLane,
+            ),
+        ] {
+            let error = serialize_automation_lane_replacement(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&source],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                request,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap_err();
+            assert_eq!(
+                core::mem::discriminant(&error),
+                core::mem::discriminant(&expected),
+                "{error}"
+            );
+        }
+        let pretty =
+            serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(&source).unwrap()).unwrap();
+        assert!(matches!(
+            serialize_automation_lane_replacement(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&pretty],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                request,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AutomationTakeEditSerializationError::NonCanonicalSource)
+        ));
+        let overlap = AutomationLaneReplacement {
+            target: AutomationTargetSelection::Channel {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456",
+                parameter: AutomationChannelParameter::Gain,
+            },
+            ..request
+        };
+        assert!(matches!(
+            serialize_automation_lane_replacement(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&source],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                overlap,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AutomationTakeEditSerializationError::Source(_))
+        ));
+    }
+
     type AutomationRejectionCheck = fn(&AutomationTakeAdditionSerializationError) -> bool;
 
     fn automation_take_request(points: &[AutomationPoint]) -> AutomationTakeAddition<'_> {
@@ -21642,6 +21820,23 @@ mod tests {
             LoaderLimits::VERSION_1,
         )
         .unwrap();
+        (loaded, mixer, source)
+    }
+
+    fn automation_lane_replacement_fixture() -> (LoadedPlaybackProject, LoadedMixer, Vec<u8>) {
+        let (loaded, mixer, source) = automation_take_replacement_fixture();
+        let mut value: Value = serde_json::from_slice(&source).unwrap();
+        value["extensions"] = json!({"org.example.automation": {"retained": true}});
+        value["lanes"].as_array_mut().unwrap().push(json!({
+            "id": "018f47a2-6b2d-7c11-8a44-0011223344a2",
+            "target": {"kind": "mixer-main", "parameter": "mute"},
+            "interpolation": "hold",
+            "points": [
+                {"tick": 0, "value": false},
+                {"tick": 4, "value": true}
+            ]
+        }));
+        let source = serde_json_canonicalizer::to_vec(&value).unwrap();
         (loaded, mixer, source)
     }
 

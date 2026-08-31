@@ -241,6 +241,7 @@ export struct AutomationTakeRow {
     name: string,
     enabled: bool,
     editable: bool,
+    lane-editable: bool,
     range: string,
     target: string,
     interpolation: string,
@@ -416,7 +417,10 @@ export global IdeActions {
     callback remove-native-filter(int);
     callback add-automation-take(string, int, int, string, string, string);
     callback begin-edit-automation-take(string);
+    callback begin-edit-automation-lane(string);
+    callback select-automation-edit-lane(int);
     callback save-automation-take-edit();
+    callback save-automation-lane-edit();
     callback set-automation-take-active(string, bool);
     callback remove-automation-take(string);
     callback add-control-binding(int, int, bool, string, string);
@@ -985,6 +989,10 @@ export component MainWindow inherits Window {
     in-out property <string> automation-create-points: "";
     in-out property <bool> automation-edit-visible: false;
     in-out property <string> automation-edit-take-id: "";
+    in-out property <bool> automation-edit-lane-only: false;
+    in-out property <string> automation-edit-lane-id: "";
+    in property <[string]> automation-edit-lane-names: [];
+    in-out property <int> automation-edit-lane-index: 0;
     in-out property <string> automation-edit-name: "";
     in-out property <int> automation-edit-target-index: 0;
     in-out property <int> automation-edit-interpolation-index: 0;
@@ -3809,18 +3817,33 @@ export component MainWindow inherits Window {
 
                     if root.automation-edit-visible : VerticalLayout {
                         spacing: 8px;
-                        Text { height: 16px; text: "EDIT AUTOMATION TAKE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                        Text { height: 14px; text: "Edits retain this take's identity, activation state, capture time, and extension data."; color: #8fa0b4; font-size: 9px; overflow: elide; }
+                        Text { height: 16px; text: root.automation-edit-lane-only ? "EDIT AUTOMATION LANE" : "EDIT AUTOMATION TAKE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { height: 14px; text: root.automation-edit-lane-only ? "This changes only the selected lane. Take metadata and every other lane stay unchanged." : "Edits retain this take's identity, activation state, capture time, and extension data."; color: #8fa0b4; font-size: 9px; overflow: elide; }
                         HorizontalLayout {
                             height: 48px;
                             spacing: 8px;
-                            VerticalLayout {
+                            if !root.automation-edit-lane-only : VerticalLayout {
                                 horizontal-stretch: 1;
                                 Text { text: "Name"; color: #8fa0b4; font-size: 9px; }
                                 IdeLineEdit {
                                     placeholder-text: "Take name";
                                     text <=> root.automation-edit-name;
                                     enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                            if root.automation-edit-lane-only : VerticalLayout {
+                                width: 150px;
+                                Text { text: "Take"; color: #8fa0b4; font-size: 9px; }
+                                Text { text: root.automation-edit-name; color: #dce5ef; font-size: 11px; overflow: elide; }
+                            }
+                            if root.automation-edit-lane-only : VerticalLayout {
+                                width: 150px;
+                                Text { text: "Lane"; color: #8fa0b4; font-size: 9px; }
+                                ComboBox {
+                                    model: root.automation-edit-lane-names;
+                                    current-index <=> root.automation-edit-lane-index;
+                                    enabled: root.app-mode == AppMode.running;
+                                    selected(_) => { IdeActions.select-automation-edit-lane(root.automation-edit-lane-index); }
                                 }
                             }
                             VerticalLayout {
@@ -3851,7 +3874,7 @@ export component MainWindow inherits Window {
                         HorizontalLayout {
                             height: 48px;
                             spacing: 8px;
-                            VerticalLayout {
+                            if !root.automation-edit-lane-only : VerticalLayout {
                                 width: 120px;
                                 Text { text: "Start tick"; color: #8fa0b4; font-size: 9px; }
                                 IdeLineEdit {
@@ -3860,7 +3883,7 @@ export component MainWindow inherits Window {
                                     enabled: root.app-mode == AppMode.running;
                                 }
                             }
-                            VerticalLayout {
+                            if !root.automation-edit-lane-only : VerticalLayout {
                                 width: 120px;
                                 Text { text: "End tick"; color: #8fa0b4; font-size: 9px; }
                                 IdeLineEdit {
@@ -3868,6 +3891,11 @@ export component MainWindow inherits Window {
                                     input-type: number;
                                     enabled: root.app-mode == AppMode.running;
                                 }
+                            }
+                            if root.automation-edit-lane-only : VerticalLayout {
+                                width: 200px;
+                                Text { text: "Take range"; color: #8fa0b4; font-size: 9px; }
+                                Text { text: "TICK " + root.automation-edit-start + " to " + root.automation-edit-end; color: #e7b96d; font-size: 11px; overflow: elide; }
                             }
                             VerticalLayout {
                                 horizontal-stretch: 1;
@@ -3893,14 +3921,18 @@ export component MainWindow inherits Window {
                             }
                             Button {
                                 horizontal-stretch: 1;
-                                text: root.app-mode == AppMode.editing-automation-take ? "Saving take..." : "Save automation take";
+                                text: root.app-mode == AppMode.editing-automation-take ? (root.automation-edit-lane-only ? "Saving lane..." : "Saving take...") : (root.automation-edit-lane-only ? "Save automation lane" : "Save automation take");
                                 enabled: root.app-mode == AppMode.running
                                     && root.automation-edit-take-id != ""
-                                    && root.automation-edit-name != ""
-                                    && root.automation-edit-start != ""
-                                    && root.automation-edit-end != ""
-                                    && root.automation-edit-points != "";
-                                clicked => { IdeActions.save-automation-take-edit(); }
+                                    && root.automation-edit-points != ""
+                                    && ((root.automation-edit-lane-only && root.automation-edit-lane-id != "") || (!root.automation-edit-lane-only && root.automation-edit-name != "" && root.automation-edit-start != "" && root.automation-edit-end != ""));
+                                clicked => {
+                                    if root.automation-edit-lane-only {
+                                        IdeActions.save-automation-lane-edit();
+                                    } else {
+                                        IdeActions.save-automation-take-edit();
+                                    }
+                                }
                             }
                         }
                         Rectangle { height: 1px; background: #27313d; }
@@ -3957,12 +3989,12 @@ export component MainWindow inherits Window {
                                         spacing: 6px;
                                         Button {
                                             width: 54px;
-                                            text: take.editable ? "Edit" : "Locked";
+                                            text: take.editable ? "Edit" : "Lanes";
                                             accessible-label: take.editable
                                                 ? "Edit " + take.name + " automation take"
-                                                : "Editing is unavailable because " + take.name + " has multiple automation lanes";
+                                                : "Select a lane to edit " + take.name + " automation take";
                                             enabled: root.app-mode == AppMode.running
-                                                && take.editable
+                                                && (take.editable || take.lane-editable)
                                                 && !root.automation-capture-visible
                                                 && !root.automation-create-visible
                                                 && !root.automation-edit-visible
@@ -3971,7 +4003,11 @@ export component MainWindow inherits Window {
                                                 root.automation-capture-visible = false;
                                                 root.automation-create-visible = false;
                                                 root.automation-take-remove-confirming-id = "";
-                                                IdeActions.begin-edit-automation-take(take.id);
+                                                if take.editable {
+                                                    IdeActions.begin-edit-automation-take(take.id);
+                                                } else {
+                                                    IdeActions.begin-edit-automation-lane(take.id);
+                                                }
                                             }
                                         }
                                         Button {
