@@ -120,19 +120,19 @@ use hyper_playback_json::{
     ArrangementPlacementDocumentSerializationError, ArrangementPlacementFadeSerializationError,
     ArrangementPlacementGainSerializationError, ArrangementSceneLaunchAddition,
     AudioClipAdditionSerializationError, AudioClipDocumentSerializationError,
-    AudioClipDuplicationSerializationError, AudioClipFadeSerializationError,
-    AudioClipGainSerializationError, AudioClipLoopSerializationError,
-    AudioClipRemovalSerializationError, AudioClipRenameSerializationError,
-    AudioClipSourceStartSerializationError, AudioClipSourceViewSerializationError,
-    AudioPrimaryRouteSerializationError, AudioPrimaryRouteTarget,
-    AudioTrackAdditionSerializationError, AudioTrackContentRemovalDocuments,
-    AudioTrackContentRemovalSerializationError, AudioTrackContentRemovalSource,
-    AudioTrackDocumentSerializationError, AudioTrackDuplicationSerializationError,
-    AudioTrackDuplicationSource, AudioTrackFreezeDeviceChain, AudioTrackFreezeDocuments,
-    AudioTrackFreezeReactivationDocuments, AudioTrackFreezeSerializationError,
-    AudioTrackRemovalBlockers, AudioTrackRemovalSerializationError,
-    AudioTrackRenameSerializationError, AudioTrackUnfreezeDocuments,
-    AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
+    AudioClipDuplicationPlacementSerializationError, AudioClipDuplicationSerializationError,
+    AudioClipFadeSerializationError, AudioClipGainSerializationError,
+    AudioClipLoopSerializationError, AudioClipRemovalSerializationError,
+    AudioClipRenameSerializationError, AudioClipSourceStartSerializationError,
+    AudioClipSourceViewSerializationError, AudioPrimaryRouteSerializationError,
+    AudioPrimaryRouteTarget, AudioTrackAdditionSerializationError,
+    AudioTrackContentRemovalDocuments, AudioTrackContentRemovalSerializationError,
+    AudioTrackContentRemovalSource, AudioTrackDocumentSerializationError,
+    AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
+    AudioTrackFreezeDeviceChain, AudioTrackFreezeDocuments, AudioTrackFreezeReactivationDocuments,
+    AudioTrackFreezeSerializationError, AudioTrackRemovalBlockers,
+    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
+    AudioTrackUnfreezeDocuments, AudioTrackUnfreezeSerializationError, AutomationTakeAddition,
     AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
     AutomationTakeReplacement, AutomationTargetSelection, CompiledMixerDestination,
     CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
@@ -159,11 +159,11 @@ use hyper_playback_json::{
     serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_removal,
     serialize_audio_clip_rename, serialize_audio_clip_reverse, serialize_audio_clip_source_start,
     serialize_audio_clip_source_view, serialize_audio_clip_source_view_duplication,
-    serialize_audio_primary_route_change, serialize_audio_track_activation,
-    serialize_audio_track_addition, serialize_audio_track_content_removal,
-    serialize_audio_track_duplication, serialize_audio_track_freeze,
-    serialize_audio_track_freeze_reactivation, serialize_audio_track_removal,
-    serialize_audio_track_rename, serialize_audio_track_unfreeze,
+    serialize_audio_clip_source_view_duplication_placement, serialize_audio_primary_route_change,
+    serialize_audio_track_activation, serialize_audio_track_addition,
+    serialize_audio_track_content_removal, serialize_audio_track_duplication,
+    serialize_audio_track_freeze, serialize_audio_track_freeze_reactivation,
+    serialize_audio_track_removal, serialize_audio_track_rename, serialize_audio_track_unfreeze,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_automation_take_replacement, serialize_mixer_base_state,
     serialize_mixer_strip_reorder, serialize_recording_audio_clip_addition,
@@ -198,8 +198,9 @@ pub use hyper_project_history::{
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackError, ProjectPlaybackLimits};
 use hyper_project_model::{ResourceRole, is_valid_entity_id};
 use hyper_storage_engine::{
-    ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
-    AudioClipRemovalOutcome, AudioClipRemovalRequest, AudioTrackContentRemovalPublicationOutcome,
+    ArrangementPublicationRequest, AudioClipPlacementPublicationRequest,
+    AudioClipPublicationOutcome, AudioClipPublicationRequest, AudioClipRemovalOutcome,
+    AudioClipRemovalRequest, AudioTrackContentRemovalPublicationOutcome,
     AudioTrackContentRemovalPublicationRequest, AudioTrackDuplicationPublicationOutcome,
     AudioTrackDuplicationPublicationRequest, AudioTrackFlattenPublicationOutcome,
     AudioTrackFlattenPublicationRequest, AudioTrackFreezePublicationOutcome,
@@ -210,20 +211,19 @@ use hyper_storage_engine::{
     AutomationTakeRemovalRequest, ControlMappingPublicationRequest, DeviceChainPublicationRequest,
     DeviceChainRemovalRequest, ImportedAudioClipPublicationRequest, MixerRecoverySnapshotError,
     MixerRecoverySnapshotRequest, ProjectResourcePublicationError,
-    ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
-    RecordedTakePlacementPublicationRequest, RecordingDiscardOutcome, RecordingDiscardRequest,
-    RequiredControlCapabilities, RoutingBusPublicationKind, RoutingBusPublicationRequest,
-    RoutingBusRemovalKind, RoutingBusRemovalOutcome, RoutingBusRemovalRequest,
-    SampleCleanupOutcome, SampleCleanupRequest, ScenePublicationRequest, SceneRemovalRequest,
-    StorageError, TrackOrderPublicationOutcome, TrackOrderPublicationRequest, clean_unused_samples,
-    discard_recording_take, publish_arrangement, publish_audio_clip, publish_audio_track,
-    publish_audio_track_content_removal, publish_audio_track_duplication,
-    publish_audio_track_flatten, publish_audio_track_freeze,
+    ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest, RecordingDiscardOutcome,
+    RecordingDiscardRequest, RequiredControlCapabilities, RoutingBusPublicationKind,
+    RoutingBusPublicationRequest, RoutingBusRemovalKind, RoutingBusRemovalOutcome,
+    RoutingBusRemovalRequest, SampleCleanupOutcome, SampleCleanupRequest, ScenePublicationRequest,
+    SceneRemovalRequest, StorageError, TrackOrderPublicationOutcome, TrackOrderPublicationRequest,
+    clean_unused_samples, discard_recording_take, publish_arrangement, publish_audio_clip,
+    publish_audio_clip_placement, publish_audio_track, publish_audio_track_content_removal,
+    publish_audio_track_duplication, publish_audio_track_flatten, publish_audio_track_freeze,
     publish_audio_track_freeze_reactivation, publish_audio_track_unfreeze, publish_automation_take,
     publish_control_mapping, publish_device_chain, publish_imported_audio_clip,
-    publish_project_resource, publish_recorded_take_placement, publish_routing_bus, publish_scene,
-    publish_track_order, remove_audio_clip, remove_audio_track, remove_automation_take,
-    remove_device_chain, remove_routing_bus, remove_scene, store_mixer_recovery_snapshot,
+    publish_project_resource, publish_routing_bus, publish_scene, publish_track_order,
+    remove_audio_clip, remove_audio_track, remove_automation_take, remove_device_chain,
+    remove_routing_bus, remove_scene, store_mixer_recovery_snapshot,
 };
 use hyper_track_freeze::TrackFreezeState;
 use sha2::{Digest, Sha256};
@@ -5110,8 +5110,10 @@ pub enum IdeAudioClipDuplicationError {
     ClipResourceRoleMismatch,
     TrackResourceMissing,
     TrackResourceRoleMismatch,
+    ArrangementResourceAmbiguous,
     Storage(StorageError),
     Serialization(AudioClipDuplicationSerializationError),
+    PlacementSerialization(AudioClipDuplicationPlacementSerializationError),
     NativeValidation(AudioClipSourceSlipValidationError),
     CapacityUnavailable,
     Publication {
@@ -5179,8 +5181,12 @@ impl fmt::Display for IdeAudioClipDuplicationError {
             Self::TrackResourceRoleMismatch => {
                 formatter.write_str("the source audio clip's owner is not a structural track")
             }
+            Self::ArrangementResourceAmbiguous => {
+                formatter.write_str("the project contains more than one arrangement resource")
+            }
             Self::Storage(source) => source.fmt(formatter),
             Self::Serialization(source) => source.fmt(formatter),
+            Self::PlacementSerialization(source) => source.fmt(formatter),
             Self::NativeValidation(source) => source.fmt(formatter),
             Self::CapacityUnavailable => {
                 formatter.write_str("audio-clip duplication capacity is unavailable")
@@ -5243,6 +5249,7 @@ impl Error for IdeAudioClipDuplicationError {
             Self::MixerSave(source) => Some(source.as_ref()),
             Self::Storage(source) => Some(source),
             Self::Serialization(source) => Some(source),
+            Self::PlacementSerialization(source) => Some(source),
             Self::NativeValidation(source) => Some(source),
             Self::Publication { source, .. } => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
@@ -5255,6 +5262,7 @@ impl Error for IdeAudioClipDuplicationError {
             | Self::ClipResourceRoleMismatch
             | Self::TrackResourceMissing
             | Self::TrackResourceRoleMismatch
+            | Self::ArrangementResourceAmbiguous
             | Self::CapacityUnavailable
             | Self::NativeClose(_) => None,
         }
@@ -8517,7 +8525,7 @@ struct IdeAudioClipCreationPlan {
 }
 
 #[derive(Debug)]
-struct IdeRecordedTakePlacementPlan {
+struct IdeAudioClipPlacementPlan {
     clip: IdeAudioClipCreationPlan,
     arrangement_id: String,
     arrangement_bytes: Vec<u8>,
@@ -10060,16 +10068,16 @@ impl IdeAudioClipCreationPlan {
     }
 }
 
-impl IdeRecordedTakePlacementPlan {
+impl IdeAudioClipPlacementPlan {
     fn publish(&self) -> Result<AudioClipPublicationOutcome, IdeAudioClipCreationPublicationError> {
         let mixer = self
             .clip
             .mixer
             .publish()
             .map_err(|source| IdeAudioClipCreationPublicationError::Mixer(Box::new(source)))?;
-        publish_recorded_take_placement(
+        publish_audio_clip_placement(
             &self.clip.mixer.project_path,
-            RecordedTakePlacementPublicationRequest {
+            AudioClipPlacementPublicationRequest {
                 clip: AudioClipPublicationRequest {
                     expected_project_sha256: *mixer.project_identity(),
                     clip_id: &self.clip.clip_id,
@@ -12622,7 +12630,7 @@ impl RunningDesktopIdeApplication {
         recovery: &DesktopPlaybackRecovery,
         recording_id: &str,
         clip_name: &str,
-    ) -> Result<IdeRecordedTakePlacementPlan, IdeRecordingClipCreationError> {
+    ) -> Result<IdeAudioClipPlacementPlan, IdeRecordingClipCreationError> {
         let mixer = Self::prepare_mixer_save(application, recovery)
             .map_err(|source| IdeRecordingClipCreationError::MixerSave(Box::new(source)))?;
         let prepared = recovery.prepared_project().ok_or_else(|| {
@@ -12645,7 +12653,7 @@ impl RunningDesktopIdeApplication {
         prepared: &PreparedProjectPlayback,
         recording_id: &str,
         clip_name: &str,
-    ) -> Result<IdeRecordedTakePlacementPlan, IdeRecordingClipCreationError> {
+    ) -> Result<IdeAudioClipPlacementPlan, IdeRecordingClipCreationError> {
         let mut recordings = prepared
             .recording_metadata()
             .iter()
@@ -12717,7 +12725,7 @@ impl RunningDesktopIdeApplication {
         })?;
         let (track_bytes, clip_bytes, arrangement_bytes, arrangement_id, _placement_id) =
             documents.into_parts();
-        Ok(IdeRecordedTakePlacementPlan {
+        Ok(IdeAudioClipPlacementPlan {
             clip: IdeAudioClipCreationPlan {
                 mixer,
                 clip_id,
@@ -13002,6 +13010,145 @@ impl RunningDesktopIdeApplication {
             track_id: owned_track_id,
             track_bytes,
             asset_id,
+        })
+    }
+
+    fn prepare_audio_clip_source_range_placement(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        source_clip_id: &str,
+        clip_name: &str,
+        source_range: IdeAudioClipSourceRange,
+        start_tick: u64,
+    ) -> Result<IdeAudioClipPlacementPlan, IdeAudioClipDuplicationError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioClipDuplicationError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioClipDuplicationError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Self::prepare_audio_clip_source_range_placement_from_project(
+            application,
+            mixer,
+            prepared,
+            source_clip_id,
+            clip_name,
+            source_range,
+            start_tick,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the preparation boundary binds the verified source documents, immutable selected range, and one explicit arrangement destination"
+    )]
+    fn prepare_audio_clip_source_range_placement_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        source_clip_id: &str,
+        clip_name: &str,
+        source_range: IdeAudioClipSourceRange,
+        start_tick: u64,
+    ) -> Result<IdeAudioClipPlacementPlan, IdeAudioClipDuplicationError> {
+        let package = prepared.package();
+        let clip_descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == source_clip_id)
+            .ok_or(IdeAudioClipDuplicationError::ClipResourceMissing)?;
+        if clip_descriptor.role() != ResourceRole::Clip {
+            return Err(IdeAudioClipDuplicationError::ClipResourceRoleMismatch);
+        }
+        let source_clip = package
+            .read_resource(source_clip_id)
+            .map_err(IdeAudioClipDuplicationError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        let source_clip_index = (0..project.clip_count())
+            .find(|index| project.clip_id_at(*index) == Some(source_clip_id))
+            .ok_or(IdeAudioClipDuplicationError::ClipResourceMissing)?;
+        let track_id = project
+            .clip_track_id_at(source_clip_index)
+            .ok_or(IdeAudioClipDuplicationError::TrackResourceMissing)?;
+        let track_descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == track_id)
+            .ok_or(IdeAudioClipDuplicationError::TrackResourceMissing)?;
+        if track_descriptor.role() != ResourceRole::Track {
+            return Err(IdeAudioClipDuplicationError::TrackResourceRoleMismatch);
+        }
+        let source_track = package
+            .read_resource(track_id)
+            .map_err(IdeAudioClipDuplicationError::Storage)?;
+        let mut arrangements = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Arrangement);
+        let arrangement = arrangements.next();
+        if arrangements.next().is_some() {
+            return Err(IdeAudioClipDuplicationError::ArrangementResourceAmbiguous);
+        }
+        let arrangement_id = arrangement.map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |descriptor| descriptor.id().to_owned(),
+        );
+        let source_arrangement = arrangement
+            .map(|descriptor| package.read_resource(descriptor.id()))
+            .transpose()
+            .map_err(IdeAudioClipDuplicationError::Storage)?;
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAudioClipDuplicationError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let (source_start_frame, source_frame_count) =
+            audio_clip_source_range_native_frames(source_range)?;
+        prepared
+            .session()
+            .validate_audio_clip_source_view(source_clip_id, source_start_frame, source_frame_count)
+            .map_err(IdeAudioClipDuplicationError::NativeValidation)?;
+        let clip_id = uuid::Uuid::new_v4().to_string();
+        let placement_id = uuid::Uuid::new_v4().to_string();
+        let documents = serialize_audio_clip_source_view_duplication_placement(
+            project,
+            &assets,
+            &source_clip,
+            &source_track,
+            source_arrangement.as_deref(),
+            source_clip_id,
+            &clip_id,
+            clip_name,
+            source_range.source_start_frame,
+            source_range.source_frame_count,
+            &arrangement_id,
+            &placement_id,
+            start_tick,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(|source| match source {
+            AudioClipDuplicationPlacementSerializationError::Duplication(
+                AudioClipDuplicationSerializationError::InvalidClipName,
+            ) => IdeAudioClipDuplicationError::InvalidClipName,
+            source => IdeAudioClipDuplicationError::PlacementSerialization(source),
+        })?;
+        let (track_bytes, clip_bytes, asset_id, arrangement_bytes, arrangement_id, _placement_id) =
+            documents.into_parts();
+        Ok(IdeAudioClipPlacementPlan {
+            clip: IdeAudioClipCreationPlan {
+                mixer,
+                clip_id,
+                clip_bytes,
+                track_id: track_id.to_owned(),
+                track_bytes,
+                asset_id,
+            },
+            arrangement_id,
+            arrangement_bytes,
         })
     }
 
@@ -20334,6 +20481,98 @@ mod tests {
         assert_eq!(
             track["clip_ids"],
             json!([ARRANGEMENT_TEST_CLIP_ID, outcome.clip_id()])
+        );
+    }
+
+    #[test]
+    fn audio_clip_source_range_placement_publishes_one_new_clip_and_one_exact_placement() {
+        let fixture = ArrangementProjectFixture::new().with_trim_compatible_source();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let source_clip_bytes = package.read_resource(ARRANGEMENT_TEST_CLIP_ID).unwrap();
+        let source_arrangement_bytes = package.read_resource(ARRANGEMENT_TEST_RESOURCE_ID).unwrap();
+        let source_audio = std::fs::read(project_path.join("assets/samples/sample.wav")).unwrap();
+        let application = DesktopIdeApplication::from_inventories(
+            desktop_ide_application_config().unwrap(),
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let plan =
+            RunningDesktopIdeApplication::prepare_audio_clip_source_range_placement_from_project(
+                &application,
+                IdeMixerSavePlan {
+                    project_path: project_path.clone(),
+                    expected_project_sha256: *package.manifest_sha256(),
+                    resource_id: mixer_id.clone(),
+                    resource_bytes: mixer_bytes.clone(),
+                },
+                &prepared,
+                ARRANGEMENT_TEST_CLIP_ID,
+                "Placed selected range",
+                IdeAudioClipSourceRange {
+                    source_start_frame: 25,
+                    source_frame_count: 50,
+                },
+                4,
+            )
+            .unwrap();
+        let duplicated_clip_id = plan.clip.clip_id.clone();
+        drop(prepared);
+
+        let outcome = plan.publish().unwrap();
+        assert_eq!(outcome.project_revision(), 2);
+        assert_eq!(outcome.clip_id(), duplicated_clip_id);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = reopened.package();
+        let (project, _, _, _) = reopened.session().parts();
+        assert_eq!(project.clip_count(), 2);
+        assert_eq!(project.placement_count(), 2);
+        assert_eq!(project.clip_id_at(0), Some(ARRANGEMENT_TEST_CLIP_ID));
+        assert_eq!(project.clip_id_at(1), Some(duplicated_clip_id.as_str()));
+        assert_eq!(project.clip_source_start_frame_at(0), Some(0));
+        assert_eq!(project.clip_source_frame_count_at(0), Some(100));
+        assert_eq!(project.clip_duration_ticks_at(0), Some(4));
+        assert_eq!(project.clip_source_start_frame_at(1), Some(25));
+        assert_eq!(project.clip_source_frame_count_at(1), Some(50));
+        assert_eq!(project.clip_duration_ticks_at(1), Some(2));
+        assert!(
+            reopened
+                .session()
+                .arrangement()
+                .placements()
+                .iter()
+                .any(|placement| {
+                    placement.clip_index() == 1
+                        && placement.start_tick() == 4
+                        && placement.clip_start_tick() == 0
+                        && placement.duration_ticks() == 2
+                })
+        );
+        assert_eq!(
+            package.read_resource(ARRANGEMENT_TEST_CLIP_ID).unwrap(),
+            source_clip_bytes
+        );
+        assert_ne!(
+            package.read_resource(ARRANGEMENT_TEST_RESOURCE_ID).unwrap(),
+            source_arrangement_bytes
+        );
+        assert_eq!(package.read_resource(&mixer_id).unwrap(), mixer_bytes);
+        assert_eq!(
+            std::fs::read(project_path.join("assets/samples/sample.wav")).unwrap(),
+            source_audio
         );
     }
 

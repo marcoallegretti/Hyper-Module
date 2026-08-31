@@ -52,15 +52,15 @@ pub struct ImportedAudioClipPublicationRequest<'a> {
     pub sample_bytes: &'a [u8],
 }
 
-/// Publishes a finalized recording as a reusable clip and appends its complete
-/// range to the linear arrangement in one recoverable project mutation.
+/// Publishes one newly created reusable clip and its authored arrangement
+/// placement in one recoverable project mutation.
 ///
 /// The arrangement bytes must be the staged result of a placement edit that
 /// refers to the clip in [`Self::clip`]. The caller supplies the target
 /// arrangement identity because the operation may either update the sole
 /// existing arrangement or create the first one.
 #[derive(Clone, Copy, Debug)]
-pub struct RecordedTakePlacementPublicationRequest<'a> {
+pub struct AudioClipPlacementPublicationRequest<'a> {
     pub clip: AudioClipPublicationRequest<'a>,
     pub arrangement_id: &'a str,
     pub arrangement_bytes: &'a [u8],
@@ -238,7 +238,7 @@ struct SampleDestinationPlan {
 }
 
 #[derive(Debug)]
-struct RecordedTakeArrangementPublicationPlan<'a> {
+struct AudioClipArrangementPublicationPlan<'a> {
     arrangement_id: &'a str,
     arrangement_bytes: &'a [u8],
     path: String,
@@ -290,22 +290,22 @@ pub fn publish_imported_audio_clip(
     )
 }
 
-/// Publishes a finalized recording clip and its full-duration arrangement
+/// Publishes one newly created reusable audio clip and its arrangement
 /// placement in one manifest-last transaction.
 ///
 /// # Errors
 ///
 /// Returns a classified validation, conflict, integrity, I/O, or recovery
 /// error. A failure never leaves only the clip or only its placement active.
-pub fn publish_recorded_take_placement(
+pub fn publish_audio_clip_placement(
     project_path: impl AsRef<Path>,
-    request: RecordedTakePlacementPublicationRequest<'_>,
+    request: AudioClipPlacementPublicationRequest<'_>,
 ) -> Result<AudioClipPublicationOutcome, ProjectResourcePublicationError> {
     publish_audio_clip_with_arrangement_observed(
         project_path.as_ref(),
         request.clip,
         None,
-        Some(RecordedTakeArrangementPublication {
+        Some(AudioClipArrangementPublication {
             arrangement_id: request.arrangement_id,
             arrangement_bytes: request.arrangement_bytes,
         }),
@@ -314,7 +314,7 @@ pub fn publish_recorded_take_placement(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct RecordedTakeArrangementPublication<'a> {
+struct AudioClipArrangementPublication<'a> {
     arrangement_id: &'a str,
     arrangement_bytes: &'a [u8],
 }
@@ -393,7 +393,7 @@ fn publish_audio_clip_with_arrangement_observed(
     project_path: &Path,
     request: AudioClipPublicationRequest<'_>,
     sample_bytes: Option<&[u8]>,
-    arrangement: Option<RecordedTakeArrangementPublication<'_>>,
+    arrangement: Option<AudioClipArrangementPublication<'_>>,
     mut observer: impl FnMut(
         AudioClipPublicationPhase,
         &Path,
@@ -437,7 +437,7 @@ fn publish_audio_clip_with_arrangement_observed(
     }
     inspect_clip_destination(&verified.root_dir, &clip_path)?;
     let arrangement = arrangement
-        .map(|arrangement| prepare_recorded_take_arrangement_publication(&verified, arrangement))
+        .map(|arrangement| prepare_audio_clip_arrangement_publication(&verified, arrangement))
         .transpose()?;
 
     let backups = open_or_create_dir(&verified.root_dir, "backups")?;
@@ -479,7 +479,7 @@ fn publish_audio_clip_with_arrangement_observed(
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::ProjectChanged,
-            "arrangement destination changed before recorded-take placement staging",
+            "arrangement destination changed before audio-clip placement staging",
         ));
     }
     let sample_destination = if let Some(path) = sample_path.as_deref() {
@@ -516,7 +516,7 @@ fn publish_audio_clip_with_arrangement_observed(
         if active != *previous {
             return Err(failure(
                 ProjectResourcePublicationErrorKind::ProjectChanged,
-                "arrangement changed before recorded-take placement staging",
+                "arrangement changed before audio-clip placement staging",
             ));
         }
     }
@@ -953,7 +953,7 @@ fn run_audio_clip_publication(
     clip_path: &str,
     sample_path: Option<&str>,
     sample_bytes: Option<&[u8]>,
-    arrangement: Option<&RecordedTakeArrangementPublicationPlan<'_>>,
+    arrangement: Option<&AudioClipArrangementPublicationPlan<'_>>,
     previous_track: &[u8],
     created_clip_directory: bool,
     sample_destination: SampleDestinationPlan,
@@ -987,7 +987,7 @@ fn run_audio_clip_publication(
     let tx = AudioClipTransactionRecord {
         format: "hyper-audio-clip-publication-transaction".to_owned(),
         format_version: if arrangement.is_some() {
-            4
+            5
         } else if sample_bytes.is_some() {
             3
         } else {
@@ -1127,7 +1127,7 @@ fn run_audio_clip_publication(
                 .map_err(|error| {
                     caused(
                         ProjectResourcePublicationErrorKind::Io,
-                        "create recorded-take placement arrangement directory",
+                        "create audio-clip placement arrangement directory",
                         error,
                     )
                 })?;
@@ -1141,7 +1141,7 @@ fn run_audio_clip_publication(
             &parent,
             file_name(&arrangement.path)?,
             &format!(".audio-clip-arrangement-{}.json", tx.id),
-            "recorded-take placement arrangement",
+            "audio-clip placement arrangement",
         )?;
         observer(AudioClipPublicationPhase::Arrangement, verified.root())?;
     }
@@ -1701,40 +1701,41 @@ fn inspect_clip_destination(
     }
 }
 
-fn prepare_recorded_take_arrangement_publication<'a>(
+fn prepare_audio_clip_arrangement_publication<'a>(
     verified: &StructurallyVerifiedProject,
-    arrangement: RecordedTakeArrangementPublication<'a>,
-) -> Result<RecordedTakeArrangementPublicationPlan<'a>, ProjectResourcePublicationError> {
+    arrangement: AudioClipArrangementPublication<'a>,
+) -> Result<AudioClipArrangementPublicationPlan<'a>, ProjectResourcePublicationError> {
     if !is_valid_entity_id(arrangement.arrangement_id) {
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
-            "recorded-take placement arrangement identity must be valid",
+            "audio-clip placement arrangement identity must be valid",
         ));
     }
-    let path = format!("arrangement/{}.json", arrangement.arrangement_id);
     let existing: Vec<_> = verified
         .manifest()
         .resources()
         .iter()
         .filter(|descriptor| descriptor.role() == ResourceRole::Arrangement)
         .collect();
-    let previous_bytes = match existing.as_slice() {
-        [] => None,
-        [descriptor]
-            if descriptor.id() == arrangement.arrangement_id && descriptor.path() == path =>
-        {
+    let (path, previous_bytes) = match existing.as_slice() {
+        [] => (
+            format!("arrangement/{}.json", arrangement.arrangement_id),
+            None,
+        ),
+        [descriptor] if descriptor.id() == arrangement.arrangement_id => (
+            descriptor.path().to_owned(),
             Some(verified.read_resource(descriptor.id()).map_err(|error| {
                 caused(
                     ProjectResourcePublicationErrorKind::Integrity,
-                    "read current recorded-take placement arrangement",
+                    "read current audio-clip placement arrangement",
                     error,
                 )
-            })?)
-        }
+            })?),
+        ),
         _ => {
             return Err(failure(
                 ProjectResourcePublicationErrorKind::ResourceConflict,
-                "recorded-take placement arrangement authority changed",
+                "audio-clip placement arrangement authority changed",
             ));
         }
     };
@@ -1743,7 +1744,7 @@ fn prepare_recorded_take_arrangement_publication<'a>(
     } else {
         false
     };
-    Ok(RecordedTakeArrangementPublicationPlan {
+    Ok(AudioClipArrangementPublicationPlan {
         arrangement_id: arrangement.arrangement_id,
         arrangement_bytes: arrangement.arrangement_bytes,
         path,
@@ -1783,11 +1784,11 @@ fn inspect_arrangement_destination(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Ok(_) => Err(failure(
             ProjectResourcePublicationErrorKind::ResourceConflict,
-            "recorded-take placement arrangement path already exists",
+            "audio-clip placement arrangement path already exists",
         )),
         Err(error) => Err(caused(
             ProjectResourcePublicationErrorKind::Io,
-            "inspect recorded-take placement arrangement destination",
+            "inspect audio-clip placement arrangement destination",
             error,
         )),
     }
@@ -1799,7 +1800,7 @@ fn candidate_audio_clip_manifest(
     clip_path: &str,
     sample_path: Option<&str>,
     sample_bytes: Option<&[u8]>,
-    arrangement: Option<&RecordedTakeArrangementPublicationPlan<'_>>,
+    arrangement: Option<&AudioClipArrangementPublicationPlan<'_>>,
     revision: u64,
 ) -> Result<Vec<u8>, ProjectResourcePublicationError> {
     let mut value: Value = serde_json::from_slice(active).map_err(|error| {
@@ -1844,7 +1845,7 @@ fn candidate_audio_clip_manifest(
                 .ok_or_else(|| {
                     failure(
                         ProjectResourcePublicationErrorKind::Integrity,
-                        "current recorded-take placement arrangement descriptor disappeared",
+                        "current audio-clip placement arrangement descriptor disappeared",
                     )
                 })?;
             descriptor["byte_length"] = arrangement.arrangement_bytes.len().into();
@@ -2098,7 +2099,7 @@ fn recover_audio_clip_transaction(
         ));
     }
     rollback_audio_clip_track(root, transaction, tx)?;
-    rollback_recorded_take_arrangement(root, transaction, tx)?;
+    rollback_audio_clip_arrangement(root, transaction, tx)?;
     if tx.operation == AudioClipTransactionOperation::Removal {
         restore_removed_clip_directory(root, tx)?;
         restore_removed_audio_clip(root, transaction, tx)?;
@@ -2128,7 +2129,7 @@ fn recover_audio_clip_transaction(
     Ok(AudioClipPublicationRecoveryDisposition::RolledBack)
 }
 
-fn rollback_recorded_take_arrangement(
+fn rollback_audio_clip_arrangement(
     root: &Dir,
     transaction: &Dir,
     tx: &AudioClipTransactionRecord,
@@ -2153,7 +2154,7 @@ fn rollback_recorded_take_arrangement(
             Some(found) if found != after => {
                 return Err(failure(
                     ProjectResourcePublicationErrorKind::Recovery,
-                    "recorded-take placement rollback refuses unrelated arrangement content",
+                    "audio-clip placement rollback refuses unrelated arrangement content",
                 ));
             }
             Some(_) | None => {}
@@ -2165,7 +2166,7 @@ fn rollback_recorded_take_arrangement(
             &parent,
             name,
             &format!(".audio-clip-arrangement-rollback-{}.json", tx.id),
-            "previous recorded-take placement arrangement",
+            "previous audio-clip placement arrangement",
         );
     }
     let Some(current) = current else {
@@ -2174,13 +2175,13 @@ fn rollback_recorded_take_arrangement(
     if digest(&current) != after {
         return Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
-            "recorded-take placement rollback refuses unrelated arrangement content",
+            "audio-clip placement rollback refuses unrelated arrangement content",
         ));
     }
     parent.remove_file(name).map_err(|error| {
         caused(
             ProjectResourcePublicationErrorKind::Recovery,
-            "remove rolled-back recorded-take placement arrangement",
+            "remove rolled-back audio-clip placement arrangement",
             error,
         )
     })?;
@@ -2401,11 +2402,11 @@ fn remove_created_arrangement_directory(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
-            "recorded-take placement rollback refuses a nonempty arrangement directory",
+            "audio-clip placement rollback refuses a nonempty arrangement directory",
         )),
         Err(error) => Err(caused(
             ProjectResourcePublicationErrorKind::Recovery,
-            "remove recorded-take placement arrangement directory",
+            "remove audio-clip placement arrangement directory",
             error,
         )),
     }
@@ -2513,7 +2514,7 @@ fn validate_staged_audio_clip_transaction(
         validate_canonical_resource(&bytes).map_err(|error| {
             caused(
                 ProjectResourcePublicationErrorKind::Recovery,
-                "staged recorded-take placement arrangement is not canonical",
+                "staged audio-clip placement arrangement is not canonical",
                 error,
             )
         })?;
@@ -2522,7 +2523,7 @@ fn validate_staged_audio_clip_transaction(
         {
             return Err(failure(
                 ProjectResourcePublicationErrorKind::Recovery,
-                "staged recorded-take placement arrangement does not match the transaction record",
+                "staged audio-clip placement arrangement does not match the transaction record",
             ));
         }
         let previous_bytes = if let Some(previous) = &arrangement.previous_arrangement {
@@ -2530,7 +2531,7 @@ fn validate_staged_audio_clip_transaction(
             validate_canonical_resource(&bytes).map_err(|error| {
                 caused(
                     ProjectResourcePublicationErrorKind::Recovery,
-                    "staged previous recorded-take placement arrangement is not canonical",
+                    "staged previous audio-clip placement arrangement is not canonical",
                     error,
                 )
             })?;
@@ -2539,7 +2540,7 @@ fn validate_staged_audio_clip_transaction(
             {
                 return Err(failure(
                     ProjectResourcePublicationErrorKind::Recovery,
-                    "staged previous recorded-take placement arrangement does not match the transaction record",
+                    "staged previous audio-clip placement arrangement does not match the transaction record",
                 ));
             }
             Some(bytes)
@@ -2554,7 +2555,7 @@ fn validate_staged_audio_clip_transaction(
         .arrangement
         .as_ref()
         .zip(arrangement_bytes.as_deref())
-        .map(|(record, bytes)| RecordedTakeArrangementPublicationPlan {
+        .map(|(record, bytes)| AudioClipArrangementPublicationPlan {
             arrangement_id: &record.arrangement_id,
             arrangement_bytes: bytes,
             path: record.arrangement.path.clone(),
@@ -2640,7 +2641,7 @@ fn validate_staged_audio_clip_transaction(
         {
             return Err(failure(
                 ProjectResourcePublicationErrorKind::Recovery,
-                "recorded-take placement arrangement descriptors do not match the transaction",
+                "audio-clip placement arrangement descriptors do not match the transaction",
             ));
         }
     }
@@ -2847,7 +2848,7 @@ fn read_audio_clip_transaction(
             (
                 AudioClipTransactionOperation::Publication,
                 "hyper-audio-clip-publication-transaction",
-                1..=4
+                1..=5
             ) | (
                 AudioClipTransactionOperation::Removal,
                 "hyper-audio-clip-removal-transaction",
@@ -2861,7 +2862,7 @@ fn read_audio_clip_transaction(
             && (tx.sample.is_none()
                 || (tx.created_asset_directory && !tx.created_sample_directory)))
         || (tx.format_version <= 3 && tx.arrangement.is_some())
-        || (tx.format_version == 4
+        || ((tx.format_version == 4 || tx.format_version == 5)
             && (tx.operation == AudioClipTransactionOperation::Publication
                 && tx.arrangement.is_none()))
         || (tx.operation == AudioClipTransactionOperation::Removal
@@ -2891,8 +2892,9 @@ fn read_audio_clip_transaction(
         })
         || tx.arrangement.as_ref().is_some_and(|arrangement| {
             !is_valid_entity_id(&arrangement.arrangement_id)
-                || arrangement.arrangement.path
-                    != format!("arrangement/{}.json", arrangement.arrangement_id)
+                || ((tx.format_version <= 4 || arrangement.previous_arrangement.is_none())
+                    && arrangement.arrangement.path
+                        != format!("arrangement/{}.json", arrangement.arrangement_id))
                 || arrangement.arrangement.byte_length == 0
                 || arrangement.arrangement.byte_length > MAX_JSON_FILE_BYTES
                 || decode_digest(&arrangement.arrangement.sha256).is_err()
@@ -3366,7 +3368,7 @@ mod tests {
             .unwrap()
         }
 
-        fn install_empty_arrangement(&self) -> Vec<u8> {
+        fn install_empty_arrangement_at(&self, path: &str) -> Vec<u8> {
             let arrangement = serde_json_canonicalizer::to_vec(&json!({
                 "format":"hyper-arrangement", "format_version":1,
                 "id":ARRANGEMENT_ID, "project_id":PROJECT_ID, "name":"Main",
@@ -3374,17 +3376,13 @@ mod tests {
             }))
             .unwrap();
             fs::create_dir(self.root.join("arrangement")).unwrap();
-            fs::write(
-                self.root.join(format!("arrangement/{ARRANGEMENT_ID}.json")),
-                &arrangement,
-            )
-            .unwrap();
+            fs::write(self.root.join(path), &arrangement).unwrap();
             let manifest_path = self.root.join(MANIFEST_NAME);
             let mut manifest: Value =
                 serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
             manifest["resources"].as_array_mut().unwrap().push(json!({
                 "id":ARRANGEMENT_ID, "role":"arrangement",
-                "path":format!("arrangement/{ARRANGEMENT_ID}.json"),
+                "path":path,
                 "media_type":"application/json", "byte_length":arrangement.len(),
                 "sha256":hex_digest(digest(&arrangement)), "extensions":{}
             }));
@@ -3462,9 +3460,9 @@ mod tests {
         let fixture = Fixture::new();
         let arrangement = Fixture::take_arrangement();
 
-        let outcome = publish_recorded_take_placement(
+        let outcome = publish_audio_clip_placement(
             &fixture.root,
-            RecordedTakePlacementPublicationRequest {
+            AudioClipPlacementPublicationRequest {
                 clip: fixture.request(),
                 arrangement_id: ARRANGEMENT_ID,
                 arrangement_bytes: &arrangement,
@@ -3491,6 +3489,45 @@ mod tests {
     }
 
     #[test]
+    fn publishes_audio_clip_placement_into_existing_named_arrangement() {
+        let fixture = Fixture::new();
+        let before = fixture.install_empty_arrangement_at("arrangement/main.json");
+        let arrangement = Fixture::take_arrangement();
+
+        let outcome = publish_audio_clip_placement(
+            &fixture.root,
+            AudioClipPlacementPublicationRequest {
+                clip: fixture.request(),
+                arrangement_id: ARRANGEMENT_ID,
+                arrangement_bytes: &arrangement,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.project_revision(), 2);
+        assert_ne!(arrangement, before);
+        assert_eq!(
+            fs::read(fixture.root.join("arrangement/main.json")).unwrap(),
+            arrangement
+        );
+        assert!(
+            !fixture
+                .root
+                .join(format!("arrangement/{ARRANGEMENT_ID}.json"))
+                .exists()
+        );
+        let verified = verify_project_package(&fixture.root).unwrap();
+        let descriptor = verified
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == ARRANGEMENT_ID)
+            .unwrap();
+        assert_eq!(descriptor.path(), "arrangement/main.json");
+        assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
     fn recorded_take_placement_crashes_before_manifest_roll_back_every_resource() {
         for crash_phase in [
             AudioClipPublicationPhase::Transaction,
@@ -3505,7 +3542,7 @@ mod tests {
                     &fixture.root,
                     fixture.request(),
                     None,
-                    Some(RecordedTakeArrangementPublication {
+                    Some(AudioClipArrangementPublication {
                         arrangement_id: ARRANGEMENT_ID,
                         arrangement_bytes: &arrangement,
                     }),
@@ -3549,7 +3586,7 @@ mod tests {
                 &fixture.root,
                 fixture.request(),
                 None,
-                Some(RecordedTakeArrangementPublication {
+                Some(AudioClipArrangementPublication {
                     arrangement_id: ARRANGEMENT_ID,
                     arrangement_bytes: &arrangement,
                 }),
@@ -3591,16 +3628,16 @@ mod tests {
     }
 
     #[test]
-    fn recorded_take_placement_rolls_back_an_existing_arrangement_exactly() {
+    fn audio_clip_placement_rolls_back_an_existing_named_arrangement_exactly() {
         let fixture = Fixture::new();
-        let before = fixture.install_empty_arrangement();
+        let before = fixture.install_empty_arrangement_at("arrangement/main.json");
         let arrangement = Fixture::take_arrangement();
         let result = catch_unwind(AssertUnwindSafe(|| {
             let _ = publish_audio_clip_with_arrangement_observed(
                 &fixture.root,
                 fixture.request(),
                 None,
-                Some(RecordedTakeArrangementPublication {
+                Some(AudioClipArrangementPublication {
                     arrangement_id: ARRANGEMENT_ID,
                     arrangement_bytes: &arrangement,
                 }),
@@ -3622,12 +3659,7 @@ mod tests {
             AudioClipPublicationRecoveryDisposition::RolledBack
         );
         assert_eq!(
-            fs::read(
-                fixture
-                    .root
-                    .join(format!("arrangement/{ARRANGEMENT_ID}.json"))
-            )
-            .unwrap(),
+            fs::read(fixture.root.join("arrangement/main.json")).unwrap(),
             before
         );
         assert_eq!(

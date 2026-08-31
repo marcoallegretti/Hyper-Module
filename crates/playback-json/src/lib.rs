@@ -1187,6 +1187,16 @@ pub struct AudioClipDuplicationDocuments {
     asset_id: String,
 }
 
+/// Canonical resources required to derive one reusable clip from a selected
+/// source view and place that derived clip in the arrangement atomically.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioClipDuplicationPlacementDocuments {
+    duplication: AudioClipDuplicationDocuments,
+    arrangement: Vec<u8>,
+    arrangement_id: String,
+    placement_id: String,
+}
+
 struct AudioClipDuplicationCandidate {
     documents: AudioClipDuplicationDocuments,
     project: LoadedPlaybackProject,
@@ -1242,6 +1252,57 @@ impl AudioClipDuplicationDocuments {
     #[must_use]
     pub fn into_parts(self) -> (Vec<u8>, Vec<u8>, String) {
         (self.track, self.clip, self.asset_id)
+    }
+}
+
+impl AudioClipDuplicationPlacementDocuments {
+    #[must_use]
+    pub fn track(&self) -> &[u8] {
+        self.duplication.track()
+    }
+
+    #[must_use]
+    pub fn clip(&self) -> &[u8] {
+        self.duplication.clip()
+    }
+
+    #[must_use]
+    pub fn asset_id(&self) -> &str {
+        self.duplication.asset_id()
+    }
+
+    #[must_use]
+    pub fn arrangement(&self) -> &[u8] {
+        &self.arrangement
+    }
+
+    #[must_use]
+    pub fn arrangement_id(&self) -> &str {
+        &self.arrangement_id
+    }
+
+    #[must_use]
+    pub fn placement_id(&self) -> &str {
+        &self.placement_id
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, Vec<u8>, String, Vec<u8>, String, String) {
+        let Self {
+            duplication,
+            arrangement,
+            arrangement_id,
+            placement_id,
+        } = self;
+        let (track, clip, asset_id) = duplication.into_parts();
+        (
+            track,
+            clip,
+            asset_id,
+            arrangement,
+            arrangement_id,
+            placement_id,
+        )
     }
 }
 
@@ -1513,6 +1574,14 @@ pub enum AudioClipDuplicationSerializationError {
     InvalidDocumentShape,
     Serialization(serde_json::Error),
     ProjectCompilation(AdapterCompileError),
+}
+
+/// Failure to derive one selected source range and place the resulting
+/// reusable clip as a single candidate project edit.
+#[derive(Debug)]
+pub enum AudioClipDuplicationPlacementSerializationError {
+    Duplication(AudioClipDuplicationSerializationError),
+    Arrangement(ArrangementPlacementAdditionSerializationError),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2928,6 +2997,24 @@ impl Error for AudioClipDuplicationSerializationError {
             | Self::InvalidClipIdentity
             | Self::InvalidClipName
             | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioClipDuplicationPlacementSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Duplication(source) => source.fmt(formatter),
+            Self::Arrangement(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioClipDuplicationPlacementSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Duplication(source) => Some(source),
+            Self::Arrangement(source) => Some(source),
         }
     }
 }
@@ -5214,6 +5301,101 @@ pub fn serialize_audio_clip_source_view_duplication(
     source_frame_count: u64,
     limits: LoaderLimits,
 ) -> Result<AudioClipDuplicationDocuments, AudioClipDuplicationSerializationError> {
+    let candidate = prepare_audio_clip_source_view_duplication_candidate(
+        project,
+        assets,
+        source_clip,
+        source_track,
+        source_clip_id,
+        duplicated_clip_id,
+        duplicated_clip_name,
+        source_start_frame,
+        source_frame_count,
+        limits,
+    )?;
+    Ok(candidate.documents)
+}
+
+/// Derives one reusable clip from an exact source-view range and places that
+/// derived clip at one exact project tick in the same compiled candidate.
+///
+/// The original clip and immutable source media remain unchanged. The returned
+/// documents must be published together: their arrangement references the new
+/// clip identity, never an independently published intermediate clip.
+///
+/// # Errors
+///
+/// Returns a classified duplication or arrangement rejection before any caller
+/// receives documents that could be made durable.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the atomic candidate binds verified source authority, a new clip and placement identity, and the exact user-entered arrangement tick"
+)]
+pub fn serialize_audio_clip_source_view_duplication_placement(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_clip: &[u8],
+    source_track: &[u8],
+    source_arrangement: Option<&[u8]>,
+    source_clip_id: &str,
+    duplicated_clip_id: &str,
+    duplicated_clip_name: &str,
+    source_start_frame: u64,
+    source_frame_count: u64,
+    arrangement_id: &str,
+    placement_id: &str,
+    start_tick: u64,
+    limits: LoaderLimits,
+) -> Result<AudioClipDuplicationPlacementDocuments, AudioClipDuplicationPlacementSerializationError>
+{
+    let candidate = prepare_audio_clip_source_view_duplication_candidate(
+        project,
+        assets,
+        source_clip,
+        source_track,
+        source_clip_id,
+        duplicated_clip_id,
+        duplicated_clip_name,
+        source_start_frame,
+        source_frame_count,
+        limits,
+    )
+    .map_err(AudioClipDuplicationPlacementSerializationError::Duplication)?;
+    let arrangement = serialize_arrangement_placement_addition(
+        &candidate.project,
+        assets,
+        source_arrangement,
+        arrangement_id,
+        placement_id,
+        duplicated_clip_id,
+        start_tick,
+        limits,
+    )
+    .map_err(AudioClipDuplicationPlacementSerializationError::Arrangement)?;
+    Ok(AudioClipDuplicationPlacementDocuments {
+        duplication: candidate.documents,
+        arrangement,
+        arrangement_id: arrangement_id.to_owned(),
+        placement_id: placement_id.to_owned(),
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared candidate keeps standalone and placed selected-range derivations under one exact source-view contract"
+)]
+fn prepare_audio_clip_source_view_duplication_candidate(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_clip: &[u8],
+    source_track: &[u8],
+    source_clip_id: &str,
+    duplicated_clip_id: &str,
+    duplicated_clip_name: &str,
+    source_start_frame: u64,
+    source_frame_count: u64,
+    limits: LoaderLimits,
+) -> Result<AudioClipDuplicationCandidate, AudioClipDuplicationSerializationError> {
     let mut candidate = prepare_audio_clip_duplication_candidate(
         project,
         assets,
@@ -5224,7 +5406,7 @@ pub fn serialize_audio_clip_source_view_duplication(
         duplicated_clip_name,
         limits,
     )?;
-    candidate.documents.clip = serialize_audio_clip_source_view(
+    let clip = serialize_audio_clip_source_view(
         &candidate.project,
         assets,
         candidate.documents.clip(),
@@ -5234,7 +5416,36 @@ pub fn serialize_audio_clip_source_view_duplication(
         limits,
     )
     .map_err(AudioClipDuplicationSerializationError::SourceView)?;
-    Ok(candidate.documents)
+    let clip_index = candidate
+        .project
+        .clips
+        .iter()
+        .position(|candidate_clip| candidate_clip.id == duplicated_clip_id)
+        .ok_or(AudioClipDuplicationSerializationError::InvalidDocumentShape)?;
+    let duplicate = load_clip(
+        &clip,
+        clip_index,
+        candidate.project.project_id(),
+        limits.max_document_bytes,
+        limits.max_warp_markers,
+    )
+    .map_err(|source| {
+        AudioClipDuplicationSerializationError::Clip(AudioClipDocumentSerializationError::Source(
+            source,
+        ))
+    })?;
+    candidate.project.clips[clip_index] = duplicate;
+    validate_loaded_identities(&candidate.project).map_err(|source| {
+        AudioClipDuplicationSerializationError::Clip(AudioClipDocumentSerializationError::Source(
+            source,
+        ))
+    })?;
+    candidate
+        .project
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(AudioClipDuplicationSerializationError::ProjectCompilation)?;
+    candidate.documents.clip = clip;
+    Ok(candidate)
 }
 
 #[allow(
@@ -13301,6 +13512,100 @@ mod tests {
                 AudioClipSourceViewSerializationError::SourceRangeExceedsCurrentView
             ))
         ));
+    }
+
+    #[test]
+    fn audio_clip_source_view_duplication_placement_keeps_one_compiled_candidate() {
+        let mut source_clip: Value = serde_json::from_slice(CLIP).unwrap();
+        source_clip["loop"]["end_tick"] = 2.into();
+        let source_clip = serde_json_canonicalizer::to_vec(&source_clip).unwrap();
+        let source_track =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(TRACK).unwrap())
+                .unwrap();
+        let source_arrangement = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
+        )
+        .unwrap();
+        let tracks: [&[u8]; 1] = [&source_track];
+        let clips: [&[u8]; 1] = [&source_clip];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source_arrangement)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let assets = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 100,
+        }];
+        let duplicated_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334470";
+
+        let documents = serialize_audio_clip_source_view_duplication_placement(
+            &loaded,
+            &assets,
+            &source_clip,
+            &source_track,
+            Some(&source_arrangement),
+            "018f47a2-6b2d-7c11-8a44-001122334460",
+            duplicated_id,
+            "Placed selection",
+            25,
+            50,
+            "018f47a2-6b2d-7c11-8a44-001122334463",
+            placement_id,
+            4,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        assert_eq!(documents.asset_id(), "018f47a2-6b2d-7c11-8a44-001122334457");
+        assert_eq!(
+            documents.arrangement_id(),
+            "018f47a2-6b2d-7c11-8a44-001122334463"
+        );
+        assert_eq!(documents.placement_id(), placement_id);
+        let duplicate: Value = serde_json::from_slice(documents.clip()).unwrap();
+        assert_eq!(duplicate["id"], duplicated_id);
+        assert_eq!(duplicate["source"]["start_frame"], 25);
+        assert_eq!(duplicate["source"]["frame_count"], 50);
+        assert_eq!(duplicate["duration_ticks"], 2);
+        let arrangement: Value = serde_json::from_slice(documents.arrangement()).unwrap();
+        assert!(
+            arrangement["placements"]
+                .as_array()
+                .is_some_and(|placements| {
+                    placements.iter().any(|placement| {
+                        placement["id"] == placement_id
+                            && placement["clip_id"] == duplicated_id
+                            && placement["start_tick"] == 4
+                            && placement["clip_start_tick"] == 0
+                            && placement["duration_ticks"] == 2
+                    })
+                })
+        );
+
+        let duplicate_clips: [&[u8]; 2] = [&source_clip, documents.clip()];
+        let duplicate_tracks: [&[u8]; 1] = [documents.track()];
+        let reopened = load(
+            input(
+                TIMELINE,
+                &duplicate_tracks,
+                &duplicate_clips,
+                Some(documents.arrangement()),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.placement_count(), 2);
+        reopened
+            .compile_playback(&assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+            .unwrap();
+
+        let original: Value = serde_json::from_slice(&source_clip).unwrap();
+        assert_eq!(original["source"]["start_frame"], 0);
+        assert_eq!(original["source"]["frame_count"], 100);
+        assert_eq!(original["duration_ticks"], 4);
     }
 
     #[test]

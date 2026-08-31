@@ -376,6 +376,7 @@ export global IdeActions {
     callback prepare-audio-clip-waveform-trim();
     callback prepare-audio-clip-waveform-range-duplication();
     callback duplicate-audio-clip-source-range(string, string, string, string);
+    callback create-and-place-audio-clip-source-range(string, string, string, string, string);
     callback toggle-audio-clip-preview(string);
     callback toggle-audio-clip-waveform-selection-preview();
     callback loudness-run();
@@ -759,6 +760,7 @@ export component MainWindow inherits Window {
     in-out property <string> clip-source-range-duplicate-start: "";
     in-out property <string> clip-source-range-duplicate-frame-count: "";
     in-out property <string> clip-source-range-duplicate-name: "";
+    in-out property <string> clip-source-range-placement-start-tick: "0";
     in-out property <bool> clip-remove-visible: false;
     in-out property <string> clip-remove-id: "";
     in-out property <string> clip-remove-name: "";
@@ -5612,7 +5614,7 @@ export component MainWindow inherits Window {
                             overflow: elide;
                         }
                         Text {
-                            text: "Enter a name from 1 to 120 characters for an independent reusable clip. The original clip, source media, and arrangement placements remain unchanged.";
+                            text: "Enter a name from 1 to 120 characters. Create range clip leaves the original clip, source media, and arrangement unchanged. Create & place makes the reusable clip and one placement atomically.";
                             color: #aebccc;
                             font-size: 11px;
                             wrap: word-wrap;
@@ -5621,6 +5623,28 @@ export component MainWindow inherits Window {
                             text <=> root.clip-source-range-duplicate-name;
                             placeholder-text: "New audio clip name";
                             accessible-label: "New clip name for the selected waveform source range";
+                        }
+                        Text { text: "ARRANGEMENT POSITION"; color: #65758a; font-size: 9px; font-weight: 700; letter-spacing: 0.6px; }
+                        IdeLineEdit {
+                            text <=> root.clip-source-range-placement-start-tick;
+                            placeholder-text: "Tick or 1|1|000";
+                            accessible-label: "Arrangement position for the selected waveform source range clip";
+                            enabled: root.app-mode == AppMode.running;
+                            accepted => {
+                                IdeActions.create-and-place-audio-clip-source-range(
+                                    root.clip-source-range-duplicate-id,
+                                    root.clip-source-range-duplicate-name,
+                                    root.clip-source-range-duplicate-start,
+                                    root.clip-source-range-duplicate-frame-count,
+                                    self.text
+                                );
+                            }
+                        }
+                        Text {
+                            text: "Use an exact project tick or bar|beat|tick. Ambiguous musical coordinates are refused; the original clip is never retargeted.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
                         }
                         Text {
                             text: "Before publication, the current native project validates this exact source range and decoded-audio gain again. It refuses ranges that cannot retain exact timing, warp, loop, or fade semantics.";
@@ -5647,6 +5671,25 @@ export component MainWindow inherits Window {
                                         root.clip-source-range-duplicate-name,
                                         root.clip-source-range-duplicate-start,
                                         root.clip-source-range-duplicate-frame-count
+                                    );
+                                }
+                            }
+                            Button {
+                                text: root.app-mode == AppMode.duplicating-clip ? "Creating & placing..." : "Create & place";
+                                accessible-label: "Create and place an independent reusable clip from the selected waveform source range";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.clip-source-range-duplicate-id != ""
+                                    && root.clip-source-range-duplicate-start != ""
+                                    && root.clip-source-range-duplicate-frame-count != ""
+                                    && root.clip-source-range-duplicate-name != ""
+                                    && root.clip-source-range-placement-start-tick != "";
+                                clicked => {
+                                    IdeActions.create-and-place-audio-clip-source-range(
+                                        root.clip-source-range-duplicate-id,
+                                        root.clip-source-range-duplicate-name,
+                                        root.clip-source-range-duplicate-start,
+                                        root.clip-source-range-duplicate-frame-count,
+                                        root.clip-source-range-placement-start-tick
                                     );
                                 }
                             }

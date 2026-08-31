@@ -4846,6 +4846,7 @@ fn prepare_waveform_source_range_duplication(
     ui.set_clip_source_range_duplicate_start(selection.source_start_frame.to_string().into());
     ui.set_clip_source_range_duplicate_frame_count(selection.source_frame_count.to_string().into());
     ui.set_clip_source_range_duplicate_name(SharedString::default());
+    ui.set_clip_source_range_placement_start_tick("0".into());
     ui.set_clip_source_range_duplicate_visible(true);
     ui.set_error_text(SharedString::default());
     Ok(())
@@ -5023,6 +5024,7 @@ fn bind_audio_clip_waveform_source_range_duplication_callbacks(
     let Some(source_range_duplicate_submitter) = source_range_duplicate_submitter else {
         return;
     };
+    let source_range_placement_submitter = Rc::clone(&source_range_duplicate_submitter);
     let weak = ui.as_weak();
     let project_state_for_duplicate = Rc::clone(project_state);
     actions.on_duplicate_audio_clip_source_range(move |clip_id, name, start, frame_count| {
@@ -5059,25 +5061,21 @@ fn bind_audio_clip_waveform_source_range_duplication_callbacks(
                 return;
             }
         };
-        let clips = project_state_for_duplicate.audio_clips.borrow();
-        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
-            drop(clips);
-            reset_audio_clip_source_range_duplication_form(&ui);
-            ui.set_error_text("The selected audio clip is no longer available".into());
-            return;
-        };
-        if let Err(message) = validate_audio_clip_source_range_duplication(
-            clip,
+        let source_clip_id = match resolve_current_audio_clip_source_range(
+            &project_state_for_duplicate,
+            clip_id.as_str(),
             source_start_frame,
             source_frame_count,
         ) {
-            drop(clips);
-            reset_audio_clip_source_range_duplication_form(&ui);
-            ui.set_error_text(message.into());
-            return;
-        }
+            Ok(source_clip_id) => source_clip_id,
+            Err(message) => {
+                reset_audio_clip_source_range_duplication_form(&ui);
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
         let command = match audio_clip_source_range_duplication_command(
-            clip.id(),
+            &source_clip_id,
             name.as_str(),
             source_start_frame,
             source_frame_count,
@@ -5088,9 +5086,104 @@ fn bind_audio_clip_waveform_source_range_duplication_callbacks(
                 return;
             }
         };
-        drop(clips);
         source_range_duplicate_submitter(&ui, command);
     });
+
+    bind_audio_clip_waveform_source_range_placement_callback(
+        ui,
+        project_state,
+        source_range_placement_submitter,
+    );
+}
+
+fn bind_audio_clip_waveform_source_range_placement_callback(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    source_range_placement_submitter: UiCommandSubmitter,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let project_state_for_placement = Rc::clone(project_state);
+    actions.on_create_and_place_audio_clip_source_range(
+        move |clip_id, name, start, frame_count, placement_start| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::Running
+                || !ui.get_clip_source_range_duplicate_visible()
+                || ui.get_clip_source_range_duplicate_id() != clip_id
+            {
+                ui.set_error_text("Selected source range is no longer current".into());
+                return;
+            }
+            if ui.get_clip_source_range_duplicate_start() != start
+                || ui.get_clip_source_range_duplicate_frame_count() != frame_count
+            {
+                reset_audio_clip_source_range_duplication_form(&ui);
+                ui.set_error_text("Selected source range is no longer current".into());
+                return;
+            }
+            if ui.get_clip_source_range_placement_start_tick() != placement_start {
+                ui.set_error_text("Selected range placement position is no longer current".into());
+                return;
+            }
+            let source_start_frame = match parse_audio_clip_source_start(start.as_str()) {
+                Ok(source_start_frame) => source_start_frame,
+                Err(message) => {
+                    reset_audio_clip_source_range_duplication_form(&ui);
+                    ui.set_error_text(message.into());
+                    return;
+                }
+            };
+            let source_frame_count = match parse_audio_clip_source_frame_count(frame_count.as_str())
+            {
+                Ok(source_frame_count) => source_frame_count,
+                Err(message) => {
+                    reset_audio_clip_source_range_duplication_form(&ui);
+                    ui.set_error_text(message.into());
+                    return;
+                }
+            };
+            let start_tick = {
+                let timeline = project_state_for_placement.timeline.borrow();
+                match parse_arrangement_start_tick(placement_start.as_str(), &timeline.meter_events)
+                {
+                    Ok(start_tick) => start_tick,
+                    Err(message) => {
+                        ui.set_error_text(message.into());
+                        return;
+                    }
+                }
+            };
+            let source_clip_id = match resolve_current_audio_clip_source_range(
+                &project_state_for_placement,
+                clip_id.as_str(),
+                source_start_frame,
+                source_frame_count,
+            ) {
+                Ok(source_clip_id) => source_clip_id,
+                Err(message) => {
+                    reset_audio_clip_source_range_duplication_form(&ui);
+                    ui.set_error_text(message.into());
+                    return;
+                }
+            };
+            let command = match audio_clip_source_range_placement_command(
+                &source_clip_id,
+                name.as_str(),
+                source_start_frame,
+                source_frame_count,
+                start_tick,
+            ) {
+                Ok(command) => command,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
+            };
+            source_range_placement_submitter(&ui, command);
+        },
+    );
 }
 
 fn bind_audio_clip_waveform_selected_preview_callback(
@@ -5749,6 +5842,25 @@ fn audio_clip_source_range_duplication_command(
     })
 }
 
+fn audio_clip_source_range_placement_command(
+    source_clip_id: &str,
+    proposed_name: &str,
+    source_start_frame: u64,
+    source_frame_count: u64,
+    start_tick: u64,
+) -> Result<IdeWorkerCommand, &'static str> {
+    let name = normalize_audio_clip_name(proposed_name)?;
+    Ok(IdeWorkerCommand::CreateAndPlaceAudioClipFromSourceRange {
+        clip_id: source_clip_id.to_owned(),
+        name: name.to_owned(),
+        source_range: IdeAudioClipSourceRange {
+            source_start_frame,
+            source_frame_count,
+        },
+        start_tick,
+    })
+}
+
 fn validate_audio_clip_source_range_duplication(
     clip: &IdeAudioClip,
     source_start_frame: u64,
@@ -5768,6 +5880,21 @@ fn validate_audio_clip_source_range_duplication(
         return Err("The selected source range is no longer within the committed source view");
     }
     Ok(())
+}
+
+fn resolve_current_audio_clip_source_range(
+    project_state: &ProjectUiState,
+    clip_id: &str,
+    source_start_frame: u64,
+    source_frame_count: u64,
+) -> Result<String, &'static str> {
+    let clips = project_state.audio_clips.borrow();
+    let clip = clips
+        .iter()
+        .find(|clip| clip.id() == clip_id)
+        .ok_or("The selected audio clip is no longer available")?;
+    validate_audio_clip_source_range_duplication(clip, source_start_frame, source_frame_count)?;
+    Ok(clip.id().to_owned())
 }
 
 fn parse_audio_clip_gain(value: &str) -> Result<f64, &'static str> {
@@ -6211,7 +6338,8 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
             AppMode::RemovingArrangementSceneLaunch
         }
         IdeWorkerCommandKind::RenameAudioClip => AppMode::RenamingClip,
-        IdeWorkerCommandKind::DuplicateAudioClip => AppMode::DuplicatingClip,
+        IdeWorkerCommandKind::DuplicateAudioClip
+        | IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange => AppMode::DuplicatingClip,
         IdeWorkerCommandKind::RemoveAudioClip => AppMode::RemovingClip,
         IdeWorkerCommandKind::CleanUnusedSamples => AppMode::CleaningSamples,
         IdeWorkerCommandKind::SetAudioClipActive => AppMode::ChangingClipActivation,
@@ -6445,6 +6573,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::DuplicateAudioClip => {
             "Preserving mixer state, duplicating the audio clip, and reopening project…"
+        }
+        IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange => {
+            "Preserving mixer state, creating and placing the selected source range, and reopening project…"
         }
         IdeWorkerCommandKind::RemoveAudioClip => {
             "Preserving mixer state, removing the unused audio clip, and reopening project…"
@@ -6893,6 +7024,11 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::AudioClipRenamed { .. } | IdeWorkerEvent::AudioClipRenaming) => {
             apply_audio_clip_rename_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioClipCreatedAndPlacedFromSourceRange { .. }
+        | IdeWorkerEvent::AudioClipSourceRangePlacementCommittedWithWarning { .. }
+        | IdeWorkerEvent::AudioClipCreatingAndPlacingFromSourceRange) => {
+            apply_audio_clip_source_range_placement_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipDuplicated { .. }
         | IdeWorkerEvent::AudioClipDuplicationCommittedWithWarning { .. }
@@ -8496,6 +8632,56 @@ fn apply_audio_clip_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     }
 }
 
+fn apply_audio_clip_source_range_placement_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioClipCreatedAndPlacedFromSourceRange {
+            revision,
+            clip_id,
+            start_tick,
+        } => {
+            reset_audio_clip_source_range_duplication_form(ui);
+            ui.set_status_text(
+                format!(
+                    "Reusable audio clip {clip_id} created from the selected source range and placed at tick {start_tick} in project revision {revision}"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipSourceRangePlacementCommittedWithWarning {
+            start_tick,
+            warning,
+        } => {
+            let clip_id = warning
+                .committed_clip_id()
+                .expect("committed selected-range placement warning must retain its clip identity");
+            reset_audio_clip_source_range_duplication_form(ui);
+            ui.set_status_text(
+                committed_warning_status(
+                    ui.get_app_mode(),
+                    &format!("Selected-range audio clip {clip_id}"),
+                )
+                .into(),
+            );
+            ui.set_error_text(
+                format!(
+                    "{warning} The requested placement at tick {start_tick} requires recovery confirmation."
+                )
+                .into(),
+            );
+        }
+        IdeWorkerEvent::AudioClipCreatingAndPlacingFromSourceRange => {
+            ui.set_app_mode(AppMode::DuplicatingClip);
+            ui.set_status_text(
+                "Waiting for native output before creating and placing the selected source range…"
+                    .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("selected-range placement event dispatcher received another event"),
+    }
+}
+
 fn reset_audio_clip_duplication_form(ui: &MainWindow) {
     ui.set_clip_duplicate_visible(false);
     ui.set_clip_duplicate_id(SharedString::default());
@@ -8510,6 +8696,7 @@ fn reset_audio_clip_source_range_duplication_form(ui: &MainWindow) {
     ui.set_clip_source_range_duplicate_start(SharedString::default());
     ui.set_clip_source_range_duplicate_frame_count(SharedString::default());
     ui.set_clip_source_range_duplicate_name(SharedString::default());
+    ui.set_clip_source_range_placement_start_tick("0".into());
 }
 
 fn apply_audio_clip_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -11215,7 +11402,10 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::RenameAudioClip if current == AppMode::RenamingClip => {
             AppMode::Running
         }
-        IdeWorkerCommandKind::DuplicateAudioClip if current == AppMode::DuplicatingClip => {
+        IdeWorkerCommandKind::DuplicateAudioClip
+        | IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange
+            if current == AppMode::DuplicatingClip =>
+        {
             AppMode::Running
         }
         IdeWorkerCommandKind::RemoveAudioClip if current == AppMode::RemovingClip => {
@@ -22815,6 +23005,89 @@ mod tests {
     }
 
     #[test]
+    fn waveform_selected_range_placement_submits_one_exact_compound_request() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let project_state = Rc::new(ProjectUiState::default());
+        project_state
+            .audio_clips
+            .borrow_mut()
+            .push(IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_audio_clip_waveform_selection_callbacks_with(
+            &ui,
+            &project_state,
+            None,
+            Some(Rc::new(move |_, command| {
+                submitted_by_callback.borrow_mut().push(command);
+            })),
+        );
+        configure_waveform_selection_test_view(&ui, "Clip A", 100);
+
+        ui.show().unwrap();
+        ui.global::<IdeActions>()
+            .invoke_begin_audio_clip_waveform_selection(0.25);
+        ui.global::<IdeActions>()
+            .invoke_complete_audio_clip_waveform_selection(0.75);
+        ui.global::<IdeActions>()
+            .invoke_prepare_audio_clip_waveform_range_duplication();
+        assert!(ui.get_clip_source_range_duplicate_visible());
+        assert_eq!(ui.get_clip_source_range_duplicate_start(), "420");
+        assert_eq!(ui.get_clip_source_range_duplicate_frame_count(), "650");
+        assert_eq!(ui.get_clip_source_range_placement_start_tick(), "0");
+
+        ui.set_clip_source_range_duplicate_name("Selected and placed clip".into());
+        ui.set_clip_source_range_placement_start_tick("1920".into());
+        let submit = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Create and place an independent reusable clip from the selected waveform source range",
+        )
+        .next()
+        .expect("the selected-range form exposes an explicit atomic placement action");
+        assert_eq!(submit.accessible_enabled(), Some(true));
+        let submit_position = submit.absolute_position();
+        let submit_size = submit.size();
+        let window_size = ui.root_element().size();
+        assert!(
+            submit_position.x >= 0.0
+                && submit_position.y >= 0.0
+                && submit_position.x + submit_size.width <= window_size.width
+                && submit_position.y + submit_size.height <= window_size.height,
+            "the selected-range placement action must remain inside the visible window: position={submit_position:?}, size={submit_size:?}, window={window_size:?}"
+        );
+        submit.mock_single_click(PointerEventButton::Left);
+
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::CreateAndPlaceAudioClipFromSourceRange {
+                clip_id,
+                name,
+                source_range: IdeAudioClipSourceRange {
+                    source_start_frame: 420,
+                    source_frame_count: 650,
+                },
+                start_tick: 1_920,
+            }] if clip_id == "clip-a" && name == "Selected and placed clip"
+        ));
+
+        ui.global::<IdeActions>()
+            .invoke_create_and_place_audio_clip_source_range(
+                "clip-a".into(),
+                "Selected and placed clip".into(),
+                "420".into(),
+                "650".into(),
+                "1921".into(),
+            );
+        assert_eq!(submitted.borrow().len(), 1);
+        assert!(
+            ui.get_error_text()
+                .contains("placement position is no longer current")
+        );
+        ui.hide().unwrap();
+    }
+
+    #[test]
     fn waveform_selected_range_duplication_refuses_callback_bounds_that_differ_from_the_displayed_selection()
      {
         i_slint_backend_testing::init_no_event_loop();
@@ -22958,7 +23231,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_clip_source_range_duplication_command_retains_exact_range_and_checks_current_view() {
+    fn audio_clip_source_range_commands_retain_exact_range_and_check_current_view() {
         assert!(matches!(
             audio_clip_source_range_duplication_command("clip-a", " Range clip ", 420, 650),
             Ok(IdeWorkerCommand::DuplicateAudioClip {
@@ -22971,6 +23244,19 @@ mod tests {
             }) if clip_id == "clip-a" && name == "Range clip"
         ));
         assert!(audio_clip_source_range_duplication_command("clip-a", "", 420, 650).is_err());
+        assert!(matches!(
+            audio_clip_source_range_placement_command("clip-a", " Range clip ", 420, 650, 1_920),
+            Ok(IdeWorkerCommand::CreateAndPlaceAudioClipFromSourceRange {
+                clip_id,
+                name,
+                source_range: IdeAudioClipSourceRange {
+                    source_start_frame: 420,
+                    source_frame_count: 650,
+                },
+                start_tick: 1_920,
+            }) if clip_id == "clip-a" && name == "Range clip"
+        ));
+        assert!(audio_clip_source_range_placement_command("clip-a", "", 420, 650, 0).is_err());
 
         let clip = IdeAudioClip::for_ui_test("clip-a", "Clip A", 100, 1_280);
         assert!(validate_audio_clip_source_range_duplication(&clip, 100, 1_280).is_ok());
@@ -22996,6 +23282,13 @@ mod tests {
             ),
             AppMode::Running
         );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::DuplicatingClip,
+                IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange,
+            ),
+            AppMode::Running
+        );
     }
 
     #[test]
@@ -23004,6 +23297,13 @@ mod tests {
             mode_after_successful_submission(
                 AppMode::Running,
                 IdeWorkerCommandKind::DuplicateAudioClip,
+            ),
+            AppMode::DuplicatingClip
+        );
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange,
             ),
             AppMode::DuplicatingClip
         );

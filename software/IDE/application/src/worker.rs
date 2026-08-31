@@ -6,6 +6,8 @@ use std::sync::mpsc::{
     Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
 use std::sync::{Arc, OnceLock};
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -97,6 +99,16 @@ const MIXER_SAVE_COMMIT_TIMEOUT: Duration = Duration::from_millis(50);
 const MIXER_RECOVERY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 pub const MAX_IDE_WORKER_COMMANDS: usize = 64;
 pub const MAX_IDE_WORKER_EVENTS: usize = 64;
+
+#[cfg(test)]
+static NATIVE_OUTPUT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+fn acquire_native_output_test_lock() -> MutexGuard<'static, ()> {
+    NATIVE_OUTPUT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Debug, Default)]
 pub struct IdeWorkerShutdownReport {
@@ -200,6 +212,7 @@ pub enum IdeWorkerCommandKind {
     CreateAudioClipFromTake,
     CreateAndPlaceAudioClipFromTake,
     DuplicateAudioClip,
+    CreateAndPlaceAudioClipFromSourceRange,
     RemoveAudioClip,
     CleanUnusedSamples,
     DiscardRecordingTake,
@@ -396,6 +409,12 @@ pub enum IdeWorkerCommand {
         clip_id: String,
         name: String,
         source_range: Option<IdeAudioClipSourceRange>,
+    },
+    CreateAndPlaceAudioClipFromSourceRange {
+        clip_id: String,
+        name: String,
+        source_range: IdeAudioClipSourceRange,
+        start_tick: u64,
     },
     RemoveAudioClip {
         clip_id: String,
@@ -671,6 +690,9 @@ impl IdeWorkerCommand {
                 IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake
             }
             Self::DuplicateAudioClip { .. } => IdeWorkerCommandKind::DuplicateAudioClip,
+            Self::CreateAndPlaceAudioClipFromSourceRange { .. } => {
+                IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange
+            }
             Self::RemoveAudioClip { .. } => IdeWorkerCommandKind::RemoveAudioClip,
             Self::CleanUnusedSamples { .. } => IdeWorkerCommandKind::CleanUnusedSamples,
             Self::DiscardRecordingTake { .. } => IdeWorkerCommandKind::DiscardRecordingTake,
@@ -3132,6 +3154,11 @@ pub enum IdeWorkerEvent {
         revision: u64,
         clip_id: String,
     },
+    AudioClipCreatedAndPlacedFromSourceRange {
+        revision: u64,
+        clip_id: String,
+        start_tick: u64,
+    },
     AudioClipDuplicated {
         revision: u64,
         clip_id: String,
@@ -3169,6 +3196,10 @@ pub enum IdeWorkerEvent {
     },
     AudioClipDuplicationCommittedWithWarning {
         name: String,
+        warning: Box<IdeAudioClipDuplicationError>,
+    },
+    AudioClipSourceRangePlacementCommittedWithWarning {
+        start_tick: u64,
         warning: Box<IdeAudioClipDuplicationError>,
     },
     AudioClipEditCommittedWithWarning {
@@ -3490,6 +3521,7 @@ pub enum IdeWorkerEvent {
     },
     AudioClipCreatingFromTake,
     AudioClipCreatingAndPlacingFromTake,
+    AudioClipCreatingAndPlacingFromSourceRange,
     AudioClipDuplicating,
     AudioClipRemoving,
     ArrangementPlacementAdding {
@@ -3714,6 +3746,8 @@ pub struct DesktopIdeWorker {
     completion: Receiver<()>,
     handle: Option<JoinHandle<IdeWorkerShutdownReport>>,
     permit: Option<ThreadPermit<IdeWorkerShutdownReport>>,
+    #[cfg(test)]
+    native_output_test_lock: Mutex<Option<MutexGuard<'static, ()>>>,
 }
 
 impl fmt::Debug for DesktopIdeWorker {
@@ -3812,7 +3846,41 @@ impl DesktopIdeWorker {
             completion: completion_receiver,
             handle: Some(handle),
             permit: Some(permit),
+            #[cfg(test)]
+            native_output_test_lock: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    fn reserve_native_output_test_lock(&self, command: &IdeWorkerCommand) -> bool {
+        if !matches!(
+            command,
+            IdeWorkerCommand::CreateProject { .. }
+                | IdeWorkerCommand::OpenProject(_)
+                | IdeWorkerCommand::OpenRecentProject(_)
+                | IdeWorkerCommand::RestoreMixerRecovery
+                | IdeWorkerCommand::DiscardMixerRecovery
+                | IdeWorkerCommand::StartOutputTest
+        ) {
+            return false;
+        }
+        let mut retained = self
+            .native_output_test_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if retained.is_some() {
+            return false;
+        }
+        *retained = Some(acquire_native_output_test_lock());
+        true
+    }
+
+    #[cfg(test)]
+    fn release_native_output_test_lock(&self) {
+        self.native_output_test_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     /// Enqueues one UI command without blocking its event loop.
@@ -3821,14 +3889,22 @@ impl DesktopIdeWorker {
     ///
     /// Returns the unchanged command when the bounded queue is full or closed.
     pub fn try_send(&self, command: IdeWorkerCommand) -> Result<(), IdeWorkerSendError> {
-        self.commands
+        #[cfg(test)]
+        let reserved_native_output_test_lock = self.reserve_native_output_test_lock(&command);
+        let result = self
+            .commands
             .try_send(command)
             .map_err(|source| match source {
                 TrySendError::Full(command) => IdeWorkerSendError::Full(Box::new(command)),
                 TrySendError::Disconnected(command) => {
                     IdeWorkerSendError::Disconnected(Box::new(command))
                 }
-            })
+            });
+        #[cfg(test)]
+        if result.is_err() && reserved_native_output_test_lock {
+            self.release_native_output_test_lock();
+        }
+        result
     }
 
     /// Reads one worker event without blocking the UI event loop.
@@ -4544,6 +4620,12 @@ enum ProjectMutation {
         name: String,
         source_range: Option<IdeAudioClipSourceRange>,
     },
+    CreateAndPlaceAudioClipFromSourceRange {
+        clip_id: String,
+        name: String,
+        source_range: IdeAudioClipSourceRange,
+        start_tick: u64,
+    },
     RemoveAudioClip {
         clip_id: String,
     },
@@ -4760,6 +4842,9 @@ impl ProjectMutation {
                 IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake
             }
             Self::DuplicateAudioClip { .. } => IdeWorkerCommandKind::DuplicateAudioClip,
+            Self::CreateAndPlaceAudioClipFromSourceRange { .. } => {
+                IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange
+            }
             Self::RemoveAudioClip { .. } => IdeWorkerCommandKind::RemoveAudioClip,
             Self::CleanUnusedSamples { .. } => IdeWorkerCommandKind::CleanUnusedSamples,
             Self::DiscardRecordingTake { .. } => IdeWorkerCommandKind::DiscardRecordingTake,
@@ -4867,6 +4952,9 @@ impl ProjectMutation {
                 IdeWorkerEvent::AudioClipCreatingAndPlacingFromTake
             }
             Self::DuplicateAudioClip { .. } => IdeWorkerEvent::AudioClipDuplicating,
+            Self::CreateAndPlaceAudioClipFromSourceRange { .. } => {
+                IdeWorkerEvent::AudioClipCreatingAndPlacingFromSourceRange
+            }
             Self::RemoveAudioClip { .. } => IdeWorkerEvent::AudioClipRemoving,
             Self::CleanUnusedSamples { confirmation } => {
                 IdeWorkerEvent::UnusedSampleCleanupStarting {
@@ -5231,6 +5319,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::CreateAudioClipFromTake
         | IdeWorkerCommandKind::CreateAndPlaceAudioClipFromTake
         | IdeWorkerCommandKind::DuplicateAudioClip
+        | IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange
         | IdeWorkerCommandKind::RemoveAudioClip
         | IdeWorkerCommandKind::CleanUnusedSamples
         | IdeWorkerCommandKind::DiscardRecordingTake
@@ -5596,6 +5685,7 @@ fn process_command(
         | IdeWorkerCommand::CreateAudioClipFromTake { .. }
         | IdeWorkerCommand::CreateAndPlaceAudioClipFromTake { .. }
         | IdeWorkerCommand::DuplicateAudioClip { .. }
+        | IdeWorkerCommand::CreateAndPlaceAudioClipFromSourceRange { .. }
         | IdeWorkerCommand::RemoveAudioClip { .. }
         | IdeWorkerCommand::CleanUnusedSamples { .. }
         | IdeWorkerCommand::DiscardRecordingTake { .. }
@@ -5885,6 +5975,19 @@ fn process_project_mutation_command(
             name,
             source_range,
         } => duplicate_audio_clip(state, events, &clip_id, &name, source_range),
+        IdeWorkerCommand::CreateAndPlaceAudioClipFromSourceRange {
+            clip_id,
+            name,
+            source_range,
+            start_tick,
+        } => create_and_place_audio_clip_from_source_range(
+            state,
+            events,
+            &clip_id,
+            &name,
+            source_range,
+            start_tick,
+        ),
         IdeWorkerCommand::RemoveAudioClip { clip_id } => remove_audio_clip(state, events, &clip_id),
         IdeWorkerCommand::CleanUnusedSamples { confirmation } => begin_project_mutation_request(
             state,
@@ -9132,6 +9235,60 @@ fn duplicate_audio_clip(
     )
 }
 
+fn create_and_place_audio_clip_from_source_range(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    clip_id: &str,
+    name: &str,
+    source_range: IdeAudioClipSourceRange,
+    start_tick: u64,
+) -> bool {
+    let name = name.trim();
+    if clip_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange,
+            IdeWorkerCommandFailure::AudioClipDuplication(Box::new(
+                IdeAudioClipDuplicationError::InvalidSourceClipIdentity,
+            )),
+        );
+    }
+    if name.is_empty() || name.chars().count() > 120 {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange,
+            IdeWorkerCommandFailure::AudioClipDuplication(Box::new(
+                IdeAudioClipDuplicationError::InvalidClipName,
+            )),
+        );
+    }
+    let mut owned_clip_id = String::new();
+    let mut normalized_name = String::new();
+    if owned_clip_id.try_reserve_exact(clip_id.len()).is_err()
+        || normalized_name.try_reserve_exact(name.len()).is_err()
+    {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange,
+            IdeWorkerCommandFailure::AudioClipDuplication(Box::new(
+                IdeAudioClipDuplicationError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_clip_id.push_str(clip_id);
+    normalized_name.push_str(name);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::CreateAndPlaceAudioClipFromSourceRange {
+            clip_id: owned_clip_id,
+            name: normalized_name,
+            source_range,
+            start_tick,
+        },
+    )
+}
+
 fn remove_audio_clip(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -10447,6 +10604,9 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::CreateAudioClipFromTake(Ok(_))
         | ProjectMutationAttempt::CreateAndPlaceAudioClipFromTake(Ok(_))
         | ProjectMutationAttempt::DuplicateAudioClip { result: Ok(_), .. }
+        | ProjectMutationAttempt::CreateAndPlaceAudioClipFromSourceRange {
+            result: Ok(_), ..
+        }
         | ProjectMutationAttempt::RemoveAudioClip(Ok(_))
         | ProjectMutationAttempt::RemoveScene { result: Ok(_), .. }
         | ProjectMutationAttempt::CleanUnusedSamples(Ok(_))
@@ -10481,6 +10641,14 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         {
             HistoryEffect::Invalidate
         }
+        ProjectMutationAttempt::DuplicateAudioClip {
+            result: Err(reason),
+            ..
+        }
+        | ProjectMutationAttempt::CreateAndPlaceAudioClipFromSourceRange {
+            result: Err(reason),
+            ..
+        } if reason.committed_clip_id().is_some() => HistoryEffect::Invalidate,
         ProjectMutationAttempt::RemoveAudioTrackContent(Err(reason))
             if reason.publication_committed() =>
         {
@@ -10526,6 +10694,9 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::RemoveArrangementPlacement(Err(_))
         | ProjectMutationAttempt::SetAudioTrackActive { result: Err(_), .. }
         | ProjectMutationAttempt::DuplicateAudioClip { result: Err(_), .. }
+        | ProjectMutationAttempt::CreateAndPlaceAudioClipFromSourceRange {
+            result: Err(_), ..
+        }
         | ProjectMutationAttempt::RemoveAudioClip(Err(_))
         | ProjectMutationAttempt::CleanUnusedSamples(Err(_))
         | ProjectMutationAttempt::DiscardRecordingTake(Err(_))
@@ -11391,7 +11562,8 @@ fn project_mutation_save_failure(
                 IdeRecordingClipCreationError::MixerSave(Box::new(reason)),
             ))
         }
-        ProjectMutation::DuplicateAudioClip { .. } => {
+        ProjectMutation::DuplicateAudioClip { .. }
+        | ProjectMutation::CreateAndPlaceAudioClipFromSourceRange { .. } => {
             IdeWorkerCommandFailure::AudioClipDuplication(Box::new(
                 IdeAudioClipDuplicationError::MixerSave(Box::new(reason)),
             ))
@@ -11733,7 +11905,8 @@ fn project_mutation_native_close_failure(
                 IdeRecordingClipCreationError::NativeClose(failure),
             ))
         }
-        ProjectMutation::DuplicateAudioClip { .. } => {
+        ProjectMutation::DuplicateAudioClip { .. }
+        | ProjectMutation::CreateAndPlaceAudioClipFromSourceRange { .. } => {
             IdeWorkerCommandFailure::AudioClipDuplication(Box::new(
                 IdeAudioClipDuplicationError::NativeClose(failure),
             ))
@@ -12078,6 +12251,11 @@ enum ProjectMutationAttempt {
     ),
     DuplicateAudioClip {
         name: String,
+        result:
+            Result<hyper_storage_engine::AudioClipPublicationOutcome, IdeAudioClipDuplicationError>,
+    },
+    CreateAndPlaceAudioClipFromSourceRange {
+        start_tick: u64,
         result:
             Result<hyper_storage_engine::AudioClipPublicationOutcome, IdeAudioClipDuplicationError>,
     },
@@ -13088,6 +13266,35 @@ fn complete_project_mutation(
                 } => publish_failure(
                     events,
                     IdeWorkerCommandKind::DuplicateAudioClip,
+                    IdeWorkerCommandFailure::AudioClipDuplication(Box::new(reason)),
+                ),
+                ProjectMutationAttempt::CreateAndPlaceAudioClipFromSourceRange {
+                    start_tick,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::AudioClipCreatedAndPlacedFromSourceRange {
+                        revision: outcome.project_revision(),
+                        clip_id: outcome.clip_id().to_owned(),
+                        start_tick,
+                    },
+                ),
+                ProjectMutationAttempt::CreateAndPlaceAudioClipFromSourceRange {
+                    start_tick,
+                    result: Err(reason),
+                } if reason.committed_clip_id().is_some() => send_event(
+                    events,
+                    IdeWorkerEvent::AudioClipSourceRangePlacementCommittedWithWarning {
+                        start_tick,
+                        warning: Box::new(reason),
+                    },
+                ),
+                ProjectMutationAttempt::CreateAndPlaceAudioClipFromSourceRange {
+                    result: Err(reason),
+                    ..
+                } => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange,
                     IdeWorkerCommandFailure::AudioClipDuplication(Box::new(reason)),
                 ),
                 ProjectMutationAttempt::RemoveAudioClip(Ok(outcome)) => send_event(
@@ -14633,6 +14840,27 @@ fn attempt_project_mutation(
                 .and_then(publish_audio_clip_duplication_plan)
             },
         },
+        ProjectMutation::CreateAndPlaceAudioClipFromSourceRange {
+            clip_id,
+            name,
+            source_range,
+            start_tick,
+        } => ProjectMutationAttempt::CreateAndPlaceAudioClipFromSourceRange {
+            start_tick,
+            result: if let Some(failure) = native_failure {
+                Err(IdeAudioClipDuplicationError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_audio_clip_source_range_placement(
+                    application,
+                    recovery,
+                    &clip_id,
+                    &name,
+                    source_range,
+                    start_tick,
+                )
+                .and_then(publish_audio_clip_source_range_placement_plan)
+            },
+        },
         ProjectMutation::RemoveAudioClip { clip_id } => {
             ProjectMutationAttempt::RemoveAudioClip(if let Some(failure) = native_failure {
                 Err(IdeAudioClipRemovalError::NativeClose(failure))
@@ -15365,6 +15593,18 @@ fn publish_audio_clip_duplication_plan(
         Ok(outcome) => Ok(outcome),
         Err(source) => Err(IdeAudioClipDuplicationError::Publication {
             clip_id: plan.clip_id,
+            source: Box::new(source),
+        }),
+    }
+}
+
+fn publish_audio_clip_source_range_placement_plan(
+    plan: super::IdeAudioClipPlacementPlan,
+) -> Result<hyper_storage_engine::AudioClipPublicationOutcome, IdeAudioClipDuplicationError> {
+    match plan.publish() {
+        Ok(outcome) => Ok(outcome),
+        Err(source) => Err(IdeAudioClipDuplicationError::Publication {
+            clip_id: plan.clip.clip_id,
             source: Box::new(source),
         }),
     }
@@ -16430,7 +16670,8 @@ fn project_mutation_reopen_failure(
         | ProjectMutationAttempt::CreateAndPlaceAudioClipFromTake(result) => {
             recording_clip_creation_reopen_failure(result, reopen)
         }
-        ProjectMutationAttempt::DuplicateAudioClip { result, .. } => {
+        ProjectMutationAttempt::DuplicateAudioClip { result, .. }
+        | ProjectMutationAttempt::CreateAndPlaceAudioClipFromSourceRange { result, .. } => {
             audio_clip_duplication_reopen_failure(result, reopen)
         }
         ProjectMutationAttempt::RemoveAudioClip(Ok(outcome)) => {
@@ -24877,6 +25118,7 @@ mod tests {
 
     #[test]
     fn completed_audio_import_closes_before_reporting_a_forced_reopen_failure() {
+        let _native_output_test_lock = acquire_native_output_test_lock();
         let fixture = std::env::temp_dir().join(format!(
             "hyper-desktop-ide-audio-import-reopen-{}",
             uuid::Uuid::new_v4()
@@ -24949,6 +25191,7 @@ mod tests {
 
     #[test]
     fn partial_audio_import_closes_before_reporting_both_failures() {
+        let _native_output_test_lock = acquire_native_output_test_lock();
         let fixture = std::env::temp_dir().join(format!(
             "hyper-desktop-ide-audio-import-partial-reopen-{}",
             uuid::Uuid::new_v4()
@@ -30632,6 +30875,90 @@ mod tests {
     }
 
     #[test]
+    fn audio_clip_source_range_placement_validates_input_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 3, 6).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::CreateAndPlaceAudioClipFromSourceRange {
+                clip_id: String::new(),
+                name: "Selected range".to_owned(),
+                source_range: IdeAudioClipSourceRange {
+                    source_start_frame: 25,
+                    source_frame_count: 50,
+                },
+                start_tick: 4,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange,
+                reason: IdeWorkerCommandFailure::AudioClipDuplication(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipDuplicationError::InvalidSourceClipIdentity)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::CreateAndPlaceAudioClipFromSourceRange {
+                clip_id: "018f47a2-6b2d-7c11-8a44-001122334460".to_owned(),
+                name: "   ".to_owned(),
+                source_range: IdeAudioClipSourceRange {
+                    source_start_frame: 25,
+                    source_frame_count: 50,
+                },
+                start_tick: 4,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange,
+                reason: IdeWorkerCommandFailure::AudioClipDuplication(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipDuplicationError::InvalidClipName)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::CreateAndPlaceAudioClipFromSourceRange {
+                clip_id: "018f47a2-6b2d-7c11-8a44-001122334460".to_owned(),
+                name: " Selected range ".to_owned(),
+                source_range: IdeAudioClipSourceRange {
+                    source_start_frame: 25,
+                    source_frame_count: 50,
+                },
+                start_tick: 4,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioClipCreatingAndPlacingFromSourceRange
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CreateAndPlaceAudioClipFromSourceRange,
+                reason: IdeWorkerCommandFailure::AudioClipDuplication(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipDuplicationError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
     fn audio_clip_removal_validates_identity_and_waits_for_the_mixer_fence() {
         let running = RunningDesktopIdeApplication {
             application: closed_application(),
@@ -31472,6 +31799,195 @@ mod tests {
                 ..
             }
         ));
+
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker sequence proves a selected source range becomes one new reusable clip and one exact arrangement placement through one durable reopen"
+    )]
+    fn selected_source_range_creation_and_placement_is_durable_through_the_real_worker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-source-range-placement-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project_path = created.project().root().to_path_buf();
+        drop(created);
+        let source = fixture.join("Source.wav");
+        std::fs::write(&source, mono_pcm16_wav(48_000, &[0; 100])).unwrap();
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 8)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project_path.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv_native_mutation(&worker) else {
+            panic!("the verified project must open before creating a selected range clip");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: vec![source],
+                track_id,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioImporting { files: 1 }
+        ));
+        let IdeWorkerEvent::Running(imported) = recv_native_mutation(&worker) else {
+            panic!("the imported source clip must reopen before range selection");
+        };
+        let source_clip = imported
+            .audio_clips()
+            .first()
+            .expect("the imported source clip must be observable");
+        let source_clip_id = source_clip.id().to_owned();
+        assert_eq!(source_clip.source_start_frame(), 0);
+        assert_eq!(source_clip.source_frame_count(), 100);
+        assert_eq!(source_clip.duration_ticks(), 8);
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioImported(outcome) if outcome.imported() == 1
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetAudioClipLoop {
+                clip_id: source_clip_id.clone(),
+                enabled: false,
+                start_tick: 0,
+                end_tick: 4,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioClipLoopChanging {
+                enabled: false,
+                start_tick: 0,
+                end_tick: 4,
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("clip loop"),
+                redo_label: None,
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::Running(_)
+        ));
+        let IdeWorkerEvent::AudioClipLoopChanged {
+            revision: revision_after_loop,
+            changed: true,
+            enabled: false,
+            start_tick: 0,
+            end_tick: 4,
+        } = recv_native_mutation(&worker)
+        else {
+            panic!("the source loop must be durably reduced before selecting its range");
+        };
+
+        worker
+            .try_send(IdeWorkerCommand::CreateAndPlaceAudioClipFromSourceRange {
+                clip_id: source_clip_id.clone(),
+                name: "Selected range".to_owned(),
+                source_range: IdeAudioClipSourceRange {
+                    source_start_frame: 25,
+                    source_frame_count: 50,
+                },
+                start_tick: 4,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioClipCreatingAndPlacingFromSourceRange
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(placed) = recv_native_mutation(&worker) else {
+            panic!("the compound source-range placement must reopen the committed project");
+        };
+        let source_clip = placed
+            .audio_clips()
+            .iter()
+            .find(|clip| clip.id() == source_clip_id)
+            .expect("the original source clip must remain present");
+        assert_eq!(source_clip.source_start_frame(), 0);
+        assert_eq!(source_clip.source_frame_count(), 100);
+        let derived_index = placed
+            .audio_clips()
+            .iter()
+            .position(|clip| clip.id() != source_clip_id && clip.name() == "Selected range")
+            .expect("the derived range clip must be present in the reopened project");
+        let derived = &placed.audio_clips()[derived_index];
+        let derived_clip_id = derived.id().to_owned();
+        assert_eq!(derived.source_start_frame(), 25);
+        assert_eq!(derived.source_frame_count(), 50);
+        assert_eq!(derived.duration_ticks(), 4);
+        let placements = placed.arrangement().placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].clip_index(), derived_index);
+        assert_eq!(placements[0].start_tick(), 4);
+        assert_eq!(placements[0].clip_start_tick(), 0);
+        assert_eq!(placements[0].duration_ticks(), 4);
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioClipCreatedAndPlacedFromSourceRange {
+                revision,
+                clip_id,
+                start_tick: 4,
+            } if revision == revision_after_loop + 1 && clip_id == derived_clip_id
+        ));
+
+        let reopened = hyper_project_loader::prepare_project_playback(
+            &project_path,
+            audio_import_application().config.project_limits,
+        )
+        .unwrap();
+        let (project, _, _, _) = reopened.session().parts();
+        assert_eq!(project.clip_count(), 2);
+        assert_eq!(project.placement_count(), 1);
+        assert_eq!(project.clip_id_at(0), Some(source_clip_id.as_str()));
+        assert_eq!(project.clip_id_at(1), Some(derived_clip_id.as_str()));
+        assert_eq!(project.clip_source_start_frame_at(0), Some(0));
+        assert_eq!(project.clip_source_frame_count_at(0), Some(100));
+        assert_eq!(project.clip_source_start_frame_at(1), Some(25));
+        assert_eq!(project.clip_source_frame_count_at(1), Some(50));
+        assert_eq!(project.clip_duration_ticks_at(1), Some(4));
+        let placement = &reopened.session().arrangement().placements()[0];
+        assert_eq!(placement.clip_index(), 1);
+        assert_eq!(placement.start_tick(), 4);
+        assert_eq!(placement.clip_start_tick(), 0);
+        assert_eq!(placement.duration_ticks(), 4);
+        drop(reopened);
 
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
