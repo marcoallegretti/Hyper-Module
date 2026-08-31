@@ -6621,6 +6621,7 @@ fn apply_event(
             project_state,
             &observation,
         ),
+        IdeWorkerEvent::NativeOutputFailed => apply_output_failure_observation(ui),
         IdeWorkerEvent::OutputPeakHoldReset(observation) => {
             apply_final_output_meter_observation(ui, &observation);
             ui.set_output_peak_hold_reset_pending(false);
@@ -7221,14 +7222,37 @@ fn apply_event(
 
 fn apply_close_discard_required(ui: &MainWindow) {
     ui.set_close_unsaved_mixer_confirming(true);
-    ui.set_status_text("Live mixer changes need a save or explicit discard before closing".into());
-    ui.set_error_text(SharedString::default());
+    if ui.get_app_mode() == AppMode::OutputFailed {
+        ui.set_status_text(
+            "Native audio output ended unexpectedly; live mixer changes need an explicit discard before closing"
+                .into(),
+        );
+        ui.set_error_text(
+            "Audio controls and project editing are locked. Close the project before reopening it."
+                .into(),
+        );
+    } else {
+        ui.set_status_text(
+            "Live mixer changes need a save or explicit discard before closing".into(),
+        );
+        ui.set_error_text(SharedString::default());
+    }
 }
 
 fn apply_close_discard_cancelled(ui: &MainWindow) {
     ui.set_close_unsaved_mixer_confirming(false);
-    ui.set_status_text("Project close canceled; live mixer changes remain active".into());
-    ui.set_error_text(SharedString::default());
+    if ui.get_app_mode() == AppMode::OutputFailed {
+        ui.set_status_text(
+            "Project close canceled; native audio output remains unavailable".into(),
+        );
+        ui.set_error_text(
+            "Audio controls and project editing are locked. Close the project before reopening it."
+                .into(),
+        );
+    } else {
+        ui.set_status_text("Project close canceled; live mixer changes remain active".into());
+        ui.set_error_text(SharedString::default());
+    }
 }
 
 fn apply_recent_projects(
@@ -16907,6 +16931,73 @@ mod tests {
         ui.set_mixer_recovery_available(false);
     }
 
+    fn assert_terminal_output_failure_close_contract(ui: &MainWindow) {
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_project_close_callback_with(
+            ui,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+        let routes = UiRoutes::default();
+        let project_state = Rc::new(ProjectUiState::default());
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_close_unsaved_mixer_confirming(false);
+        ui.set_transport_start_available(true);
+        ui.set_transport_stop_available(true);
+        ui.set_transport_seek_available(true);
+        ui.set_metronome_available(true);
+        ui.global::<IdeActions>().invoke_close_project();
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::CloseProject]
+        ));
+
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::NativeOutputFailed,
+        );
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CloseDiscardRequired,
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::OutputFailed);
+        assert!(ui.get_close_unsaved_mixer_confirming());
+        assert!(!ui.get_transport_start_available());
+        assert!(!ui.get_transport_stop_available());
+        assert!(!ui.get_transport_seek_available());
+        assert!(!ui.get_metronome_available());
+        assert!(ui.get_status_text().contains("output ended unexpectedly"));
+        assert!(ui.get_error_text().contains("locked"));
+
+        ui.global::<IdeActions>().invoke_cancel_close_project();
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [
+                IdeWorkerCommand::CloseProject,
+                IdeWorkerCommand::CancelCloseProject
+            ]
+        ));
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CloseDiscardCancelled,
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::OutputFailed);
+        assert!(!ui.get_close_unsaved_mixer_confirming());
+        assert!(ui.get_status_text().contains("output remains unavailable"));
+        assert!(ui.get_error_text().contains("locked"));
+        assert!(!ui.get_transport_start_available());
+        assert!(!ui.get_transport_stop_available());
+        assert!(!ui.get_transport_seek_available());
+        assert!(!ui.get_metronome_available());
+    }
+
     fn assert_transport_space_shortcut_contract(ui: &MainWindow) {
         let starts = Rc::new(Cell::new(0_usize));
         let starts_by_callback = Rc::clone(&starts);
@@ -23103,6 +23194,7 @@ mod tests {
         assert_audio_track_creation_shortcut_contract(&ui);
         assert_project_close_shortcut_contract(&ui);
         assert_unsaved_mixer_close_contract(&ui);
+        assert_terminal_output_failure_close_contract(&ui);
         assert_transport_space_shortcut_contract(&ui);
         assert_transport_running_observation_contract(&ui);
         assert_terminal_output_failure_event_contract(&ui);

@@ -3015,6 +3015,7 @@ pub enum IdeWorkerEvent {
         input_failure: Option<IdeInputDiscoveryError>,
     },
     Running(IdeRunningObservation),
+    NativeOutputFailed,
     OutputPeakHoldReset(IdeOutputMeterObservation),
     OutputTest(IdeOutputTestSnapshot),
     OutputTestStopping,
@@ -5456,7 +5457,9 @@ fn process_command(
     history: &mut UndoHistory,
     project_history: Option<&ProjectHistory>,
 ) -> bool {
-    transition_running_output_failure(state);
+    if !transition_running_output_failure(state, events) {
+        return false;
+    }
     let kind = command.kind();
     if command_is_blocked_by_output_failure(state, &command) {
         return publish_failure(events, kind, IdeWorkerCommandFailure::NativeOutputFailed);
@@ -5704,15 +5707,19 @@ fn process_command(
     }
 }
 
-fn transition_running_output_failure(state: &mut WorkerState) {
+fn transition_running_output_failure(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
     if !matches!(state, WorkerState::Running(application) if application.output_state() == OutputStreamState::Failed)
     {
-        return;
+        return true;
     }
     let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty) else {
         unreachable!("running state was checked before terminal output failure ownership transfer");
     };
     *state = WorkerState::OutputFailed(application);
+    send_event(events, IdeWorkerEvent::NativeOutputFailed)
 }
 
 fn command_is_blocked_by_output_failure(state: &WorkerState, command: &IdeWorkerCommand) -> bool {
@@ -8251,8 +8258,12 @@ fn cancel_project_close(
     } else {
         WorkerState::Running(application)
     };
-    publish_state(state, events, unpublished_native_failure)
-        && send_event(events, IdeWorkerEvent::CloseDiscardCancelled)
+    if output_failed {
+        send_event(events, IdeWorkerEvent::CloseDiscardCancelled)
+    } else {
+        publish_state(state, events, unpublished_native_failure)
+            && send_event(events, IdeWorkerEvent::CloseDiscardCancelled)
+    }
 }
 
 fn request_project_close(
@@ -17619,8 +17630,7 @@ fn poll_pending_state(
             // A disconnected sender remains observable when capture begins.
             let _inactive_history = application.drain_interactive_mixer_parameter_changes(|_| {});
             *state = WorkerState::Running(application);
-            transition_running_output_failure(state);
-            true
+            transition_running_output_failure(state, events)
         }
         WorkerState::Closing(pending) => match pending.wait(Duration::ZERO) {
             IdePendingCloseWait::Closed {
@@ -28534,7 +28544,43 @@ mod tests {
     }
 
     #[test]
-    fn terminal_output_failure_revokes_commands_until_explicit_discard_close() {
+    fn terminal_output_failure_revokes_nonclose_commands_at_entry() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                output_state: OutputStreamState::Failed,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(4);
+        let mut state = WorkerState::Running(running);
+        let mut history = UndoHistory::default();
+        let mut native = None;
+
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::Transport(TransportCommand::Start),
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::NativeOutputFailed)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Transport,
+                reason: IdeWorkerCommandFailure::NativeOutputFailed,
+            })
+        ));
+        assert!(matches!(state, WorkerState::OutputFailed(_)));
+    }
+
+    #[test]
+    fn terminal_output_failure_close_publishes_failure_before_dirty_discard_prompt() {
         let running = RunningDesktopIdeApplication {
             application: closed_application(),
             session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
@@ -28552,7 +28598,7 @@ mod tests {
 
         assert!(process_command(
             &mut state,
-            IdeWorkerCommand::Transport(TransportCommand::Start),
+            IdeWorkerCommand::CloseProject,
             &events,
             &mut native,
             &mut history,
@@ -28560,20 +28606,7 @@ mod tests {
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(IdeWorkerEvent::CommandFailed {
-                command: IdeWorkerCommandKind::Transport,
-                reason: IdeWorkerCommandFailure::NativeOutputFailed,
-            })
-        ));
-        assert!(matches!(state, WorkerState::OutputFailed(_)));
-
-        assert!(process_command(
-            &mut state,
-            IdeWorkerCommand::CloseProject,
-            &events,
-            &mut native,
-            &mut history,
-            None,
+            Ok(IdeWorkerEvent::NativeOutputFailed)
         ));
         assert!(matches!(
             state,
@@ -28588,6 +28621,33 @@ mod tests {
         ));
         assert_eq!(history.undo.len(), 1);
 
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::CancelCloseProject,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(state, WorkerState::OutputFailed(_)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CloseDiscardCancelled)
+        ));
+        assert_eq!(history.undo.len(), 1);
+
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::CloseProject,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CloseDiscardRequired)
+        ));
         assert!(process_command(
             &mut state,
             IdeWorkerCommand::DiscardCloseProject,
@@ -28608,6 +28668,46 @@ mod tests {
         assert!(matches!(
             receiver.try_recv(),
             Ok(IdeWorkerEvent::Closed { .. })
+        ));
+    }
+
+    #[test]
+    fn terminal_output_failure_treats_an_indeterminate_mixer_as_discard_protected() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                output_state: OutputStreamState::Failed,
+                close_requires_discard: None,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(4);
+        let mut state = WorkerState::Running(running);
+        let mut history = UndoHistory::default();
+        let mut native = None;
+
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::CloseProject,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(
+            state,
+            WorkerState::AwaitingCloseDiscard {
+                output_failed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::NativeOutputFailed)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CloseDiscardRequired)
         ));
     }
 
@@ -28635,6 +28735,10 @@ mod tests {
             None,
         ));
         assert!(matches!(state, WorkerState::OutputFailed(_)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::NativeOutputFailed)
+        ));
         assert!(process_command(
             &mut state,
             IdeWorkerCommand::CloseProject,
