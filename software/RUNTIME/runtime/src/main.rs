@@ -1430,9 +1430,11 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_metronome_toggle(&ui, &commands_tx, &diagnostic, &metronome_authority);
     wire_operator_metronome_level(&ui, &commands_tx, &diagnostic, &metronome_authority);
 
+    let output_state = observers.output_status.state();
     apply_operator_cycle_observation(
         &ui,
         &observers,
+        output_state,
         &diagnostic,
         &transport_authority,
         &loop_authority,
@@ -1499,9 +1501,11 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer = Timer::default();
     timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
         if let Some(ui) = weak.upgrade() {
+            let output_state = timer_observers.output_status.state();
             apply_operator_cycle_observation(
                 &ui,
                 &timer_observers,
+                output_state,
                 &timer_diagnostic,
                 &timer_transport_authority,
                 &timer_loop_authority,
@@ -1515,8 +1519,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &timer_scene_stop_authority,
                 completion_observed,
             );
-            let terminal_latched = completion_observed
-                || timer_observers.output_status.state() == OutputStreamState::Failed;
+            let terminal_latched = completion_observed || output_state == OutputStreamState::Failed;
             apply_operator_meter_observation(
                 &ui,
                 &mut timer_meter_observer.borrow_mut(),
@@ -3831,6 +3834,7 @@ fn operator_seek_percent(position_frame: usize, end_frame: usize) -> f32 {
 fn apply_operator_cycle_observation(
     ui: &OperatorWindow,
     observers: &RuntimeObservers,
+    output_state: OutputStreamState,
     diagnostic: &Mutex<String>,
     transport_authority: &Cell<Option<PlaybackRecoveryTransportState>>,
     loop_authority: &Cell<Option<OperatorLoopAuthority>>,
@@ -3856,8 +3860,8 @@ fn apply_operator_cycle_observation(
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
         return;
     }
-    let observation = apply_observations(ui, observers, diagnostic);
-    if observers.output_status.state() == OutputStreamState::Failed {
+    let observation = apply_observations(ui, observers, output_state, diagnostic);
+    if output_state == OutputStreamState::Failed {
         revoke_operator_transport_authority(ui, transport_authority);
         revoke_operator_loop_authority(ui, loop_authority);
         revoke_operator_metronome_authority(ui, metronome_authority);
@@ -4310,10 +4314,11 @@ fn format_transport_time(frame: u64) -> String {
 fn apply_observations(
     ui: &OperatorWindow,
     observers: &RuntimeObservers,
+    output_state: OutputStreamState,
     diagnostic: &Mutex<String>,
 ) -> PlaybackCycleObservation {
     let cycle = observers.recovery.observe_cycle();
-    let stream_state = observers.output_status.state();
+    let stream_state = output_state;
     let counters = observers.output_counters.snapshot();
     if stream_state == OutputStreamState::Failed {
         set_diagnostic(
@@ -5320,7 +5325,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_runtime_observation_revokes_timeline_marker_navigation() {
+    fn terminal_and_failed_runtime_observations_revoke_timeline_marker_navigation() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = OperatorWindow::new().unwrap();
         let timeline = test_musical_timeline();
@@ -5358,25 +5363,31 @@ mod tests {
         let scene_launch_authority = Rc::new(Cell::new(false));
         let scene_selection = Rc::new(Cell::new(None));
         let scene_stop_authority = Rc::new(Cell::new(false));
-        let diagnostic = Mutex::new(String::new());
+        let diagnostic = Arc::new(Mutex::new(String::new()));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
 
         ui.set_timeline_markers(ModelRc::from(Rc::clone(&marker_model)));
-        apply_operator_cycle_observation(
-            &ui,
-            &observers,
-            &diagnostic,
-            &transport_authority,
-            &loop_authority,
-            &metronome_authority,
-            &seek_authority,
-            &marker_model,
-            &marker_authority,
-            &scene_model,
-            &scene_launch_authority,
-            &scene_selection,
-            &scene_stop_authority,
-            false,
-        );
+        wire_operator_timeline_marker_navigation(&ui, &sender, &diagnostic, &marker_authority);
+        let apply = |output_state, terminal_latched| {
+            apply_operator_cycle_observation(
+                &ui,
+                &observers,
+                output_state,
+                &diagnostic,
+                &transport_authority,
+                &loop_authority,
+                &metronome_authority,
+                &seek_authority,
+                &marker_model,
+                &marker_authority,
+                &scene_model,
+                &scene_launch_authority,
+                &scene_selection,
+                &scene_stop_authority,
+                terminal_latched,
+            );
+        };
+        apply(observers.output_status.state(), false);
         assert!(marker_authority.borrow().is_some());
         assert!(marker_model.row_data(0).unwrap().controls_enabled);
         assert!(!ui.get_transport_seek_enabled());
@@ -5385,28 +5396,33 @@ mod tests {
             "Locate preserves the recovered transport state"
         );
 
-        apply_operator_cycle_observation(
-            &ui,
-            &observers,
-            &diagnostic,
-            &transport_authority,
-            &loop_authority,
-            &metronome_authority,
-            &seek_authority,
-            &marker_model,
-            &marker_authority,
-            &scene_model,
-            &scene_launch_authority,
-            &scene_selection,
-            &scene_stop_authority,
-            true,
-        );
+        apply(observers.output_status.state(), true);
 
         assert!(marker_authority.borrow().is_none());
         assert!(!marker_model.row_data(0).unwrap().controls_enabled);
         assert_eq!(
             ui.get_timeline_marker_navigation_state().as_str(),
             "Runtime stopped · marker navigation unavailable"
+        );
+
+        apply_operator_timeline_marker_observation(&ui, &marker_model, &marker_authority, &markers);
+        assert!(marker_authority.borrow().is_some());
+        assert!(marker_model.row_data(0).unwrap().controls_enabled);
+
+        apply(OutputStreamState::Failed, false);
+
+        assert!(marker_authority.borrow().is_none());
+        assert!(!marker_model.row_data(0).unwrap().controls_enabled);
+        assert_eq!(ui.get_stream_state().as_str(), "Failed");
+        assert_eq!(
+            ui.get_diagnostic().as_str(),
+            "native audio ownership ended unexpectedly"
+        );
+        ui.invoke_locate_timeline_marker_requested("marker-intro".into());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "timeline marker locate refused: verified marker navigation is unavailable"
         );
     }
 
@@ -7942,7 +7958,12 @@ mod tests {
             recovery: recovery.clone(),
             panel_connected: Arc::new(AtomicBool::new(false)),
         };
-        let _ = apply_observations(ui, &seek_observers, &seek_diagnostic);
+        let _ = apply_observations(
+            ui,
+            &seek_observers,
+            seek_observers.output_status.state(),
+            &seek_diagnostic,
+        );
         assert_eq!(ui.get_transport_frame().as_str(), "855");
         assert_eq!(ui.get_transport_musical_position().as_str(), "1|1|034");
         let committed_frame = ui.get_transport_frame();
@@ -8042,7 +8063,12 @@ mod tests {
             panel_connected: Arc::new(AtomicBool::new(false)),
         };
         apply_static_facts(&ui, &facts);
-        let observation = apply_observations(&ui, &observers, &diagnostic);
+        let observation = apply_observations(
+            &ui,
+            &observers,
+            observers.output_status.state(),
+            &diagnostic,
+        );
         apply_operator_transport_observation(&ui, &transport_authority, observation.state());
         assert_eq!(ui.get_transport_musical_position().as_str(), "1|1|000");
         assert_eq!(
@@ -8307,6 +8333,7 @@ mod tests {
         apply_operator_cycle_observation(
             &ui,
             &terminal_observers,
+            terminal_observers.output_status.state(),
             &diagnostic,
             &transport_authority,
             &loop_authority,
@@ -8378,6 +8405,7 @@ mod tests {
         apply_operator_cycle_observation(
             &ui,
             &terminal_observers,
+            terminal_observers.output_status.state(),
             &diagnostic,
             &transport_authority,
             &loop_authority,
