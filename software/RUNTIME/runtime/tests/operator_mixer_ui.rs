@@ -339,6 +339,52 @@ fn generated_scene_selection_uses_keyboard_and_accessible_tiles() {
 }
 
 #[test]
+fn generated_timeline_marker_controls_forward_identity_and_fail_closed() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = OperatorWindow::new().unwrap();
+    let markers = Rc::new(VecModel::from(vec![
+        OperatorTimelineMarkerRow {
+            id: "marker-intro".into(),
+            name: "Intro".into(),
+            tick: "960".into(),
+            musical_position: "1|1|960".into(),
+            available: true,
+            controls_enabled: true,
+        },
+        OperatorTimelineMarkerRow {
+            id: "marker-unavailable".into(),
+            name: "Far away".into(),
+            tick: "18446744073709551615".into(),
+            musical_position: "unavailable".into(),
+            available: false,
+            controls_enabled: false,
+        },
+    ]));
+    ui.set_timeline_markers(ModelRc::from(Rc::clone(&markers)));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let requested = Rc::clone(&requests);
+    ui.on_locate_timeline_marker_requested(move |id| {
+        requested.borrow_mut().push(id.to_string());
+    });
+    ui.show().unwrap();
+
+    let locate = find_control(&ui, "Locate Intro at 1|1|960");
+    let unavailable = find_control(&ui, "Far away is unavailable");
+    assert_eq!(locate.accessible_enabled(), Some(true));
+    assert_eq!(unavailable.accessible_enabled(), Some(false));
+    locate.mock_single_click(PointerEventButton::Left);
+    unavailable.mock_single_click(PointerEventButton::Left);
+    assert_eq!(requests.borrow().as_slice(), ["marker-intro"]);
+
+    let mut row = markers.row_data(0).unwrap();
+    row.controls_enabled = false;
+    markers.set_row_data(0, row);
+    assert_eq!(locate.accessible_enabled(), Some(false));
+    locate.mock_single_click(PointerEventButton::Left);
+    assert_eq!(requests.borrow().as_slice(), ["marker-intro"]);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "one generated-window contract keeps actual control mapping and capability evidence together"

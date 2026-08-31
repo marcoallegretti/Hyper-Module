@@ -40,7 +40,7 @@ use hyper_native_device::{
 };
 use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_compiler::{FrameTimeline, MeterEvent, TempoEvent, musical_position};
-use hyper_playback_json::LoaderLimits;
+use hyper_playback_json::{LoadedTimelineMarker, LoaderLimits};
 use hyper_playback_session::{PlaybackExtent, PlaybackSessionAssemblyLimits};
 use hyper_project_loader::ProjectPlaybackLimits;
 use hyper_runtime_deployment::resolve_runtime_deployment;
@@ -153,6 +153,7 @@ struct RuntimeFacts {
     project_revision: u64,
     playback_extent: PlaybackExtent,
     musical_timeline: RuntimeMusicalTimeline,
+    timeline_markers: Arc<[OperatorTimelineMarker]>,
 }
 
 /// Immutable conversion authority for the Runtime's display-only musical
@@ -184,6 +185,10 @@ impl RuntimeMusicalTimeline {
 
     fn format_position(&self, frame: usize) -> Option<String> {
         let tick = self.frames.position_at_frame(frame).ok()?.whole_tick();
+        self.format_tick(tick)
+    }
+
+    fn format_tick(&self, tick: u64) -> Option<String> {
         let position = musical_position(self.meter_events.as_ref(), tick).ok()?;
         Some(format!(
             "{}|{}|{:03}",
@@ -192,6 +197,19 @@ impl RuntimeMusicalTimeline {
             position.tick()
         ))
     }
+
+    fn tick_to_frame_ceil(&self, tick: u64) -> Option<usize> {
+        self.frames.tick_to_frame_ceil(tick).ok()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperatorTimelineMarker {
+    id: String,
+    name: String,
+    tick: u64,
+    musical_position: Option<String>,
+    frame: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -501,6 +519,40 @@ impl RuntimeOperatorControl for SessionHost {
     }
 }
 
+fn operator_timeline_marker_catalog(
+    markers: &[LoadedTimelineMarker],
+    timeline: &RuntimeMusicalTimeline,
+) -> Result<Vec<OperatorTimelineMarker>, String> {
+    let mut catalog = Vec::new();
+    catalog
+        .try_reserve_exact(markers.len())
+        .map_err(|_| "operator timeline-marker catalog capacity is unavailable".to_owned())?;
+    for marker in markers {
+        catalog.push(operator_timeline_marker(
+            marker.id().to_owned(),
+            marker.name().to_owned(),
+            marker.tick(),
+            timeline,
+        ));
+    }
+    Ok(catalog)
+}
+
+fn operator_timeline_marker(
+    id: String,
+    name: String,
+    tick: u64,
+    timeline: &RuntimeMusicalTimeline,
+) -> OperatorTimelineMarker {
+    OperatorTimelineMarker {
+        id,
+        name,
+        tick,
+        musical_position: timeline.format_tick(tick),
+        frame: timeline.tick_to_frame_ceil(tick),
+    }
+}
+
 fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String> {
     let (facts, session) = prepare_output_and_host(
         || {
@@ -519,6 +571,16 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
             })?;
             let manifest = deployment.bundle().project().package().manifest();
             let (project, ..) = deployment.bundle().project().session().parts();
+            let musical_timeline = RuntimeMusicalTimeline::try_new(
+                project.sample_rate_hz(),
+                project.tempo_events(),
+                project.meter_events(),
+            )
+            .map_err(|error| {
+                format!("verified project musical timing could not be prepared: {error}")
+            })?;
+            let timeline_markers =
+                operator_timeline_marker_catalog(project.timeline_markers(), &musical_timeline)?;
             let facts = RuntimeFacts {
                 bundle_identity: hex_digest(deployment.bundle().bundle_sha256()),
                 deployment_generation: deployment.generation(),
@@ -527,14 +589,8 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
                 project_id: manifest.project_id().to_owned(),
                 project_revision: manifest.revision(),
                 playback_extent: deployment.bundle().project().session().extent(),
-                musical_timeline: RuntimeMusicalTimeline::try_new(
-                    project.sample_rate_hz(),
-                    project.tempo_events(),
-                    project.meter_events(),
-                )
-                .map_err(|error| {
-                    format!("verified project musical timing could not be prepared: {error}")
-                })?,
+                musical_timeline,
+                timeline_markers: timeline_markers.into(),
             };
             Ok((facts, deployment.into_bundle().into_project()))
         },
@@ -1315,6 +1371,9 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         meters,
         meter_config,
     )));
+    let timeline_marker_model = Rc::new(VecModel::from(operator_timeline_marker_rows(
+        &observers.facts.timeline_markers,
+    )));
     let scene_model = Rc::new(VecModel::from(operator_scene_rows(&scenes)));
     let mixer_model = Rc::new(VecModel::from(operator_mixer_rows(&mixer_channels)));
     let mixer_send_model = Rc::new(VecModel::from(operator_mixer_send_rows(&mixer_sends)));
@@ -1323,12 +1382,14 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let loop_authority = Rc::new(Cell::new(None));
     let metronome_authority = Rc::new(Cell::new(None));
     let seek_authority = Rc::new(Cell::new(None));
+    let timeline_marker_authority = Rc::new(RefCell::new(None));
     let scene_launch_authority = Rc::new(Cell::new(false));
     let scene_selection = Rc::new(Cell::new(None));
     let scene_stop_authority = Rc::new(Cell::new(false));
     let loudness_authority = Rc::new(Cell::new(None));
     let mixer_authority = Rc::new(RefCell::new(None));
     let native_device_authority = Rc::new(RefCell::new(None));
+    ui.set_timeline_markers(ModelRc::from(Rc::clone(&timeline_marker_model)));
     ui.set_scenes(ModelRc::from(Rc::clone(&scene_model)));
     ui.set_mixer_channels(ModelRc::from(Rc::clone(&mixer_model)));
     ui.set_mixer_sends(ModelRc::from(Rc::clone(&mixer_send_model)));
@@ -1337,6 +1398,12 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     apply_static_facts(&ui, &observers.facts);
     wire_operator_transport_controls(&ui, &commands_tx, &diagnostic, &transport_authority);
     wire_operator_seek(&ui, &commands_tx, &diagnostic, &seek_authority);
+    wire_operator_timeline_marker_navigation(
+        &ui,
+        &commands_tx,
+        &diagnostic,
+        &timeline_marker_authority,
+    );
     wire_operator_quit(&ui, &commands_tx, &stop, &diagnostic);
     wire_operator_peak_reset(&ui, &meter_observer, &loudness_authority);
     wire_operator_loudness_controls(&ui, &commands_tx, &diagnostic, &loudness_authority);
@@ -1371,6 +1438,8 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &loop_authority,
         &metronome_authority,
         &seek_authority,
+        &timeline_marker_model,
+        &timeline_marker_authority,
         &scene_model,
         &scene_launch_authority,
         &scene_selection,
@@ -1413,6 +1482,8 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_loop_authority = Rc::clone(&loop_authority);
     let timer_metronome_authority = Rc::clone(&metronome_authority);
     let timer_seek_authority = Rc::clone(&seek_authority);
+    let timer_timeline_marker_model = Rc::clone(&timeline_marker_model);
+    let timer_timeline_marker_authority = Rc::clone(&timeline_marker_authority);
     let timer_loudness_authority = Rc::clone(&loudness_authority);
     let timer_mixer_model = Rc::clone(&mixer_model);
     let timer_mixer_send_model = Rc::clone(&mixer_send_model);
@@ -1436,6 +1507,8 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &timer_loop_authority,
                 &timer_metronome_authority,
                 &timer_seek_authority,
+                &timer_timeline_marker_model,
+                &timer_timeline_marker_authority,
                 &timer_scene_model,
                 &timer_scene_launch_authority,
                 &timer_scene_selection,
@@ -1496,6 +1569,11 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 completion_observed = true;
                 revoke_operator_loop_authority(&ui, &timer_loop_authority);
                 revoke_operator_seek_authority(&ui, &timer_seek_authority);
+                revoke_operator_timeline_marker_authority(
+                    &ui,
+                    &timer_timeline_marker_model,
+                    &timer_timeline_marker_authority,
+                );
                 revoke_operator_loudness_authority(&ui, &timer_loudness_authority);
                 revoke_operator_mixer_authority(
                     &ui,
@@ -1743,6 +1821,50 @@ fn wire_operator_seek(
                 "transport locate refused: position is outside 0..=100%".to_owned(),
             );
             return;
+        };
+        send_operator_command(&sender, OperatorCommand::Locate { frame }, &diagnostic);
+    });
+}
+
+fn wire_operator_timeline_marker_navigation(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    authority: &Rc<RefCell<Option<Arc<[OperatorTimelineMarker]>>>>,
+) {
+    let sender = sender.clone();
+    let diagnostic = Arc::clone(diagnostic);
+    let authority = Rc::clone(authority);
+    ui.on_locate_timeline_marker_requested(move |requested_id| {
+        let frame = {
+            let catalog = authority.borrow();
+            let Some(markers) = catalog.as_ref() else {
+                set_diagnostic(
+                    &diagnostic,
+                    "timeline marker locate refused: verified marker navigation is unavailable"
+                        .to_owned(),
+                );
+                return;
+            };
+            let Some(marker) = markers
+                .iter()
+                .find(|marker| marker.id.as_str() == requested_id.as_str())
+            else {
+                set_diagnostic(
+                    &diagnostic,
+                    "timeline marker locate refused: marker identity is not current".to_owned(),
+                );
+                return;
+            };
+            let Some(frame) = marker.frame else {
+                set_diagnostic(
+                    &diagnostic,
+                    "timeline marker locate refused: marker cannot be represented by this Runtime"
+                        .to_owned(),
+                );
+                return;
+            };
+            frame
         };
         send_operator_command(&sender, OperatorCommand::Locate { frame }, &diagnostic);
     });
@@ -3073,6 +3195,95 @@ fn operator_scene_rows(scenes: &[OperatorScene]) -> Vec<OperatorSceneRow> {
         .collect()
 }
 
+fn operator_timeline_marker_rows(
+    markers: &[OperatorTimelineMarker],
+) -> Vec<OperatorTimelineMarkerRow> {
+    markers
+        .iter()
+        .map(|marker| OperatorTimelineMarkerRow {
+            id: marker.id.clone().into(),
+            name: marker.name.clone().into(),
+            tick: marker.tick.to_string().into(),
+            musical_position: marker
+                .musical_position
+                .clone()
+                .unwrap_or_else(|| "unavailable".to_owned())
+                .into(),
+            available: marker.frame.is_some(),
+            controls_enabled: false,
+        })
+        .collect()
+}
+
+fn operator_timeline_marker_navigation_state(
+    markers: &[OperatorTimelineMarker],
+    authority_active: bool,
+) -> &'static str {
+    if markers.is_empty() {
+        "No named markers in this verified project"
+    } else if !markers.iter().any(|marker| marker.frame.is_some()) {
+        "No named marker can be represented by this Runtime"
+    } else if authority_active {
+        "Locate preserves the recovered transport state"
+    } else {
+        "Waiting for verified output recovery"
+    }
+}
+
+fn apply_operator_timeline_marker_observation(
+    ui: &OperatorWindow,
+    model: &VecModel<OperatorTimelineMarkerRow>,
+    authority: &RefCell<Option<Arc<[OperatorTimelineMarker]>>>,
+    markers: &Arc<[OperatorTimelineMarker]>,
+) {
+    if authority.borrow().is_some() {
+        return;
+    }
+    for row in 0..model.row_count() {
+        if let Some(mut marker) = model.row_data(row) {
+            marker.controls_enabled = false;
+            model.set_row_data(row, marker);
+        }
+    }
+    if model.row_count() != markers.len() {
+        ui.set_timeline_marker_navigation_state("Marker model unavailable".into());
+        return;
+    }
+    for (row, marker) in markers.iter().enumerate() {
+        let Some(mut presented) = model.row_data(row) else {
+            ui.set_timeline_marker_navigation_state("Marker model unavailable".into());
+            return;
+        };
+        if presented.id.as_str() != marker.id {
+            ui.set_timeline_marker_navigation_state("Marker model unavailable".into());
+            return;
+        }
+        presented.controls_enabled = marker.frame.is_some();
+        model.set_row_data(row, presented);
+    }
+    *authority.borrow_mut() = Some(Arc::clone(markers));
+    ui.set_timeline_marker_navigation_state(
+        operator_timeline_marker_navigation_state(markers, true).into(),
+    );
+}
+
+fn revoke_operator_timeline_marker_authority(
+    ui: &OperatorWindow,
+    model: &VecModel<OperatorTimelineMarkerRow>,
+    authority: &RefCell<Option<Arc<[OperatorTimelineMarker]>>>,
+) {
+    *authority.borrow_mut() = None;
+    for row in 0..model.row_count() {
+        if let Some(mut marker) = model.row_data(row) {
+            marker.controls_enabled = false;
+            model.set_row_data(row, marker);
+        }
+    }
+    ui.set_timeline_marker_navigation_state(
+        "Runtime stopped · marker navigation unavailable".into(),
+    );
+}
+
 fn operator_scene_row_is_launchable(scenes: &VecModel<OperatorSceneRow>, row: usize) -> bool {
     scenes
         .row_data(row)
@@ -3625,6 +3836,8 @@ fn apply_operator_cycle_observation(
     loop_authority: &Cell<Option<OperatorLoopAuthority>>,
     metronome_authority: &Cell<Option<OperatorMetronomeAuthority>>,
     seek_authority: &Cell<Option<usize>>,
+    timeline_marker_model: &VecModel<OperatorTimelineMarkerRow>,
+    timeline_marker_authority: &RefCell<Option<Arc<[OperatorTimelineMarker]>>>,
     scene_model: &VecModel<OperatorSceneRow>,
     scene_launch_authority: &Cell<bool>,
     scene_selection: &Cell<Option<usize>>,
@@ -3634,6 +3847,11 @@ fn apply_operator_cycle_observation(
     if terminal_latched {
         revoke_operator_transport_authority(ui, transport_authority);
         revoke_operator_metronome_authority(ui, metronome_authority);
+        revoke_operator_timeline_marker_authority(
+            ui,
+            timeline_marker_model,
+            timeline_marker_authority,
+        );
         revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
         return;
@@ -3644,6 +3862,11 @@ fn apply_operator_cycle_observation(
         revoke_operator_loop_authority(ui, loop_authority);
         revoke_operator_metronome_authority(ui, metronome_authority);
         revoke_operator_seek_authority(ui, seek_authority);
+        revoke_operator_timeline_marker_authority(
+            ui,
+            timeline_marker_model,
+            timeline_marker_authority,
+        );
         revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
         return;
@@ -3654,6 +3877,12 @@ fn apply_operator_cycle_observation(
         seek_authority,
         observers.facts.playback_extent,
         observation.position_frame(),
+    );
+    apply_operator_timeline_marker_observation(
+        ui,
+        timeline_marker_model,
+        timeline_marker_authority,
+        &observers.facts.timeline_markers,
     );
     apply_operator_loop_observation(
         ui,
@@ -3780,6 +4009,9 @@ fn apply_static_facts(ui: &OperatorWindow, facts: &RuntimeFacts) {
     ui.set_project_revision(facts.project_revision.to_string().into());
     ui.set_deployment_generation(facts.deployment_generation.to_string().into());
     ui.set_bundle_identity(facts.bundle_identity.clone().into());
+    ui.set_timeline_marker_navigation_state(
+        operator_timeline_marker_navigation_state(&facts.timeline_markers, false).into(),
+    );
     ui.set_recovery_state(
         facts
             .recovered_from
@@ -4976,6 +5208,205 @@ mod tests {
         assert_eq!(
             diagnostic.into_inner(),
             "transport locate to frame 751 queued"
+        );
+    }
+
+    #[test]
+    fn operator_timeline_marker_navigation_is_identity_safe_and_recovery_gated() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = OperatorWindow::new().unwrap();
+        let timeline = test_musical_timeline();
+        let markers: Arc<[OperatorTimelineMarker]> = Arc::from([
+            operator_timeline_marker(
+                "marker-intro".to_owned(),
+                "Intro".to_owned(),
+                960,
+                &timeline,
+            ),
+            OperatorTimelineMarker {
+                id: "marker-unavailable".to_owned(),
+                name: "Far away".to_owned(),
+                tick: u64::MAX,
+                musical_position: None,
+                frame: None,
+            },
+        ]);
+        let model = Rc::new(VecModel::from(operator_timeline_marker_rows(&markers)));
+        let authority = Rc::new(RefCell::new(None));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let diagnostic = Arc::new(Mutex::new(String::new()));
+        ui.set_timeline_markers(ModelRc::from(Rc::clone(&model)));
+        ui.set_transport_frame("0".into());
+        wire_operator_timeline_marker_navigation(&ui, &sender, &diagnostic, &authority);
+
+        ui.invoke_locate_timeline_marker_requested("marker-intro".into());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "timeline marker locate refused: verified marker navigation is unavailable"
+        );
+        assert_eq!(ui.get_transport_frame().as_str(), "0");
+
+        apply_operator_timeline_marker_observation(&ui, &model, &authority, &markers);
+        assert_eq!(
+            ui.get_timeline_marker_navigation_state().as_str(),
+            "Locate preserves the recovered transport state"
+        );
+        assert_eq!(model.row_data(0).unwrap().id.as_str(), "marker-intro");
+        assert_eq!(model.row_data(0).unwrap().name.as_str(), "Intro");
+        assert_eq!(model.row_data(0).unwrap().tick.as_str(), "960");
+        assert_eq!(
+            model.row_data(0).unwrap().musical_position.as_str(),
+            "1|1|960"
+        );
+        assert!(model.row_data(0).unwrap().available);
+        assert!(model.row_data(0).unwrap().controls_enabled);
+        assert!(!model.row_data(1).unwrap().available);
+        assert!(!model.row_data(1).unwrap().controls_enabled);
+
+        ui.invoke_locate_timeline_marker_requested("stale-marker".into());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "timeline marker locate refused: marker identity is not current"
+        );
+        ui.invoke_locate_timeline_marker_requested("marker-unavailable".into());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "timeline marker locate refused: marker cannot be represented by this Runtime"
+        );
+
+        ui.invoke_locate_timeline_marker_requested("marker-intro".into());
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::Locate { frame: 12_000 })
+        );
+        assert_eq!(ui.get_transport_frame().as_str(), "0");
+
+        let (saturated_sender, saturated_receiver) = std::sync::mpsc::sync_channel(1);
+        saturated_sender.send(OperatorCommand::Quit).unwrap();
+        let saturated_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_timeline_marker_navigation(
+            &ui,
+            &saturated_sender,
+            &saturated_diagnostic,
+            &authority,
+        );
+        ui.invoke_locate_timeline_marker_requested("marker-intro".into());
+        assert_eq!(saturated_receiver.try_recv(), Ok(OperatorCommand::Quit));
+        assert_eq!(saturated_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert!(
+            saturated_diagnostic
+                .lock()
+                .unwrap()
+                .contains("operator command refused")
+        );
+        assert_eq!(ui.get_transport_frame().as_str(), "0");
+
+        revoke_operator_timeline_marker_authority(&ui, &model, &authority);
+        assert!(authority.borrow().is_none());
+        assert!(!model.row_data(0).unwrap().controls_enabled);
+        assert_eq!(
+            ui.get_timeline_marker_navigation_state().as_str(),
+            "Runtime stopped · marker navigation unavailable"
+        );
+        ui.invoke_locate_timeline_marker_requested("marker-intro".into());
+        assert_eq!(saturated_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            saturated_diagnostic.lock().unwrap().as_str(),
+            "timeline marker locate refused: verified marker navigation is unavailable"
+        );
+    }
+
+    #[test]
+    fn terminal_runtime_observation_revokes_timeline_marker_navigation() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = OperatorWindow::new().unwrap();
+        let timeline = test_musical_timeline();
+        let markers: Arc<[OperatorTimelineMarker]> = Arc::from([operator_timeline_marker(
+            "marker-intro".to_owned(),
+            "Intro".to_owned(),
+            960,
+            &timeline,
+        )]);
+        let facts = RuntimeFacts {
+            bundle_identity: "marker-fixture".to_owned(),
+            deployment_generation: 1,
+            recovered_from: None,
+            project_name: "Marker fixture".to_owned(),
+            project_id: "project-marker-fixture".to_owned(),
+            project_revision: 1,
+            playback_extent: PlaybackExtent::Unbounded,
+            musical_timeline: timeline,
+            timeline_markers: Arc::clone(&markers),
+        };
+        let observers = RuntimeObservers {
+            facts,
+            output_status: OutputStreamStatus::default(),
+            output_counters: OutputStreamCounters::default(),
+            recovery: PlaybackRecoveryCheckpoint::default(),
+            panel_connected: Arc::new(AtomicBool::new(false)),
+        };
+        let marker_model = Rc::new(VecModel::from(operator_timeline_marker_rows(&markers)));
+        let marker_authority = Rc::new(RefCell::new(None));
+        let scene_model = Rc::new(VecModel::from(Vec::<OperatorSceneRow>::new()));
+        let transport_authority = Rc::new(Cell::new(None));
+        let loop_authority = Rc::new(Cell::new(None));
+        let metronome_authority = Rc::new(Cell::new(None));
+        let seek_authority = Rc::new(Cell::new(None));
+        let scene_launch_authority = Rc::new(Cell::new(false));
+        let scene_selection = Rc::new(Cell::new(None));
+        let scene_stop_authority = Rc::new(Cell::new(false));
+        let diagnostic = Mutex::new(String::new());
+
+        ui.set_timeline_markers(ModelRc::from(Rc::clone(&marker_model)));
+        apply_operator_cycle_observation(
+            &ui,
+            &observers,
+            &diagnostic,
+            &transport_authority,
+            &loop_authority,
+            &metronome_authority,
+            &seek_authority,
+            &marker_model,
+            &marker_authority,
+            &scene_model,
+            &scene_launch_authority,
+            &scene_selection,
+            &scene_stop_authority,
+            false,
+        );
+        assert!(marker_authority.borrow().is_some());
+        assert!(marker_model.row_data(0).unwrap().controls_enabled);
+        assert!(!ui.get_transport_seek_enabled());
+        assert_eq!(
+            ui.get_timeline_marker_navigation_state().as_str(),
+            "Locate preserves the recovered transport state"
+        );
+
+        apply_operator_cycle_observation(
+            &ui,
+            &observers,
+            &diagnostic,
+            &transport_authority,
+            &loop_authority,
+            &metronome_authority,
+            &seek_authority,
+            &marker_model,
+            &marker_authority,
+            &scene_model,
+            &scene_launch_authority,
+            &scene_selection,
+            &scene_stop_authority,
+            true,
+        );
+
+        assert!(marker_authority.borrow().is_none());
+        assert!(!marker_model.row_data(0).unwrap().controls_enabled);
+        assert_eq!(
+            ui.get_timeline_marker_navigation_state().as_str(),
+            "Runtime stopped · marker navigation unavailable"
         );
     }
 
@@ -7504,6 +7935,7 @@ mod tests {
                 project_revision: 1,
                 playback_extent: PlaybackExtent::Bounded { end_frame: 1_500 },
                 musical_timeline: runtime_musical_timeline.clone(),
+                timeline_markers: Arc::from([]),
             },
             output_status: OutputStreamStatus::default(),
             output_counters: OutputStreamCounters::default(),
@@ -7573,6 +8005,7 @@ mod tests {
         reason = "one linear test proves generated command and authority wiring"
     )]
     fn operator_ui_wires_commands_and_authoritative_properties() {
+        i_slint_backend_testing::init_no_event_loop();
         let ui = OperatorWindow::new().unwrap();
         let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
         let diagnostic = Arc::new(Mutex::new("authoritative diagnostic".to_owned()));
@@ -7599,6 +8032,7 @@ mod tests {
             project_revision: u64::MAX - 1,
             playback_extent: PlaybackExtent::Bounded { end_frame: 1_500 },
             musical_timeline: test_musical_timeline(),
+            timeline_markers: Arc::from([]),
         };
         let observers = RuntimeObservers {
             facts: facts.clone(),
@@ -7855,6 +8289,10 @@ mod tests {
         let terminal_scene_launch_authority = Rc::new(Cell::new(false));
         let terminal_scene_selection = Rc::new(Cell::new(None));
         let terminal_scene_stop_authority = Rc::new(Cell::new(false));
+        let terminal_timeline_marker_model = Rc::new(VecModel::from(
+            operator_timeline_marker_rows(&facts.timeline_markers),
+        ));
+        let terminal_timeline_marker_authority = Rc::new(RefCell::new(None));
         wire_operator_loop_toggle(&ui, &sender, &diagnostic, &loop_authority);
         wire_operator_scene_launch(
             &ui,
@@ -7874,6 +8312,8 @@ mod tests {
             &loop_authority,
             &metronome_authority,
             &seek_authority,
+            &terminal_timeline_marker_model,
+            &terminal_timeline_marker_authority,
             &terminal_scenes,
             &terminal_scene_launch_authority,
             &terminal_scene_selection,
@@ -7943,6 +8383,8 @@ mod tests {
             &loop_authority,
             &metronome_authority,
             &seek_authority,
+            &terminal_timeline_marker_model,
+            &terminal_timeline_marker_authority,
             &terminal_scenes,
             &terminal_scene_launch_authority,
             &terminal_scene_selection,
