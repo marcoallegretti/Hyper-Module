@@ -6,13 +6,14 @@ mod duplication;
 
 pub use automation::{
     AutomationChannelParameter, AutomationCompileError, AutomationEvaluationError,
-    AutomationInterpolation, AutomationLane, AutomationLaneReplacement, AutomationMainParameter,
-    AutomationPoint, AutomationSendParameter, AutomationTake, AutomationTakeAddition,
-    AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
-    AutomationTakeReplacement, AutomationTarget, AutomationTargetSelection, AutomationValue,
-    CompiledAutomation, LoadedAutomationSet, serialize_automation_lane_replacement,
-    serialize_automation_take_activation, serialize_automation_take_addition,
-    serialize_automation_take_replacement,
+    AutomationInterpolation, AutomationLane, AutomationLaneAddition, AutomationLaneReplacement,
+    AutomationMainParameter, AutomationPoint, AutomationSendParameter, AutomationTake,
+    AutomationTakeAddition, AutomationTakeAdditionSerializationError,
+    AutomationTakeEditSerializationError, AutomationTakeReplacement, AutomationTarget,
+    AutomationTargetSelection, AutomationValue, CompiledAutomation, LoadedAutomationSet,
+    serialize_automation_lane_addition, serialize_automation_lane_removal,
+    serialize_automation_lane_replacement, serialize_automation_take_activation,
+    serialize_automation_take_addition, serialize_automation_take_replacement,
 };
 pub use duplication::{
     AudioTrackContentRemovalDocument, AudioTrackContentRemovalDocuments,
@@ -21763,6 +21764,302 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn automation_lane_addition_inserts_canonically_and_preserves_existing_authority() {
+        let (loaded, mixer, source) = automation_lane_replacement_fixture();
+        let mut source_value: Value = serde_json::from_slice(&source).unwrap();
+        source_value["lanes"][1]["id"] = json!("018f47a2-6b2d-7c11-8a44-0011223344a4");
+        let source = serde_json_canonicalizer::to_vec(&source_value).unwrap();
+        let points = [
+            AutomationPoint::new(0, AutomationValue::Integer(-250_000)),
+            AutomationPoint::new(4, AutomationValue::Integer(500_000)),
+        ];
+
+        let rewritten = serialize_automation_lane_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&source],
+            "018f47a2-6b2d-7c11-8a44-0011223344a0",
+            AutomationLaneAddition {
+                lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a3",
+                target: AutomationTargetSelection::Channel {
+                    track_id: "018f47a2-6b2d-7c11-8a44-001122334456",
+                    parameter: AutomationChannelParameter::Pan,
+                },
+                interpolation: AutomationInterpolation::Linear,
+                points: &points,
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let rewritten_value: Value = serde_json::from_slice(&rewritten).unwrap();
+        for field in [
+            "id",
+            "project_id",
+            "format",
+            "format_version",
+            "name",
+            "enabled",
+            "captured_at_utc",
+            "start_tick",
+            "end_tick",
+            "extensions",
+        ] {
+            assert_eq!(
+                rewritten_value[field], source_value[field],
+                "{field} must be retained"
+            );
+        }
+        assert_eq!(rewritten_value["lanes"][0], source_value["lanes"][0]);
+        assert_eq!(rewritten_value["lanes"][2], source_value["lanes"][1]);
+        assert_eq!(
+            rewritten_value["lanes"][1],
+            json!({
+                "id": "018f47a2-6b2d-7c11-8a44-0011223344a3",
+                "target": {
+                    "kind": "mixer-channel",
+                    "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+                    "parameter": "pan"
+                },
+                "interpolation": "linear",
+                "points": [
+                    {"tick": 0, "value": -250_000},
+                    {"tick": 4, "value": 500_000}
+                ]
+            })
+        );
+
+        let reloaded = loaded
+            .load_automation_takes(
+                &mixer,
+                &asset_facts(),
+                &[&rewritten],
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+        let take = &reloaded.takes()[0];
+        assert_eq!(take.lanes().len(), 3);
+        assert_eq!(
+            take.lanes()[1].target(),
+            AutomationTarget::Channel {
+                slot: 0,
+                parameter: AutomationChannelParameter::Pan,
+            }
+        );
+        assert_eq!(take.lanes()[1].points(), points);
+    }
+
+    #[test]
+    fn automation_lane_addition_refuses_stale_duplicate_and_exhausted_authority() {
+        let (loaded, mixer, source) = automation_lane_replacement_fixture();
+        let points = [AutomationPoint::new(0, AutomationValue::Integer(500_000))];
+        let request = automation_lane_addition_request(&points);
+        for (request, expected) in [
+            (
+                AutomationLaneAddition {
+                    lane_id: "lane",
+                    ..request
+                },
+                AutomationTakeEditSerializationError::InvalidLaneIdentity,
+            ),
+            (
+                AutomationLaneAddition {
+                    lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                    ..request
+                },
+                AutomationTakeEditSerializationError::InvalidLaneIdentity,
+            ),
+            (
+                AutomationLaneAddition {
+                    lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a2",
+                    ..request
+                },
+                AutomationTakeEditSerializationError::InvalidLaneIdentity,
+            ),
+            (
+                AutomationLaneAddition {
+                    points: &[],
+                    ..request
+                },
+                AutomationTakeEditSerializationError::EmptyLane,
+            ),
+        ] {
+            let error = serialize_automation_lane_addition(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&source],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                request,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap_err();
+            assert_eq!(
+                core::mem::discriminant(&error),
+                core::mem::discriminant(&expected),
+                "{error}"
+            );
+        }
+        assert!(matches!(
+            serialize_automation_lane_addition(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&source],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                request,
+                LoaderLimits {
+                    max_automation_lanes: 2,
+                    ..LoaderLimits::VERSION_1
+                },
+            ),
+            Err(AutomationTakeEditSerializationError::LaneCapacity)
+        ));
+        let pretty =
+            serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(&source).unwrap()).unwrap();
+        assert!(matches!(
+            serialize_automation_lane_addition(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&pretty],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                request,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AutomationTakeEditSerializationError::NonCanonicalSource)
+        ));
+        let duplicate_target = AutomationLaneAddition {
+            target: AutomationTargetSelection::Channel {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456",
+                parameter: AutomationChannelParameter::Gain,
+            },
+            ..request
+        };
+        assert!(matches!(
+            serialize_automation_lane_addition(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&source],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                duplicate_target,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AutomationTakeEditSerializationError::Source(_))
+        ));
+    }
+
+    #[test]
+    fn automation_lane_removal_preserves_shared_and_remaining_authority() {
+        let (loaded, mixer, source) = automation_lane_replacement_fixture();
+        let source_value: Value = serde_json::from_slice(&source).unwrap();
+        let rewritten = serialize_automation_lane_removal(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&source],
+            "018f47a2-6b2d-7c11-8a44-0011223344a0",
+            "018f47a2-6b2d-7c11-8a44-0011223344a2",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let rewritten_value: Value = serde_json::from_slice(&rewritten).unwrap();
+        for field in [
+            "id",
+            "project_id",
+            "format",
+            "format_version",
+            "name",
+            "enabled",
+            "captured_at_utc",
+            "start_tick",
+            "end_tick",
+            "extensions",
+        ] {
+            assert_eq!(
+                rewritten_value[field], source_value[field],
+                "{field} must be retained"
+            );
+        }
+        assert_eq!(
+            rewritten_value["lanes"],
+            json!([source_value["lanes"][0].clone()])
+        );
+        let reloaded = loaded
+            .load_automation_takes(
+                &mixer,
+                &asset_facts(),
+                &[&rewritten],
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+        assert_eq!(reloaded.takes()[0].lanes().len(), 1);
+        assert_eq!(
+            reloaded.takes()[0].lanes()[0].id(),
+            "018f47a2-6b2d-7c11-8a44-0011223344a1"
+        );
+    }
+
+    #[test]
+    fn automation_lane_removal_refuses_invalid_stale_final_and_noncanonical_sources() {
+        let (loaded, mixer, source) = automation_lane_replacement_fixture();
+        for (lane_id, expected) in [
+            (
+                "lane",
+                AutomationTakeEditSerializationError::InvalidLaneIdentity,
+            ),
+            (
+                "018f47a2-6b2d-7c11-8a44-0011223344ff",
+                AutomationTakeEditSerializationError::LaneMissing,
+            ),
+        ] {
+            let error = serialize_automation_lane_removal(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&source],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                lane_id,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap_err();
+            assert_eq!(
+                core::mem::discriminant(&error),
+                core::mem::discriminant(&expected),
+                "{error}"
+            );
+        }
+        let (_, _, one_lane) = automation_take_replacement_fixture();
+        assert!(matches!(
+            serialize_automation_lane_removal(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&one_lane],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                "018f47a2-6b2d-7c11-8a44-0011223344a1",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AutomationTakeEditSerializationError::LastLane)
+        ));
+        let pretty =
+            serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(&source).unwrap()).unwrap();
+        assert!(matches!(
+            serialize_automation_lane_removal(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&pretty],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                "018f47a2-6b2d-7c11-8a44-0011223344a2",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AutomationTakeEditSerializationError::NonCanonicalSource)
+        ));
+    }
+
     type AutomationRejectionCheck = fn(&AutomationTakeAdditionSerializationError) -> bool;
 
     fn automation_take_request(points: &[AutomationPoint]) -> AutomationTakeAddition<'_> {
@@ -21790,6 +22087,18 @@ mod tests {
             target: AutomationTargetSelection::Channel {
                 track_id: "018f47a2-6b2d-7c11-8a44-001122334456",
                 parameter: AutomationChannelParameter::Gain,
+            },
+            interpolation: AutomationInterpolation::Linear,
+            points,
+        }
+    }
+
+    fn automation_lane_addition_request(points: &[AutomationPoint]) -> AutomationLaneAddition<'_> {
+        AutomationLaneAddition {
+            lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a3",
+            target: AutomationTargetSelection::Channel {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456",
+                parameter: AutomationChannelParameter::Pan,
             },
             interpolation: AutomationInterpolation::Linear,
             points,

@@ -242,6 +242,7 @@ export struct AutomationTakeRow {
     enabled: bool,
     editable: bool,
     lane-editable: bool,
+    lane-addable: bool,
     range: string,
     target: string,
     interpolation: string,
@@ -417,10 +418,13 @@ export global IdeActions {
     callback remove-native-filter(int);
     callback add-automation-take(string, int, int, string, string, string);
     callback begin-edit-automation-take(string);
+    callback begin-add-automation-lane(string);
     callback begin-edit-automation-lane(string);
     callback select-automation-edit-lane(int);
     callback save-automation-take-edit();
+    callback add-automation-lane(int, int, string);
     callback save-automation-lane-edit();
+    callback remove-automation-lane(string, string);
     callback set-automation-take-active(string, bool);
     callback remove-automation-take(string);
     callback add-control-binding(int, int, bool, string, string);
@@ -866,11 +870,21 @@ export component MainWindow inherits Window {
         || root.control-create-visible
         || root.automation-capture-visible
         || root.automation-create-visible
+        || root.automation-lane-add-visible
         || root.automation-edit-visible
+        || root.automation-lane-remove-confirming-id != ""
         || root.automation-take-remove-confirming-id != ""
         || root.close-unsaved-mixer-confirming
         || root.unused-sample-cleanup-confirming
         || root.loudness-reset-confirming;
+    private property <bool> automation-take-direct-action-available:
+        root.app-mode == AppMode.running
+        && !root.automation-capture-visible
+        && !root.automation-create-visible
+        && !root.automation-lane-add-visible
+        && !root.automation-edit-visible
+        && root.automation-lane-remove-confirming-id == ""
+        && root.automation-take-remove-confirming-id == "";
     private property <bool> audio-import-available:
         root.app-mode == AppMode.running
         && !root.project-form-visible
@@ -987,6 +1001,17 @@ export component MainWindow inherits Window {
     in-out property <string> automation-create-start: "0";
     in-out property <string> automation-create-end: "1920";
     in-out property <string> automation-create-points: "";
+    in-out property <bool> automation-lane-add-visible: false;
+    in-out property <string> automation-lane-add-take-id: "";
+    in property <string> automation-lane-add-take-name: "";
+    in property <string> automation-lane-add-range: "";
+    in property <[string]> automation-lane-add-target-names: [];
+    in property <[bool]> automation-lane-add-target-boolean: [];
+    in property <[string]> automation-lane-add-target-domain: [];
+    in property <[string]> automation-lane-add-target-identities: [];
+    in-out property <int> automation-lane-add-target-index: 0;
+    in-out property <int> automation-lane-add-interpolation-index: 0;
+    in-out property <string> automation-lane-add-points: "";
     in-out property <bool> automation-edit-visible: false;
     in-out property <string> automation-edit-take-id: "";
     in-out property <bool> automation-edit-lane-only: false;
@@ -999,6 +1024,7 @@ export component MainWindow inherits Window {
     in-out property <string> automation-edit-start: "";
     in-out property <string> automation-edit-end: "";
     in-out property <string> automation-edit-points: "";
+    in-out property <string> automation-lane-remove-confirming-id: "";
     in property <bool> mixer-main-state-available: false;
     in property <float> mixer-main-gain-percent: 0;
     in property <bool> mixer-main-muted: false;
@@ -3572,7 +3598,7 @@ export component MainWindow inherits Window {
                             text: "Channels";
                             accessible-label: "Return from automation to mixer channels";
                             enabled: !root.local-edit-form-visible;
-                            clicked => { root.automation-capture-visible = false; root.automation-create-visible = false; root.automation-edit-visible = false; root.automation-take-remove-confirming-id = ""; root.mixer-automation-visible = false; }
+                            clicked => { root.automation-capture-visible = false; root.automation-create-visible = false; root.automation-lane-add-visible = false; root.automation-edit-visible = false; root.automation-lane-remove-confirming-id = ""; root.automation-take-remove-confirming-id = ""; root.mixer-automation-visible = false; }
                         }
                         Button {
                             text: "Performance";
@@ -3581,7 +3607,9 @@ export component MainWindow inherits Window {
                             clicked => {
                                 root.automation-capture-visible = false;
                                 root.automation-create-visible = false;
+                                root.automation-lane-add-visible = false;
                                 root.automation-edit-visible = false;
+                                root.automation-lane-remove-confirming-id = "";
                                 root.automation-take-remove-confirming-id = "";
                                 root.mixer-automation-visible = false;
                                 root.mixer-sends-visible = false;
@@ -3590,10 +3618,7 @@ export component MainWindow inherits Window {
                         }
                         Button {
                             text: "Add take";
-                            enabled: root.app-mode == AppMode.running
-                                && !root.automation-capture-visible
-                                && !root.automation-create-visible
-                                && !root.automation-edit-visible;
+                            enabled: root.automation-take-direct-action-available;
                             clicked => {
                                 root.automation-capture-visible = false;
                                 root.automation-create-name = "";
@@ -3602,7 +3627,9 @@ export component MainWindow inherits Window {
                                 root.automation-create-start = "0";
                                 root.automation-create-end = "1920";
                                 root.automation-create-points = "";
+                                root.automation-lane-add-visible = false;
                                 root.automation-edit-visible = false;
+                                root.automation-lane-remove-confirming-id = "";
                                 root.automation-take-remove-confirming-id = "";
                                 root.automation-create-visible = true;
                             }
@@ -3610,16 +3637,15 @@ export component MainWindow inherits Window {
                         Button {
                             text: "Capture live";
                             accessible-label: "Capture one selected mixer parameter from committed rolling output callbacks";
-                            enabled: root.app-mode == AppMode.running
+                            enabled: root.automation-take-direct-action-available
                                 && root.transport-start-available
                                 && !root.loop-engaged
-                                && root.automation-target-names.length > 0
-                                && !root.automation-capture-visible
-                                && !root.automation-create-visible
-                                && !root.automation-edit-visible;
+                                && root.automation-target-names.length > 0;
                             clicked => {
                                 root.automation-create-visible = false;
+                                root.automation-lane-add-visible = false;
                                 root.automation-edit-visible = false;
+                                root.automation-lane-remove-confirming-id = "";
                                 root.automation-take-remove-confirming-id = "";
                                 root.automation-capture-name = "";
                                 root.automation-capture-target-index = 0;
@@ -3815,6 +3841,96 @@ export component MainWindow inherits Window {
                         Rectangle { height: 1px; background: #27313d; }
                     }
 
+                    if root.automation-lane-add-visible : VerticalLayout {
+                        spacing: 8px;
+                        Text { height: 16px; text: "ADD AUTOMATION LANE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { height: 14px; text: "This preserves the take's shared authority and offers only targets not already driven by that take."; color: #8fa0b4; font-size: 9px; overflow: elide; }
+                        HorizontalLayout {
+                            height: 48px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text { text: "Take"; color: #8fa0b4; font-size: 9px; }
+                                Text { text: root.automation-lane-add-take-name; color: #dce5ef; font-size: 11px; overflow: elide; }
+                            }
+                            VerticalLayout {
+                                width: 200px;
+                                Text { text: "Take range"; color: #8fa0b4; font-size: 9px; }
+                                Text { text: root.automation-lane-add-range; color: #e7b96d; font-size: 11px; overflow: elide; }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 2;
+                                Text { text: "Target"; color: #8fa0b4; font-size: 9px; }
+                                ComboBox {
+                                    model: root.automation-lane-add-target-names;
+                                    current-index <=> root.automation-lane-add-target-index;
+                                    enabled: root.app-mode == AppMode.running;
+                                    selected(_) => {
+                                        if (root.automation-lane-add-target-boolean[self.current-index]) {
+                                            root.automation-lane-add-interpolation-index = 0;
+                                        }
+                                    }
+                                }
+                            }
+                            VerticalLayout {
+                                width: 120px;
+                                Text { text: "Interpolation"; color: #8fa0b4; font-size: 9px; }
+                                ComboBox {
+                                    model: ["Hold", "Linear"];
+                                    current-index <=> root.automation-lane-add-interpolation-index;
+                                    enabled: root.app-mode == AppMode.running
+                                        && !root.automation-lane-add-target-boolean[root.automation-lane-add-target-index];
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 48px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: "Points  " + root.automation-lane-add-target-domain[root.automation-lane-add-target-index];
+                                    color: #8fa0b4;
+                                    font-size: 9px;
+                                }
+                                IdeLineEdit {
+                                    placeholder-text: "tick=value, tick=value";
+                                    text <=> root.automation-lane-add-points;
+                                    enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 34px;
+                            spacing: 8px;
+                            Button {
+                                text: "Cancel";
+                                enabled: root.app-mode == AppMode.running;
+                                clicked => {
+                                    root.automation-lane-add-visible = false;
+                                    root.automation-lane-add-take-id = "";
+                                    root.automation-lane-add-points = "";
+                                }
+                            }
+                            Button {
+                                horizontal-stretch: 1;
+                                text: root.app-mode == AppMode.editing-automation-take ? "Adding lane..." : "Add automation lane";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.automation-lane-add-take-id != ""
+                                    && root.automation-lane-add-target-names.length > 0
+                                    && root.automation-lane-add-points != "";
+                                clicked => {
+                                    IdeActions.add-automation-lane(
+                                        root.automation-lane-add-target-index,
+                                        root.automation-lane-add-interpolation-index,
+                                        root.automation-lane-add-points
+                                    );
+                                }
+                            }
+                        }
+                        Rectangle { height: 1px; background: #27313d; }
+                    }
+
                     if root.automation-edit-visible : VerticalLayout {
                         spacing: 8px;
                         Text { height: 16px; text: root.automation-edit-lane-only ? "EDIT AUTOMATION LANE" : "EDIT AUTOMATION TAKE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
@@ -3917,7 +4033,30 @@ export component MainWindow inherits Window {
                             Button {
                                 text: "Cancel";
                                 enabled: root.app-mode == AppMode.running;
-                                clicked => { root.automation-edit-visible = false; }
+                                clicked => {
+                                    root.automation-edit-visible = false;
+                                    root.automation-lane-remove-confirming-id = "";
+                                }
+                            }
+                            if root.automation-edit-lane-only && root.automation-edit-lane-names.length > 1 : Button {
+                                width: 122px;
+                                text: root.automation-lane-remove-confirming-id == root.automation-edit-lane-id ? "Confirm remove" : "Remove lane";
+                                accessible-label: root.automation-lane-remove-confirming-id == root.automation-edit-lane-id
+                                    ? "Confirm removal of the selected automation lane"
+                                    : "Remove the selected automation lane";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.automation-edit-take-id != ""
+                                    && root.automation-edit-lane-id != "";
+                                clicked => {
+                                    if root.automation-lane-remove-confirming-id == root.automation-edit-lane-id {
+                                        IdeActions.remove-automation-lane(
+                                            root.automation-edit-take-id,
+                                            root.automation-edit-lane-id
+                                        );
+                                    } else {
+                                        root.automation-lane-remove-confirming-id = root.automation-edit-lane-id;
+                                    }
+                                }
                             }
                             Button {
                                 horizontal-stretch: 1;
@@ -3982,7 +4121,7 @@ export component MainWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 VerticalLayout {
-                                    width: 202px;
+                                    width: 282px;
                                     padding-top: 9px;
                                     padding-bottom: 9px;
                                     HorizontalLayout {
@@ -3993,15 +4132,13 @@ export component MainWindow inherits Window {
                                             accessible-label: take.editable
                                                 ? "Edit " + take.name + " automation take"
                                                 : "Select a lane to edit " + take.name + " automation take";
-                                            enabled: root.app-mode == AppMode.running
-                                                && (take.editable || take.lane-editable)
-                                                && !root.automation-capture-visible
-                                                && !root.automation-create-visible
-                                                && !root.automation-edit-visible
-                                                && root.automation-take-remove-confirming-id == "";
+                                            enabled: root.automation-take-direct-action-available
+                                                && (take.editable || take.lane-editable);
                                             clicked => {
                                                 root.automation-capture-visible = false;
                                                 root.automation-create-visible = false;
+                                                root.automation-lane-add-visible = false;
+                                                root.automation-lane-remove-confirming-id = "";
                                                 root.automation-take-remove-confirming-id = "";
                                                 if take.editable {
                                                     IdeActions.begin-edit-automation-take(take.id);
@@ -4011,14 +4148,25 @@ export component MainWindow inherits Window {
                                             }
                                         }
                                         Button {
+                                            width: 66px;
+                                            text: "Add lane";
+                                            accessible-label: "Add an automation lane to " + take.name + " automation take";
+                                            enabled: root.automation-take-direct-action-available && take.lane-addable;
+                                            clicked => {
+                                                root.automation-capture-visible = false;
+                                                root.automation-create-visible = false;
+                                                root.automation-edit-visible = false;
+                                                root.automation-lane-remove-confirming-id = "";
+                                                root.automation-take-remove-confirming-id = "";
+                                                IdeActions.begin-add-automation-lane(take.id);
+                                            }
+                                        }
+                                        Button {
                                             text: take.enabled ? "Disable" : "Enable";
                                             accessible-label: (take.enabled ? "Disable " : "Enable ") + take.name + " automation take";
-                                            enabled: root.app-mode == AppMode.running
-                                                && !root.automation-capture-visible
-                                                && !root.automation-create-visible
-                                                && !root.automation-edit-visible
-                                                && root.automation-take-remove-confirming-id == "";
+                                            enabled: root.automation-take-direct-action-available;
                                             clicked => {
+                                                root.automation-lane-remove-confirming-id = "";
                                                 root.automation-take-remove-confirming-id = "";
                                                 IdeActions.set-automation-take-active(take.id, !take.enabled);
                                             }
@@ -4029,7 +4177,9 @@ export component MainWindow inherits Window {
                                             enabled: root.app-mode == AppMode.running
                                                 && !root.automation-capture-visible
                                                 && !root.automation-create-visible
-                                                && !root.automation-edit-visible;
+                                                && !root.automation-lane-add-visible
+                                                && !root.automation-edit-visible
+                                                && root.automation-lane-remove-confirming-id == "";
                                             clicked => {
                                                 if root.automation-take-remove-confirming-id == take.id {
                                                     IdeActions.remove-automation-take(take.id);

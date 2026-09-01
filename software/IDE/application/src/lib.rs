@@ -132,8 +132,8 @@ use hyper_playback_json::{
     AudioTrackFreezeDeviceChain, AudioTrackFreezeDocuments, AudioTrackFreezeReactivationDocuments,
     AudioTrackFreezeSerializationError, AudioTrackRemovalBlockers,
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
-    AudioTrackUnfreezeDocuments, AudioTrackUnfreezeSerializationError, AutomationLaneReplacement,
-    AutomationTakeAddition, AutomationTakeAdditionSerializationError,
+    AudioTrackUnfreezeDocuments, AudioTrackUnfreezeSerializationError, AutomationLaneAddition,
+    AutomationLaneReplacement, AutomationTakeAddition, AutomationTakeAdditionSerializationError,
     AutomationTakeEditSerializationError, AutomationTakeReplacement, AutomationTargetSelection,
     CompiledMixerDestination, CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
     LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact, MixerBaseState,
@@ -164,6 +164,7 @@ use hyper_playback_json::{
     serialize_audio_track_content_removal, serialize_audio_track_duplication,
     serialize_audio_track_freeze, serialize_audio_track_freeze_reactivation,
     serialize_audio_track_removal, serialize_audio_track_rename, serialize_audio_track_unfreeze,
+    serialize_automation_lane_addition, serialize_automation_lane_removal,
     serialize_automation_lane_replacement, serialize_automation_take_activation,
     serialize_automation_take_addition, serialize_automation_take_replacement,
     serialize_mixer_base_state, serialize_mixer_strip_reorder,
@@ -5827,6 +5828,17 @@ pub struct IdeAutomationTakeRequest {
 /// take. Shared take authority remains outside this request.
 #[derive(Clone, Debug)]
 pub struct IdeAutomationLaneEditRequest {
+    pub target: IdeAutomationTarget,
+    pub interpolation: AutomationInterpolation,
+    pub points: Vec<AutomationPoint>,
+}
+
+/// The authored fields of one new lane in an existing automation take.
+///
+/// The stable lane identity is generated only after the worker has fenced the
+/// live mixer and obtained the current verified project authority.
+#[derive(Clone, Debug)]
+pub struct IdeAutomationLaneAddRequest {
     pub target: IdeAutomationTarget,
     pub interpolation: AutomationInterpolation,
     pub points: Vec<AutomationPoint>,
@@ -15515,6 +15527,216 @@ impl RunningDesktopIdeApplication {
         })
     }
 
+    fn prepare_automation_lane_addition(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        take_id: &str,
+        request: &IdeAutomationLaneAddRequest,
+    ) -> Result<IdeAutomationTakeEditPlan, IdeAutomationTakeEditError> {
+        if take_id.is_empty() {
+            return Err(IdeAutomationTakeEditError::InvalidTakeIdentity);
+        }
+        let empty_target = match &request.target {
+            IdeAutomationTarget::Channel { track_id, .. } => track_id.is_empty(),
+            IdeAutomationTarget::Send { send_id, .. } => send_id.is_empty(),
+            IdeAutomationTarget::Main { .. } => false,
+        };
+        if empty_target {
+            return Err(IdeAutomationTakeEditError::InvalidTargetIdentity);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAutomationTakeEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAutomationTakeEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Self::prepare_automation_lane_addition_from_project(
+            application,
+            mixer,
+            prepared,
+            take_id,
+            request,
+        )
+    }
+
+    fn prepare_automation_lane_addition_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        take_id: &str,
+        request: &IdeAutomationLaneAddRequest,
+    ) -> Result<IdeAutomationTakeEditPlan, IdeAutomationTakeEditError> {
+        if take_id.is_empty() {
+            return Err(IdeAutomationTakeEditError::InvalidTakeIdentity);
+        }
+        let package = prepared.package();
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let limits = application.config.project_limits.session.documents;
+        let loaded_mixer = project
+            .load_mixer(&mixer.resource_bytes, &assets, limits)
+            .map_err(IdeAutomationTakeEditError::MixerDocument)?;
+        let mut existing = Vec::new();
+        for descriptor in package.manifest().resources() {
+            if descriptor.role() != ResourceRole::AutomationTake {
+                continue;
+            }
+            existing
+                .try_reserve(1)
+                .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+            existing.push(
+                package
+                    .read_resource(descriptor.id())
+                    .map_err(IdeAutomationTakeEditError::Storage)?,
+            );
+        }
+        let mut references = Vec::new();
+        references
+            .try_reserve_exact(existing.len())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        references.extend(existing.iter().map(Vec::as_slice));
+        let lane_id = uuid::Uuid::new_v4().to_string();
+        let target = match &request.target {
+            IdeAutomationTarget::Channel {
+                track_id,
+                parameter,
+            } => AutomationTargetSelection::Channel {
+                track_id,
+                parameter: *parameter,
+            },
+            IdeAutomationTarget::Send { send_id, parameter } => AutomationTargetSelection::Send {
+                send_id,
+                parameter: *parameter,
+            },
+            IdeAutomationTarget::Main { parameter } => AutomationTargetSelection::Main {
+                parameter: *parameter,
+            },
+        };
+        let take_bytes = serialize_automation_lane_addition(
+            project,
+            &loaded_mixer,
+            &assets,
+            &references,
+            take_id,
+            AutomationLaneAddition {
+                lane_id: &lane_id,
+                target,
+                interpolation: request.interpolation,
+                points: &request.points,
+            },
+            limits,
+        )
+        .map_err(IdeAutomationTakeEditError::Serialization)?;
+        let mut owned_take_id = String::new();
+        owned_take_id
+            .try_reserve_exact(take_id.len())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        owned_take_id.push_str(take_id);
+        Ok(IdeAutomationTakeEditPlan {
+            mixer,
+            take_id: owned_take_id,
+            take_bytes,
+        })
+    }
+
+    fn prepare_automation_lane_removal(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        take_id: &str,
+        lane_id: &str,
+    ) -> Result<IdeAutomationTakeEditPlan, IdeAutomationTakeEditError> {
+        if take_id.is_empty() {
+            return Err(IdeAutomationTakeEditError::InvalidTakeIdentity);
+        }
+        if !is_valid_entity_id(lane_id) {
+            return Err(IdeAutomationTakeEditError::InvalidLaneIdentity);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAutomationTakeEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAutomationTakeEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Self::prepare_automation_lane_removal_from_project(
+            application,
+            mixer,
+            prepared,
+            take_id,
+            lane_id,
+        )
+    }
+
+    fn prepare_automation_lane_removal_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        take_id: &str,
+        lane_id: &str,
+    ) -> Result<IdeAutomationTakeEditPlan, IdeAutomationTakeEditError> {
+        if take_id.is_empty() {
+            return Err(IdeAutomationTakeEditError::InvalidTakeIdentity);
+        }
+        if !is_valid_entity_id(lane_id) {
+            return Err(IdeAutomationTakeEditError::InvalidLaneIdentity);
+        }
+        let package = prepared.package();
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let limits = application.config.project_limits.session.documents;
+        let loaded_mixer = project
+            .load_mixer(&mixer.resource_bytes, &assets, limits)
+            .map_err(IdeAutomationTakeEditError::MixerDocument)?;
+        let mut existing = Vec::new();
+        for descriptor in package.manifest().resources() {
+            if descriptor.role() != ResourceRole::AutomationTake {
+                continue;
+            }
+            existing
+                .try_reserve(1)
+                .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+            existing.push(
+                package
+                    .read_resource(descriptor.id())
+                    .map_err(IdeAutomationTakeEditError::Storage)?,
+            );
+        }
+        let mut references = Vec::new();
+        references
+            .try_reserve_exact(existing.len())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        references.extend(existing.iter().map(Vec::as_slice));
+        let take_bytes = serialize_automation_lane_removal(
+            project,
+            &loaded_mixer,
+            &assets,
+            &references,
+            take_id,
+            lane_id,
+            limits,
+        )
+        .map_err(IdeAutomationTakeEditError::Serialization)?;
+        let mut owned_take_id = String::new();
+        owned_take_id
+            .try_reserve_exact(take_id.len())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        owned_take_id.push_str(take_id);
+        Ok(IdeAutomationTakeEditPlan {
+            mixer,
+            take_id: owned_take_id,
+            take_bytes,
+        })
+    }
+
     fn prepare_automation_take_removal(
         application: &DesktopIdeApplication,
         recovery: &DesktopPlaybackRecovery,
@@ -21167,6 +21389,144 @@ mod tests {
                 AutomationPoint::new(3, AutomationValue::Integer(500_000)),
             ]
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one lifecycle test keeps candidate preservation, final-lane refusal, and durable lane publication together"
+    )]
+    fn automation_lane_management_publishes_and_reopens_exactly() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let take_id = "018f47a2-6b2d-7c11-8a44-00112233850a";
+        let original_lane_id = "018f47a2-6b2d-7c11-8a44-00112233850b";
+        publish_main_gain_automation(&project_path, limits, take_id);
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert!(matches!(
+            RunningDesktopIdeApplication::prepare_automation_lane_removal_from_project(
+                &application,
+                fixture_mixer_save_plan(&prepared),
+                &prepared,
+                take_id,
+                original_lane_id,
+            ),
+            Err(IdeAutomationTakeEditError::Serialization(
+                AutomationTakeEditSerializationError::LastLane
+            ))
+        ));
+        let source: Value =
+            serde_json::from_slice(&prepared.package().read_resource(take_id).unwrap()).unwrap();
+        let addition = RunningDesktopIdeApplication::prepare_automation_lane_addition_from_project(
+            &application,
+            fixture_mixer_save_plan(&prepared),
+            &prepared,
+            take_id,
+            &IdeAutomationLaneAddRequest {
+                target: IdeAutomationTarget::Main {
+                    parameter: AutomationMainParameter::Mute,
+                },
+                interpolation: AutomationInterpolation::Hold,
+                points: vec![
+                    AutomationPoint::new(0, AutomationValue::Boolean(false)),
+                    AutomationPoint::new(3, AutomationValue::Boolean(true)),
+                ],
+            },
+        )
+        .unwrap();
+        let candidate: Value = serde_json::from_slice(&addition.take_bytes).unwrap();
+        for field in [
+            "id",
+            "project_id",
+            "format",
+            "format_version",
+            "name",
+            "enabled",
+            "captured_at_utc",
+            "start_tick",
+            "end_tick",
+            "extensions",
+        ] {
+            assert_eq!(candidate[field], source[field], "{field} must be retained");
+        }
+        let lanes = candidate["lanes"].as_array().unwrap();
+        assert_eq!(lanes.len(), 2);
+        let lane_ids = lanes
+            .iter()
+            .map(|lane| lane["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(lane_ids.windows(2).all(|pair| pair[0] < pair[1]));
+        let added_lane_id = lanes
+            .iter()
+            .find(|lane| lane["target"] == json!({"kind": "mixer-main", "parameter": "mute"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(added_lane_id, original_lane_id);
+        assert_eq!(
+            lanes
+                .iter()
+                .find(|lane| lane["id"] == original_lane_id)
+                .unwrap(),
+            &source["lanes"][0]
+        );
+        drop(prepared);
+
+        assert!(addition.publish().unwrap().changed());
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let take = prepared
+            .session()
+            .automation_takes()
+            .takes()
+            .iter()
+            .find(|take| take.id() == take_id)
+            .unwrap();
+        assert_eq!(take.lanes().len(), 2);
+        assert!(take.lanes().iter().any(|lane| {
+            lane.id() == added_lane_id
+                && lane.target()
+                    == (AutomationTarget::Main {
+                        parameter: AutomationMainParameter::Mute,
+                    })
+        }));
+
+        let removal = RunningDesktopIdeApplication::prepare_automation_lane_removal_from_project(
+            &application,
+            fixture_mixer_save_plan(&prepared),
+            &prepared,
+            take_id,
+            &added_lane_id,
+        )
+        .unwrap();
+        let removal_candidate: Value = serde_json::from_slice(&removal.take_bytes).unwrap();
+        assert_eq!(removal_candidate["lanes"].as_array().unwrap().len(), 1);
+        assert_eq!(removal_candidate["lanes"][0], source["lanes"][0]);
+        drop(prepared);
+
+        assert!(removal.publish().unwrap().changed());
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let take = reopened
+            .session()
+            .automation_takes()
+            .takes()
+            .iter()
+            .find(|take| take.id() == take_id)
+            .unwrap();
+        assert_eq!(take.lanes().len(), 1);
+        assert_eq!(take.lanes()[0].id(), original_lane_id);
+        hyper_storage_engine::verify_project_package(&project_path).unwrap();
     }
 
     #[test]

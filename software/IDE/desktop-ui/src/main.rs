@@ -16,10 +16,10 @@ use hyper_desktop_ide::{
     DesktopAudioPreviewState, DesktopIdeWorker, Edge, IDE_AUDIO_CLIP_WAVEFORM_BINS,
     IdeApplicationConfig, IdeAudioClip, IdeAudioClipSourceRange, IdeAudioClipWaveform,
     IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
-    IdeAutomationLaneEditRequest, IdeAutomationTakeRequest, IdeAutomationTarget,
-    IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
-    IdeControlMappingEdit, IdeInputMeterObservation, IdeInputSelection, IdeLoopRangeFrames,
-    IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
+    IdeAutomationLaneAddRequest, IdeAutomationLaneEditRequest, IdeAutomationTakeRequest,
+    IdeAutomationTarget, IdeControlBindingRequest, IdeControlChannelParameter,
+    IdeControlMainParameter, IdeControlMappingEdit, IdeInputMeterObservation, IdeInputSelection,
+    IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
     IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
     IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerChannelKind,
     IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice,
@@ -6326,9 +6326,10 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::AddArrangementSceneLaunch => AppMode::AddingArrangementSceneLaunch,
         IdeWorkerCommandKind::AddAutomationTake => AppMode::AddingAutomationTake,
         IdeWorkerCommandKind::SetAutomationTakeActive => AppMode::ChangingAutomationTakeActivation,
-        IdeWorkerCommandKind::EditAutomationTake | IdeWorkerCommandKind::EditAutomationLane => {
-            AppMode::EditingAutomationTake
-        }
+        IdeWorkerCommandKind::EditAutomationTake
+        | IdeWorkerCommandKind::AddAutomationLane
+        | IdeWorkerCommandKind::EditAutomationLane
+        | IdeWorkerCommandKind::RemoveAutomationLane => AppMode::EditingAutomationTake,
         IdeWorkerCommandKind::RemoveAutomationTake => AppMode::RemovingAutomationTake,
         IdeWorkerCommandKind::EditControlMapping => AppMode::EditingControlMapping,
         IdeWorkerCommandKind::EditNativeFilter => AppMode::EditingNativeFilter,
@@ -6621,7 +6622,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
             "Preserving mixer state, adding the automation take, and reopening project..."
         }
         IdeWorkerCommandKind::EditAutomationTake
+        | IdeWorkerCommandKind::AddAutomationLane
         | IdeWorkerCommandKind::EditAutomationLane
+        | IdeWorkerCommandKind::RemoveAutomationLane
         | IdeWorkerCommandKind::SetAutomationTakeActive => {
             "Preserving mixer state, editing automation, and reopening project..."
         }
@@ -7108,10 +7111,20 @@ fn apply_event(
         | IdeWorkerEvent::AutomationTakeEditing { .. }) => {
             apply_automation_take_edit_event(ui, &event);
         }
+        event @ (IdeWorkerEvent::AutomationLaneAdded { .. }
+        | IdeWorkerEvent::AutomationLaneAdditionCommittedWithWarning { .. }
+        | IdeWorkerEvent::AutomationLaneAdding { .. }) => {
+            apply_automation_lane_addition_event(ui, &event);
+        }
         event @ (IdeWorkerEvent::AutomationLaneEdited { .. }
         | IdeWorkerEvent::AutomationLaneEditCommittedWithWarning { .. }
         | IdeWorkerEvent::AutomationLaneEditing { .. }) => {
             apply_automation_lane_edit_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AutomationLaneRemoved { .. }
+        | IdeWorkerEvent::AutomationLaneRemovalCommittedWithWarning { .. }
+        | IdeWorkerEvent::AutomationLaneRemoving { .. }) => {
+            apply_automation_lane_removal_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AutomationTakeRemoved { .. }
         | IdeWorkerEvent::AutomationTakeRemovalCommittedWithWarning { .. }
@@ -11172,6 +11185,7 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_mixer_automation_visible(false);
     reset_mixer_automation_capture_form(ui);
     reset_automation_creation_form(ui);
+    reset_automation_lane_addition_form(ui);
     reset_automation_take_edit_form(ui);
     ui.set_control_bindings(ModelRc::default());
     ui.set_control_source_names(ModelRc::default());
@@ -11360,7 +11374,10 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         {
             AppMode::Running
         }
-        IdeWorkerCommandKind::EditAutomationTake | IdeWorkerCommandKind::EditAutomationLane
+        IdeWorkerCommandKind::EditAutomationTake
+        | IdeWorkerCommandKind::AddAutomationLane
+        | IdeWorkerCommandKind::EditAutomationLane
+        | IdeWorkerCommandKind::RemoveAutomationLane
             if current == AppMode::EditingAutomationTake =>
         {
             AppMode::Running
@@ -12664,6 +12681,7 @@ fn set_automation_targets(
 struct AutomationTakeListModel {
     owner: Arc<IdePlaybackAutomation>,
     labels: Vec<String>,
+    choices: Vec<AutomationTargetChoice>,
 }
 
 impl Model for AutomationTakeListModel {
@@ -12683,6 +12701,12 @@ impl Model for AutomationTakeListModel {
             .sum();
         let editable = take.lanes().len() == 1;
         let lane_editable = take.lanes().len() > 1;
+        let lane_addable = self.choices.iter().any(|choice| {
+            !take
+                .lanes()
+                .iter()
+                .any(|lane| lane.target() == choice.resolved)
+        });
         let target = if editable {
             self.labels.get(row)?.clone()
         } else {
@@ -12706,6 +12730,7 @@ impl Model for AutomationTakeListModel {
             enabled: take.enabled(),
             editable,
             lane_editable,
+            lane_addable,
             range: format!("TICK {} to {}", take.start_tick(), take.end_tick()).into(),
             target: target.into(),
             interpolation: interpolation.into(),
@@ -12726,6 +12751,23 @@ fn automation_lane_label(target: AutomationTarget, choices: &[AutomationTargetCh
             || "Unresolved mixer target".to_owned(),
             |choice| choice.label.clone(),
         )
+}
+
+/// Returns an in-memory-only identity for one form candidate. It carries the
+/// durable project identifier rather than a display label, so a same-named
+/// mixer strip cannot be selected after the topology behind an open form has
+/// changed.
+fn automation_target_identity(target: &IdeAutomationTarget) -> String {
+    match target {
+        IdeAutomationTarget::Channel {
+            track_id,
+            parameter,
+        } => format!("channel:{track_id}:{parameter:?}"),
+        IdeAutomationTarget::Send { send_id, parameter } => {
+            format!("send:{send_id}:{parameter:?}")
+        }
+        IdeAutomationTarget::Main { parameter } => format!("main:{parameter:?}"),
+    }
 }
 
 fn set_automation(
@@ -12756,6 +12798,7 @@ fn set_automation(
     ui.set_automation_takes(ModelRc::new(AutomationTakeListModel {
         owner: Arc::clone(owner),
         labels,
+        choices,
     }));
 }
 
@@ -12771,7 +12814,9 @@ fn replace_automation_take_authority(
         .as_ref()
         .is_none_or(|current| !Arc::ptr_eq(current, &owner));
     ui.set_automation_take_remove_confirming_id(SharedString::default());
+    ui.set_automation_lane_remove_confirming_id(SharedString::default());
     if authority_replaced {
+        reset_automation_lane_addition_form(ui);
         reset_automation_take_edit_form(ui);
     }
     *project_state.automation.borrow_mut() = Some(owner);
@@ -12883,6 +12928,33 @@ fn automation_lane_edit_request(
     })
 }
 
+/// Builds a request for one new lane from the target candidates attached to
+/// the currently observed take. The caller verifies the form's candidate
+/// model before indexing it, so a topology change cannot silently redirect
+/// the selected lane to another target.
+fn automation_lane_addition_request(
+    choices: &[AutomationTargetChoice],
+    target_index: i32,
+    interpolation_index: i32,
+    points: &str,
+) -> Result<IdeAutomationLaneAddRequest, &'static str> {
+    let choice = usize::try_from(target_index)
+        .ok()
+        .and_then(|index| choices.get(index))
+        .ok_or("The selected automation target is unavailable")?;
+    let interpolation = if choice.boolean || interpolation_index == 0 {
+        AutomationInterpolation::Hold
+    } else {
+        AutomationInterpolation::Linear
+    };
+    let points = parse_automation_points(points, choice.boolean)?;
+    Ok(IdeAutomationLaneAddRequest {
+        target: choice.target.clone(),
+        interpolation,
+        points,
+    })
+}
+
 /// Builds the only authoring input that live capture is allowed to choose:
 /// a normalized take name and one target from the current compiled topology.
 fn mixer_automation_capture_request(
@@ -12913,6 +12985,14 @@ struct AutomationTakeEditForm {
     points: String,
 }
 
+#[derive(Clone)]
+struct AutomationLaneAdditionForm {
+    take_id: String,
+    take_name: String,
+    range: String,
+    choices: Vec<AutomationTargetChoice>,
+}
+
 struct AutomationLaneEditForm {
     take_id: String,
     lane_id: String,
@@ -12924,6 +13004,37 @@ struct AutomationLaneEditForm {
     start: String,
     end: String,
     points: String,
+}
+
+fn automation_lane_addition_form(
+    owner: &IdePlaybackAutomation,
+    choices: &[AutomationTargetChoice],
+    take_id: &str,
+) -> Result<AutomationLaneAdditionForm, &'static str> {
+    let take = owner
+        .takes()
+        .iter()
+        .find(|take| take.id() == take_id)
+        .ok_or("The selected automation take is no longer available")?;
+    let choices = choices
+        .iter()
+        .filter(|choice| {
+            !take
+                .lanes()
+                .iter()
+                .any(|lane| lane.target() == choice.resolved)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        return Err("Every available mixer target is already automated by this take");
+    }
+    Ok(AutomationLaneAdditionForm {
+        take_id: take.id().to_owned(),
+        take_name: take.name().to_owned(),
+        range: format!("TICK {} to {}", take.start_tick(), take.end_tick()),
+        choices,
+    })
 }
 
 fn automation_take_edit_form(
@@ -13026,6 +13137,7 @@ fn populate_automation_lane_edit_form(ui: &MainWindow, form: AutomationLaneEditF
     ui.set_automation_edit_take_id(form.take_id.into());
     ui.set_automation_edit_lane_only(true);
     ui.set_automation_edit_lane_id(form.lane_id.into());
+    ui.set_automation_lane_remove_confirming_id(SharedString::default());
     ui.set_automation_edit_lane_names(ModelRc::from(Rc::new(VecModel::from(form.lane_names))));
     ui.set_automation_edit_lane_index(form.lane_index);
     ui.set_automation_edit_name(form.name.into());
@@ -13036,6 +13148,70 @@ fn populate_automation_lane_edit_form(ui: &MainWindow, form: AutomationLaneEditF
     ui.set_automation_edit_points(form.points.into());
     ui.set_automation_edit_visible(true);
     ui.set_error_text(SharedString::default());
+}
+
+fn populate_automation_lane_addition_form(ui: &MainWindow, form: AutomationLaneAdditionForm) {
+    ui.set_automation_lane_add_take_id(form.take_id.into());
+    ui.set_automation_lane_add_take_name(form.take_name.into());
+    ui.set_automation_lane_add_range(form.range.into());
+    ui.set_automation_lane_add_target_names(ModelRc::from(Rc::new(VecModel::from(
+        form.choices
+            .iter()
+            .map(|choice| SharedString::from(choice.label.as_str()))
+            .collect::<Vec<_>>(),
+    ))));
+    ui.set_automation_lane_add_target_boolean(ModelRc::from(Rc::new(VecModel::from(
+        form.choices
+            .iter()
+            .map(|choice| choice.boolean)
+            .collect::<Vec<_>>(),
+    ))));
+    ui.set_automation_lane_add_target_domain(ModelRc::from(Rc::new(VecModel::from(
+        form.choices
+            .iter()
+            .map(|choice| SharedString::from(choice.domain.as_str()))
+            .collect::<Vec<_>>(),
+    ))));
+    ui.set_automation_lane_add_target_identities(ModelRc::from(Rc::new(VecModel::from(
+        form.choices
+            .iter()
+            .map(|choice| SharedString::from(automation_target_identity(&choice.target)))
+            .collect::<Vec<_>>(),
+    ))));
+    ui.set_automation_lane_add_target_index(0);
+    ui.set_automation_lane_add_interpolation_index(0);
+    ui.set_automation_lane_add_points(SharedString::default());
+    ui.set_automation_lane_add_visible(true);
+    ui.set_error_text(SharedString::default());
+}
+
+fn automation_lane_addition_form_matches_ui(
+    ui: &MainWindow,
+    form: &AutomationLaneAdditionForm,
+) -> bool {
+    if ui.get_automation_lane_add_take_id().as_str() != form.take_id {
+        return false;
+    }
+    let names = ui.get_automation_lane_add_target_names();
+    let booleans = ui.get_automation_lane_add_target_boolean();
+    let domains = ui.get_automation_lane_add_target_domain();
+    let identities = ui.get_automation_lane_add_target_identities();
+    names.row_count() == form.choices.len()
+        && booleans.row_count() == form.choices.len()
+        && domains.row_count() == form.choices.len()
+        && identities.row_count() == form.choices.len()
+        && form.choices.iter().enumerate().all(|(index, choice)| {
+            names
+                .row_data(index)
+                .is_some_and(|name| name.as_str() == choice.label.as_str())
+                && booleans.row_data(index) == Some(choice.boolean)
+                && domains
+                    .row_data(index)
+                    .is_some_and(|domain| domain.as_str() == choice.domain.as_str())
+                && identities.row_data(index).is_some_and(|identity| {
+                    identity.as_str() == automation_target_identity(&choice.target)
+                })
+        })
 }
 
 fn format_automation_points(points: &[AutomationPoint]) -> String {
@@ -13056,12 +13232,14 @@ fn format_automation_points(points: &[AutomationPoint]) -> String {
 fn automation_take_form_is_open(ui: &MainWindow) -> bool {
     ui.get_automation_capture_visible()
         || ui.get_automation_create_visible()
+        || ui.get_automation_lane_add_visible()
         || ui.get_automation_edit_visible()
 }
 
 fn automation_take_direct_action_is_current(ui: &MainWindow, take_id: &str) -> bool {
     ui.get_app_mode() == AppMode::Running
         && !automation_take_form_is_open(ui)
+        && ui.get_automation_lane_remove_confirming_id().is_empty()
         && ui.get_automation_take_remove_confirming_id().is_empty()
         && !take_id.is_empty()
 }
@@ -13095,6 +13273,7 @@ fn bind_begin_automation_take_edit_callback(ui: &MainWindow, project_state: &Pro
         ui.set_automation_edit_take_id(form.take_id.into());
         ui.set_automation_edit_lane_only(false);
         ui.set_automation_edit_lane_id(SharedString::default());
+        ui.set_automation_lane_remove_confirming_id(SharedString::default());
         ui.set_automation_edit_lane_names(ModelRc::default());
         ui.set_automation_edit_lane_index(0);
         ui.set_automation_edit_name(form.name.into());
@@ -13165,6 +13344,98 @@ fn bind_save_automation_take_edit_callback(
             &ui,
             &worker_for_edit,
             IdeWorkerCommand::EditAutomationTake { take_id, request },
+        );
+    });
+}
+
+fn bind_begin_automation_lane_addition_callback(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let project_state_for_begin = Rc::clone(project_state);
+    actions.on_begin_add_automation_lane(move |take_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if !automation_take_direct_action_is_current(&ui, take_id.as_str()) {
+            ui.set_error_text("Automation lane addition request is no longer current".into());
+            return;
+        }
+        let owner = project_state_for_begin.automation.borrow().clone();
+        let choices =
+            automation_target_choices(&project_state_for_begin.automation_channels.borrow());
+        let form = owner
+            .as_deref()
+            .ok_or("Automation take data is no longer available")
+            .and_then(|owner| automation_lane_addition_form(owner, &choices, take_id.as_str()));
+        match form {
+            Ok(form) => populate_automation_lane_addition_form(&ui, form),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+}
+
+fn bind_automation_lane_addition_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_addition = Rc::clone(worker);
+    let project_state_for_addition = Rc::clone(project_state);
+    actions.on_add_automation_lane(move |target_index, interpolation_index, points| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_automation_lane_add_visible() {
+            ui.set_error_text("Automation lane addition request is no longer current".into());
+            return;
+        }
+        let take_id = ui.get_automation_lane_add_take_id().to_string();
+        if take_id.is_empty() {
+            reset_automation_lane_addition_form(&ui);
+            ui.set_error_text("Automation lane addition request is no longer current".into());
+            return;
+        }
+        let owner = project_state_for_addition.automation.borrow().clone();
+        let choices =
+            automation_target_choices(&project_state_for_addition.automation_channels.borrow());
+        let form = owner
+            .as_deref()
+            .ok_or("Automation take data is no longer available")
+            .and_then(|owner| automation_lane_addition_form(owner, &choices, &take_id));
+        let form = match form {
+            Ok(form) if automation_lane_addition_form_matches_ui(&ui, &form) => form,
+            Ok(_) => {
+                reset_automation_lane_addition_form(&ui);
+                ui.set_error_text("The selected automation target is no longer available".into());
+                return;
+            }
+            Err(message) => {
+                reset_automation_lane_addition_form(&ui);
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let request = match automation_lane_addition_request(
+            &form.choices,
+            target_index,
+            interpolation_index,
+            points.as_str(),
+        ) {
+            Ok(request) => request,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_addition,
+            IdeWorkerCommand::AddAutomationLane { take_id, request },
         );
     });
 }
@@ -13326,6 +13597,73 @@ fn bind_save_automation_lane_edit_callback(
     });
 }
 
+fn bind_automation_lane_removal_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_removal = Rc::clone(worker);
+    let project_state_for_removal = Rc::clone(project_state);
+    actions.on_remove_automation_lane(move |take_id, lane_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let selected_take_id = ui.get_automation_edit_take_id().to_string();
+        let selected_lane_id = ui.get_automation_edit_lane_id().to_string();
+        let confirmation = ui.get_automation_lane_remove_confirming_id().to_string();
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_automation_edit_visible()
+            || !ui.get_automation_edit_lane_only()
+            || take_id.is_empty()
+            || lane_id.is_empty()
+            || take_id.as_str() != selected_take_id
+            || lane_id.as_str() != selected_lane_id
+            || confirmation != lane_id.as_str()
+        {
+            ui.set_automation_lane_remove_confirming_id(SharedString::default());
+            ui.set_error_text("Automation lane removal request is no longer current".into());
+            return;
+        }
+        let owner = project_state_for_removal.automation.borrow().clone();
+        let choices =
+            automation_target_choices(&project_state_for_removal.automation_channels.borrow());
+        let form = owner
+            .as_deref()
+            .ok_or("Automation take data is no longer available")
+            .and_then(|owner| {
+                automation_lane_edit_form(owner, &choices, take_id.as_str(), Some(lane_id.as_str()))
+            });
+        match form {
+            Ok(form)
+                if form.lane_id == lane_id.as_str()
+                    && form.lane_index == ui.get_automation_edit_lane_index() =>
+            {
+                ui.set_automation_lane_remove_confirming_id(SharedString::default());
+            }
+            Ok(_) => {
+                reset_automation_take_edit_form(&ui);
+                ui.set_error_text("Automation lane selection is no longer current".into());
+                return;
+            }
+            Err(message) => {
+                reset_automation_take_edit_form(&ui);
+                ui.set_error_text(message.into());
+                return;
+            }
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_removal,
+            IdeWorkerCommand::RemoveAutomationLane {
+                take_id: take_id.to_string(),
+                lane_id: lane_id.to_string(),
+            },
+        );
+    });
+}
+
 fn bind_automation_take_edit_callbacks(
     ui: &MainWindow,
     worker: &WorkerCell,
@@ -13333,9 +13671,12 @@ fn bind_automation_take_edit_callbacks(
 ) {
     bind_begin_automation_take_edit_callback(ui, project_state);
     bind_save_automation_take_edit_callback(ui, worker, project_state);
+    bind_begin_automation_lane_addition_callback(ui, project_state);
+    bind_automation_lane_addition_callback(ui, worker, project_state);
     bind_begin_automation_lane_edit_callback(ui, project_state);
     bind_automation_lane_selection_callback(ui, project_state);
     bind_save_automation_lane_edit_callback(ui, worker, project_state);
+    bind_automation_lane_removal_callback(ui, worker, project_state);
 }
 
 fn bind_automation_take_callback(
@@ -13459,6 +13800,32 @@ fn apply_automation_take_edit_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     }
 }
 
+fn apply_automation_lane_addition_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AutomationLaneAdded { revision, .. } => {
+            reset_automation_lane_addition_form(ui);
+            ui.set_status_text(
+                format!("Automation lane added in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AutomationLaneAdditionCommittedWithWarning { warning, .. } => {
+            reset_automation_lane_addition_form(ui);
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), "Automation lane addition").into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::AutomationLaneAdding { .. } => {
+            ui.set_app_mode(AppMode::EditingAutomationTake);
+            ui.set_status_text(
+                "Waiting for native output before adding the automation lane…".into(),
+            );
+        }
+        _ => unreachable!("automation lane addition event dispatcher received another event"),
+    }
+}
+
 fn apply_automation_lane_edit_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::AutomationLaneEdited {
@@ -13489,6 +13856,33 @@ fn apply_automation_lane_edit_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             );
         }
         _ => unreachable!("automation lane edit event dispatcher received another event"),
+    }
+}
+
+fn apply_automation_lane_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AutomationLaneRemoved { revision, .. } => {
+            reset_automation_take_edit_form(ui);
+            ui.set_status_text(
+                format!("Automation lane removed in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AutomationLaneRemovalCommittedWithWarning { warning, .. } => {
+            reset_automation_take_edit_form(ui);
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), "Automation lane removal").into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::AutomationLaneRemoving { .. } => {
+            ui.set_automation_lane_remove_confirming_id(SharedString::default());
+            ui.set_app_mode(AppMode::EditingAutomationTake);
+            ui.set_status_text(
+                "Waiting for native output before removing the automation lane…".into(),
+            );
+        }
+        _ => unreachable!("automation lane removal event dispatcher received another event"),
     }
 }
 
@@ -13611,6 +14005,20 @@ fn reset_automation_creation_form(ui: &MainWindow) {
     ui.set_automation_create_points(SharedString::default());
 }
 
+fn reset_automation_lane_addition_form(ui: &MainWindow) {
+    ui.set_automation_lane_add_visible(false);
+    ui.set_automation_lane_add_take_id(SharedString::default());
+    ui.set_automation_lane_add_take_name(SharedString::default());
+    ui.set_automation_lane_add_range(SharedString::default());
+    ui.set_automation_lane_add_target_names(ModelRc::default());
+    ui.set_automation_lane_add_target_boolean(ModelRc::default());
+    ui.set_automation_lane_add_target_domain(ModelRc::default());
+    ui.set_automation_lane_add_target_identities(ModelRc::default());
+    ui.set_automation_lane_add_target_index(0);
+    ui.set_automation_lane_add_interpolation_index(0);
+    ui.set_automation_lane_add_points(SharedString::default());
+}
+
 fn reset_mixer_automation_capture_form(ui: &MainWindow) {
     ui.set_automation_capture_visible(false);
     ui.set_automation_capture_name(SharedString::default());
@@ -13632,6 +14040,7 @@ fn reset_automation_take_edit_form(ui: &MainWindow) {
     ui.set_automation_edit_start(SharedString::default());
     ui.set_automation_edit_end(SharedString::default());
     ui.set_automation_edit_points(SharedString::default());
+    ui.set_automation_lane_remove_confirming_id(SharedString::default());
 }
 
 fn apply_automation_take_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -18828,6 +19237,7 @@ mod tests {
                 enabled: true,
                 editable: true,
                 lane_editable: false,
+                lane_addable: true,
                 range: "TICK 0 to 960".into(),
                 target: "Main gain".into(),
                 interpolation: "Linear".into(),
@@ -22099,6 +22509,126 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "the one form/event test keeps selection identity and both durable lane outcomes visible"
+    )]
+    fn automation_lane_management_form_rejects_stale_targets_and_resets_after_events() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        let choices = automation_target_choices(&automation_channel_fixture());
+        let form = AutomationLaneAdditionForm {
+            take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+            take_name: "Main fade".to_owned(),
+            range: "TICK 0 to 960".to_owned(),
+            choices: vec![choices[3].clone(), choices[4].clone()],
+        };
+        populate_automation_lane_addition_form(&ui, form.clone());
+        assert!(ui.get_automation_lane_add_visible());
+        assert_eq!(ui.get_automation_lane_add_target_names().row_count(), 2);
+        assert!(automation_lane_addition_form_matches_ui(&ui, &form));
+        let request =
+            automation_lane_addition_request(&form.choices, 1, 1, "0=off, 960=on").unwrap();
+        assert_eq!(request.interpolation, AutomationInterpolation::Hold);
+        assert_eq!(
+            request.target,
+            IdeAutomationTarget::Channel {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+                parameter: AutomationChannelParameter::Mute,
+            }
+        );
+        ui.set_automation_lane_add_target_identities(ModelRc::from(Rc::new(VecModel::from(vec![
+            SharedString::from("stale"),
+            SharedString::from("stale"),
+        ]))));
+        assert!(
+            !automation_lane_addition_form_matches_ui(&ui, &form),
+            "a new mixer topology cannot redirect an open form by retaining only its display names"
+        );
+
+        populate_automation_lane_addition_form(&ui, form);
+        ui.set_app_mode(AppMode::Running);
+        apply_automation_lane_addition_event(
+            &ui,
+            &IdeWorkerEvent::AutomationLaneAdding {
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::EditingAutomationTake);
+        assert!(ui.get_automation_lane_add_visible());
+        apply_automation_lane_addition_event(
+            &ui,
+            &IdeWorkerEvent::AutomationLaneAdded {
+                revision: 9,
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+            },
+        );
+        assert!(!ui.get_automation_lane_add_visible());
+        assert!(ui.get_automation_lane_add_take_id().is_empty());
+        assert_eq!(ui.get_automation_lane_add_target_names().row_count(), 0);
+        assert!(
+            ui.get_status_text()
+                .contains("lane added in project revision 9")
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        populate_automation_lane_addition_form(
+            &ui,
+            AutomationLaneAdditionForm {
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+                take_name: "Main fade".to_owned(),
+                range: "TICK 0 to 960".to_owned(),
+                choices: vec![choices[3].clone()],
+            },
+        );
+        apply_automation_lane_addition_event(
+            &ui,
+            &IdeWorkerEvent::AutomationLaneAdditionCommittedWithWarning {
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+                warning: Box::new(IdeAutomationTakeEditError::TakeUnavailable),
+            },
+        );
+        assert!(!ui.get_automation_lane_add_visible());
+        assert!(ui.get_status_text().contains("committed"));
+        assert!(!ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_automation_edit_visible(true);
+        ui.set_automation_edit_take_id("018f47a2-6b2d-7c11-8a44-0011223344a0".into());
+        ui.set_automation_edit_lane_only(true);
+        ui.set_automation_edit_lane_id("018f47a2-6b2d-7c11-8a44-0011223344a1".into());
+        ui.set_automation_edit_lane_names(ModelRc::from(Rc::new(VecModel::from(vec![
+            SharedString::from("Lane 1 · Main gain"),
+            SharedString::from("Lane 2 · Main mute"),
+        ]))));
+        ui.set_automation_lane_remove_confirming_id("018f47a2-6b2d-7c11-8a44-0011223344a1".into());
+        apply_automation_lane_removal_event(
+            &ui,
+            &IdeWorkerEvent::AutomationLaneRemoving {
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+                lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a1".to_owned(),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::EditingAutomationTake);
+        assert!(ui.get_automation_lane_remove_confirming_id().is_empty());
+        apply_automation_lane_removal_event(
+            &ui,
+            &IdeWorkerEvent::AutomationLaneRemoved {
+                revision: 10,
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+                lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a1".to_owned(),
+            },
+        );
+        assert!(!ui.get_automation_edit_visible());
+        assert!(ui.get_automation_edit_lane_id().is_empty());
+        assert!(
+            ui.get_status_text()
+                .contains("lane removed in project revision 10")
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "one generated UI contract keeps every mutually-exclusive automation action state visible"
     )]
     fn generated_automation_take_actions_close_while_an_edit_form_is_open() {
@@ -22116,6 +22646,7 @@ mod tests {
                 enabled: true,
                 editable: true,
                 lane_editable: false,
+                lane_addable: true,
                 range: "TICK 0 to 960".into(),
                 target: "Main gain".into(),
                 interpolation: "Linear".into(),
@@ -22127,6 +22658,7 @@ mod tests {
                 enabled: true,
                 editable: true,
                 lane_editable: false,
+                lane_addable: true,
                 range: "TICK 960 to 1920".into(),
                 target: "Main gain".into(),
                 interpolation: "Linear".into(),
@@ -22138,6 +22670,7 @@ mod tests {
                 enabled: true,
                 editable: false,
                 lane_editable: true,
+                lane_addable: true,
                 range: "TICK 0 to 960".into(),
                 target: "2 lanes · select a lane".into(),
                 interpolation: "Mixed".into(),
@@ -22159,6 +22692,12 @@ mod tests {
         )
         .next()
         .expect("the multi-lane take exposes lane selection");
+        let lane_addition = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Add an automation lane to First automation take",
+        )
+        .next()
+        .expect("the first generated take exposes lane addition");
         let activation =
             ElementHandle::find_by_accessible_label(&ui, "Disable First automation take")
                 .next()
@@ -22179,6 +22718,7 @@ mod tests {
         assert_eq!(first_edit.accessible_enabled(), Some(true));
         assert_eq!(second_edit.accessible_enabled(), Some(true));
         assert_eq!(lane_edit.accessible_enabled(), Some(true));
+        assert_eq!(lane_addition.accessible_enabled(), Some(true));
         assert_eq!(activation.accessible_enabled(), Some(true));
         assert_eq!(removal.accessible_enabled(), Some(true));
         assert_eq!(channels.accessible_enabled(), Some(true));
@@ -22190,6 +22730,7 @@ mod tests {
         assert_eq!(first_edit.accessible_enabled(), Some(false));
         assert_eq!(second_edit.accessible_enabled(), Some(false));
         assert_eq!(lane_edit.accessible_enabled(), Some(false));
+        assert_eq!(lane_addition.accessible_enabled(), Some(false));
         assert_eq!(activation.accessible_enabled(), Some(false));
         assert_eq!(removal.accessible_enabled(), Some(false));
         assert_eq!(channels.accessible_enabled(), Some(false));
@@ -22200,16 +22741,27 @@ mod tests {
         assert!(!automation_take_direct_action_is_current(&ui, first_id));
         assert_eq!(first_edit.accessible_enabled(), Some(false));
         assert_eq!(lane_edit.accessible_enabled(), Some(false));
+        assert_eq!(lane_addition.accessible_enabled(), Some(false));
         assert_eq!(activation.accessible_enabled(), Some(false));
         assert_eq!(removal.accessible_enabled(), Some(false));
         assert_eq!(channels.accessible_enabled(), Some(false));
         assert_eq!(performance.accessible_enabled(), Some(false));
 
         ui.set_automation_create_visible(false);
+        ui.set_automation_lane_add_visible(true);
+        assert!(!automation_take_direct_action_is_current(&ui, first_id));
+        assert_eq!(first_edit.accessible_enabled(), Some(false));
+        assert_eq!(lane_edit.accessible_enabled(), Some(false));
+        assert_eq!(lane_addition.accessible_enabled(), Some(false));
+        assert_eq!(activation.accessible_enabled(), Some(false));
+        assert_eq!(removal.accessible_enabled(), Some(false));
+
+        ui.set_automation_lane_add_visible(false);
         ui.set_automation_take_remove_confirming_id(first_id.into());
         assert!(!automation_take_direct_action_is_current(&ui, first_id));
         assert_eq!(first_edit.accessible_enabled(), Some(false));
         assert_eq!(lane_edit.accessible_enabled(), Some(false));
+        assert_eq!(lane_addition.accessible_enabled(), Some(false));
         assert_eq!(activation.accessible_enabled(), Some(false));
         assert_eq!(channels.accessible_enabled(), Some(false));
         assert_eq!(performance.accessible_enabled(), Some(false));

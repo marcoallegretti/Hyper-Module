@@ -57,13 +57,13 @@ use super::{
     IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioPrimaryRouteError,
     IdeAudioTrackAdditionError, IdeAudioTrackContentRemovalError, IdeAudioTrackDuplicationError,
     IdeAudioTrackEditError, IdeAudioTrackFlattenError, IdeAudioTrackFreezeError,
-    IdeAudioTrackRemovalError, IdeAudioTrackUnfreezeError, IdeAutomationLaneEditRequest,
-    IdeAutomationTakeCreationError, IdeAutomationTakeEditError, IdeAutomationTakeRequest,
-    IdeAutomationTarget, IdeCloseOutcome, IdeControlMappingEdit, IdeControlMappingEditError,
-    IdeHistoryOperation, IdeInputDiscoveryError, IdeInputSelection, IdeInputSelectionError,
-    IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessCommandError, IdeMixerChannelKind,
-    IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError, IdeMixerMainState,
-    IdeMixerPrimaryDestination, IdeMixerStripReorderError, IdeMonitoringCommand,
+    IdeAudioTrackRemovalError, IdeAudioTrackUnfreezeError, IdeAutomationLaneAddRequest,
+    IdeAutomationLaneEditRequest, IdeAutomationTakeCreationError, IdeAutomationTakeEditError,
+    IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome, IdeControlMappingEdit,
+    IdeControlMappingEditError, IdeHistoryOperation, IdeInputDiscoveryError, IdeInputSelection,
+    IdeInputSelectionError, IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessCommandError,
+    IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
+    IdeMixerMainState, IdeMixerPrimaryDestination, IdeMixerStripReorderError, IdeMonitoringCommand,
     IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure, IdeNativeFilterEdit,
     IdeNativeFilterEditError, IdeOutputDiscoveryError, IdeOutputMeterObservation,
     IdeOutputSelection, IdeOutputSelectionError, IdeOutputTestError, IdeOutputTestSnapshot,
@@ -256,7 +256,9 @@ pub enum IdeWorkerCommandKind {
     AddAutomationTake,
     SetAutomationTakeActive,
     EditAutomationTake,
+    AddAutomationLane,
     EditAutomationLane,
+    RemoveAutomationLane,
     RemoveAutomationTake,
     EditNativeFilter,
     EditControlMapping,
@@ -563,10 +565,18 @@ pub enum IdeWorkerCommand {
         take_id: String,
         request: IdeAutomationTakeRequest,
     },
+    AddAutomationLane {
+        take_id: String,
+        request: IdeAutomationLaneAddRequest,
+    },
     EditAutomationLane {
         take_id: String,
         lane_id: String,
         request: IdeAutomationLaneEditRequest,
+    },
+    RemoveAutomationLane {
+        take_id: String,
+        lane_id: String,
     },
     RemoveAutomationTake {
         take_id: String,
@@ -764,7 +774,9 @@ impl IdeWorkerCommand {
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
             Self::EditAutomationTake { .. } => IdeWorkerCommandKind::EditAutomationTake,
+            Self::AddAutomationLane { .. } => IdeWorkerCommandKind::AddAutomationLane,
             Self::EditAutomationLane { .. } => IdeWorkerCommandKind::EditAutomationLane,
+            Self::RemoveAutomationLane { .. } => IdeWorkerCommandKind::RemoveAutomationLane,
             Self::RemoveAutomationTake { .. } => IdeWorkerCommandKind::RemoveAutomationTake,
             Self::EditNativeFilter { .. } => IdeWorkerCommandKind::EditNativeFilter,
             Self::EditControlMapping { .. } => IdeWorkerCommandKind::EditControlMapping,
@@ -3376,6 +3388,14 @@ pub enum IdeWorkerEvent {
         take_id: String,
         warning: Box<IdeAutomationTakeEditError>,
     },
+    AutomationLaneAdded {
+        revision: u64,
+        take_id: String,
+    },
+    AutomationLaneAdditionCommittedWithWarning {
+        take_id: String,
+        warning: Box<IdeAutomationTakeEditError>,
+    },
     AutomationLaneEdited {
         revision: u64,
         changed: bool,
@@ -3383,6 +3403,16 @@ pub enum IdeWorkerEvent {
         lane_id: String,
     },
     AutomationLaneEditCommittedWithWarning {
+        take_id: String,
+        lane_id: String,
+        warning: Box<IdeAutomationTakeEditError>,
+    },
+    AutomationLaneRemoved {
+        revision: u64,
+        take_id: String,
+        lane_id: String,
+    },
+    AutomationLaneRemovalCommittedWithWarning {
         take_id: String,
         lane_id: String,
         warning: Box<IdeAutomationTakeEditError>,
@@ -3654,7 +3684,14 @@ pub enum IdeWorkerEvent {
     AutomationTakeEditing {
         take_id: String,
     },
+    AutomationLaneAdding {
+        take_id: String,
+    },
     AutomationLaneEditing {
+        take_id: String,
+        lane_id: String,
+    },
+    AutomationLaneRemoving {
         take_id: String,
         lane_id: String,
     },
@@ -4795,10 +4832,18 @@ enum ProjectMutation {
         take_id: String,
         request: IdeAutomationTakeRequest,
     },
+    AddAutomationLane {
+        take_id: String,
+        request: IdeAutomationLaneAddRequest,
+    },
     EditAutomationLane {
         take_id: String,
         lane_id: String,
         request: IdeAutomationLaneEditRequest,
+    },
+    RemoveAutomationLane {
+        take_id: String,
+        lane_id: String,
     },
     RemoveAutomationTake {
         take_id: String,
@@ -4932,7 +4977,9 @@ impl ProjectMutation {
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
             Self::EditAutomationTake { .. } => IdeWorkerCommandKind::EditAutomationTake,
+            Self::AddAutomationLane { .. } => IdeWorkerCommandKind::AddAutomationLane,
             Self::EditAutomationLane { .. } => IdeWorkerCommandKind::EditAutomationLane,
+            Self::RemoveAutomationLane { .. } => IdeWorkerCommandKind::RemoveAutomationLane,
             Self::RemoveAutomationTake { .. } => IdeWorkerCommandKind::RemoveAutomationTake,
             Self::EditNativeFilter { .. } => IdeWorkerCommandKind::EditNativeFilter,
             Self::EditControlMapping { .. } => IdeWorkerCommandKind::EditControlMapping,
@@ -5115,12 +5162,21 @@ impl ProjectMutation {
             Self::EditAutomationTake { take_id, .. } => IdeWorkerEvent::AutomationTakeEditing {
                 take_id: take_id.clone(),
             },
+            Self::AddAutomationLane { take_id, .. } => IdeWorkerEvent::AutomationLaneAdding {
+                take_id: take_id.clone(),
+            },
             Self::EditAutomationLane {
                 take_id, lane_id, ..
             } => IdeWorkerEvent::AutomationLaneEditing {
                 take_id: take_id.clone(),
                 lane_id: lane_id.clone(),
             },
+            Self::RemoveAutomationLane { take_id, lane_id } => {
+                IdeWorkerEvent::AutomationLaneRemoving {
+                    take_id: take_id.clone(),
+                    lane_id: lane_id.clone(),
+                }
+            }
             Self::RemoveAutomationTake { take_id } => IdeWorkerEvent::AutomationTakeRemoving {
                 take_id: take_id.clone(),
             },
@@ -5311,7 +5367,9 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetSceneActive => "scene activation",
         IdeWorkerCommandKind::SetAutomationTakeActive => "automation activation",
         IdeWorkerCommandKind::EditAutomationTake => "automation take edit",
+        IdeWorkerCommandKind::AddAutomationLane => "automation lane addition",
         IdeWorkerCommandKind::EditAutomationLane => "automation lane edit",
+        IdeWorkerCommandKind::RemoveAutomationLane => "automation lane removal",
         IdeWorkerCommandKind::RemoveAutomationTake => "automation take removal",
         IdeWorkerCommandKind::EditNativeFilter => "native device",
         IdeWorkerCommandKind::AddArrangementPlacement => "placement",
@@ -5759,7 +5817,9 @@ fn process_command(
         | IdeWorkerCommand::AddAutomationTake { .. }
         | IdeWorkerCommand::SetAutomationTakeActive { .. }
         | IdeWorkerCommand::EditAutomationTake { .. }
+        | IdeWorkerCommand::AddAutomationLane { .. }
         | IdeWorkerCommand::EditAutomationLane { .. }
+        | IdeWorkerCommand::RemoveAutomationLane { .. }
         | IdeWorkerCommand::RemoveAutomationTake { .. }
         | IdeWorkerCommand::EditNativeFilter { .. }
         | IdeWorkerCommand::EditControlMapping { .. }
@@ -6116,11 +6176,17 @@ fn process_project_mutation_command(
         IdeWorkerCommand::EditAutomationTake { take_id, request } => {
             edit_automation_take(state, events, &take_id, request)
         }
+        IdeWorkerCommand::AddAutomationLane { take_id, request } => {
+            add_automation_lane(state, events, &take_id, request)
+        }
         IdeWorkerCommand::EditAutomationLane {
             take_id,
             lane_id,
             request,
         } => edit_automation_lane(state, events, &take_id, &lane_id, request),
+        IdeWorkerCommand::RemoveAutomationLane { take_id, lane_id } => {
+            remove_automation_lane(state, events, &take_id, &lane_id)
+        }
         IdeWorkerCommand::RemoveAutomationTake { take_id } => {
             remove_automation_take_request(state, events, &take_id)
         }
@@ -10609,7 +10675,15 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             result: Ok(outcome),
             ..
         }
+        | ProjectMutationAttempt::AddAutomationLane {
+            result: Ok(outcome),
+            ..
+        }
         | ProjectMutationAttempt::EditAutomationLane {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::RemoveAutomationLane {
             result: Ok(outcome),
             ..
         }
@@ -10781,7 +10855,9 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::AddAutomationTake { result: Err(_), .. }
         | ProjectMutationAttempt::SetAutomationTakeActive { result: Err(_), .. }
         | ProjectMutationAttempt::EditAutomationTake { result: Err(_), .. }
+        | ProjectMutationAttempt::AddAutomationLane { result: Err(_), .. }
         | ProjectMutationAttempt::EditAutomationLane { result: Err(_), .. }
+        | ProjectMutationAttempt::RemoveAutomationLane { result: Err(_), .. }
         | ProjectMutationAttempt::EditControlMapping { result: Err(_), .. }
         | ProjectMutationAttempt::DuplicateScene { result: Err(_), .. }
         | ProjectMutationAttempt::RenameScene { result: Err(_), .. }
@@ -10987,6 +11063,56 @@ fn edit_automation_take(
     )
 }
 
+fn add_automation_lane(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    take_id: &str,
+    request: IdeAutomationLaneAddRequest,
+) -> bool {
+    if take_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::AddAutomationLane,
+            IdeWorkerCommandFailure::AutomationTakeEdit(Box::new(
+                IdeAutomationTakeEditError::InvalidTakeIdentity,
+            )),
+        );
+    }
+    let empty_target = match &request.target {
+        IdeAutomationTarget::Channel { track_id, .. } => track_id.is_empty(),
+        IdeAutomationTarget::Send { send_id, .. } => send_id.is_empty(),
+        IdeAutomationTarget::Main { .. } => false,
+    };
+    if empty_target {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::AddAutomationLane,
+            IdeWorkerCommandFailure::AutomationTakeEdit(Box::new(
+                IdeAutomationTakeEditError::InvalidTargetIdentity,
+            )),
+        );
+    }
+    let mut owned_take_id = String::new();
+    if owned_take_id.try_reserve_exact(take_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::AddAutomationLane,
+            IdeWorkerCommandFailure::AutomationTakeEdit(Box::new(
+                IdeAutomationTakeEditError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_take_id.push_str(take_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::AddAutomationLane {
+            take_id: owned_take_id,
+            request,
+        },
+    )
+}
+
 fn edit_automation_lane(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -11048,6 +11174,55 @@ fn edit_automation_lane(
             take_id: owned_take_id,
             lane_id: owned_lane_id,
             request,
+        },
+    )
+}
+
+fn remove_automation_lane(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    take_id: &str,
+    lane_id: &str,
+) -> bool {
+    if take_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RemoveAutomationLane,
+            IdeWorkerCommandFailure::AutomationTakeEdit(Box::new(
+                IdeAutomationTakeEditError::InvalidTakeIdentity,
+            )),
+        );
+    }
+    if !is_valid_entity_id(lane_id) {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RemoveAutomationLane,
+            IdeWorkerCommandFailure::AutomationTakeEdit(Box::new(
+                IdeAutomationTakeEditError::InvalidLaneIdentity,
+            )),
+        );
+    }
+    let mut owned_take_id = String::new();
+    let mut owned_lane_id = String::new();
+    if owned_take_id.try_reserve_exact(take_id.len()).is_err()
+        || owned_lane_id.try_reserve_exact(lane_id.len()).is_err()
+    {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RemoveAutomationLane,
+            IdeWorkerCommandFailure::AutomationTakeEdit(Box::new(
+                IdeAutomationTakeEditError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_take_id.push_str(take_id);
+    owned_lane_id.push_str(lane_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::RemoveAutomationLane {
+            take_id: owned_take_id,
+            lane_id: owned_lane_id,
         },
     )
 }
@@ -11831,7 +12006,10 @@ fn project_mutation_save_failure(
                 IdeAutomationTakeEditError::MixerSave(Box::new(reason)),
             ))
         }
-        ProjectMutation::EditAutomationTake { .. } | ProjectMutation::EditAutomationLane { .. } => {
+        ProjectMutation::EditAutomationTake { .. }
+        | ProjectMutation::AddAutomationLane { .. }
+        | ProjectMutation::EditAutomationLane { .. }
+        | ProjectMutation::RemoveAutomationLane { .. } => {
             IdeWorkerCommandFailure::AutomationTakeEdit(Box::new(
                 IdeAutomationTakeEditError::MixerSave(Box::new(reason)),
             ))
@@ -12176,7 +12354,10 @@ fn project_mutation_native_close_failure(
                 IdeAutomationTakeEditError::NativeClose(failure),
             ))
         }
-        ProjectMutation::EditAutomationTake { .. } | ProjectMutation::EditAutomationLane { .. } => {
+        ProjectMutation::EditAutomationTake { .. }
+        | ProjectMutation::AddAutomationLane { .. }
+        | ProjectMutation::EditAutomationLane { .. }
+        | ProjectMutation::RemoveAutomationLane { .. } => {
             IdeWorkerCommandFailure::AutomationTakeEdit(Box::new(
                 IdeAutomationTakeEditError::NativeClose(failure),
             ))
@@ -12616,7 +12797,22 @@ enum ProjectMutationAttempt {
             IdeAutomationTakeEditError,
         >,
     },
+    AddAutomationLane {
+        take_id: String,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeAutomationTakeEditError,
+        >,
+    },
     EditAutomationLane {
+        take_id: String,
+        lane_id: String,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeAutomationTakeEditError,
+        >,
+    },
+    RemoveAutomationLane {
         take_id: String,
         lane_id: String,
         result: Result<
@@ -12973,6 +13169,42 @@ fn automation_lane_edit_failure_event(
     } else {
         IdeWorkerEvent::CommandFailed {
             command: IdeWorkerCommandKind::EditAutomationLane,
+            reason: IdeWorkerCommandFailure::AutomationTakeEdit(Box::new(reason)),
+        }
+    }
+}
+
+fn automation_lane_addition_failure_event(
+    take_id: String,
+    reason: IdeAutomationTakeEditError,
+) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::AutomationLaneAdditionCommittedWithWarning {
+            take_id,
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::AddAutomationLane,
+            reason: IdeWorkerCommandFailure::AutomationTakeEdit(Box::new(reason)),
+        }
+    }
+}
+
+fn automation_lane_removal_failure_event(
+    take_id: String,
+    lane_id: String,
+    reason: IdeAutomationTakeEditError,
+) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::AutomationLaneRemovalCommittedWithWarning {
+            take_id,
+            lane_id,
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::RemoveAutomationLane,
             reason: IdeWorkerCommandFailure::AutomationTakeEdit(Box::new(reason)),
         }
     }
@@ -14117,6 +14349,16 @@ fn complete_project_mutation(
                         name,
                     },
                 ),
+                ProjectMutationAttempt::AddAutomationLane {
+                    take_id,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::AutomationLaneAdded {
+                        revision: outcome.project_revision(),
+                        take_id,
+                    },
+                ),
                 ProjectMutationAttempt::EditAutomationLane {
                     take_id,
                     lane_id,
@@ -14126,6 +14368,18 @@ fn complete_project_mutation(
                     IdeWorkerEvent::AutomationLaneEdited {
                         revision: outcome.project_revision(),
                         changed: outcome.changed(),
+                        take_id,
+                        lane_id,
+                    },
+                ),
+                ProjectMutationAttempt::RemoveAutomationLane {
+                    take_id,
+                    lane_id,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::AutomationLaneRemoved {
+                        revision: outcome.project_revision(),
                         take_id,
                         lane_id,
                     },
@@ -14172,6 +14426,13 @@ fn complete_project_mutation(
                     result: Err(reason),
                     ..
                 } => send_event(events, automation_take_edit_failure_event(take_id, reason)),
+                ProjectMutationAttempt::AddAutomationLane {
+                    take_id,
+                    result: Err(reason),
+                } => send_event(
+                    events,
+                    automation_lane_addition_failure_event(take_id, reason),
+                ),
                 ProjectMutationAttempt::EditAutomationLane {
                     take_id,
                     lane_id,
@@ -14179,6 +14440,14 @@ fn complete_project_mutation(
                 } => send_event(
                     events,
                     automation_lane_edit_failure_event(take_id, lane_id, reason),
+                ),
+                ProjectMutationAttempt::RemoveAutomationLane {
+                    take_id,
+                    lane_id,
+                    result: Err(reason),
+                } => send_event(
+                    events,
+                    automation_lane_removal_failure_event(take_id, lane_id, reason),
                 ),
                 ProjectMutationAttempt::RemoveAutomationTake {
                     take_id,
@@ -15618,6 +15887,18 @@ fn attempt_project_mutation(
                 ),
             }
         }
+        ProjectMutation::AddAutomationLane { take_id, request } => {
+            ProjectMutationAttempt::AddAutomationLane {
+                take_id: take_id.clone(),
+                result: attempt_automation_lane_addition(
+                    application,
+                    recovery,
+                    &take_id,
+                    &request,
+                    native_failure,
+                ),
+            }
+        }
         ProjectMutation::EditAutomationLane {
             take_id,
             lane_id,
@@ -15634,6 +15915,19 @@ fn attempt_project_mutation(
                 native_failure,
             ),
         },
+        ProjectMutation::RemoveAutomationLane { take_id, lane_id } => {
+            ProjectMutationAttempt::RemoveAutomationLane {
+                take_id: take_id.clone(),
+                lane_id: lane_id.clone(),
+                result: attempt_automation_lane_removal(
+                    application,
+                    recovery,
+                    &take_id,
+                    &lane_id,
+                    native_failure,
+                ),
+            }
+        }
         ProjectMutation::RemoveAutomationTake { take_id } => {
             let (inverse, result) =
                 attempt_automation_take_removal(application, recovery, &take_id, native_failure);
@@ -17111,7 +17405,9 @@ fn project_mutation_reopen_failure(
             automation_take_activation_reopen_failure(result, reopen)
         }
         ProjectMutationAttempt::EditAutomationTake { result, .. }
-        | ProjectMutationAttempt::EditAutomationLane { result, .. } => {
+        | ProjectMutationAttempt::AddAutomationLane { result, .. }
+        | ProjectMutationAttempt::EditAutomationLane { result, .. }
+        | ProjectMutationAttempt::RemoveAutomationLane { result, .. } => {
             automation_take_edit_reopen_failure(result, reopen)
         }
         ProjectMutationAttempt::RemoveAutomationTake { result, .. } => {
@@ -17223,6 +17519,28 @@ fn attempt_automation_take_replacement(
     })
 }
 
+fn attempt_automation_lane_addition(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    take_id: &str,
+    request: &IdeAutomationLaneAddRequest,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAutomationTakeEditError> {
+    if let Some(failure) = native_failure {
+        return Err(IdeAutomationTakeEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_automation_lane_addition(
+        application,
+        recovery,
+        take_id,
+        request,
+    )
+    .and_then(|plan| {
+        plan.publish()
+            .map_err(|source| IdeAutomationTakeEditError::Publication(Box::new(source)))
+    })
+}
+
 fn attempt_automation_lane_replacement(
     application: &DesktopIdeApplication,
     recovery: &DesktopPlaybackRecovery,
@@ -17240,6 +17558,28 @@ fn attempt_automation_lane_replacement(
         take_id,
         lane_id,
         request,
+    )
+    .and_then(|plan| {
+        plan.publish()
+            .map_err(|source| IdeAutomationTakeEditError::Publication(Box::new(source)))
+    })
+}
+
+fn attempt_automation_lane_removal(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    take_id: &str,
+    lane_id: &str,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAutomationTakeEditError> {
+    if let Some(failure) = native_failure {
+        return Err(IdeAutomationTakeEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_automation_lane_removal(
+        application,
+        recovery,
+        take_id,
+        lane_id,
     )
     .and_then(|plan| {
         plan.publish()
@@ -28684,37 +29024,59 @@ mod tests {
     }
 
     #[test]
-    fn automation_lane_edit_is_captured_as_a_resource_replacement() {
+    fn automation_lane_mutations_are_captured_as_resource_replacements() {
         let edit = captured_mixer_edit("automation-lane-history");
-        let attempt = ProjectMutationAttempt::EditAutomationLane {
-            take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
-            lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a1".to_owned(),
-            result: Ok(edit.outcome.clone()),
-        };
-        assert!(matches!(
-            history_effect(&attempt),
-            HistoryEffect::Replacement(_)
-        ));
+        let take_id = "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned();
+        let lane_id = "018f47a2-6b2d-7c11-8a44-0011223344a1".to_owned();
+        let attempts = [
+            (
+                IdeWorkerCommandKind::AddAutomationLane,
+                "automation lane addition",
+                ProjectMutationAttempt::AddAutomationLane {
+                    take_id: take_id.clone(),
+                    result: Ok(edit.outcome.clone()),
+                },
+            ),
+            (
+                IdeWorkerCommandKind::EditAutomationLane,
+                "automation lane edit",
+                ProjectMutationAttempt::EditAutomationLane {
+                    take_id: take_id.clone(),
+                    lane_id: lane_id.clone(),
+                    result: Ok(edit.outcome.clone()),
+                },
+            ),
+            (
+                IdeWorkerCommandKind::RemoveAutomationLane,
+                "automation lane removal",
+                ProjectMutationAttempt::RemoveAutomationLane {
+                    take_id,
+                    lane_id,
+                    result: Ok(edit.outcome.clone()),
+                },
+            ),
+        ];
+        for (command, label, attempt) in attempts {
+            assert!(matches!(
+                history_effect(&attempt),
+                HistoryEffect::Replacement(_)
+            ));
 
-        let (events, receiver) = std::sync::mpsc::sync_channel(4);
-        let mut history = UndoHistory::default();
-        observe_history(
-            &mut history,
-            &attempt,
-            IdeWorkerCommandKind::EditAutomationLane,
-            &events,
-        );
-        assert_eq!(history.undo.len(), 1);
-        assert_eq!(history.undo[0].resource_id(), edit.mixer_id);
-        assert_eq!(history.undo[0].bytes(), edit.original);
-        assert_eq!(history.undo[0].label, "automation lane edit");
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(IdeWorkerEvent::UndoStateChanged {
-                undo_label: Some("automation lane edit"),
-                redo_label: None,
-            })
-        ));
+            let (events, receiver) = std::sync::mpsc::sync_channel(4);
+            let mut history = UndoHistory::default();
+            observe_history(&mut history, &attempt, command, &events);
+            assert_eq!(history.undo.len(), 1);
+            assert_eq!(history.undo[0].resource_id(), edit.mixer_id);
+            assert_eq!(history.undo[0].bytes(), edit.original);
+            assert_eq!(history.undo[0].label, label);
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::UndoStateChanged {
+                    undo_label: Some(observed),
+                    redo_label: None,
+                }) if observed == label
+            ));
+        }
     }
 
     #[test]
@@ -30286,8 +30648,16 @@ mod tests {
             "automation take edit",
         ),
         (
+            IdeWorkerCommandKind::AddAutomationLane,
+            "automation lane addition",
+        ),
+        (
             IdeWorkerCommandKind::EditAutomationLane,
             "automation lane edit",
+        ),
+        (
+            IdeWorkerCommandKind::RemoveAutomationLane,
+            "automation lane removal",
         ),
     ];
 
@@ -30737,6 +31107,150 @@ mod tests {
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the two lane lifecycle commands share one exact fence and refusal contract"
+    )]
+    fn automation_lane_management_validates_inputs_and_waits_for_the_mixer_fence() {
+        let make_worker = || {
+            let running = RunningDesktopIdeApplication {
+                application: closed_application(),
+                session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                    save_eligible: true,
+                    commit_mixer_fences: true,
+                    ..TestPlaybackSession::default()
+                }),
+            };
+            let worker =
+                DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+            assert!(matches!(
+                recv(&worker),
+                IdeWorkerEvent::CommandFailed {
+                    command: IdeWorkerCommandKind::Observe,
+                    reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+                }
+            ));
+            worker
+        };
+        let take_id = "018f47a2-6b2d-7c11-8a44-0011223344a0";
+        let lane_id = "018f47a2-6b2d-7c11-8a44-0011223344a1";
+        let request = |target| IdeAutomationLaneAddRequest {
+            target,
+            interpolation: crate::AutomationInterpolation::Hold,
+            points: vec![crate::AutomationPoint::new(
+                0,
+                crate::AutomationValue::Integer(1_000_000),
+            )],
+        };
+
+        let addition = make_worker();
+        addition
+            .try_send(IdeWorkerCommand::AddAutomationLane {
+                take_id: String::new(),
+                request: request(IdeAutomationTarget::Main {
+                    parameter: crate::AutomationMainParameter::Gain,
+                }),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&addition),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::AddAutomationLane,
+                reason: IdeWorkerCommandFailure::AutomationTakeEdit(reason),
+            } if matches!(reason.as_ref(), IdeAutomationTakeEditError::InvalidTakeIdentity)
+        ));
+        addition
+            .try_send(IdeWorkerCommand::AddAutomationLane {
+                take_id: take_id.to_owned(),
+                request: request(IdeAutomationTarget::Channel {
+                    track_id: String::new(),
+                    parameter: crate::AutomationChannelParameter::Gain,
+                }),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&addition),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::AddAutomationLane,
+                reason: IdeWorkerCommandFailure::AutomationTakeEdit(reason),
+            } if matches!(reason.as_ref(), IdeAutomationTakeEditError::InvalidTargetIdentity)
+        ));
+        addition
+            .try_send(IdeWorkerCommand::AddAutomationLane {
+                take_id: take_id.to_owned(),
+                request: request(IdeAutomationTarget::Main {
+                    parameter: crate::AutomationMainParameter::Gain,
+                }),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&addition),
+            IdeWorkerEvent::AutomationLaneAdding { take_id: observed } if observed == take_id
+        ));
+        assert!(matches!(recv(&addition), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&addition),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::AddAutomationLane,
+                reason: IdeWorkerCommandFailure::AutomationTakeEdit(reason),
+            } if matches!(reason.as_ref(), IdeAutomationTakeEditError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(addition).native_failure(), None);
+
+        let removal = make_worker();
+        removal
+            .try_send(IdeWorkerCommand::RemoveAutomationLane {
+                take_id: String::new(),
+                lane_id: lane_id.to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&removal),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RemoveAutomationLane,
+                reason: IdeWorkerCommandFailure::AutomationTakeEdit(reason),
+            } if matches!(reason.as_ref(), IdeAutomationTakeEditError::InvalidTakeIdentity)
+        ));
+        removal
+            .try_send(IdeWorkerCommand::RemoveAutomationLane {
+                take_id: take_id.to_owned(),
+                lane_id: "lane".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&removal),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RemoveAutomationLane,
+                reason: IdeWorkerCommandFailure::AutomationTakeEdit(reason),
+            } if matches!(reason.as_ref(), IdeAutomationTakeEditError::InvalidLaneIdentity)
+        ));
+        removal
+            .try_send(IdeWorkerCommand::RemoveAutomationLane {
+                take_id: take_id.to_owned(),
+                lane_id: lane_id.to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&removal),
+            IdeWorkerEvent::AutomationLaneRemoving {
+                take_id: observed_take,
+                lane_id: observed_lane,
+            } if observed_take == take_id && observed_lane == lane_id
+        ));
+        assert!(matches!(recv(&removal), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&removal),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RemoveAutomationLane,
+                reason: IdeWorkerCommandFailure::AutomationTakeEdit(reason),
+            } if matches!(reason.as_ref(), IdeAutomationTakeEditError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(removal).native_failure(), None);
     }
 
     #[test]

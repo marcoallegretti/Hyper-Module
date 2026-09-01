@@ -608,6 +608,18 @@ pub struct AutomationLaneReplacement<'a> {
     pub points: &'a [AutomationPoint],
 }
 
+/// One new lane to add to an existing automation take.
+///
+/// The caller names a fresh stable lane identity, while the serializer retains
+/// every existing lane and all shared take authority.
+#[derive(Clone, Copy, Debug)]
+pub struct AutomationLaneAddition<'a> {
+    pub lane_id: &'a str,
+    pub target: AutomationTargetSelection<'a>,
+    pub interpolation: AutomationInterpolation,
+    pub points: &'a [AutomationPoint],
+}
+
 #[derive(Clone, Copy, Debug)]
 enum AutomationTakeBodyValidationError {
     InvalidName,
@@ -826,6 +838,8 @@ pub enum AutomationTakeEditSerializationError {
     TakeMissing,
     InvalidLaneIdentity,
     LaneMissing,
+    LaneCapacity,
+    LastLane,
     NonCanonicalSource,
     InvalidTakeName,
     InvalidInterval,
@@ -849,6 +863,10 @@ impl fmt::Display for AutomationTakeEditSerializationError {
             }
             Self::LaneMissing => {
                 formatter.write_str("the automation lane is missing from the selected take")
+            }
+            Self::LaneCapacity => formatter.write_str("the automation lane capacity is exhausted"),
+            Self::LastLane => {
+                formatter.write_str("an automation take must retain at least one lane")
             }
             Self::NonCanonicalSource => {
                 formatter.write_str("the source automation take is not canonical")
@@ -884,6 +902,8 @@ impl Error for AutomationTakeEditSerializationError {
             Self::TakeMissing
             | Self::InvalidLaneIdentity
             | Self::LaneMissing
+            | Self::LaneCapacity
+            | Self::LastLane
             | Self::NonCanonicalSource
             | Self::InvalidTakeName
             | Self::InvalidInterval
@@ -924,7 +944,7 @@ pub fn serialize_automation_take_activation(
         takes,
         take_id,
         limits,
-        |_, document| {
+        |_, _, document| {
             document.insert("enabled".to_owned(), enabled.into());
             Ok(())
         },
@@ -981,7 +1001,7 @@ pub fn serialize_automation_take_replacement(
         takes,
         take_id,
         limits,
-        move |take, document| {
+        move |_, take, document| {
             if take.lanes().len() != 1 {
                 return Err(AutomationTakeEditSerializationError::UnsupportedTakeShape);
             }
@@ -1060,7 +1080,7 @@ pub fn serialize_automation_lane_replacement(
         takes,
         take_id,
         limits,
-        move |take, document| {
+        move |_, take, document| {
             let (lane_index, source_lane) = take
                 .lanes()
                 .iter()
@@ -1096,6 +1116,163 @@ pub fn serialize_automation_lane_replacement(
     )
 }
 
+/// Adds one identified lane to an existing automation take.
+///
+/// The source must be canonical and belong to the selected `take_id`. The new
+/// lane identity must be fresh across the complete current automation set and
+/// the candidate remains subject to the existing global lane limit, target
+/// uniqueness, interval, and compilation checks. Existing lanes retain their
+/// exact canonical JSON values; the new lane is inserted by stable identity so
+/// the version-1 required ordering remains valid.
+///
+/// # Errors
+///
+/// Returns a classified rejection for an invalid or colliding lane identity,
+/// an exhausted lane capacity, an empty lane, malformed source bytes, or a
+/// candidate set the loader or main-graph compiler rejects.
+pub fn serialize_automation_lane_addition(
+    project: &LoadedPlaybackProject,
+    mixer: &LoadedMixer,
+    assets: &[MediaAssetFact<'_>],
+    takes: &[&[u8]],
+    take_id: &str,
+    request: AutomationLaneAddition<'_>,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AutomationTakeEditSerializationError> {
+    if !is_valid_entity_id(request.lane_id)
+        || identity_collides(project, mixer, assets, "", request.lane_id)
+    {
+        return Err(AutomationTakeEditSerializationError::InvalidLaneIdentity);
+    }
+    if request.points.is_empty() {
+        return Err(AutomationTakeEditSerializationError::EmptyLane);
+    }
+    let target = automation_target_value(request.target);
+    let points = automation_point_values(request.points)
+        .map_err(AutomationTakeEditSerializationError::Source)?;
+    serialize_automation_take_document_edit(
+        project,
+        mixer,
+        assets,
+        takes,
+        take_id,
+        limits,
+        move |loaded, take, document| {
+            if loaded
+                .takes()
+                .iter()
+                .flat_map(AutomationTake::lanes)
+                .count()
+                >= limits.max_automation_lanes
+            {
+                return Err(AutomationTakeEditSerializationError::LaneCapacity);
+            }
+            if loaded.takes().iter().any(|candidate| {
+                candidate.id() == request.lane_id
+                    || candidate
+                        .lanes()
+                        .iter()
+                        .any(|lane| lane.id() == request.lane_id)
+            }) {
+                return Err(AutomationTakeEditSerializationError::InvalidLaneIdentity);
+            }
+            let lanes = document
+                .get_mut("lanes")
+                .and_then(Value::as_array_mut)
+                .ok_or(AutomationTakeEditSerializationError::InvalidDocumentShape)?;
+            if lanes.len() != take.lanes().len()
+                || lanes
+                    .iter()
+                    .zip(take.lanes())
+                    .any(|(value, lane)| value.get("id").and_then(Value::as_str) != Some(lane.id()))
+            {
+                return Err(AutomationTakeEditSerializationError::InvalidDocumentShape);
+            }
+            let insertion_index = take
+                .lanes()
+                .iter()
+                .position(|lane| request.lane_id < lane.id())
+                .unwrap_or(take.lanes().len());
+            lanes
+                .try_reserve(1)
+                .map_err(|_| AutomationTakeEditSerializationError::Source(capacity_error()))?;
+            lanes.insert(
+                insertion_index,
+                json!({
+                    "id": request.lane_id,
+                    "target": target,
+                    "interpolation": match request.interpolation {
+                        AutomationInterpolation::Hold => "hold",
+                        AutomationInterpolation::Linear => "linear",
+                    },
+                    "points": points,
+                }),
+            );
+            Ok(())
+        },
+    )
+}
+
+/// Removes one identified lane while retaining the owning automation take.
+///
+/// The final lane cannot be removed: deleting a one-lane take remains the
+/// separate take-removal operation, so a successful lane removal never creates
+/// an invalid empty take.
+///
+/// # Errors
+///
+/// Returns a classified rejection for an invalid or missing lane identity, a
+/// final-lane removal request, malformed source bytes, or a candidate set the
+/// loader or main-graph compiler rejects.
+pub fn serialize_automation_lane_removal(
+    project: &LoadedPlaybackProject,
+    mixer: &LoadedMixer,
+    assets: &[MediaAssetFact<'_>],
+    takes: &[&[u8]],
+    take_id: &str,
+    lane_id: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AutomationTakeEditSerializationError> {
+    if !is_valid_entity_id(lane_id) {
+        return Err(AutomationTakeEditSerializationError::InvalidLaneIdentity);
+    }
+    serialize_automation_take_document_edit(
+        project,
+        mixer,
+        assets,
+        takes,
+        take_id,
+        limits,
+        |_, take, document| {
+            let (lane_index, source_lane) = take
+                .lanes()
+                .iter()
+                .enumerate()
+                .find(|(_, lane)| lane.id() == lane_id)
+                .ok_or(AutomationTakeEditSerializationError::LaneMissing)?;
+            if take.lanes().len() <= 1 {
+                return Err(AutomationTakeEditSerializationError::LastLane);
+            }
+            let lanes = document
+                .get_mut("lanes")
+                .and_then(Value::as_array_mut)
+                .ok_or(AutomationTakeEditSerializationError::InvalidDocumentShape)?;
+            if lanes.len() != take.lanes().len() {
+                return Err(AutomationTakeEditSerializationError::InvalidDocumentShape);
+            }
+            let lane = lanes
+                .get(lane_index)
+                .and_then(Value::as_object)
+                .ok_or(AutomationTakeEditSerializationError::InvalidDocumentShape)?;
+            if lane.get("id").and_then(Value::as_str) != Some(source_lane.id()) {
+                return Err(AutomationTakeEditSerializationError::InvalidDocumentShape);
+            }
+            lanes.remove(lane_index);
+            Ok(())
+        },
+    )
+}
+
 fn serialize_automation_take_document_edit(
     project: &LoadedPlaybackProject,
     mixer: &LoadedMixer,
@@ -1104,6 +1281,7 @@ fn serialize_automation_take_document_edit(
     take_id: &str,
     limits: LoaderLimits,
     edit: impl FnOnce(
+        &LoadedAutomationSet,
         &AutomationTake,
         &mut serde_json::Map<String, Value>,
     ) -> Result<(), AutomationTakeEditSerializationError>,
@@ -1136,7 +1314,7 @@ fn serialize_automation_take_document_edit(
     if document.get("id").and_then(Value::as_str) != Some(take_id) {
         return Err(AutomationTakeEditSerializationError::TakeMissing);
     }
-    edit(source_take, document)?;
+    edit(&loaded, source_take, document)?;
     let output = serde_json_canonicalizer::to_vec(&value)
         .map_err(AutomationTakeEditSerializationError::Serialization)?;
     let mut documents = Vec::new();
