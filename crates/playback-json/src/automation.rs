@@ -54,6 +54,24 @@ pub enum AutomationTarget {
     },
 }
 
+impl AutomationTarget {
+    /// Whether this target accepts Boolean automation points.
+    #[must_use]
+    pub const fn is_boolean(self) -> bool {
+        target_is_boolean(self)
+    }
+
+    /// Inclusive native integer bounds for a continuous target.
+    #[must_use]
+    pub const fn integer_bounds(self) -> Option<(i32, i32)> {
+        if self.is_boolean() {
+            None
+        } else {
+            Some(target_bounds(self))
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AutomationInterpolation {
     Hold,

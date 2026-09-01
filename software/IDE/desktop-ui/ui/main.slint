@@ -249,6 +249,12 @@ export struct AutomationTakeRow {
     points: string,
 }
 
+export struct AutomationPointRow {
+    index: int,
+    tick: string,
+    value: string,
+}
+
 export struct ArrangementSceneLaunchRow {
     index: int,
     id: string,
@@ -421,6 +427,11 @@ export global IdeActions {
     callback begin-add-automation-lane(string);
     callback begin-edit-automation-lane(string);
     callback select-automation-edit-lane(int);
+    callback reload-automation-edit-point-draft();
+    callback select-automation-edit-point(int);
+    callback add-automation-edit-point();
+    callback update-automation-edit-point();
+    callback remove-automation-edit-point();
     callback save-automation-take-edit();
     callback add-automation-lane(int, int, string);
     callback save-automation-lane-edit();
@@ -1024,6 +1035,14 @@ export component MainWindow inherits Window {
     in-out property <string> automation-edit-start: "";
     in-out property <string> automation-edit-end: "";
     in-out property <string> automation-edit-points: "";
+    in-out property <[AutomationPointRow]> automation-edit-point-rows: [];
+    in-out property <int> automation-edit-selected-point-index: -1;
+    in-out property <string> automation-edit-selected-point-original-tick: "";
+    in-out property <string> automation-edit-selected-point-original-value: "";
+    in-out property <string> automation-edit-selected-point-tick: "";
+    in-out property <string> automation-edit-selected-point-value: "";
+    in-out property <string> automation-edit-new-point-tick: "";
+    in-out property <string> automation-edit-new-point-value: "";
     in-out property <string> automation-lane-remove-confirming-id: "";
     in property <bool> mixer-main-state-available: false;
     in property <float> mixer-main-gain-percent: 0;
@@ -4024,6 +4043,129 @@ export component MainWindow inherits Window {
                                     placeholder-text: "tick=value, tick=value";
                                     text <=> root.automation-edit-points;
                                     enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 22px;
+                            spacing: 8px;
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "EXACT POINT DRAFT";
+                                color: #8fa0b4;
+                                font-size: 9px;
+                                font-weight: 700;
+                                letter-spacing: 0.6px;
+                            }
+                            Button {
+                                width: 132px;
+                                text: "Reload point draft";
+                                accessible-label: "Reload the exact automation point draft";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.automation-edit-points != "";
+                                clicked => { IdeActions.reload-automation-edit-point-draft(); }
+                            }
+                        }
+                        Text {
+                            height: 28px;
+                            text: "Structured changes update only this local exact point draft. Save publishes the complete revalidated lane through the existing project transaction.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            height: 164px;
+                            spacing: 10px;
+                            ListView {
+                                width: 260px;
+                                horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                                for point in root.automation-edit-point-rows : Button {
+                                    height: 30px;
+                                    checkable: true;
+                                    checked: point.index == root.automation-edit-selected-point-index;
+                                    text: point.tick + " = " + point.value;
+                                    accessible-label: "Automation point " + point.tick + " equals " + point.value;
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => { IdeActions.select-automation-edit-point(point.index); }
+                                }
+                            }
+                            Rectangle { width: 1px; background: #27313d; }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 5px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        Text { text: "Selected tick"; color: #8fa0b4; font-size: 9px; }
+                                        IdeLineEdit {
+                                            text <=> root.automation-edit-selected-point-tick;
+                                            input-type: number;
+                                            enabled: root.app-mode == AppMode.running
+                                                && root.automation-edit-selected-point-index >= 0;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        Text { text: "Selected value"; color: #8fa0b4; font-size: 9px; }
+                                        IdeLineEdit {
+                                            text <=> root.automation-edit-selected-point-value;
+                                            enabled: root.app-mode == AppMode.running
+                                                && root.automation-edit-selected-point-index >= 0;
+                                        }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    height: 30px;
+                                    spacing: 8px;
+                                    Button {
+                                        horizontal-stretch: 1;
+                                        text: "Update selected";
+                                        accessible-label: "Update the selected exact automation point";
+                                        enabled: root.app-mode == AppMode.running
+                                            && root.automation-edit-selected-point-index >= 0
+                                            && root.automation-edit-selected-point-tick != ""
+                                            && root.automation-edit-selected-point-value != "";
+                                        clicked => { IdeActions.update-automation-edit-point(); }
+                                    }
+                                    Button {
+                                        horizontal-stretch: 1;
+                                        text: "Remove selected";
+                                        accessible-label: "Remove the selected automation point from the local draft";
+                                        enabled: root.app-mode == AppMode.running
+                                            && root.automation-edit-point-rows.length > 1
+                                            && root.automation-edit-selected-point-index >= 0;
+                                        clicked => { IdeActions.remove-automation-edit-point(); }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        Text { text: "New tick"; color: #8fa0b4; font-size: 9px; }
+                                        IdeLineEdit {
+                                            text <=> root.automation-edit-new-point-tick;
+                                            input-type: number;
+                                            enabled: root.app-mode == AppMode.running;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        Text { text: "New value"; color: #8fa0b4; font-size: 9px; }
+                                        IdeLineEdit {
+                                            text <=> root.automation-edit-new-point-value;
+                                            enabled: root.app-mode == AppMode.running;
+                                        }
+                                    }
+                                }
+                                Button {
+                                    height: 30px;
+                                    text: "Add exact point";
+                                    accessible-label: "Add one exact automation point to the local draft";
+                                    enabled: root.app-mode == AppMode.running
+                                        && root.automation-edit-new-point-tick != ""
+                                        && root.automation-edit-new-point-value != "";
+                                    clicked => { IdeActions.add-automation-edit-point(); }
                                 }
                             }
                         }

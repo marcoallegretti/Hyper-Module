@@ -20463,6 +20463,103 @@ mod tests {
     }
 
     #[test]
+    fn automation_target_point_domains_match_loader_rules() {
+        let cases = [
+            (
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Gain,
+                },
+                false,
+                Some((0, 2_000_000)),
+            ),
+            (
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Pan,
+                },
+                false,
+                Some((-1_000_000, 1_000_000)),
+            ),
+            (
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Mute,
+                },
+                true,
+                None,
+            ),
+            (
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Solo,
+                },
+                true,
+                None,
+            ),
+            (
+                AutomationTarget::Send {
+                    slot: 0,
+                    send: 0,
+                    parameter: AutomationSendParameter::Gain,
+                },
+                false,
+                Some((0, 2_000_000)),
+            ),
+            (
+                AutomationTarget::Send {
+                    slot: 0,
+                    send: 0,
+                    parameter: AutomationSendParameter::Pan,
+                },
+                false,
+                Some((-1_000_000, 1_000_000)),
+            ),
+            (
+                AutomationTarget::Send {
+                    slot: 0,
+                    send: 0,
+                    parameter: AutomationSendParameter::Enabled,
+                },
+                true,
+                None,
+            ),
+            (
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+                false,
+                Some((0, 2_000_000)),
+            ),
+            (
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Mute,
+                },
+                true,
+                None,
+            ),
+            (
+                AutomationTarget::Cue {
+                    parameter: AutomationMainParameter::Gain,
+                },
+                false,
+                Some((0, 2_000_000)),
+            ),
+            (
+                AutomationTarget::Cue {
+                    parameter: AutomationMainParameter::Mute,
+                },
+                true,
+                None,
+            ),
+        ];
+        for (target, boolean, bounds) in cases {
+            assert_eq!(target.is_boolean(), boolean);
+            assert_eq!(target.integer_bounds(), bounds);
+        }
+    }
+
+    #[test]
     fn automation_loader_resolves_targets_and_matches_exact_tick_vectors() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];

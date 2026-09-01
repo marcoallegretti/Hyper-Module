@@ -12843,25 +12843,42 @@ fn parse_automation_points(
         if tick > MAX_SAFE_TIMELINE_TICK {
             return Err("Automation point tick exceeds the exact project range");
         }
-        let raw = raw.trim();
-        let point = if boolean {
-            match raw {
-                "on" | "true" => AutomationValue::Boolean(true),
-                "off" | "false" => AutomationValue::Boolean(false),
-                _ => return Err("Switch automation values must be on or off"),
-            }
-        } else {
-            AutomationValue::Integer(
-                raw.parse::<i32>()
-                    .map_err(|_| "Automation values must be whole millionths")?,
-            )
-        };
+        let point = parse_automation_point_value(raw, boolean)?;
         points.push(AutomationPoint::new(tick, point));
     }
     if points.is_empty() {
         return Err("An automation take needs at least one point");
     }
     Ok(points)
+}
+
+fn parse_automation_point_value(
+    value: &str,
+    boolean: bool,
+) -> Result<AutomationValue, &'static str> {
+    let value = value.trim();
+    if boolean {
+        match value {
+            "on" | "true" => Ok(AutomationValue::Boolean(true)),
+            "off" | "false" => Ok(AutomationValue::Boolean(false)),
+            _ => Err("Switch automation values must be on or off"),
+        }
+    } else {
+        value
+            .parse::<i32>()
+            .map(AutomationValue::Integer)
+            .map_err(|_| "Automation values must be whole millionths")
+    }
+}
+
+fn parse_automation_point_fields(
+    tick: &str,
+    value: &str,
+    boolean: bool,
+) -> Result<AutomationPoint, &'static str> {
+    let tick = parse_automation_tick(tick)?;
+    let value = parse_automation_point_value(value, boolean)?;
+    Ok(AutomationPoint::new(tick, value))
 }
 
 /// Builds one authoring request from the exact values the form submitted.
@@ -12982,7 +12999,7 @@ struct AutomationTakeEditForm {
     interpolation_index: i32,
     start: String,
     end: String,
-    points: String,
+    points: Vec<AutomationPoint>,
 }
 
 #[derive(Clone)]
@@ -13003,7 +13020,7 @@ struct AutomationLaneEditForm {
     interpolation_index: i32,
     start: String,
     end: String,
-    points: String,
+    points: Vec<AutomationPoint>,
 }
 
 fn automation_lane_addition_form(
@@ -13067,7 +13084,7 @@ fn automation_take_edit_form(
         interpolation_index,
         start: take.start_tick().to_string(),
         end: take.end_tick().to_string(),
-        points: format_automation_points(lane.points()),
+        points: lane.points().to_vec(),
     })
 }
 
@@ -13129,7 +13146,7 @@ fn automation_lane_edit_form(
         interpolation_index,
         start: take.start_tick().to_string(),
         end: take.end_tick().to_string(),
-        points: format_automation_points(lane.points()),
+        points: lane.points().to_vec(),
     })
 }
 
@@ -13145,7 +13162,7 @@ fn populate_automation_lane_edit_form(ui: &MainWindow, form: AutomationLaneEditF
     ui.set_automation_edit_interpolation_index(form.interpolation_index);
     ui.set_automation_edit_start(form.start.into());
     ui.set_automation_edit_end(form.end.into());
-    ui.set_automation_edit_points(form.points.into());
+    populate_automation_edit_point_draft(ui, &form.points, Some(0));
     ui.set_automation_edit_visible(true);
     ui.set_error_text(SharedString::default());
 }
@@ -13218,15 +13235,232 @@ fn format_automation_points(points: &[AutomationPoint]) -> String {
     points
         .iter()
         .map(|point| {
-            let value = match point.value() {
-                AutomationValue::Integer(value) => value.to_string(),
-                AutomationValue::Boolean(true) => "on".to_owned(),
-                AutomationValue::Boolean(false) => "off".to_owned(),
-            };
-            format!("{}={value}", point.tick())
+            format!(
+                "{}={}",
+                point.tick(),
+                format_automation_point_value(point.value())
+            )
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn format_automation_point_value(value: AutomationValue) -> String {
+    match value {
+        AutomationValue::Integer(value) => value.to_string(),
+        AutomationValue::Boolean(true) => "on".to_owned(),
+        AutomationValue::Boolean(false) => "off".to_owned(),
+    }
+}
+
+fn automation_point_rows(points: &[AutomationPoint]) -> Vec<AutomationPointRow> {
+    points
+        .iter()
+        .enumerate()
+        .map(|(index, point)| AutomationPointRow {
+            index: i32::try_from(index).unwrap_or(-1),
+            tick: point.tick().to_string().into(),
+            value: format_automation_point_value(point.value()).into(),
+        })
+        .collect()
+}
+
+fn set_automation_edit_point_selection(
+    ui: &MainWindow,
+    points: &[AutomationPoint],
+    index: Option<usize>,
+) {
+    let Some((index, point)) =
+        index.and_then(|index| points.get(index).copied().map(|point| (index, point)))
+    else {
+        ui.set_automation_edit_selected_point_index(-1);
+        ui.set_automation_edit_selected_point_original_tick(SharedString::default());
+        ui.set_automation_edit_selected_point_original_value(SharedString::default());
+        ui.set_automation_edit_selected_point_tick(SharedString::default());
+        ui.set_automation_edit_selected_point_value(SharedString::default());
+        return;
+    };
+    let tick = point.tick().to_string();
+    let value = format_automation_point_value(point.value());
+    ui.set_automation_edit_selected_point_index(i32::try_from(index).unwrap_or(-1));
+    ui.set_automation_edit_selected_point_original_tick(tick.clone().into());
+    ui.set_automation_edit_selected_point_original_value(value.clone().into());
+    ui.set_automation_edit_selected_point_tick(tick.into());
+    ui.set_automation_edit_selected_point_value(value.into());
+}
+
+fn populate_automation_edit_point_rows(
+    ui: &MainWindow,
+    points: &[AutomationPoint],
+    selected_index: Option<usize>,
+) {
+    ui.set_automation_edit_point_rows(ModelRc::from(Rc::new(VecModel::from(
+        automation_point_rows(points),
+    ))));
+    set_automation_edit_point_selection(ui, points, selected_index);
+}
+
+fn populate_automation_edit_point_draft(
+    ui: &MainWindow,
+    points: &[AutomationPoint],
+    selected_index: Option<usize>,
+) {
+    ui.set_automation_edit_points(format_automation_points(points).into());
+    ui.set_automation_edit_new_point_tick(SharedString::default());
+    ui.set_automation_edit_new_point_value(SharedString::default());
+    populate_automation_edit_point_rows(ui, points, selected_index);
+}
+
+fn automation_point_rows_match_draft(ui: &MainWindow, points: &[AutomationPoint]) -> bool {
+    let rows = ui.get_automation_edit_point_rows();
+    rows.row_count() == points.len()
+        && points.iter().enumerate().all(|(index, point)| {
+            rows.row_data(index).is_some_and(|row| {
+                row.index == i32::try_from(index).unwrap_or(-1)
+                    && row.tick.as_str() == point.tick().to_string()
+                    && row.value.as_str() == format_automation_point_value(point.value())
+            })
+        })
+}
+
+fn automation_edit_point_interval(ui: &MainWindow) -> Result<(u64, u64), &'static str> {
+    let start = parse_automation_tick(ui.get_automation_edit_start().as_str())?;
+    let end = parse_automation_tick(ui.get_automation_edit_end().as_str())?;
+    if start >= end {
+        return Err("The automation end tick must follow its start tick");
+    }
+    Ok((start, end))
+}
+
+fn validate_automation_point_draft(
+    points: &[AutomationPoint],
+    target: AutomationTarget,
+    start_tick: u64,
+    end_tick: u64,
+) -> Result<(), &'static str> {
+    if points.is_empty() {
+        return Err("An automation take needs at least one point");
+    }
+    let boolean = target.is_boolean();
+    let integer_bounds = target.integer_bounds();
+    let mut previous_tick = None;
+    for point in points {
+        if point.tick() < start_tick || point.tick() >= end_tick {
+            return Err("Automation points must stay inside the take interval");
+        }
+        if previous_tick.is_some_and(|previous| previous >= point.tick()) {
+            return Err("Automation point ticks must be strictly ordered");
+        }
+        match (point.value(), boolean, integer_bounds) {
+            (AutomationValue::Boolean(_), true, None) => {}
+            (AutomationValue::Integer(value), false, Some((minimum, maximum)))
+                if (minimum..=maximum).contains(&value) => {}
+            (AutomationValue::Boolean(_), false, _) | (AutomationValue::Integer(_), true, _) => {
+                return Err("Automation point values do not match the selected target");
+            }
+            (AutomationValue::Integer(_), false, Some(_)) => {
+                return Err("Automation point value is outside the selected target domain");
+            }
+            _ => return Err("The selected automation target is unavailable"),
+        }
+        previous_tick = Some(point.tick());
+    }
+    Ok(())
+}
+
+fn selected_automation_edit_point_index(
+    ui: &MainWindow,
+    points: &[AutomationPoint],
+) -> Result<usize, &'static str> {
+    let index = usize::try_from(ui.get_automation_edit_selected_point_index())
+        .map_err(|_| "The selected automation point is no longer available")?;
+    let point = points
+        .get(index)
+        .ok_or("The selected automation point is no longer available")?;
+    if ui
+        .get_automation_edit_selected_point_original_tick()
+        .as_str()
+        != point.tick().to_string()
+        || ui
+            .get_automation_edit_selected_point_original_value()
+            .as_str()
+            != format_automation_point_value(point.value())
+    {
+        return Err("The selected automation point is no longer current");
+    }
+    Ok(index)
+}
+
+fn insert_automation_point_draft(
+    points: &[AutomationPoint],
+    point: AutomationPoint,
+    target: AutomationTarget,
+    start_tick: u64,
+    end_tick: u64,
+) -> Result<(Vec<AutomationPoint>, usize), &'static str> {
+    validate_automation_point_draft(points, target, start_tick, end_tick)?;
+    if points
+        .iter()
+        .any(|existing| existing.tick() == point.tick())
+    {
+        return Err("An automation point already exists at that tick");
+    }
+    let mut updated = points.to_vec();
+    let index = updated.partition_point(|existing| existing.tick() < point.tick());
+    updated.insert(index, point);
+    validate_automation_point_draft(&updated, target, start_tick, end_tick)?;
+    Ok((updated, index))
+}
+
+fn replace_automation_point_draft(
+    points: &[AutomationPoint],
+    selected_index: usize,
+    replacement: AutomationPoint,
+    target: AutomationTarget,
+    start_tick: u64,
+    end_tick: u64,
+) -> Result<(Vec<AutomationPoint>, usize), &'static str> {
+    validate_automation_point_draft(points, target, start_tick, end_tick)?;
+    if selected_index >= points.len() {
+        return Err("The selected automation point is no longer available");
+    }
+    if points
+        .iter()
+        .enumerate()
+        .any(|(index, point)| index != selected_index && point.tick() == replacement.tick())
+    {
+        return Err("An automation point already exists at that tick");
+    }
+    let mut updated = points.to_vec();
+    updated[selected_index] = replacement;
+    updated.sort_by_key(|point| point.tick());
+    validate_automation_point_draft(&updated, target, start_tick, end_tick)?;
+    let index = updated
+        .iter()
+        .position(|point| *point == replacement)
+        .ok_or("The selected automation point is no longer available")?;
+    Ok((updated, index))
+}
+
+fn remove_automation_point_draft(
+    points: &[AutomationPoint],
+    selected_index: usize,
+    target: AutomationTarget,
+    start_tick: u64,
+    end_tick: u64,
+) -> Result<(Vec<AutomationPoint>, Option<usize>), &'static str> {
+    validate_automation_point_draft(points, target, start_tick, end_tick)?;
+    if points.len() == 1 {
+        return Err("An automation lane must retain at least one point");
+    }
+    if selected_index >= points.len() {
+        return Err("The selected automation point is no longer available");
+    }
+    let mut updated = points.to_vec();
+    updated.remove(selected_index);
+    validate_automation_point_draft(&updated, target, start_tick, end_tick)?;
+    let next_index = selected_index.min(updated.len() - 1);
+    Ok((updated, Some(next_index)))
 }
 
 fn automation_take_form_is_open(ui: &MainWindow) -> bool {
@@ -13242,6 +13476,333 @@ fn automation_take_direct_action_is_current(ui: &MainWindow, take_id: &str) -> b
         && ui.get_automation_lane_remove_confirming_id().is_empty()
         && ui.get_automation_take_remove_confirming_id().is_empty()
         && !take_id.is_empty()
+}
+
+fn automation_edit_source_is_current(
+    owner: &IdePlaybackAutomation,
+    choices: &[AutomationTargetChoice],
+    take_id: &str,
+    lane_only: bool,
+    lane_id: &str,
+    lane_index: i32,
+) -> Result<(), &'static str> {
+    let take = owner
+        .takes()
+        .iter()
+        .find(|take| take.id() == take_id)
+        .ok_or("The selected automation take is no longer available")?;
+    let lane = if lane_only {
+        if take.lanes().len() < 2 {
+            return Err("Only multi-lane automation takes use the lane editor");
+        }
+        let index = take
+            .lanes()
+            .iter()
+            .position(|lane| lane.id() == lane_id)
+            .ok_or("The selected automation lane is no longer available")?;
+        if i32::try_from(index)
+            .map_err(|_| "The automation lane index is outside the supported range")?
+            != lane_index
+        {
+            return Err("Automation lane selection is no longer current");
+        }
+        take.lanes()
+            .get(index)
+            .ok_or("The selected automation lane is no longer available")?
+    } else {
+        let [lane] = take.lanes() else {
+            return Err("Only single-lane automation takes can be edited safely");
+        };
+        lane
+    };
+    if !choices
+        .iter()
+        .any(|choice| choice.resolved == lane.target())
+    {
+        return Err("The automation take target is no longer available");
+    }
+    Ok(())
+}
+
+fn automation_edit_point_choice(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+) -> Result<AutomationTargetChoice, &'static str> {
+    if ui.get_app_mode() != AppMode::Running || !ui.get_automation_edit_visible() {
+        return Err("Automation point editing is no longer current");
+    }
+    let take_id = ui.get_automation_edit_take_id().to_string();
+    if take_id.is_empty() {
+        return Err("Automation point editing is no longer current");
+    }
+    let owner = project_state
+        .automation
+        .borrow()
+        .clone()
+        .ok_or("Automation take data is no longer available")?;
+    let choices = automation_target_choices(&project_state.automation_channels.borrow());
+    let lane_id = ui.get_automation_edit_lane_id().to_string();
+    automation_edit_source_is_current(
+        &owner,
+        &choices,
+        &take_id,
+        ui.get_automation_edit_lane_only(),
+        &lane_id,
+        ui.get_automation_edit_lane_index(),
+    )?;
+    usize::try_from(ui.get_automation_edit_target_index())
+        .ok()
+        .and_then(|index| choices.get(index))
+        .cloned()
+        .ok_or("The selected automation target is unavailable")
+}
+
+fn automation_edit_point_draft(
+    ui: &MainWindow,
+    choice: &AutomationTargetChoice,
+    require_current_rows: bool,
+) -> Result<(Vec<AutomationPoint>, u64, u64), &'static str> {
+    let points = parse_automation_points(
+        ui.get_automation_edit_points().as_str(),
+        choice.resolved.is_boolean(),
+    )?;
+    let (start_tick, end_tick) = automation_edit_point_interval(ui)?;
+    validate_automation_point_draft(&points, choice.resolved, start_tick, end_tick)?;
+    if require_current_rows && !automation_point_rows_match_draft(ui, &points) {
+        return Err("The point table is stale; reload the exact draft before changing a point");
+    }
+    Ok((points, start_tick, end_tick))
+}
+
+fn bind_reload_automation_edit_point_draft_callback(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let project_state_for_reload = Rc::clone(project_state);
+    actions.on_reload_automation_edit_point_draft(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let choice = match automation_edit_point_choice(&ui, &project_state_for_reload) {
+            Ok(choice) => choice,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let (points, _, _) = match automation_edit_point_draft(&ui, &choice, false) {
+            Ok(draft) => draft,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        ui.set_automation_edit_new_point_tick(SharedString::default());
+        ui.set_automation_edit_new_point_value(SharedString::default());
+        populate_automation_edit_point_rows(&ui, &points, Some(0));
+        ui.set_error_text(SharedString::default());
+    });
+}
+
+fn bind_select_automation_edit_point_callback(ui: &MainWindow, project_state: &ProjectUiStateCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let project_state_for_selection = Rc::clone(project_state);
+    actions.on_select_automation_edit_point(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let choice = match automation_edit_point_choice(&ui, &project_state_for_selection) {
+            Ok(choice) => choice,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let (points, _, _) = match automation_edit_point_draft(&ui, &choice, true) {
+            Ok(draft) => draft,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let Some(index) = usize::try_from(index)
+            .ok()
+            .filter(|index| *index < points.len())
+        else {
+            ui.set_error_text("The selected automation point is no longer available".into());
+            return;
+        };
+        set_automation_edit_point_selection(&ui, &points, Some(index));
+        ui.set_error_text(SharedString::default());
+    });
+}
+
+fn bind_add_automation_edit_point_callback(ui: &MainWindow, project_state: &ProjectUiStateCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let project_state_for_addition = Rc::clone(project_state);
+    actions.on_add_automation_edit_point(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let choice = match automation_edit_point_choice(&ui, &project_state_for_addition) {
+            Ok(choice) => choice,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let (points, start_tick, end_tick) = match automation_edit_point_draft(&ui, &choice, true) {
+            Ok(draft) => draft,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let point = match parse_automation_point_fields(
+            ui.get_automation_edit_new_point_tick().as_str(),
+            ui.get_automation_edit_new_point_value().as_str(),
+            choice.resolved.is_boolean(),
+        ) {
+            Ok(point) => point,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let (points, selected_index) = match insert_automation_point_draft(
+            &points,
+            point,
+            choice.resolved,
+            start_tick,
+            end_tick,
+        ) {
+            Ok(draft) => draft,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        populate_automation_edit_point_draft(&ui, &points, Some(selected_index));
+        ui.set_error_text(SharedString::default());
+    });
+}
+
+fn bind_update_automation_edit_point_callback(ui: &MainWindow, project_state: &ProjectUiStateCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let project_state_for_update = Rc::clone(project_state);
+    actions.on_update_automation_edit_point(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let choice = match automation_edit_point_choice(&ui, &project_state_for_update) {
+            Ok(choice) => choice,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let (points, start_tick, end_tick) = match automation_edit_point_draft(&ui, &choice, true) {
+            Ok(draft) => draft,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let selected_index = match selected_automation_edit_point_index(&ui, &points) {
+            Ok(index) => index,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let replacement = match parse_automation_point_fields(
+            ui.get_automation_edit_selected_point_tick().as_str(),
+            ui.get_automation_edit_selected_point_value().as_str(),
+            choice.resolved.is_boolean(),
+        ) {
+            Ok(point) => point,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let (points, selected_index) = match replace_automation_point_draft(
+            &points,
+            selected_index,
+            replacement,
+            choice.resolved,
+            start_tick,
+            end_tick,
+        ) {
+            Ok(draft) => draft,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        populate_automation_edit_point_draft(&ui, &points, Some(selected_index));
+        ui.set_error_text(SharedString::default());
+    });
+}
+
+fn bind_remove_automation_edit_point_callback(ui: &MainWindow, project_state: &ProjectUiStateCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let project_state_for_removal = Rc::clone(project_state);
+    actions.on_remove_automation_edit_point(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let choice = match automation_edit_point_choice(&ui, &project_state_for_removal) {
+            Ok(choice) => choice,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let (points, start_tick, end_tick) = match automation_edit_point_draft(&ui, &choice, true) {
+            Ok(draft) => draft,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let selected_index = match selected_automation_edit_point_index(&ui, &points) {
+            Ok(index) => index,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let (points, selected_index) = match remove_automation_point_draft(
+            &points,
+            selected_index,
+            choice.resolved,
+            start_tick,
+            end_tick,
+        ) {
+            Ok(draft) => draft,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        populate_automation_edit_point_draft(&ui, &points, selected_index);
+        ui.set_error_text(SharedString::default());
+    });
+}
+
+fn bind_automation_edit_point_callbacks(ui: &MainWindow, project_state: &ProjectUiStateCell) {
+    bind_reload_automation_edit_point_draft_callback(ui, project_state);
+    bind_select_automation_edit_point_callback(ui, project_state);
+    bind_add_automation_edit_point_callback(ui, project_state);
+    bind_update_automation_edit_point_callback(ui, project_state);
+    bind_remove_automation_edit_point_callback(ui, project_state);
 }
 
 fn bind_begin_automation_take_edit_callback(ui: &MainWindow, project_state: &ProjectUiStateCell) {
@@ -13281,7 +13842,7 @@ fn bind_begin_automation_take_edit_callback(ui: &MainWindow, project_state: &Pro
         ui.set_automation_edit_interpolation_index(form.interpolation_index);
         ui.set_automation_edit_start(form.start.into());
         ui.set_automation_edit_end(form.end.into());
-        ui.set_automation_edit_points(form.points.into());
+        populate_automation_edit_point_draft(&ui, &form.points, Some(0));
         ui.set_automation_edit_visible(true);
         ui.set_error_text(SharedString::default());
     });
@@ -13669,6 +14230,7 @@ fn bind_automation_take_edit_callbacks(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    bind_automation_edit_point_callbacks(ui, project_state);
     bind_begin_automation_take_edit_callback(ui, project_state);
     bind_save_automation_take_edit_callback(ui, worker, project_state);
     bind_begin_automation_lane_addition_callback(ui, project_state);
@@ -14040,6 +14602,14 @@ fn reset_automation_take_edit_form(ui: &MainWindow) {
     ui.set_automation_edit_start(SharedString::default());
     ui.set_automation_edit_end(SharedString::default());
     ui.set_automation_edit_points(SharedString::default());
+    ui.set_automation_edit_point_rows(ModelRc::default());
+    ui.set_automation_edit_selected_point_index(-1);
+    ui.set_automation_edit_selected_point_original_tick(SharedString::default());
+    ui.set_automation_edit_selected_point_original_value(SharedString::default());
+    ui.set_automation_edit_selected_point_tick(SharedString::default());
+    ui.set_automation_edit_selected_point_value(SharedString::default());
+    ui.set_automation_edit_new_point_tick(SharedString::default());
+    ui.set_automation_edit_new_point_value(SharedString::default());
     ui.set_automation_lane_remove_confirming_id(SharedString::default());
 }
 
@@ -22405,6 +22975,197 @@ mod tests {
             parse_automation_points(&format_automation_points(&switches), true),
             Ok(switches.to_vec())
         );
+    }
+
+    #[test]
+    fn structured_automation_point_drafts_preserve_order_and_target_domains() {
+        let gain = AutomationTarget::Main {
+            parameter: AutomationMainParameter::Gain,
+        };
+        let original = vec![
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(960, AutomationValue::Integer(0)),
+        ];
+        validate_automation_point_draft(&original, gain, 0, 1_920).unwrap();
+
+        let (inserted, selected_index) = insert_automation_point_draft(
+            &original,
+            AutomationPoint::new(480, AutomationValue::Integer(500_000)),
+            gain,
+            0,
+            1_920,
+        )
+        .unwrap();
+        assert_eq!(selected_index, 1);
+        assert_eq!(
+            inserted,
+            vec![
+                AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+                AutomationPoint::new(480, AutomationValue::Integer(500_000)),
+                AutomationPoint::new(960, AutomationValue::Integer(0)),
+            ]
+        );
+
+        let (updated, selected_index) = replace_automation_point_draft(
+            &inserted,
+            selected_index,
+            AutomationPoint::new(240, AutomationValue::Integer(750_000)),
+            gain,
+            0,
+            1_920,
+        )
+        .unwrap();
+        assert_eq!(selected_index, 1);
+        assert_eq!(
+            format_automation_points(&updated),
+            "0=1000000, 240=750000, 960=0"
+        );
+
+        let (removed, selected_index) =
+            remove_automation_point_draft(&updated, selected_index, gain, 0, 1_920).unwrap();
+        assert_eq!(selected_index, Some(1));
+        assert_eq!(removed, original);
+    }
+
+    #[test]
+    fn structured_automation_point_drafts_refuse_invalid_values_and_final_removal() {
+        let gain = AutomationTarget::Main {
+            parameter: AutomationMainParameter::Gain,
+        };
+        let points = vec![
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(960, AutomationValue::Integer(0)),
+        ];
+
+        assert_eq!(
+            insert_automation_point_draft(
+                &points,
+                AutomationPoint::new(960, AutomationValue::Integer(250_000)),
+                gain,
+                0,
+                1_920,
+            ),
+            Err("An automation point already exists at that tick")
+        );
+        assert_eq!(
+            insert_automation_point_draft(
+                &points,
+                AutomationPoint::new(1_920, AutomationValue::Integer(250_000)),
+                gain,
+                0,
+                1_920,
+            ),
+            Err("Automation points must stay inside the take interval")
+        );
+        assert_eq!(
+            replace_automation_point_draft(
+                &points,
+                1,
+                AutomationPoint::new(960, AutomationValue::Integer(2_000_001)),
+                gain,
+                0,
+                1_920,
+            ),
+            Err("Automation point value is outside the selected target domain")
+        );
+
+        let mute = AutomationTarget::Main {
+            parameter: AutomationMainParameter::Mute,
+        };
+        assert_eq!(
+            validate_automation_point_draft(
+                &[AutomationPoint::new(0, AutomationValue::Integer(0))],
+                mute,
+                0,
+                1_920,
+            ),
+            Err("Automation point values do not match the selected target")
+        );
+        assert!(
+            validate_automation_point_draft(
+                &[
+                    AutomationPoint::new(0, AutomationValue::Boolean(false)),
+                    AutomationPoint::new(960, AutomationValue::Boolean(true)),
+                ],
+                mute,
+                0,
+                1_920,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            remove_automation_point_draft(
+                &[AutomationPoint::new(0, AutomationValue::Boolean(false))],
+                0,
+                mute,
+                0,
+                1_920,
+            ),
+            Err("An automation lane must retain at least one point")
+        );
+    }
+
+    #[test]
+    fn structured_automation_point_rows_fail_closed_after_raw_drift() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        let choices = automation_target_choices(&automation_channel_fixture());
+        let choice = choices
+            .iter()
+            .find(|choice| {
+                choice.resolved
+                    == AutomationTarget::Channel {
+                        slot: 0,
+                        parameter: AutomationChannelParameter::Gain,
+                    }
+            })
+            .unwrap();
+        let points = vec![
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(960, AutomationValue::Integer(0)),
+        ];
+        ui.set_automation_edit_start("0".into());
+        ui.set_automation_edit_end("1920".into());
+        populate_automation_edit_point_draft(&ui, &points, Some(1));
+
+        assert_eq!(ui.get_automation_edit_points(), "0=1000000, 960=0");
+        assert_eq!(ui.get_automation_edit_point_rows().row_count(), 2);
+        assert_eq!(ui.get_automation_edit_selected_point_index(), 1);
+        assert_eq!(ui.get_automation_edit_selected_point_original_tick(), "960");
+        assert_eq!(ui.get_automation_edit_selected_point_original_value(), "0");
+        assert!(automation_point_rows_match_draft(&ui, &points));
+        assert_eq!(
+            automation_edit_point_draft(&ui, choice, true).unwrap(),
+            (points.clone(), 0, 1_920)
+        );
+
+        ui.set_automation_edit_points("0=1000000, 480=500000, 960=0".into());
+        assert_eq!(
+            automation_edit_point_draft(&ui, choice, true),
+            Err("The point table is stale; reload the exact draft before changing a point")
+        );
+        assert_eq!(
+            ui.get_automation_edit_point_rows().row_count(),
+            2,
+            "manual raw edits must not silently mutate the structured rows"
+        );
+
+        let reloaded = automation_edit_point_draft(&ui, choice, false).unwrap().0;
+        populate_automation_edit_point_rows(&ui, &reloaded, Some(1));
+        assert!(automation_point_rows_match_draft(&ui, &reloaded));
+        ui.set_automation_edit_selected_point_original_value("stale".into());
+        assert_eq!(
+            selected_automation_edit_point_index(&ui, &reloaded),
+            Err("The selected automation point is no longer current")
+        );
+
+        reset_automation_take_edit_form(&ui);
+        assert!(ui.get_automation_edit_points().is_empty());
+        assert_eq!(ui.get_automation_edit_point_rows().row_count(), 0);
+        assert_eq!(ui.get_automation_edit_selected_point_index(), -1);
+        assert!(ui.get_automation_edit_selected_point_tick().is_empty());
+        assert!(ui.get_automation_edit_new_point_tick().is_empty());
     }
 
     #[test]
