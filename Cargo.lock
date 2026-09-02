@@ -2473,6 +2473,7 @@ dependencies = [
  "hyper-project-model",
  "hyper-runtime-deployment",
  "hyper-runtime-host",
+ "hyper-runtime-loop-update",
  "hyper-runtime-mixer-update",
  "hyper-scene-performance",
  "hyper-storage-engine",

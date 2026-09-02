@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+mod loop_update;
 mod mixer_update;
 mod output;
 mod scene_performance;
@@ -49,12 +50,17 @@ use hyper_playback_session::{PlaybackExtent, PlaybackSessionAssemblyLimits};
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackLimits};
 use hyper_runtime_deployment::resolve_runtime_deployment;
 use hyper_runtime_host::{PanelHost, RuntimeArguments, ServedPanel, serve_panels_with_idle};
+use hyper_runtime_loop_update::{RuntimeLoopUpdateDirectory, RuntimeLoopUpdateSource};
 use hyper_runtime_mixer_update::{RuntimeMixerUpdateDirectory, RuntimeMixerUpdateSource};
 use hyper_scene_performance::{
     RuntimeScenePerformanceSource, RuntimeScenePerformanceUpdateDirectory, sha256_hex,
 };
 use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
 
+use loop_update::{
+    RuntimeLoopUpdateConfiguration, RuntimeLoopUpdateController, RuntimeLoopUpdateObservation,
+    RuntimeLoopUpdatePoll,
+};
 use mixer_update::{
     RuntimeMixerUpdateConfiguration, RuntimeMixerUpdateController, RuntimeMixerUpdateObservation,
     RuntimeMixerUpdatePoll,
@@ -89,6 +95,7 @@ const HEARTBEAT_TIMEOUT_MS: u32 = 500;
 struct SessionHost {
     session: DesktopPlaybackSession,
     mixer_update: RuntimeMixerUpdateController,
+    loop_update: RuntimeLoopUpdateController,
     scene_performance: RuntimeScenePerformanceCaptureController,
     panel_connected: Arc<AtomicBool>,
 }
@@ -152,7 +159,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     match parse_runtime_invocation(std::env::args().skip(1)).map_err(|error| {
         format!(
-            "{error}\nusage:\n  hyper-runtime --list-audio-outputs\n  hyper-runtime <deployment-target-directory> [--audio-output ROUTING_ID] [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--mixer-updates DIRECTORY] [--operator-ui]"
+            "{error}\nusage:\n  hyper-runtime --list-audio-outputs\n  hyper-runtime <deployment-target-directory> [--audio-output ROUTING_ID] [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--mixer-updates DIRECTORY] [--loop-updates DIRECTORY] [--operator-ui]"
         )
     })? {
         RuntimeInvocation::ListAudioOutputs => list_runtime_audio_outputs(),
@@ -278,6 +285,7 @@ struct RuntimeObservers {
     recovery: PlaybackRecoveryCheckpoint,
     panel_connected: Arc<AtomicBool>,
     mixer_update: Arc<Mutex<RuntimeMixerUpdateObservation>>,
+    loop_update: Arc<Mutex<RuntimeLoopUpdateObservation>>,
     scene_performance: Arc<Mutex<RuntimeScenePerformanceCaptureObservation>>,
 }
 
@@ -409,6 +417,7 @@ enum OperatorCommand {
     Start,
     Stop,
     ExportMixerUpdate,
+    ExportLoopUpdate,
     StartScenePerformanceCapture,
     StopScenePerformanceCapture,
     ReturnToStart,
@@ -562,6 +571,13 @@ trait RuntimeMixerUpdateControl {
     fn poll_mixer_update_export(&mut self) -> Option<String>;
 }
 
+/// Loop-update export remains with the same owner as live transport commands.
+trait RuntimeLoopUpdateControl {
+    fn export_loop_update(&mut self) -> Result<String, String>;
+
+    fn poll_loop_update_export(&mut self) -> Option<String>;
+}
+
 trait RuntimeOutputObservation {
     fn output_state(&self) -> OutputStreamState;
 }
@@ -676,6 +692,38 @@ impl RuntimeMixerUpdateControl for SessionHost {
     }
 }
 
+impl RuntimeLoopUpdateControl for SessionHost {
+    fn export_loop_update(&mut self) -> Result<String, String> {
+        let update = &mut self.loop_update;
+        let session = &mut self.session;
+        update.request_export(session).map_or_else(
+            |error| Err(error.to_string()),
+            |fence_sequence| {
+                Ok(format!(
+                    "loop-update export queued at committed transport fence {fence_sequence}"
+                ))
+            },
+        )
+    }
+
+    fn poll_loop_update_export(&mut self) -> Option<String> {
+        let update = &mut self.loop_update;
+        let session = &mut self.session;
+        match update.poll(session) {
+            Some(RuntimeLoopUpdatePoll::Saved(saved)) => {
+                Some(format!("loop update published to {}", saved.path.display()))
+            }
+            Some(RuntimeLoopUpdatePoll::NoChanges) => {
+                Some("loop update not published: no committed loop changes".to_owned())
+            }
+            Some(RuntimeLoopUpdatePoll::Failed(error)) => {
+                Some(format!("loop-update export failed: {error}"))
+            }
+            None => None,
+        }
+    }
+}
+
 fn operator_timeline_marker_catalog(
     markers: &[LoadedTimelineMarker],
     timeline: &RuntimeMusicalTimeline,
@@ -714,7 +762,32 @@ struct PreparedRuntimeStartup {
     facts: RuntimeFacts,
     project: PreparedProjectPlayback,
     mixer_update: RuntimeMixerUpdateConfiguration,
+    loop_update: RuntimeLoopUpdateConfiguration,
     scene_performance: RuntimeScenePerformanceCaptureConfiguration,
+}
+
+/// Prepares the immutable provenance and source-loop baseline for one Runtime
+/// handback before the native audio owner starts.
+fn prepare_runtime_loop_update_configuration(
+    project: &PreparedProjectPlayback,
+    bundle_identity: &str,
+    deployment_generation: u64,
+    output_directory: Option<RuntimeLoopUpdateDirectory>,
+) -> Result<RuntimeLoopUpdateConfiguration, String> {
+    let manifest = project.package().manifest();
+    let source = RuntimeLoopUpdateSource::try_new(
+        manifest.project_id().to_owned(),
+        manifest.revision(),
+        sha256_hex(project.package().manifest_sha256()),
+        bundle_identity.to_owned(),
+        deployment_generation,
+    )
+    .map_err(|error| {
+        format!("verified Runtime loop-update source could not be prepared: {error}")
+    })?;
+    RuntimeLoopUpdateConfiguration::try_new(source, project, output_directory).map_err(|error| {
+        format!("verified Runtime loop-update configuration could not be prepared: {error}")
+    })
 }
 
 fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRuntimeStartup, String> {
@@ -733,6 +806,7 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
     })?;
     let scene_performance_output = open_runtime_scene_performance_output(arguments)?;
     let mixer_update_output = open_runtime_mixer_update_output(arguments)?;
+    let loop_update_output = open_runtime_loop_update_output(arguments)?;
     let prepared_project = deployment.bundle().project();
     let manifest = prepared_project.package().manifest();
     let (project, ..) = prepared_project.session().parts();
@@ -781,6 +855,12 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
     .map_err(|error| {
         format!("verified Runtime mixer-update configuration could not be prepared: {error}")
     })?;
+    let loop_update = prepare_runtime_loop_update_configuration(
+        prepared_project,
+        &bundle_identity,
+        deployment.generation(),
+        loop_update_output,
+    )?;
     let facts = RuntimeFacts {
         bundle_identity,
         deployment_generation: deployment.generation(),
@@ -797,6 +877,7 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
         facts,
         project: deployment.into_bundle().into_project(),
         mixer_update,
+        loop_update,
         scene_performance,
     })
 }
@@ -807,6 +888,8 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         session,
         mixer_update,
         mixer_update_observation,
+        loop_update,
+        loop_update_observation,
         scene_performance,
         scene_performance_observation,
     ) = prepare_output_and_host(
@@ -832,11 +915,15 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
             let scene_performance_observation = scene_performance.observation();
             let mixer_update = startup.mixer_update.attach();
             let mixer_update_observation = mixer_update.observation();
+            let loop_update = startup.loop_update.attach();
+            let loop_update_observation = loop_update.observation();
             Ok((
                 facts,
                 session,
                 mixer_update,
                 mixer_update_observation,
+                loop_update,
+                loop_update_observation,
                 scene_performance,
                 scene_performance_observation,
             ))
@@ -850,12 +937,14 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         recovery: session.recovery_checkpoint(),
         panel_connected: Arc::clone(&panel_connected),
         mixer_update: mixer_update_observation,
+        loop_update: loop_update_observation,
         scene_performance: scene_performance_observation,
     };
     Ok(StartedRuntime {
         host: SessionHost {
             session,
             mixer_update,
+            loop_update,
             scene_performance,
             panel_connected,
         },
@@ -937,6 +1026,43 @@ fn open_runtime_mixer_update_output(
     Ok(Some(output))
 }
 
+/// Opens an explicit Runtime loop-update directory only when it is outside the
+/// verified deployment tree. The Runtime never writes an update into its
+/// deployment, bundle, or embedded project package.
+fn open_runtime_loop_update_output(
+    arguments: &RuntimeArguments,
+) -> Result<Option<RuntimeLoopUpdateDirectory>, String> {
+    let Some(path) = arguments.loop_updates() else {
+        return Ok(None);
+    };
+    let output = RuntimeLoopUpdateDirectory::open(path).map_err(|error| {
+        format!(
+            "loop-update output directory {} is invalid: {error}",
+            path.display()
+        )
+    })?;
+    let deployment_root = std::fs::canonicalize(arguments.deployment_root()).map_err(|error| {
+        format!(
+            "verified deployment root {} cannot be canonicalized for loop-update output isolation: {error}",
+            arguments.deployment_root().display()
+        )
+    })?;
+    let output_root = std::fs::canonicalize(output.root_path()).map_err(|error| {
+        format!(
+            "loop-update output directory {} cannot be canonicalized: {error}",
+            output.root_path().display()
+        )
+    })?;
+    if output_root.starts_with(&deployment_root) {
+        return Err(format!(
+            "loop-update output directory {} must be outside deployment target {}",
+            output.root_path().display(),
+            arguments.deployment_root().display()
+        ));
+    }
+    Ok(Some(output))
+}
+
 fn announce_runtime(arguments: &RuntimeArguments, runtime: &StartedRuntime) {
     println!(
         "hosting deployment generation {} bundle {} from {} with {} mixer channels via {}",
@@ -982,6 +1108,7 @@ fn host_runtime<H, O>(
 where
     H: PanelHost
         + RuntimeMixerUpdateControl
+        + RuntimeLoopUpdateControl
         + RuntimeOperatorControl
         + RuntimeScenePerformanceControl,
     O: RuntimeOutputObservation,
@@ -998,6 +1125,9 @@ where
             diagnostic(message);
         }
         if let Some(message) = host.poll_mixer_update_export() {
+            diagnostic(message);
+        }
+        if let Some(message) = host.poll_loop_update_export() {
             diagnostic(message);
         }
     };
@@ -1111,7 +1241,10 @@ fn finish_runtime_output<O: RuntimeOutputObservation>(
     reason = "the bounded operator command dispatcher keeps every queue outcome explicit"
 )]
 fn drain_operator_commands<
-    H: RuntimeMixerUpdateControl + RuntimeOperatorControl + RuntimeScenePerformanceControl,
+    H: RuntimeLoopUpdateControl
+        + RuntimeMixerUpdateControl
+        + RuntimeOperatorControl
+        + RuntimeScenePerformanceControl,
 >(
     host: &mut H,
     commands: &Receiver<OperatorCommand>,
@@ -1139,6 +1272,10 @@ fn drain_operator_commands<
             OperatorCommand::ExportMixerUpdate => match host.export_mixer_update() {
                 Ok(message) => diagnostic(message),
                 Err(error) => diagnostic(format!("mixer-update export refused: {error}")),
+            },
+            OperatorCommand::ExportLoopUpdate => match host.export_loop_update() {
+                Ok(message) => diagnostic(message),
+                Err(error) => diagnostic(format!("loop-update export refused: {error}")),
             },
             OperatorCommand::StartScenePerformanceCapture => {
                 match host.start_scene_performance_capture() {
@@ -1759,6 +1896,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_loudness_controls(&ui, &commands_tx, &diagnostic, &loudness_authority);
     wire_operator_mixer_controls(&ui, &commands_tx, &diagnostic, &mixer_authority);
     wire_operator_mixer_update_export(&ui, &commands_tx, &diagnostic, &observers.mixer_update);
+    wire_operator_loop_update_export(&ui, &commands_tx, &diagnostic, &observers.loop_update);
     wire_operator_native_device_controls(
         &ui,
         &commands_tx,
@@ -1831,6 +1969,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     );
     apply_operator_scene_performance_observation(&ui, observers.scene_performance.as_ref(), false);
     apply_operator_mixer_update_observation(&ui, observers.mixer_update.as_ref(), false);
+    apply_operator_loop_update_observation(&ui, observers.loop_update.as_ref(), false);
 
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
@@ -1853,6 +1992,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_native_device_authority = Rc::clone(&native_device_authority);
     let timer_scene_performance = Arc::clone(&observers.scene_performance);
     let timer_mixer_update = Arc::clone(&observers.mixer_update);
+    let timer_loop_update = Arc::clone(&observers.loop_update);
     let timer_native_devices = native_devices;
     let timer_mixer_channels = mixer_channels;
     let timer_mixer_sends = mixer_sends;
@@ -1913,6 +2053,11 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
             apply_operator_mixer_update_observation(
                 &ui,
                 timer_mixer_update.as_ref(),
+                terminal_latched,
+            );
+            apply_operator_loop_update_observation(
+                &ui,
+                timer_loop_update.as_ref(),
                 terminal_latched,
             );
             if !completion_observed
@@ -2623,6 +2768,41 @@ fn wire_operator_scene_performance_capture(
             OperatorCommand::StopScenePerformanceCapture,
             &stop_diagnostic,
         );
+    });
+}
+
+/// Forwards only an export that the Runtime-owned loop observation enables.
+///
+/// The UI neither snapshots nor persists loop state itself. It simply queues
+/// an explicit request for the sole Runtime owner, which publishes the next
+/// observation after accepting or refusing it.
+fn wire_operator_loop_update_export(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    observation: &Arc<Mutex<RuntimeLoopUpdateObservation>>,
+) {
+    let sender = sender.clone();
+    let diagnostic = Arc::clone(diagnostic);
+    let observation = Arc::clone(observation);
+    let weak = ui.as_weak();
+    ui.on_export_loop_update_requested(move || {
+        let export_enabled = weak
+            .upgrade()
+            .is_some_and(|ui| ui.get_loop_update_export_enabled())
+            && observation
+                .lock()
+                .map(|observation| observation.export_enabled)
+                .unwrap_or(false);
+        if !export_enabled {
+            set_diagnostic(
+                &diagnostic,
+                "loop-update export refused: committed Runtime loop state is unavailable"
+                    .to_owned(),
+            );
+            return;
+        }
+        send_operator_command(&sender, OperatorCommand::ExportLoopUpdate, &diagnostic);
     });
 }
 
@@ -4491,9 +4671,32 @@ fn apply_operator_mixer_update_observation(
     ui.set_mixer_update_export_enabled(observation.export_enabled);
 }
 
+fn apply_operator_loop_update_observation(
+    ui: &OperatorWindow,
+    observation: &Mutex<RuntimeLoopUpdateObservation>,
+    terminal_latched: bool,
+) {
+    if terminal_latched {
+        revoke_operator_loop_update_authority(ui);
+        return;
+    }
+    let Ok(observation) = observation.lock() else {
+        ui.set_loop_update_state("Runtime loop-update state unavailable".into());
+        ui.set_loop_update_export_enabled(false);
+        return;
+    };
+    ui.set_loop_update_state(observation.state.clone().into());
+    ui.set_loop_update_export_enabled(observation.export_enabled);
+}
+
 fn revoke_operator_mixer_update_authority(ui: &OperatorWindow) {
     ui.set_mixer_update_state("Runtime stopped · mixer update unavailable".into());
     ui.set_mixer_update_export_enabled(false);
+}
+
+fn revoke_operator_loop_update_authority(ui: &OperatorWindow) {
+    ui.set_loop_update_state("Runtime stopped · loop update unavailable".into());
+    ui.set_loop_update_export_enabled(false);
 }
 
 fn revoke_operator_scene_performance_authority(ui: &OperatorWindow) {
@@ -5136,6 +5339,13 @@ mod tests {
         }))
     }
 
+    fn test_loop_update_observation() -> Arc<Mutex<RuntimeLoopUpdateObservation>> {
+        Arc::new(Mutex::new(RuntimeLoopUpdateObservation {
+            state: "fixture loop-update state".to_owned(),
+            export_enabled: false,
+        }))
+    }
+
     #[test]
     fn audio_output_listing_is_a_standalone_invocation() {
         assert_eq!(
@@ -5211,6 +5421,19 @@ mod tests {
         let mut arguments = Vec::new();
         if let Some(output) = output {
             arguments.push("--mixer-updates".to_owned());
+            arguments.push(output.display().to_string());
+        }
+        arguments.push(deployment.display().to_string());
+        RuntimeArguments::parse(arguments).expect("construct Runtime arguments")
+    }
+
+    fn runtime_arguments_with_loop_update_output(
+        deployment: &Path,
+        output: Option<&Path>,
+    ) -> RuntimeArguments {
+        let mut arguments = Vec::new();
+        if let Some(output) = output {
+            arguments.push("--loop-updates".to_owned());
             arguments.push(output.display().to_string());
         }
         arguments.push(deployment.display().to_string());
@@ -5678,6 +5901,48 @@ mod tests {
     }
 
     #[test]
+    fn loop_update_output_is_explicit_and_outside_the_deployment_tree() {
+        let temporary = RuntimeTemporaryDirectory::new();
+        let deployment = temporary.child("deployment");
+        let output = temporary.child("loop-updates");
+        fs::create_dir(&deployment).unwrap();
+        fs::create_dir(&output).unwrap();
+
+        let disabled = runtime_arguments_with_loop_update_output(&deployment, None);
+        assert!(
+            open_runtime_loop_update_output(&disabled)
+                .unwrap()
+                .is_none()
+        );
+
+        let arguments = runtime_arguments_with_loop_update_output(&deployment, Some(&output));
+        let retained = open_runtime_loop_update_output(&arguments)
+            .unwrap()
+            .expect("the explicit external directory is retained");
+        assert_eq!(retained.root_path(), output);
+        assert!(retained.root_path().starts_with(temporary.path()));
+    }
+
+    #[test]
+    fn loop_update_output_never_targets_the_deployment_tree() {
+        let temporary = RuntimeTemporaryDirectory::new();
+        let deployment = temporary.child("deployment");
+        let output = deployment.join("loop-updates");
+        fs::create_dir(&deployment).unwrap();
+        fs::create_dir(&output).unwrap();
+        let arguments = runtime_arguments_with_loop_update_output(&deployment, Some(&output));
+
+        let Err(error) = open_runtime_loop_update_output(&arguments) else {
+            panic!("a deployment child cannot be used for loop updates");
+        };
+        assert!(
+            error.contains("must be outside deployment target"),
+            "{error}"
+        );
+        assert!(fs::read_dir(&output).unwrap().next().is_none());
+    }
+
+    #[test]
     fn an_unavailable_panel_listener_keeps_the_runtime_owner_until_quit() {
         let occupied = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = occupied.local_addr().unwrap();
@@ -5763,6 +6028,8 @@ mod tests {
         native_device_commands: Vec<NativeDeviceCommand>,
         mixer_update_commands: usize,
         mixer_update_poll: Option<String>,
+        loop_update_commands: usize,
+        loop_update_poll: Option<String>,
         scene_performance_commands: Vec<OperatorScenePerformanceAction>,
         scene_performance_poll: Option<String>,
         reject: bool,
@@ -5854,6 +6121,21 @@ mod tests {
         }
     }
 
+    impl RuntimeLoopUpdateControl for OperatorControl {
+        fn export_loop_update(&mut self) -> Result<String, String> {
+            if self.reject {
+                Err("owner busy".to_owned())
+            } else {
+                self.loop_update_commands = self.loop_update_commands.saturating_add(1);
+                Ok("loop-update export queued".to_owned())
+            }
+        }
+
+        fn poll_loop_update_export(&mut self) -> Option<String> {
+            self.loop_update_poll.take()
+        }
+    }
+
     impl PanelHost for OperatorControl {
         type Error = core::convert::Infallible;
 
@@ -5934,6 +6216,7 @@ mod tests {
             .send(OperatorCommand::StopScenePerformanceCapture)
             .unwrap();
         sender.send(OperatorCommand::ExportMixerUpdate).unwrap();
+        sender.send(OperatorCommand::ExportLoopUpdate).unwrap();
         sender.send(OperatorCommand::ResetLoudness).unwrap();
         drain_operator_commands(&mut owner, &receiver, &stop, &|message| {
             diagnostics.borrow_mut().push(message);
@@ -5972,6 +6255,7 @@ mod tests {
             ]
         );
         assert_eq!(owner.mixer_update_commands, 1);
+        assert_eq!(owner.loop_update_commands, 1);
         assert_eq!(
             diagnostics.into_inner(),
             [
@@ -5986,6 +6270,7 @@ mod tests {
                 "scene-performance capture started",
                 "scene-performance capture stop requested",
                 "mixer-update export queued",
+                "loop-update export queued",
                 "programme loudness reset queued",
             ]
         );
@@ -6101,6 +6386,50 @@ mod tests {
         assert_eq!(
             diagnostic.lock().unwrap().as_str(),
             "mixer-update export refused: committed Runtime mixer state is unavailable"
+        );
+    }
+
+    #[test]
+    fn loop_update_export_control_follows_committed_runtime_observation() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = OperatorWindow::new().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let diagnostic = Arc::new(Mutex::new(String::new()));
+        let observation = test_loop_update_observation();
+        wire_operator_loop_update_export(&ui, &sender, &diagnostic, &observation);
+        apply_operator_loop_update_observation(&ui, observation.as_ref(), false);
+
+        ui.invoke_export_loop_update_requested();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "loop-update export refused: committed Runtime loop state is unavailable"
+        );
+
+        *observation.lock().unwrap() = RuntimeLoopUpdateObservation {
+            state: "Ready to export the committed loop state".to_owned(),
+            export_enabled: true,
+        };
+        apply_operator_loop_update_observation(&ui, observation.as_ref(), false);
+        assert_eq!(
+            ui.get_loop_update_state().as_str(),
+            "Ready to export the committed loop state"
+        );
+        assert!(ui.get_loop_update_export_enabled());
+
+        ui.invoke_export_loop_update_requested();
+        assert_eq!(receiver.try_recv(), Ok(OperatorCommand::ExportLoopUpdate));
+        assert!(
+            ui.get_loop_update_export_enabled(),
+            "the UI retains the committed presentation until Runtime publishes another one"
+        );
+
+        revoke_operator_loop_update_authority(&ui);
+        ui.invoke_export_loop_update_requested();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "loop-update export refused: committed Runtime loop state is unavailable"
         );
     }
 
@@ -6378,6 +6707,7 @@ mod tests {
             recovery: PlaybackRecoveryCheckpoint::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
             mixer_update: test_mixer_update_observation(),
+            loop_update: test_loop_update_observation(),
             scene_performance: test_scene_performance_observation(),
         };
         let marker_model = Rc::new(VecModel::from(operator_timeline_marker_rows(&markers)));
@@ -9006,6 +9336,7 @@ mod tests {
             recovery: recovery.clone(),
             panel_connected: Arc::new(AtomicBool::new(false)),
             mixer_update: test_mixer_update_observation(),
+            loop_update: test_loop_update_observation(),
             scene_performance: test_scene_performance_observation(),
         };
         let _ = apply_observations(
@@ -9115,6 +9446,7 @@ mod tests {
             recovery: PlaybackRecoveryCheckpoint::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
             mixer_update: test_mixer_update_observation(),
+            loop_update: test_loop_update_observation(),
             scene_performance: test_scene_performance_observation(),
         };
         apply_static_facts(&ui, &facts);
@@ -9363,6 +9695,7 @@ mod tests {
             recovery: terminal_recovery,
             panel_connected: Arc::new(AtomicBool::new(false)),
             mixer_update: test_mixer_update_observation(),
+            loop_update: test_loop_update_observation(),
             scene_performance: test_scene_performance_observation(),
         };
         let terminal_operator_scenes = [OperatorScene {

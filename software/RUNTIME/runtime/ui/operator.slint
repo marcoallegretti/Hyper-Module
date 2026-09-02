@@ -79,6 +79,57 @@ component FactCard inherits Rectangle {
     }
 }
 
+component LoopFactCard inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <string> detail;
+    in property <string> update-state;
+    in property <bool> export-enabled;
+    callback export-requested();
+    background: #171b24;
+    border-color: #2c3445;
+    border-width: 1px;
+    border-radius: 8px;
+    min-height: 72px;
+
+    Text {
+        x: 12px;
+        y: 12px;
+        width: root.width - 24px;
+        text: root.label;
+        color: #8d99ad;
+        font-size: 11px;
+    }
+    Text {
+        x: 12px;
+        y: 28px;
+        width: root.width - 24px;
+        text: root.value;
+        color: #edf2f8;
+        font-size: 15px;
+        overflow: elide;
+    }
+    Text {
+        x: 12px;
+        y: 50px;
+        width: root.width - 92px;
+        text: root.detail;
+        color: #8d99ad;
+        font-size: 11px;
+        overflow: elide;
+    }
+    Button {
+        x: root.width - 68px;
+        y: 45px;
+        width: 56px;
+        height: 20px;
+        text: "Export";
+        accessible-label: "Export the committed session loop as an external update for manual IDE import. " + root.update-state;
+        enabled: root.export-enabled;
+        clicked => { root.export-requested(); }
+    }
+}
+
 component OutputMeterBar inherits Rectangle {
     in property <string> channel;
     in property <float> level;
@@ -552,6 +603,8 @@ export component OperatorWindow inherits Window {
     in property <string> mixer-state: "Mixer state unavailable";
     in property <string> mixer-update-state: "Mixer update unavailable";
     in property <bool> mixer-update-export-enabled: false;
+    in property <string> loop-update-state: "Loop update unavailable";
+    in property <bool> loop-update-export-enabled: false;
     in property <string> diagnostic;
 
     callback start-requested();
@@ -593,6 +646,7 @@ export component OperatorWindow inherits Window {
     callback set-main-gain-requested(float);
     callback toggle-main-mute-requested();
     callback export-mixer-update-requested();
+    callback export-loop-update-requested();
     callback launch-scene-requested(int);
     callback select-scene-requested(int);
     callback move-scene-selection-requested(int);
@@ -680,7 +734,15 @@ export component OperatorWindow inherits Window {
                 value: root.transport-state + "  ·  " + root.transport-time;
                 detail: "BBT " + root.transport-musical-position + "  ·  frame " + root.transport-frame;
             }
-            FactCard { width: 156px; label: "SESSION LOOP"; value: root.loop-state; detail: root.loop-range; }
+            LoopFactCard {
+                width: 156px;
+                label: "SESSION LOOP";
+                value: root.loop-state;
+                detail: root.loop-range;
+                update-state: root.loop-update-state;
+                export-enabled: root.loop-update-export-enabled;
+                export-requested => { root.export-loop-update-requested(); }
+            }
             FactCard { width: 156px; label: "METRONOME"; value: root.metronome-state; }
             FactCard { width: 156px; label: "AUDIO OWNER"; value: root.stream-state; detail: root.output-route; }
             FactCard { width: 156px; label: "PANEL LINK"; value: root.panel-state; }
