@@ -964,6 +964,7 @@ fn arguments_name_a_deployment_target_and_optionally_a_panel_address() {
     );
     assert_eq!(parsed.panel_listen(), None);
     assert_eq!(parsed.performance_updates(), None);
+    assert_eq!(parsed.audio_output(), None);
     assert!(!parsed.operator_ui());
 
     let parsed = RuntimeArguments::parse([
@@ -971,6 +972,8 @@ fn arguments_name_a_deployment_target_and_optionally_a_panel_address() {
         "127.0.0.1:9000".to_owned(),
         "--performance-updates".to_owned(),
         "/performances/demo".to_owned(),
+        "--audio-output".to_owned(),
+        "studio-right".to_owned(),
         "--operator-ui".to_owned(),
         "/deployments/demo".to_owned(),
     ])
@@ -987,6 +990,7 @@ fn arguments_name_a_deployment_target_and_optionally_a_panel_address() {
         parsed.performance_updates(),
         Some(std::path::Path::new("/performances/demo"))
     );
+    assert_eq!(parsed.audio_output(), Some("studio-right"));
     assert!(parsed.operator_ui());
 }
 
@@ -1003,6 +1007,10 @@ fn a_malformed_argument_list_is_reported_rather_than_assumed() {
     assert_eq!(
         RuntimeArguments::parse(["--performance-updates".to_owned()]),
         Err(ArgumentError::MissingValue("--performance-updates"))
+    );
+    assert_eq!(
+        RuntimeArguments::parse(["--audio-output".to_owned()]),
+        Err(ArgumentError::MissingValue("--audio-output"))
     );
     assert_eq!(
         RuntimeArguments::parse(["--panel-listen".to_owned(), "not-an-address".to_owned()]),
@@ -1047,6 +1055,16 @@ fn a_malformed_argument_list_is_reported_rather_than_assumed() {
         ]),
         Err(ArgumentError::Repeated("--operator-ui"))
     );
+    assert_eq!(
+        RuntimeArguments::parse([
+            "one".to_owned(),
+            "--audio-output".to_owned(),
+            "first".to_owned(),
+            "--audio-output".to_owned(),
+            "second".to_owned(),
+        ]),
+        Err(ArgumentError::Repeated("--audio-output"))
+    );
 }
 
 #[test]
@@ -1056,6 +1074,7 @@ fn every_argument_failure_says_what_was_wrong() {
         ArgumentError::UnknownOption("--nope".to_owned()),
         ArgumentError::MissingValue("--panel-listen"),
         ArgumentError::MissingValue("--performance-updates"),
+        ArgumentError::MissingValue("--audio-output"),
         ArgumentError::UnreadableAddress("1.2.3".to_owned()),
         ArgumentError::Repeated("--panel-listen"),
     ]
@@ -1068,6 +1087,7 @@ fn every_argument_failure_says_what_was_wrong() {
         "--nope",
         "--panel-listen",
         "--performance-updates",
+        "--audio-output",
         "1.2.3",
         "more than once",
     ] {

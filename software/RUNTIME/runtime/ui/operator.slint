@@ -508,6 +508,7 @@ export component OperatorWindow inherits Window {
     in property <bool> metronome-toggle-enabled: false;
     in property <float> metronome-gain-percent: 0;
     in property <bool> metronome-gain-enabled: false;
+    in property <string> output-route: "System default";
     in property <string> stream-state;
     in property <string> callback-count;
     in property <string> stream-failures;
@@ -681,7 +682,7 @@ export component OperatorWindow inherits Window {
             }
             FactCard { width: 156px; label: "SESSION LOOP"; value: root.loop-state; detail: root.loop-range; }
             FactCard { width: 156px; label: "METRONOME"; value: root.metronome-state; }
-            FactCard { width: 156px; label: "AUDIO OWNER"; value: root.stream-state; }
+            FactCard { width: 156px; label: "AUDIO OWNER"; value: root.stream-state; detail: root.output-route; }
             FactCard { width: 156px; label: "PANEL LINK"; value: root.panel-state; }
         }
 

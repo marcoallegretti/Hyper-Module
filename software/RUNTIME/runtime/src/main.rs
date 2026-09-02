@@ -3,6 +3,7 @@
 #![deny(unsafe_code)]
 
 mod mixer_update;
+mod output;
 mod scene_performance;
 
 use std::cell::{Cell, RefCell};
@@ -22,9 +23,9 @@ use hyper_control_runtime::{
     PanelDisplay, PanelReleaseFailure,
 };
 use hyper_desktop_audio::{
-    DesktopControlSinkError, DesktopMixerSendTap, DesktopNativeDevice, DesktopOutputConfig,
-    DesktopPlaybackSession, DesktopSceneAvailability, OutputStreamCounters, OutputStreamSnapshot,
-    OutputStreamState, OutputStreamStatus,
+    DesktopControlSinkError, DesktopMixerSendTap, DesktopNativeDevice, DesktopPlaybackSession,
+    DesktopSceneAvailability, OutputStreamCounters, OutputStreamSnapshot, OutputStreamState,
+    OutputStreamStatus,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
@@ -58,6 +59,7 @@ use mixer_update::{
     RuntimeMixerUpdateConfiguration, RuntimeMixerUpdateController, RuntimeMixerUpdateObservation,
     RuntimeMixerUpdatePoll,
 };
+use output::{RuntimeOutputRoute, discover_runtime_output_targets, prepare_runtime_output};
 use scene_performance::{
     RuntimeScenePerformanceCaptureConfiguration, RuntimeScenePerformanceCaptureController,
     RuntimeScenePerformanceCaptureObservation, RuntimeScenePerformanceCapturePoll,
@@ -148,17 +150,54 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let arguments = RuntimeArguments::parse(std::env::args().skip(1)).map_err(|error| {
+    match parse_runtime_invocation(std::env::args().skip(1)).map_err(|error| {
         format!(
-            "{error}\nusage: hyper-runtime <deployment-target-directory> [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--mixer-updates DIRECTORY] [--operator-ui]"
+            "{error}\nusage:\n  hyper-runtime --list-audio-outputs\n  hyper-runtime <deployment-target-directory> [--audio-output ROUTING_ID] [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--mixer-updates DIRECTORY] [--operator-ui]"
         )
-    })?;
-
-    if arguments.operator_ui() {
-        run_operator_ui(arguments)
-    } else {
-        run_headless(&arguments)
+    })? {
+        RuntimeInvocation::ListAudioOutputs => list_runtime_audio_outputs(),
+        RuntimeInvocation::Host(arguments) if arguments.operator_ui() => run_operator_ui(arguments),
+        RuntimeInvocation::Host(arguments) => run_headless(&arguments),
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeInvocation {
+    ListAudioOutputs,
+    Host(RuntimeArguments),
+}
+
+fn parse_runtime_invocation<I>(arguments: I) -> Result<RuntimeInvocation, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let arguments: Vec<_> = arguments.into_iter().collect();
+    if matches!(arguments.as_slice(), [option] if option == "--list-audio-outputs") {
+        return Ok(RuntimeInvocation::ListAudioOutputs);
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument == "--list-audio-outputs")
+    {
+        return Err("--list-audio-outputs must be used by itself".to_owned());
+    }
+    RuntimeArguments::parse(arguments)
+        .map(RuntimeInvocation::Host)
+        .map_err(|error| error.to_string())
+}
+
+fn list_runtime_audio_outputs() -> Result<(), String> {
+    let targets = discover_runtime_output_targets()
+        .map_err(|error| format!("desktop audio-output discovery failed: {error}"))?;
+    if targets.is_empty() {
+        println!("No routable desktop audio outputs found.");
+        return Ok(());
+    }
+    println!("ROUTING ID\tOUTPUT");
+    for target in targets {
+        println!("{}\t{}", target.routing_id(), target.display_name());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +208,7 @@ struct RuntimeFacts {
     project_name: String,
     project_id: String,
     project_revision: u64,
+    output_route: RuntimeOutputRoute,
     playback_extent: PlaybackExtent,
     musical_timeline: RuntimeMusicalTimeline,
     timeline_markers: Arc<[OperatorTimelineMarker]>,
@@ -748,6 +788,7 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
         project_name: manifest.name().to_owned(),
         project_id: manifest.project_id().to_owned(),
         project_revision: manifest.revision(),
+        output_route: RuntimeOutputRoute::SystemDefault,
         playback_extent: deployment.bundle().project().session().extent(),
         musical_timeline,
         timeline_markers: timeline_markers.into(),
@@ -771,10 +812,17 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
     ) = prepare_output_and_host(
         || prepare_runtime_startup(arguments),
         || {
-            DesktopOutputConfig::try_new(SAMPLE_RATE_HZ, MAXIMUM_BLOCK_FRAMES)
-                .map_err(|error| format!("output configuration is invalid: {error}"))
+            prepare_runtime_output(
+                arguments.audio_output(),
+                SAMPLE_RATE_HZ,
+                MAXIMUM_BLOCK_FRAMES,
+            )
+            .map_err(|error| format!("Runtime audio-output preflight failed: {error}"))
         },
         |output, startup| {
+            let (output, output_route) = output.into_parts();
+            let mut facts = startup.facts;
+            facts.output_route = output_route;
             let mut session = DesktopPlaybackSession::start_project(output, startup.project)
                 .map_err(|error| format!("verified bundle could not be hosted: {error}"))?;
             let receiver = session.take_scene_launch_receiver().ok_or_else(|| {
@@ -785,7 +833,7 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
             let mixer_update = startup.mixer_update.attach();
             let mixer_update_observation = mixer_update.observation();
             Ok((
-                startup.facts,
+                facts,
                 session,
                 mixer_update,
                 mixer_update_observation,
@@ -891,11 +939,12 @@ fn open_runtime_mixer_update_output(
 
 fn announce_runtime(arguments: &RuntimeArguments, runtime: &StartedRuntime) {
     println!(
-        "hosting deployment generation {} bundle {} from {} with {} mixer channels",
+        "hosting deployment generation {} bundle {} from {} with {} mixer channels via {}",
         runtime.observers.facts.deployment_generation,
         runtime.observers.facts.bundle_identity,
         arguments.deployment_root().display(),
-        runtime.host.mixer_channel_count()
+        runtime.host.mixer_channel_count(),
+        runtime.observers.facts.output_route
     );
     if let Some(recovered) = &runtime.observers.facts.recovered_from {
         println!("recovered from rejected bundle {recovered}");
@@ -4521,6 +4570,7 @@ fn apply_static_facts(ui: &OperatorWindow, facts: &RuntimeFacts) {
     ui.set_project_revision(facts.project_revision.to_string().into());
     ui.set_deployment_generation(facts.deployment_generation.to_string().into());
     ui.set_bundle_identity(facts.bundle_identity.clone().into());
+    ui.set_output_route(facts.output_route.to_string().into());
     ui.set_timeline_marker_navigation_state(
         operator_timeline_marker_navigation_state(&facts.timeline_markers, false).into(),
     );
@@ -5084,6 +5134,29 @@ mod tests {
             state: "fixture mixer-update state".to_owned(),
             export_enabled: false,
         }))
+    }
+
+    #[test]
+    fn audio_output_listing_is_a_standalone_invocation() {
+        assert_eq!(
+            parse_runtime_invocation(["--list-audio-outputs".to_owned()]),
+            Ok(RuntimeInvocation::ListAudioOutputs)
+        );
+
+        let RuntimeInvocation::Host(arguments) = parse_runtime_invocation([
+            "--audio-output".to_owned(),
+            "studio-right".to_owned(),
+            "deployment".to_owned(),
+        ])
+        .unwrap() else {
+            panic!("a deployment invocation must remain a host invocation");
+        };
+        assert_eq!(arguments.audio_output(), Some("studio-right"));
+
+        assert_eq!(
+            parse_runtime_invocation(["--list-audio-outputs".to_owned(), "deployment".to_owned(),]),
+            Err("--list-audio-outputs must be used by itself".to_owned())
+        );
     }
 
     struct RuntimeTemporaryDirectory {
@@ -6293,6 +6366,7 @@ mod tests {
             project_name: "Marker fixture".to_owned(),
             project_id: "project-marker-fixture".to_owned(),
             project_revision: 1,
+            output_route: RuntimeOutputRoute::SystemDefault,
             playback_extent: PlaybackExtent::Unbounded,
             musical_timeline: timeline,
             timeline_markers: Arc::clone(&markers),
@@ -8922,6 +8996,7 @@ mod tests {
                 project_name: "Seek fixture".to_owned(),
                 project_id: PROJECT_ID.to_owned(),
                 project_revision: 1,
+                output_route: RuntimeOutputRoute::SystemDefault,
                 playback_extent: PlaybackExtent::Bounded { end_frame: 1_500 },
                 musical_timeline: runtime_musical_timeline.clone(),
                 timeline_markers: Arc::from([]),
@@ -9026,6 +9101,9 @@ mod tests {
             project_name: "Night Drive".to_owned(),
             project_id: "project-night-drive".to_owned(),
             project_revision: u64::MAX - 1,
+            output_route: RuntimeOutputRoute::Pinned {
+                display_name: "Studio Output".to_owned(),
+            },
             playback_extent: PlaybackExtent::Bounded { end_frame: 1_500 },
             musical_timeline: test_musical_timeline(),
             timeline_markers: Arc::from([]),
@@ -9040,6 +9118,7 @@ mod tests {
             scene_performance: test_scene_performance_observation(),
         };
         apply_static_facts(&ui, &facts);
+        assert_eq!(ui.get_output_route().as_str(), "Pinned: Studio Output");
         let observation = apply_observations(
             &ui,
             &observers,

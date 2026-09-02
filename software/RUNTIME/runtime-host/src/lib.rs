@@ -82,6 +82,7 @@ pub struct RuntimeArguments {
     panel_listen: Option<SocketAddr>,
     performance_updates: Option<PathBuf>,
     mixer_updates: Option<PathBuf>,
+    audio_output: Option<String>,
     operator_ui: bool,
 }
 
@@ -130,6 +131,7 @@ impl RuntimeArguments {
         let mut panel_listen = None;
         let mut performance_updates = None;
         let mut mixer_updates = None;
+        let mut audio_output = None;
         let mut operator_ui = false;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -171,6 +173,16 @@ impl RuntimeArguments {
                         .ok_or(ArgumentError::MissingValue("--mixer-updates"))?;
                     mixer_updates = Some(PathBuf::from(value));
                 }
+                "--audio-output" => {
+                    if audio_output.is_some() {
+                        return Err(ArgumentError::Repeated("--audio-output"));
+                    }
+                    audio_output = Some(
+                        arguments
+                            .next()
+                            .ok_or(ArgumentError::MissingValue("--audio-output"))?,
+                    );
+                }
                 option if option.starts_with("--") => {
                     return Err(ArgumentError::UnknownOption(option.to_owned()));
                 }
@@ -187,6 +199,7 @@ impl RuntimeArguments {
             panel_listen,
             performance_updates,
             mixer_updates,
+            audio_output,
             operator_ui,
         })
     }
@@ -213,6 +226,13 @@ impl RuntimeArguments {
         self.mixer_updates.as_deref()
     }
 
+    /// Returns the opaque desktop output routing identity requested for this
+    /// Runtime launch, if one was explicitly selected.
+    #[must_use]
+    pub fn audio_output(&self) -> Option<&str> {
+        self.audio_output.as_deref()
+    }
+
     #[must_use]
     pub const fn operator_ui(&self) -> bool {
         self.operator_ui
@@ -224,12 +244,14 @@ mod argument_tests {
     use super::*;
 
     #[test]
-    fn parses_independent_external_update_directories() {
+    fn parses_independent_external_update_directories_and_audio_output() {
         let arguments = RuntimeArguments::parse([
             "--performance-updates".to_owned(),
             "scene-updates".to_owned(),
             "--mixer-updates".to_owned(),
             "mixer-updates".to_owned(),
+            "--audio-output".to_owned(),
+            "studio-right".to_owned(),
             "deployment".to_owned(),
         ])
         .unwrap();
@@ -240,10 +262,11 @@ mod argument_tests {
             Some(Path::new("scene-updates"))
         );
         assert_eq!(arguments.mixer_updates(), Some(Path::new("mixer-updates")));
+        assert_eq!(arguments.audio_output(), Some("studio-right"));
     }
 
     #[test]
-    fn refuses_repeated_or_value_less_mixer_update_options() {
+    fn refuses_repeated_or_value_less_value_options() {
         assert_eq!(
             RuntimeArguments::parse([
                 "--mixer-updates".to_owned(),
@@ -262,6 +285,20 @@ mod argument_tests {
         assert_eq!(
             RuntimeArguments::parse(["--mixer-updates".to_owned()]),
             Err(ArgumentError::MissingValue("--mixer-updates"))
+        );
+        assert_eq!(
+            RuntimeArguments::parse([
+                "--audio-output".to_owned(),
+                "first".to_owned(),
+                "--audio-output".to_owned(),
+                "second".to_owned(),
+                "deployment".to_owned(),
+            ]),
+            Err(ArgumentError::Repeated("--audio-output"))
+        );
+        assert_eq!(
+            RuntimeArguments::parse(["--audio-output".to_owned()]),
+            Err(ArgumentError::MissingValue("--audio-output"))
         );
     }
 }
