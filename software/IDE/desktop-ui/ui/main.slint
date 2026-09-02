@@ -69,6 +69,7 @@ export enum AppMode {
     removing-scene,
     creating-clip,
     importing-audio,
+    importing-runtime-scene-performance,
     preparing-preview,
     previewing,
     saving,
@@ -325,6 +326,7 @@ export global IdeActions {
     callback transport-return-start();
     callback start-scene-performance-capture();
     callback stop-scene-performance-capture();
+    callback import-runtime-scene-performance();
     callback start-mixer-automation-capture(string, int);
     callback stop-mixer-automation-capture();
     callback transport-seek(float);
@@ -2081,6 +2083,12 @@ export component MainWindow inherits Window {
                                         && !root.loop-engaged;
                                     clicked => { IdeActions.start-scene-performance-capture(); }
                                 }
+                                Button {
+                                    text: "Import Runtime capture…";
+                                    accessible-label: "Select one Runtime scene-performance update and import it as one verified arrangement edit";
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => { IdeActions.import-runtime-scene-performance(); }
+                                }
                                 if root.app-mode == AppMode.capturing-scene-performance : Button {
                                     text: "■  End capture";
                                     accessible-label: "Stop scene-performance capture and atomically save the committed grid launches";
@@ -2094,6 +2102,8 @@ export component MainWindow inherits Window {
                                         ? "Ending after " + root.scene-performance-capture-launch-count + " grid launches"
                                         : root.app-mode == AppMode.saving-scene-performance
                                         ? "Saving one arrangement edit"
+                                        : root.app-mode == AppMode.importing-runtime-scene-performance
+                                        ? "Importing one Runtime capture"
                                         : "Grid scenes → one arrangement edit";
                                     color: root.app-mode == AppMode.capturing-scene-performance ? #ffd166 : #8fa0b4;
                                     font-size: 9px;

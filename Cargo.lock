@@ -2210,6 +2210,7 @@ dependencies = [
  "hyper-recording-metadata",
  "hyper-recording-worker",
  "hyper-runtime-bundle-builder",
+ "hyper-scene-performance",
  "hyper-storage-engine",
  "hyper-thread-supervisor",
  "hyper-track-freeze",
@@ -2470,9 +2471,11 @@ dependencies = [
  "hyper-project-loader",
  "hyper-runtime-deployment",
  "hyper-runtime-host",
+ "hyper-scene-performance",
  "i-slint-backend-testing",
  "slint",
  "slint-build",
+ "uuid",
 ]
 
 [[package]]
@@ -2562,6 +2565,22 @@ version = "0.1.0"
 dependencies = [
  "hyper-panel-protocol",
  "hyper-panel-simulator",
+]
+
+[[package]]
+name = "hyper-scene-performance"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "hyper-fs-authority",
+ "hyper-project-model",
+ "hyper-strict-json",
+ "same-file",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "uuid",
 ]
 
 [[package]]

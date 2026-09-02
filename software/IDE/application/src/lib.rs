@@ -244,11 +244,12 @@ pub use worker::{
     IdeMixerAutomationCaptureError, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerSend,
     IdeNativeCompressor, IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError,
     IdeRecordingCaptureKind, IdeRecordingState, IdeRecordingTake, IdeRunningObservation,
-    IdeRuntimePreparationError, IdeScene, IdeScenePerformanceCaptureError, IdeSceneTrackAction,
-    IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind,
-    IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError, IdeWorkerPendingShutdownWait,
-    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, IdeWorkerStartError,
-    MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS, desktop_ide_worker_supervisor_snapshot,
+    IdeRuntimePreparationError, IdeRuntimeScenePerformanceImportError, IdeScene,
+    IdeScenePerformanceCaptureError, IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand,
+    IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError,
+    IdeWorkerJoinError, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeWorkerShutdownReport, IdeWorkerStartError, MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS,
+    desktop_ide_worker_supervisor_snapshot,
 };
 
 const DESKTOP_MAXIMUM_BLOCK_FRAMES: usize = 4_096;
@@ -10345,6 +10346,13 @@ pub struct RunningIdeSnapshot<'a> {
     pub playback_session_generation: u64,
     pub project_path: &'a Path,
     pub project_id: &'a str,
+    pub project_revision: u64,
+    /// Exact digest of the verified manifest that produced this snapshot.
+    ///
+    /// This is deliberately separate from the user-facing project identity:
+    /// external Runtime updates must bind to the full immutable project
+    /// revision before they can become an arrangement edit.
+    pub project_manifest_sha256: [u8; 32],
     pub project_name: &'a str,
     pub sample_rate_hz: u32,
     pub playback_extent: IdePlaybackExtent,
@@ -16401,6 +16409,8 @@ impl RunningDesktopIdeApplication {
             playback_session_generation: self.application.playback_session_generation,
             project_path: project.package().root(),
             project_id: project.package().manifest().project_id(),
+            project_revision: project.package().manifest().revision(),
+            project_manifest_sha256: *project.package().manifest_sha256(),
             project_name: project.package().manifest().name(),
             sample_rate_hz: project.session().sample_rate_hz(),
             playback_extent: project.session().extent(),

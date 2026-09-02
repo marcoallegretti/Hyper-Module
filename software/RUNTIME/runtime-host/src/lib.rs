@@ -80,6 +80,7 @@ pub const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub struct RuntimeArguments {
     deployment_root: PathBuf,
     panel_listen: Option<SocketAddr>,
+    performance_updates: Option<PathBuf>,
     operator_ui: bool,
 }
 
@@ -126,6 +127,7 @@ impl RuntimeArguments {
     {
         let mut deployment_root = None;
         let mut panel_listen = None;
+        let mut performance_updates = None;
         let mut operator_ui = false;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -149,6 +151,15 @@ impl RuntimeArguments {
                             .map_err(|_| ArgumentError::UnreadableAddress(value))?,
                     );
                 }
+                "--performance-updates" => {
+                    if performance_updates.is_some() {
+                        return Err(ArgumentError::Repeated("--performance-updates"));
+                    }
+                    let value = arguments
+                        .next()
+                        .ok_or(ArgumentError::MissingValue("--performance-updates"))?;
+                    performance_updates = Some(PathBuf::from(value));
+                }
                 option if option.starts_with("--") => {
                     return Err(ArgumentError::UnknownOption(option.to_owned()));
                 }
@@ -163,6 +174,7 @@ impl RuntimeArguments {
         Ok(Self {
             deployment_root: deployment_root.ok_or(ArgumentError::MissingDeploymentRoot)?,
             panel_listen,
+            performance_updates,
             operator_ui,
         })
     }
@@ -175,6 +187,12 @@ impl RuntimeArguments {
     #[must_use]
     pub const fn panel_listen(&self) -> Option<SocketAddr> {
         self.panel_listen
+    }
+
+    /// Returns the explicit Runtime scene-performance update directory, when enabled.
+    #[must_use]
+    pub fn performance_updates(&self) -> Option<&Path> {
+        self.performance_updates.as_deref()
     }
 
     #[must_use]

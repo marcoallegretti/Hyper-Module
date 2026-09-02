@@ -963,11 +963,14 @@ fn arguments_name_a_deployment_target_and_optionally_a_panel_address() {
         std::path::Path::new("/deployments/demo")
     );
     assert_eq!(parsed.panel_listen(), None);
+    assert_eq!(parsed.performance_updates(), None);
     assert!(!parsed.operator_ui());
 
     let parsed = RuntimeArguments::parse([
         "--panel-listen".to_owned(),
         "127.0.0.1:9000".to_owned(),
+        "--performance-updates".to_owned(),
+        "/performances/demo".to_owned(),
         "--operator-ui".to_owned(),
         "/deployments/demo".to_owned(),
     ])
@@ -979,6 +982,10 @@ fn arguments_name_a_deployment_target_and_optionally_a_panel_address() {
     assert_eq!(
         parsed.panel_listen(),
         Some("127.0.0.1:9000".parse::<SocketAddr>().unwrap())
+    );
+    assert_eq!(
+        parsed.performance_updates(),
+        Some(std::path::Path::new("/performances/demo"))
     );
     assert!(parsed.operator_ui());
 }
@@ -992,6 +999,10 @@ fn a_malformed_argument_list_is_reported_rather_than_assumed() {
     assert_eq!(
         RuntimeArguments::parse(["--panel-listen".to_owned()]),
         Err(ArgumentError::MissingValue("--panel-listen"))
+    );
+    assert_eq!(
+        RuntimeArguments::parse(["--performance-updates".to_owned()]),
+        Err(ArgumentError::MissingValue("--performance-updates"))
     );
     assert_eq!(
         RuntimeArguments::parse(["--panel-listen".to_owned(), "not-an-address".to_owned()]),
@@ -1021,6 +1032,16 @@ fn a_malformed_argument_list_is_reported_rather_than_assumed() {
     assert_eq!(
         RuntimeArguments::parse([
             "one".to_owned(),
+            "--performance-updates".to_owned(),
+            "one".to_owned(),
+            "--performance-updates".to_owned(),
+            "two".to_owned(),
+        ]),
+        Err(ArgumentError::Repeated("--performance-updates"))
+    );
+    assert_eq!(
+        RuntimeArguments::parse([
+            "one".to_owned(),
             "--operator-ui".to_owned(),
             "--operator-ui".to_owned(),
         ]),
@@ -1034,6 +1055,7 @@ fn every_argument_failure_says_what_was_wrong() {
         ArgumentError::MissingDeploymentRoot,
         ArgumentError::UnknownOption("--nope".to_owned()),
         ArgumentError::MissingValue("--panel-listen"),
+        ArgumentError::MissingValue("--performance-updates"),
         ArgumentError::UnreadableAddress("1.2.3".to_owned()),
         ArgumentError::Repeated("--panel-listen"),
     ]
@@ -1041,11 +1063,19 @@ fn every_argument_failure_says_what_was_wrong() {
     .map(ToString::to_string)
     .collect();
 
-    assert!(rendered[0].contains("Runtime deployment target directory"));
-    assert!(rendered[1].contains("--nope"));
-    assert!(rendered[2].contains("--panel-listen"));
-    assert!(rendered[3].contains("1.2.3"));
-    assert!(rendered[4].contains("more than once"));
+    for expected in [
+        "Runtime deployment target directory",
+        "--nope",
+        "--panel-listen",
+        "--performance-updates",
+        "1.2.3",
+        "more than once",
+    ] {
+        assert!(
+            rendered.iter().any(|message| message.contains(expected)),
+            "missing argument diagnostic containing {expected:?}: {rendered:?}"
+        );
+    }
     assert!(
         rendered.iter().all(|message| !message.is_empty()),
         "every failure renders something the operator can act on"

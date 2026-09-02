@@ -30,6 +30,7 @@ hyper-recording-journal = { path = "../../../crates/recording-journal" }
 hyper-recording-metadata = { path = "../../../crates/recording-metadata" }
 hyper-recording-worker = { path = "../../../crates/recording-worker" }
 hyper-runtime-bundle-builder = { path = "../runtime-bundle-builder" }
+hyper-scene-performance = { path = "../../../crates/scene-performance" }
 hyper-storage-engine = { path = "../../../crates/storage-engine" }
 hyper-thread-supervisor = { path = "../../../crates/thread-supervisor" }
 hyper-track-freeze = { path = "../../../crates/track-freeze" }

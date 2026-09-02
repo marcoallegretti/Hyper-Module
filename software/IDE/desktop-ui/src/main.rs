@@ -53,9 +53,9 @@ use hyper_desktop_ide::{
     IdeArrangementPlacementEditError, IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError,
     IdeAudioClipLoopEditError, IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
     IdeAudioClipSourceTrimEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
-    IdeAudioImportError, IdeAutomationTakeEditError, IdeSceneCreationError,
-    IdeSceneDuplicationError, IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEditError,
-    IdeTempoEditError,
+    IdeAudioImportError, IdeAutomationTakeEditError, IdeRuntimeScenePerformanceImportError,
+    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneRemovalError, IdeSceneRenameError,
+    IdeSceneSlotEditError, IdeTempoEditError,
 };
 #[cfg(test)]
 use hyper_mixer_runtime::PlaybackRecoverySnapshot;
@@ -82,6 +82,7 @@ const MAX_SAFE_TIMELINE_TICK: u64 = 9_007_199_254_740_991;
 const FINAL_OUTPUT_METER_FLOOR_DBFS: f32 = -60.0;
 const INPUT_METER_FLOOR_DBFS: f32 = -60.0;
 const MIXER_STRIP_METER_FLOOR_DBFS: f32 = -60.0;
+const RUNTIME_SCENE_PERFORMANCE_IMPORT_FILTER_LABEL: &str = "Runtime scene-performance updates";
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
@@ -96,6 +97,12 @@ type UiCommandSubmitter = Rc<dyn Fn(&MainWindow, IdeWorkerCommand)>;
 #[derive(Debug)]
 enum AudioImportChoice {
     Selected(Vec<PathBuf>),
+    Cancelled,
+}
+
+#[derive(Debug)]
+enum RuntimeScenePerformanceImportChoice {
+    Selected(PathBuf),
     Cancelled,
 }
 
@@ -555,6 +562,7 @@ fn bind_callbacks(
     bind_monitoring_callbacks(ui, worker);
     bind_recording_callbacks(ui, worker, &routes.recordings);
     bind_scene_performance_capture_callbacks(ui, worker);
+    bind_runtime_scene_performance_import_callback(ui, worker);
     bind_audio_preview_callbacks(ui, worker, &routes.takes);
     bind_audio_import_callback(ui, worker, &routes.audio_imports);
 }
@@ -1395,6 +1403,86 @@ fn bind_scene_performance_capture_callbacks(ui: &MainWindow, worker: &WorkerCell
                 IdeWorkerCommand::StopScenePerformanceCapture,
             );
         }
+    });
+}
+
+fn bind_runtime_scene_performance_import_callback(ui: &MainWindow, worker: &WorkerCell) {
+    bind_runtime_scene_performance_import_callback_with(ui, worker, |weak, worker| {
+        let weak_for_dialog = weak.clone();
+        let spawn_result = slint::spawn_local(async move {
+            let selection = rfd::AsyncFileDialog::new()
+                .set_title("Import Runtime scene performance")
+                .add_filter(RUNTIME_SCENE_PERFORMANCE_IMPORT_FILTER_LABEL, &["json"])
+                .pick_file()
+                .await;
+            let Some(ui) = weak_for_dialog.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::ImportingRuntimeScenePerformance {
+                return;
+            }
+            let choice = selection.map_or(
+                RuntimeScenePerformanceImportChoice::Cancelled,
+                |selection| {
+                    RuntimeScenePerformanceImportChoice::Selected(selection.path().to_path_buf())
+                },
+            );
+            complete_runtime_scene_performance_import_choice(&ui, &worker, choice);
+        });
+        if spawn_result.is_err()
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime scene-performance selection is unavailable".into());
+        }
+    });
+}
+
+fn complete_runtime_scene_performance_import_choice(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    choice: RuntimeScenePerformanceImportChoice,
+) {
+    complete_runtime_scene_performance_import_choice_with(ui, choice, |command| {
+        submit_to_ui(ui, worker, command);
+    });
+}
+
+fn complete_runtime_scene_performance_import_choice_with(
+    ui: &MainWindow,
+    choice: RuntimeScenePerformanceImportChoice,
+    submit: impl FnOnce(IdeWorkerCommand),
+) {
+    match choice {
+        RuntimeScenePerformanceImportChoice::Selected(path) => {
+            submit(IdeWorkerCommand::ImportRuntimeScenePerformance { path });
+        }
+        RuntimeScenePerformanceImportChoice::Cancelled => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime scene-performance import cancelled".into());
+        }
+    }
+}
+
+fn bind_runtime_scene_performance_import_callback_with(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell) + 'static,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    actions.on_import_runtime_scene_performance(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        ui.set_app_mode(AppMode::ImportingRuntimeScenePerformance);
+        ui.set_status_text("Waiting for a Runtime scene-performance update…".into());
+        ui.set_error_text(SharedString::default());
+        choose(weak.clone(), Rc::clone(&worker));
     });
 }
 
@@ -6312,6 +6400,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         }
         IdeWorkerCommandKind::SetAudioTrackActive => AppMode::ChangingTrackActivation,
         IdeWorkerCommandKind::ImportAudio => AppMode::ImportingAudio,
+        IdeWorkerCommandKind::ImportRuntimeScenePerformance => {
+            AppMode::ImportingRuntimeScenePerformance
+        }
         IdeWorkerCommandKind::SetArrangementPlacementActive
         | IdeWorkerCommandKind::MoveArrangementPlacement
         | IdeWorkerCommandKind::SetArrangementPlacementDuration
@@ -6544,6 +6635,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::ImportAudio => {
             "Preserving mixer state, importing project-owned audio, and reopening project…"
+        }
+        IdeWorkerCommandKind::ImportRuntimeScenePerformance => {
+            "Verifying Runtime scene performance and reopening project after one arrangement edit…"
         }
         IdeWorkerCommandKind::SetArrangementPlacementActive => {
             "Preserving mixer state, updating the arrangement placement, and reopening project…"
@@ -7340,6 +7434,10 @@ fn apply_event(
         }
         IdeWorkerEvent::RecordingImported(outcome) => apply_recording_imported(ui, &outcome),
         IdeWorkerEvent::RecordingAborted(outcome) => apply_recording_aborted(ui, &outcome),
+        event @ (IdeWorkerEvent::RuntimeScenePerformanceImporting { .. }
+        | IdeWorkerEvent::RuntimeScenePerformanceImported { .. }) => {
+            apply_runtime_scene_performance_import_event(ui, &event);
+        }
         event @ (IdeWorkerEvent::ScenePerformanceCaptureStarted { .. }
         | IdeWorkerEvent::ScenePerformanceCaptureProgress { .. }
         | IdeWorkerEvent::ScenePerformanceCaptureStopping { .. }
@@ -8243,6 +8341,9 @@ fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWor
         unreachable!("arrangement committed-warning dispatcher received another event");
     };
     let action = match command {
+        IdeWorkerCommandKind::ImportRuntimeScenePerformance => {
+            "Runtime scene-performance import".to_owned()
+        }
         IdeWorkerCommandKind::CaptureScenePerformance => "Scene-performance capture".to_owned(),
         IdeWorkerCommandKind::AddArrangementSceneLaunch => {
             reset_arrangement_scene_launch_addition_form(ui);
@@ -10449,6 +10550,37 @@ fn apply_scene_performance_capture_event(ui: &MainWindow, event: &IdeWorkerEvent
     }
 }
 
+fn apply_runtime_scene_performance_import_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::RuntimeScenePerformanceImporting { launch_count } => {
+            ui.set_app_mode(AppMode::ImportingRuntimeScenePerformance);
+            ui.set_status_text(
+                format!(
+                    "Verifying {launch_count} Runtime scene {} and preparing one atomic arrangement edit…",
+                    if *launch_count == 1 { "launch" } else { "launches" }
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RuntimeScenePerformanceImported {
+            revision,
+            launch_count,
+        } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(
+                format!(
+                    "Imported {launch_count} Runtime scene {} in project revision {revision} as one arrangement edit",
+                    if *launch_count == 1 { "launch" } else { "launches" }
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("Runtime scene-performance import dispatcher received another event"),
+    }
+}
+
 fn apply_mixer_automation_capture_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::MixerAutomationCaptureStarted {
@@ -11317,6 +11449,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::ImportAudio if current == AppMode::ImportingAudio => AppMode::Running,
+        IdeWorkerCommandKind::ImportRuntimeScenePerformance
+            if current == AppMode::ImportingRuntimeScenePerformance =>
+        {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::SetArrangementPlacementActive
             if current == AppMode::ChangingArrangementActivation =>
         {
@@ -25491,6 +25628,7 @@ mod tests {
     fn assert_window_contracts(ui: &MainWindow) {
         assert_recent_project_window_contract(ui);
         assert_audio_import_window_contract(ui);
+        assert_runtime_scene_performance_import_window_contract(ui);
         assert_audio_track_content_removal_window_contract(ui);
         assert_audio_track_freeze_window_contract(ui);
         assert_audio_track_flatten_window_contract(ui);
@@ -25605,6 +25743,143 @@ mod tests {
 
         assert_audio_import_callback_contract(ui, &routes);
         assert_audio_import_event_contract(ui, &routes);
+    }
+
+    fn assert_runtime_scene_performance_import_window_contract(ui: &MainWindow) {
+        assert_runtime_scene_performance_import_callback_contract(ui);
+        assert_runtime_scene_performance_import_event_contract(ui);
+    }
+
+    fn assert_runtime_scene_performance_import_callback_contract(ui: &MainWindow) {
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        bind_runtime_scene_performance_import_callback_with(ui, &worker, move |weak, _| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_scene_performance_import_choice_with(
+                &ui,
+                RuntimeScenePerformanceImportChoice::Selected(PathBuf::from(
+                    "performance.hyper-scene-performance.json",
+                )),
+                |command| submitted_by_callback.borrow_mut().push(command),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.set_error_text("stale error".into());
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_scene_performance();
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::ImportRuntimeScenePerformance { path }]
+                if path == &PathBuf::from("performance.hyper-scene-performance.json")
+        ));
+        assert_eq!(ui.get_app_mode(), AppMode::ImportingRuntimeScenePerformance);
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::Closed);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_scene_performance();
+        assert_eq!(
+            submitted.borrow().len(),
+            1,
+            "Closed mode owns no import action"
+        );
+
+        bind_runtime_scene_performance_import_callback_with(ui, &worker, move |weak, _| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_scene_performance_import_choice_with(
+                &ui,
+                RuntimeScenePerformanceImportChoice::Cancelled,
+                |_| panic!("a cancelled chooser must not submit a command"),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_scene_performance();
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime scene-performance import cancelled"
+        );
+
+        bind_runtime_scene_performance_import_callback_with(ui, &worker, move |weak, worker| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_scene_performance_import_choice(
+                &ui,
+                &worker,
+                RuntimeScenePerformanceImportChoice::Selected(PathBuf::from(
+                    "performance.hyper-scene-performance.json",
+                )),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_scene_performance();
+        assert_eq!(ui.get_app_mode(), AppMode::Unavailable);
+        assert!(ui.get_error_text().contains("no longer available"));
+    }
+
+    fn assert_runtime_scene_performance_import_event_contract(ui: &MainWindow) {
+        let routes = UiRoutes::default();
+        let project_state = Rc::new(ProjectUiState::default());
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeScenePerformanceImporting { launch_count: 1 },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::ImportingRuntimeScenePerformance);
+        assert_eq!(
+            ui.get_status_text(),
+            "Verifying 1 Runtime scene launch and preparing one atomic arrangement edit…"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeScenePerformanceImported {
+                revision: 8,
+                launch_count: 2,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Imported 2 Runtime scene launches in project revision 8 as one arrangement edit"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::ImportingRuntimeScenePerformance);
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeScenePerformance,
+                reason: IdeWorkerCommandFailure::RuntimeScenePerformanceImport(Box::new(
+                    IdeRuntimeScenePerformanceImportError::ProjectIdentityMismatch,
+                )),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(ui.get_error_text().contains("another project"));
+
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::ImportRuntimeScenePerformance,
+            ),
+            AppMode::ImportingRuntimeScenePerformance
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ImportingRuntimeScenePerformance,
+                IdeWorkerCommandKind::ImportRuntimeScenePerformance,
+            ),
+            AppMode::Running
+        );
     }
 
     fn assert_audio_track_content_removal_window_contract(ui: &MainWindow) {

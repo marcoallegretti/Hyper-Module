@@ -538,6 +538,9 @@ export component OperatorWindow inherits Window {
     in property <string> scene-feedback;
     in property <bool> scene-selection-enabled: false;
     in property <bool> stop-interactive-scenes-enabled: false;
+    in property <string> scene-performance-state: "Waiting for committed Runtime transport recovery";
+    in property <bool> scene-performance-start-enabled: false;
+    in property <bool> scene-performance-stop-enabled: false;
     in property <[OperatorMixerRow]> mixer-channels;
     in property <[OperatorMixerSendRow]> mixer-sends;
     in property <[OperatorNativeDeviceRow]> native-devices;
@@ -591,6 +594,8 @@ export component OperatorWindow inherits Window {
     callback move-scene-selection-requested(int);
     callback launch-selected-scene-requested();
     callback stop-interactive-scenes-requested();
+    callback start-scene-performance-capture-requested();
+    callback stop-scene-performance-capture-requested();
     callback quit-requested();
 
     begin-loudness-reset => {
@@ -1076,6 +1081,29 @@ export component OperatorWindow inherits Window {
                         text: "Stop interactive scenes";
                         enabled: root.stop-interactive-scenes-enabled;
                         clicked => { root.stop-interactive-scenes-requested(); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: root.scene-performance-state;
+                        color: #8d99ad;
+                        font-size: 10px;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                    }
+                    Button {
+                        text: "Capture performance";
+                        enabled: root.scene-performance-start-enabled;
+                        accessible-label: "Capture committed grid scene performance";
+                        clicked => { root.start-scene-performance-capture-requested(); }
+                    }
+                    Button {
+                        text: "Stop capture";
+                        enabled: root.scene-performance-stop-enabled;
+                        accessible-label: "Stop scene performance capture at the next committed transport boundary";
+                        clicked => { root.stop-scene-performance-capture-requested(); }
                     }
                 }
                 HorizontalLayout {

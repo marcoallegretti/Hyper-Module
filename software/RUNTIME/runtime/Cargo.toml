@@ -28,6 +28,7 @@ hyper-runtime-deployment = { path = "../deployment" }
 hyper-runtime-host = { path = "../runtime-host" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
 hyper-native-device = { path = "../../../crates/native-device" }
+hyper-scene-performance = { path = "../../../crates/scene-performance" }
 slint = { version = "=1.17.1", default-features = false, features = [
     "accessibility",
     "backend-winit",
@@ -35,6 +36,7 @@ slint = { version = "=1.17.1", default-features = false, features = [
     "renderer-femtovg",
     "std",
 ] }
+uuid = { version = "=1.24.0", features = ["v4"] }
 
 [build-dependencies]
 slint-build = "=1.17.1"

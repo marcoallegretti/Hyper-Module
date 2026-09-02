@@ -2,6 +2,8 @@
 
 #![deny(unsafe_code)]
 
+mod scene_performance;
+
 use std::cell::{Cell, RefCell};
 use std::io::BufRead;
 use std::net::TcpListener;
@@ -42,10 +44,18 @@ use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_compiler::{FrameTimeline, MeterEvent, TempoEvent, musical_position};
 use hyper_playback_json::{LoadedTimelineMarker, LoaderLimits};
 use hyper_playback_session::{PlaybackExtent, PlaybackSessionAssemblyLimits};
-use hyper_project_loader::ProjectPlaybackLimits;
+use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackLimits};
 use hyper_runtime_deployment::resolve_runtime_deployment;
 use hyper_runtime_host::{PanelHost, RuntimeArguments, ServedPanel, serve_panels_with_idle};
+use hyper_scene_performance::{
+    RuntimeScenePerformanceSource, RuntimeScenePerformanceUpdateDirectory, sha256_hex,
+};
 use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
+
+use scene_performance::{
+    RuntimeScenePerformanceCaptureConfiguration, RuntimeScenePerformanceCaptureController,
+    RuntimeScenePerformanceCaptureObservation, RuntimeScenePerformanceCapturePoll,
+};
 
 slint::include_modules!();
 
@@ -70,6 +80,7 @@ const HEARTBEAT_TIMEOUT_MS: u32 = 500;
 /// sole control runtime, so it is the only thing that can answer these.
 struct SessionHost {
     session: DesktopPlaybackSession,
+    scene_performance: RuntimeScenePerformanceCaptureController,
     panel_connected: Arc<AtomicBool>,
 }
 
@@ -132,7 +143,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let arguments = RuntimeArguments::parse(std::env::args().skip(1)).map_err(|error| {
         format!(
-            "{error}\nusage: hyper-runtime <deployment-target-directory> [--panel-listen ADDRESS] [--operator-ui]"
+            "{error}\nusage: hyper-runtime <deployment-target-directory> [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--operator-ui]"
         )
     })?;
 
@@ -219,6 +230,7 @@ struct RuntimeObservers {
     output_counters: OutputStreamCounters,
     recovery: PlaybackRecoveryCheckpoint,
     panel_connected: Arc<AtomicBool>,
+    scene_performance: Arc<Mutex<RuntimeScenePerformanceCaptureObservation>>,
 }
 
 struct OperatorReady {
@@ -348,6 +360,8 @@ struct StartedRuntime {
 enum OperatorCommand {
     Start,
     Stop,
+    StartScenePerformanceCapture,
+    StopScenePerformanceCapture,
     ReturnToStart,
     Locate {
         frame: usize,
@@ -483,6 +497,15 @@ trait RuntimeOperatorControl {
     fn queue_native_device(&mut self, command: NativeDeviceCommand) -> Result<(), String>;
 }
 
+/// Runtime scene-performance commands remain with the same owner as transport.
+trait RuntimeScenePerformanceControl {
+    fn start_scene_performance_capture(&mut self) -> Result<String, String>;
+
+    fn stop_scene_performance_capture(&mut self) -> Result<String, String>;
+
+    fn poll_scene_performance_capture(&mut self) -> Option<String>;
+}
+
 trait RuntimeOutputObservation {
     fn output_state(&self) -> OutputStreamState;
 }
@@ -520,6 +543,50 @@ impl RuntimeOperatorControl for SessionHost {
     }
 }
 
+impl RuntimeScenePerformanceControl for SessionHost {
+    fn start_scene_performance_capture(&mut self) -> Result<String, String> {
+        let capture = &mut self.scene_performance;
+        let session = &mut self.session;
+        capture.start(session).map_or_else(
+            |error| Err(error.to_string()),
+            |maximum_launch_count| {
+                Ok(format!(
+                    "scene-performance capture started with capacity for {maximum_launch_count} arrangement scene launch(es)"
+                ))
+            },
+        )
+    }
+
+    fn stop_scene_performance_capture(&mut self) -> Result<String, String> {
+        let capture = &mut self.scene_performance;
+        let session = &mut self.session;
+        capture.stop(session).map_or_else(
+            |error| Err(error.to_string()),
+            |captured_launch_count| {
+                Ok(format!(
+                    "scene-performance capture stop requested after {captured_launch_count} committed launch(es)"
+                ))
+            },
+        )
+    }
+
+    fn poll_scene_performance_capture(&mut self) -> Option<String> {
+        let capture = &mut self.scene_performance;
+        let session = &mut self.session;
+        match capture.poll(session) {
+            Some(RuntimeScenePerformanceCapturePoll::Saved(saved)) => Some(format!(
+                "scene-performance capture published {} launch(es) to {}",
+                saved.launch_count,
+                saved.path.display()
+            )),
+            Some(RuntimeScenePerformanceCapturePoll::Failed(error)) => {
+                Some(format!("scene-performance capture failed: {error}"))
+            }
+            None => None,
+        }
+    }
+}
+
 fn operator_timeline_marker_catalog(
     markers: &[LoadedTimelineMarker],
     timeline: &RuntimeMusicalTimeline,
@@ -554,57 +621,98 @@ fn operator_timeline_marker(
     }
 }
 
+struct PreparedRuntimeStartup {
+    facts: RuntimeFacts,
+    project: PreparedProjectPlayback,
+    scene_performance: RuntimeScenePerformanceCaptureConfiguration,
+}
+
+fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRuntimeStartup, String> {
+    let deployment = resolve_runtime_deployment(
+        arguments.deployment_root(),
+        env!("CARGO_PKG_VERSION"),
+        MAX_RUNTIME_BUNDLE_BYTES,
+        limits()?,
+    )
+    .map_err(|error| {
+        format!(
+            "deployment target {} could not be resolved: {}",
+            arguments.deployment_root().display(),
+            format_error_chain(&error)
+        )
+    })?;
+    let scene_performance_output = open_runtime_scene_performance_output(arguments)?;
+    let manifest = deployment.bundle().project().package().manifest();
+    let (project, ..) = deployment.bundle().project().session().parts();
+    let musical_timeline = RuntimeMusicalTimeline::try_new(
+        project.sample_rate_hz(),
+        project.tempo_events(),
+        project.meter_events(),
+    )
+    .map_err(|error| format!("verified project musical timing could not be prepared: {error}"))?;
+    let timeline_markers =
+        operator_timeline_marker_catalog(project.timeline_markers(), &musical_timeline)?;
+    let bundle_identity = sha256_hex(deployment.bundle().bundle_sha256());
+    let scene_performance_source = RuntimeScenePerformanceSource::try_new(
+        manifest.project_id().to_owned(),
+        manifest.revision(),
+        sha256_hex(deployment.bundle().project().package().manifest_sha256()),
+        bundle_identity.clone(),
+        deployment.generation(),
+    )
+    .map_err(|error| {
+        format!("verified Runtime scene-performance source could not be prepared: {error}")
+    })?;
+    let scene_performance = RuntimeScenePerformanceCaptureConfiguration::try_new(
+        scene_performance_source,
+        project,
+        scene_performance_output,
+    )
+    .map_err(|error| {
+        format!("verified Runtime scene-performance configuration could not be prepared: {error}")
+    })?;
+    let facts = RuntimeFacts {
+        bundle_identity,
+        deployment_generation: deployment.generation(),
+        recovered_from: deployment.recovered_from_bundle_sha256().map(sha256_hex),
+        project_name: manifest.name().to_owned(),
+        project_id: manifest.project_id().to_owned(),
+        project_revision: manifest.revision(),
+        playback_extent: deployment.bundle().project().session().extent(),
+        musical_timeline,
+        timeline_markers: timeline_markers.into(),
+    };
+    Ok(PreparedRuntimeStartup {
+        facts,
+        project: deployment.into_bundle().into_project(),
+        scene_performance,
+    })
+}
+
 fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String> {
-    let (facts, session) = prepare_output_and_host(
-        || {
-            let deployment = resolve_runtime_deployment(
-                arguments.deployment_root(),
-                env!("CARGO_PKG_VERSION"),
-                MAX_RUNTIME_BUNDLE_BYTES,
-                limits()?,
-            )
-            .map_err(|error| {
-                format!(
-                    "deployment target {} could not be resolved: {}",
-                    arguments.deployment_root().display(),
-                    format_error_chain(&error)
-                )
-            })?;
-            let manifest = deployment.bundle().project().package().manifest();
-            let (project, ..) = deployment.bundle().project().session().parts();
-            let musical_timeline = RuntimeMusicalTimeline::try_new(
-                project.sample_rate_hz(),
-                project.tempo_events(),
-                project.meter_events(),
-            )
-            .map_err(|error| {
-                format!("verified project musical timing could not be prepared: {error}")
-            })?;
-            let timeline_markers =
-                operator_timeline_marker_catalog(project.timeline_markers(), &musical_timeline)?;
-            let facts = RuntimeFacts {
-                bundle_identity: hex_digest(deployment.bundle().bundle_sha256()),
-                deployment_generation: deployment.generation(),
-                recovered_from: deployment.recovered_from_bundle_sha256().map(hex_digest),
-                project_name: manifest.name().to_owned(),
-                project_id: manifest.project_id().to_owned(),
-                project_revision: manifest.revision(),
-                playback_extent: deployment.bundle().project().session().extent(),
-                musical_timeline,
-                timeline_markers: timeline_markers.into(),
-            };
-            Ok((facts, deployment.into_bundle().into_project()))
-        },
-        || {
-            DesktopOutputConfig::try_new(SAMPLE_RATE_HZ, MAXIMUM_BLOCK_FRAMES)
-                .map_err(|error| format!("output configuration is invalid: {error}"))
-        },
-        |output, (facts, project)| {
-            DesktopPlaybackSession::start_project(output, project)
-                .map(|session| (facts, session))
-                .map_err(|error| format!("verified bundle could not be hosted: {error}"))
-        },
-    )?;
+    let (facts, session, scene_performance, scene_performance_observation) =
+        prepare_output_and_host(
+            || prepare_runtime_startup(arguments),
+            || {
+                DesktopOutputConfig::try_new(SAMPLE_RATE_HZ, MAXIMUM_BLOCK_FRAMES)
+                    .map_err(|error| format!("output configuration is invalid: {error}"))
+            },
+            |output, startup| {
+                let mut session = DesktopPlaybackSession::start_project(output, startup.project)
+                    .map_err(|error| format!("verified bundle could not be hosted: {error}"))?;
+                let receiver = session.take_scene_launch_receiver().ok_or_else(|| {
+                    "verified bundle could not transfer committed scene-launch authority".to_owned()
+                })?;
+                let scene_performance = startup.scene_performance.attach(receiver);
+                let scene_performance_observation = scene_performance.observation();
+                Ok((
+                    startup.facts,
+                    session,
+                    scene_performance,
+                    scene_performance_observation,
+                ))
+            },
+        )?;
     let panel_connected = Arc::new(AtomicBool::new(false));
     let observers = RuntimeObservers {
         facts,
@@ -612,14 +720,53 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         output_counters: session.counters(),
         recovery: session.recovery_checkpoint(),
         panel_connected: Arc::clone(&panel_connected),
+        scene_performance: scene_performance_observation,
     };
     Ok(StartedRuntime {
         host: SessionHost {
             session,
+            scene_performance,
             panel_connected,
         },
         observers,
     })
+}
+
+/// Opens an explicit Runtime output directory only when it is outside the
+/// verified deployment tree. Runtime artifacts must never change the
+/// deployment, content-addressed bundle, or embedded project package.
+fn open_runtime_scene_performance_output(
+    arguments: &RuntimeArguments,
+) -> Result<Option<RuntimeScenePerformanceUpdateDirectory>, String> {
+    let Some(path) = arguments.performance_updates() else {
+        return Ok(None);
+    };
+    let output = RuntimeScenePerformanceUpdateDirectory::open(path).map_err(|error| {
+        format!(
+            "scene-performance output directory {} is invalid: {error}",
+            path.display()
+        )
+    })?;
+    let deployment_root = std::fs::canonicalize(arguments.deployment_root()).map_err(|error| {
+        format!(
+            "verified deployment root {} cannot be canonicalized for scene-performance output isolation: {error}",
+            arguments.deployment_root().display()
+        )
+    })?;
+    let output_root = std::fs::canonicalize(output.root_path()).map_err(|error| {
+        format!(
+            "scene-performance output directory {} cannot be canonicalized: {error}",
+            output.root_path().display()
+        )
+    })?;
+    if output_root.starts_with(&deployment_root) {
+        return Err(format!(
+            "scene-performance output directory {} must be outside deployment target {}",
+            output.root_path().display(),
+            arguments.deployment_root().display()
+        ));
+    }
+    Ok(Some(output))
 }
 
 fn announce_runtime(arguments: &RuntimeArguments, runtime: &StartedRuntime) {
@@ -664,7 +811,7 @@ fn host_runtime<H, O>(
     diagnostic: &dyn Fn(String),
 ) -> Result<(), String>
 where
-    H: PanelHost + RuntimeOperatorControl,
+    H: PanelHost + RuntimeOperatorControl + RuntimeScenePerformanceControl,
     O: RuntimeOutputObservation,
 {
     let mut owner_turn = |host: &mut H| {
@@ -674,6 +821,9 @@ where
         }
         if let Some(commands) = commands {
             drain_operator_commands(host, commands, stop, diagnostic);
+        }
+        if let Some(message) = host.poll_scene_performance_capture() {
+            diagnostic(message);
         }
     };
 
@@ -785,7 +935,7 @@ fn finish_runtime_output<O: RuntimeOutputObservation>(
     clippy::too_many_lines,
     reason = "the bounded operator command dispatcher keeps every queue outcome explicit"
 )]
-fn drain_operator_commands<H: RuntimeOperatorControl>(
+fn drain_operator_commands<H: RuntimeOperatorControl + RuntimeScenePerformanceControl>(
     host: &mut H,
     commands: &Receiver<OperatorCommand>,
     stop: &AtomicBool,
@@ -809,6 +959,22 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
                 Ok(()) => diagnostic("transport stop queued".to_owned()),
                 Err(error) => diagnostic(format!("transport stop refused: {error}")),
             },
+            OperatorCommand::StartScenePerformanceCapture => {
+                match host.start_scene_performance_capture() {
+                    Ok(message) => diagnostic(message),
+                    Err(error) => {
+                        diagnostic(format!("scene-performance capture start refused: {error}"));
+                    }
+                }
+            }
+            OperatorCommand::StopScenePerformanceCapture => {
+                match host.stop_scene_performance_capture() {
+                    Ok(message) => diagnostic(message),
+                    Err(error) => {
+                        diagnostic(format!("scene-performance capture stop refused: {error}"));
+                    }
+                }
+            }
             OperatorCommand::ReturnToStart => match host.queue_transport(TransportCommand::Locate {
                 frame: 0,
                 state: LocateState::Preserve,
@@ -1428,6 +1594,12 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &scene_selection,
     );
     wire_operator_scene_stop(&ui, &commands_tx, &diagnostic, &scene_stop_authority);
+    wire_operator_scene_performance_capture(
+        &ui,
+        &commands_tx,
+        &diagnostic,
+        &observers.scene_performance,
+    );
     wire_operator_loop_toggle(&ui, &commands_tx, &diagnostic, &loop_authority);
     wire_operator_loop_range(&ui, &commands_tx, &diagnostic, &loop_authority);
     wire_operator_metronome_toggle(&ui, &commands_tx, &diagnostic, &metronome_authority);
@@ -1475,6 +1647,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &observers.recovery.snapshot(),
         false,
     );
+    apply_operator_scene_performance_observation(&ui, observers.scene_performance.as_ref(), false);
 
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
@@ -1495,6 +1668,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_mixer_authority = Rc::clone(&mixer_authority);
     let timer_native_device_model = Rc::clone(&native_device_model);
     let timer_native_device_authority = Rc::clone(&native_device_authority);
+    let timer_scene_performance = Arc::clone(&observers.scene_performance);
     let timer_native_devices = native_devices;
     let timer_mixer_channels = mixer_channels;
     let timer_mixer_sends = mixer_sends;
@@ -1545,6 +1719,11 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &timer_native_devices,
                 &timer_native_device_authority,
                 &timer_observers.recovery.snapshot(),
+                terminal_latched,
+            );
+            apply_operator_scene_performance_observation(
+                &ui,
+                timer_scene_performance.as_ref(),
                 terminal_latched,
             );
             if !completion_observed
@@ -1710,6 +1889,7 @@ fn apply_operator_worker_completion(
     revoke_operator_transport_authority(ui, transport_authority);
     revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
     revoke_operator_scene_stop_authority(ui, scene_stop_authority);
+    revoke_operator_scene_performance_authority(ui);
     let close_result = close_operator_surface();
     let message = close_result
         .as_ref()
@@ -2189,6 +2369,71 @@ fn wire_operator_scene_stop(
             return;
         }
         send_operator_command(&sender, OperatorCommand::StopInteractiveScenes, &diagnostic);
+    });
+}
+
+/// Forwards only actions enabled by the Runtime-owned capture observation.
+///
+/// The UI does not change these flags optimistically: the owner turn publishes
+/// the next presentation after it accepts or refuses the command.
+fn wire_operator_scene_performance_capture(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    observation: &Arc<Mutex<RuntimeScenePerformanceCaptureObservation>>,
+) {
+    let start_sender = sender.clone();
+    let start_diagnostic = Arc::clone(diagnostic);
+    let start_observation = Arc::clone(observation);
+    let start_ui = ui.as_weak();
+    ui.on_start_scene_performance_capture_requested(move || {
+        let start_enabled = start_ui
+            .upgrade()
+            .is_some_and(|ui| ui.get_scene_performance_start_enabled())
+            && start_observation
+                .lock()
+                .map(|observation| observation.start_enabled)
+                .unwrap_or(false);
+        if !start_enabled {
+            set_diagnostic(
+                &start_diagnostic,
+                "scene-performance capture start refused: committed Runtime capture state is unavailable"
+                    .to_owned(),
+            );
+            return;
+        }
+        send_operator_command(
+            &start_sender,
+            OperatorCommand::StartScenePerformanceCapture,
+            &start_diagnostic,
+        );
+    });
+
+    let stop_sender = sender.clone();
+    let stop_diagnostic = Arc::clone(diagnostic);
+    let stop_observation = Arc::clone(observation);
+    let stop_ui = ui.as_weak();
+    ui.on_stop_scene_performance_capture_requested(move || {
+        let stop_enabled = stop_ui
+            .upgrade()
+            .is_some_and(|ui| ui.get_scene_performance_stop_enabled())
+            && stop_observation
+                .lock()
+                .map(|observation| observation.stop_enabled)
+                .unwrap_or(false);
+        if !stop_enabled {
+            set_diagnostic(
+                &stop_diagnostic,
+                "scene-performance capture stop refused: committed Runtime capture state is unavailable"
+                    .to_owned(),
+            );
+            return;
+        }
+        send_operator_command(
+            &stop_sender,
+            OperatorCommand::StopScenePerformanceCapture,
+            &stop_diagnostic,
+        );
     });
 }
 
@@ -3895,6 +4140,7 @@ fn apply_operator_cycle_observation(
         );
         revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
+        revoke_operator_scene_performance_authority(ui);
         return;
     }
     let observation = apply_observations(ui, observers, output_state, diagnostic);
@@ -3910,6 +4156,7 @@ fn apply_operator_cycle_observation(
         );
         revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
+        revoke_operator_scene_performance_authority(ui);
         return;
     }
     apply_operator_transport_observation(ui, transport_authority, observation.state());
@@ -3980,6 +4227,32 @@ fn revoke_operator_scene_launch_authority(
 fn revoke_operator_scene_stop_authority(ui: &OperatorWindow, authority: &Cell<bool>) {
     authority.set(false);
     ui.set_stop_interactive_scenes_enabled(false);
+}
+
+fn apply_operator_scene_performance_observation(
+    ui: &OperatorWindow,
+    observation: &Mutex<RuntimeScenePerformanceCaptureObservation>,
+    terminal_latched: bool,
+) {
+    if terminal_latched {
+        revoke_operator_scene_performance_authority(ui);
+        return;
+    }
+    let Ok(observation) = observation.lock() else {
+        ui.set_scene_performance_state("Runtime capture state unavailable".into());
+        ui.set_scene_performance_start_enabled(false);
+        ui.set_scene_performance_stop_enabled(false);
+        return;
+    };
+    ui.set_scene_performance_state(observation.state.clone().into());
+    ui.set_scene_performance_start_enabled(observation.start_enabled);
+    ui.set_scene_performance_stop_enabled(observation.stop_enabled);
+}
+
+fn revoke_operator_scene_performance_authority(ui: &OperatorWindow) {
+    ui.set_scene_performance_state("Runtime stopped · capture unavailable".into());
+    ui.set_scene_performance_start_enabled(false);
+    ui.set_scene_performance_stop_enabled(false);
 }
 
 fn apply_operator_transport_observation(
@@ -4573,18 +4846,11 @@ fn millis_since(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn hex_digest(value: &[u8; 32]) -> String {
-    let mut output = String::with_capacity(64);
-    for byte in value {
-        use core::fmt::Write;
-        write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     use hyper_arrangement_renderer::RenderScratchSlot;
     use hyper_audio_engine::{InterleavedStereoCallback, StereoOutput};
@@ -4595,6 +4861,7 @@ mod tests {
         DecodedPlaybackAsset, PlaybackDocumentBytes, PlaybackSessionAssemblyInput,
         assemble_playback_session,
     };
+    use uuid::Uuid;
 
     use super::*;
 
@@ -4603,6 +4870,60 @@ mod tests {
             (actual - expected).abs() <= f32::EPSILON,
             "{actual} != {expected}"
         );
+    }
+
+    fn test_scene_performance_observation() -> Arc<Mutex<RuntimeScenePerformanceCaptureObservation>>
+    {
+        Arc::new(Mutex::new(RuntimeScenePerformanceCaptureObservation {
+            state: "fixture capture state".to_owned(),
+            start_enabled: false,
+            stop_enabled: false,
+        }))
+    }
+
+    struct RuntimeTemporaryDirectory {
+        path: PathBuf,
+    }
+
+    impl RuntimeTemporaryDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "hyper-runtime-test-{}-{}",
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+            fs::create_dir(&path).expect("create isolated Runtime test directory");
+            Self { path }
+        }
+
+        fn child(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for RuntimeTemporaryDirectory {
+        fn drop(&mut self) {
+            if self.path.starts_with(std::env::temp_dir()) {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    fn runtime_arguments_with_scene_performance_output(
+        deployment: &Path,
+        output: Option<&Path>,
+    ) -> RuntimeArguments {
+        let mut arguments = Vec::new();
+        if let Some(output) = output {
+            arguments.push("--performance-updates".to_owned());
+            arguments.push(output.display().to_string());
+        }
+        arguments.push(deployment.display().to_string());
+        RuntimeArguments::parse(arguments).expect("construct Runtime arguments")
     }
 
     fn test_musical_timeline() -> RuntimeMusicalTimeline {
@@ -4982,6 +5303,48 @@ mod tests {
     }
 
     #[test]
+    fn scene_performance_output_is_explicit_and_outside_the_deployment_tree() {
+        let temporary = RuntimeTemporaryDirectory::new();
+        let deployment = temporary.child("deployment");
+        let output = temporary.child("performance-updates");
+        fs::create_dir(&deployment).unwrap();
+        fs::create_dir(&output).unwrap();
+
+        let disabled = runtime_arguments_with_scene_performance_output(&deployment, None);
+        assert!(
+            open_runtime_scene_performance_output(&disabled)
+                .unwrap()
+                .is_none()
+        );
+
+        let arguments = runtime_arguments_with_scene_performance_output(&deployment, Some(&output));
+        let retained = open_runtime_scene_performance_output(&arguments)
+            .unwrap()
+            .expect("the explicit external directory is retained");
+        assert_eq!(retained.root_path(), output);
+        assert!(retained.root_path().starts_with(temporary.path()));
+    }
+
+    #[test]
+    fn scene_performance_output_never_targets_the_deployment_tree() {
+        let temporary = RuntimeTemporaryDirectory::new();
+        let deployment = temporary.child("deployment");
+        let output = deployment.join("performance-updates");
+        fs::create_dir(&deployment).unwrap();
+        fs::create_dir(&output).unwrap();
+        let arguments = runtime_arguments_with_scene_performance_output(&deployment, Some(&output));
+
+        let Err(error) = open_runtime_scene_performance_output(&arguments) else {
+            panic!("a deployment child cannot be used for performance updates");
+        };
+        assert!(
+            error.contains("must be outside deployment target"),
+            "{error}"
+        );
+        assert!(fs::read_dir(&output).unwrap().next().is_none());
+    }
+
+    #[test]
     fn an_unavailable_panel_listener_keeps_the_runtime_owner_until_quit() {
         let occupied = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = occupied.local_addr().unwrap();
@@ -5065,8 +5428,16 @@ mod tests {
         loudness_commands: Vec<LoudnessMeasurementCommand>,
         mixer_commands: Vec<MixerParameterCommand>,
         native_device_commands: Vec<NativeDeviceCommand>,
+        scene_performance_commands: Vec<OperatorScenePerformanceAction>,
+        scene_performance_poll: Option<String>,
         reject: bool,
         disconnects: usize,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum OperatorScenePerformanceAction {
+        Start,
+        Stop,
     }
 
     impl RuntimeOperatorControl for OperatorControl {
@@ -5104,6 +5475,32 @@ mod tests {
                 self.native_device_commands.push(command);
                 Ok(())
             }
+        }
+    }
+
+    impl RuntimeScenePerformanceControl for OperatorControl {
+        fn start_scene_performance_capture(&mut self) -> Result<String, String> {
+            if self.reject {
+                Err("owner busy".to_owned())
+            } else {
+                self.scene_performance_commands
+                    .push(OperatorScenePerformanceAction::Start);
+                Ok("scene-performance capture started".to_owned())
+            }
+        }
+
+        fn stop_scene_performance_capture(&mut self) -> Result<String, String> {
+            if self.reject {
+                Err("owner busy".to_owned())
+            } else {
+                self.scene_performance_commands
+                    .push(OperatorScenePerformanceAction::Stop);
+                Ok("scene-performance capture stop requested".to_owned())
+            }
+        }
+
+        fn poll_scene_performance_capture(&mut self) -> Option<String> {
+            self.scene_performance_poll.take()
         }
     }
 
@@ -5180,6 +5577,12 @@ mod tests {
         drain_operator_commands(&mut owner, &receiver, &stop, &|message| {
             diagnostics.borrow_mut().push(message);
         });
+        sender
+            .send(OperatorCommand::StartScenePerformanceCapture)
+            .unwrap();
+        sender
+            .send(OperatorCommand::StopScenePerformanceCapture)
+            .unwrap();
         sender.send(OperatorCommand::ResetLoudness).unwrap();
         drain_operator_commands(&mut owner, &receiver, &stop, &|message| {
             diagnostics.borrow_mut().push(message);
@@ -5211,6 +5614,13 @@ mod tests {
             ]
         );
         assert_eq!(
+            owner.scene_performance_commands,
+            [
+                OperatorScenePerformanceAction::Start,
+                OperatorScenePerformanceAction::Stop,
+            ]
+        );
+        assert_eq!(
             diagnostics.into_inner(),
             [
                 "transport start queued",
@@ -5221,10 +5631,80 @@ mod tests {
                 "interactive scene stop queued",
                 "session loop enable queued",
                 "programme loudness standby queued",
+                "scene-performance capture started",
+                "scene-performance capture stop requested",
                 "programme loudness reset queued",
             ]
         );
         assert!(!stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn operator_scene_performance_controls_follow_committed_runtime_observation() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = OperatorWindow::new().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let diagnostic = Arc::new(Mutex::new(String::new()));
+        let observation = test_scene_performance_observation();
+        wire_operator_scene_performance_capture(&ui, &sender, &diagnostic, &observation);
+        apply_operator_scene_performance_observation(&ui, observation.as_ref(), false);
+
+        ui.invoke_start_scene_performance_capture_requested();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "scene-performance capture start refused: committed Runtime capture state is unavailable"
+        );
+
+        *observation.lock().unwrap() = RuntimeScenePerformanceCaptureObservation {
+            state: "Ready to capture a scene performance".to_owned(),
+            start_enabled: true,
+            stop_enabled: false,
+        };
+        apply_operator_scene_performance_observation(&ui, observation.as_ref(), false);
+        assert_eq!(
+            ui.get_scene_performance_state().as_str(),
+            "Ready to capture a scene performance"
+        );
+        assert!(ui.get_scene_performance_start_enabled());
+        assert!(!ui.get_scene_performance_stop_enabled());
+
+        ui.invoke_start_scene_performance_capture_requested();
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::StartScenePerformanceCapture)
+        );
+        assert!(
+            ui.get_scene_performance_start_enabled(),
+            "the UI does not claim that the queued request was committed"
+        );
+
+        *observation.lock().unwrap() = RuntimeScenePerformanceCaptureObservation {
+            state: "Capturing 0 committed launch(es)".to_owned(),
+            start_enabled: false,
+            stop_enabled: true,
+        };
+        apply_operator_scene_performance_observation(&ui, observation.as_ref(), false);
+        assert!(!ui.get_scene_performance_start_enabled());
+        assert!(ui.get_scene_performance_stop_enabled());
+
+        ui.invoke_stop_scene_performance_capture_requested();
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::StopScenePerformanceCapture)
+        );
+        assert!(
+            ui.get_scene_performance_stop_enabled(),
+            "the UI retains the committed presentation until Runtime publishes another one"
+        );
+
+        revoke_operator_scene_performance_authority(&ui);
+        ui.invoke_stop_scene_performance_capture_requested();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "scene-performance capture stop refused: committed Runtime capture state is unavailable"
+        );
     }
 
     #[test]
@@ -5499,6 +5979,7 @@ mod tests {
             output_counters: OutputStreamCounters::default(),
             recovery: PlaybackRecoveryCheckpoint::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
+            scene_performance: test_scene_performance_observation(),
         };
         let marker_model = Rc::new(VecModel::from(operator_timeline_marker_rows(&markers)));
         let marker_authority = Rc::new(RefCell::new(None));
@@ -8124,6 +8605,7 @@ mod tests {
             output_counters: OutputStreamCounters::default(),
             recovery: recovery.clone(),
             panel_connected: Arc::new(AtomicBool::new(false)),
+            scene_performance: test_scene_performance_observation(),
         };
         let _ = apply_observations(
             ui,
@@ -8228,6 +8710,7 @@ mod tests {
             output_counters: OutputStreamCounters::default(),
             recovery: PlaybackRecoveryCheckpoint::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
+            scene_performance: test_scene_performance_observation(),
         };
         apply_static_facts(&ui, &facts);
         let observation = apply_observations(
@@ -8473,6 +8956,7 @@ mod tests {
             output_counters: OutputStreamCounters::default(),
             recovery: terminal_recovery,
             panel_connected: Arc::new(AtomicBool::new(false)),
+            scene_performance: test_scene_performance_observation(),
         };
         let terminal_operator_scenes = [OperatorScene {
             index: 0,
