@@ -1,0 +1,21 @@
+[package]
+name = "hyper-runtime-loop-update"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+cap-fs-ext = "=4.0.2"
+cap-std = "=4.0.2"
+hyper-fs-authority = { path = "../fs-authority" }
+hyper-project-model = { path = "../project-model" }
+hyper-strict-json = { path = "../strict-json" }
+same-file = "=1.0.6"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+serde_json_canonicalizer = "=0.3.2"
+uuid = { version = "=1.24.0", features = ["v4"] }
+
+[lints]
+workspace = true
