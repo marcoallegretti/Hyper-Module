@@ -2560,6 +2560,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-runtime-mixer-update"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "hyper-audio-engine",
+ "hyper-fs-authority",
+ "hyper-playback-json",
+ "hyper-project-model",
+ "hyper-strict-json",
+ "same-file",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "uuid",
+]
+
+[[package]]
 name = "hyper-runtime-panel-session"
 version = "0.1.0"
 dependencies = [

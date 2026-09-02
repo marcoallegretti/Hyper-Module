@@ -21,6 +21,7 @@ members = [
     "crates/recording-metadata",
     "crates/recording-transport",
     "crates/recording-worker",
+    "crates/runtime-mixer-update",
     "crates/scene-performance",
     "crates/storage-engine",
     "crates/strict-json",
