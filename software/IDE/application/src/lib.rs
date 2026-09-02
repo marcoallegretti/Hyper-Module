@@ -64,7 +64,6 @@ use hyper_mapping_editor::{
     MappingEditorPublicationError,
 };
 use hyper_media_cache::CacheLimits;
-use hyper_mixer_runtime::MixerParameterStateSnapshot;
 pub use hyper_mixer_runtime::{
     ChannelSamplePeakBallistics as IdeOutputPeakChannel,
     EbuLoudnessPresentationConfig as IdeLoudnessPresentationConfig,
@@ -93,6 +92,9 @@ use hyper_mixer_runtime::{
     InteractiveMixerParameterPublisher, InteractiveMixerParameterReceiver,
     InteractiveSceneLaunchPublisher, InteractiveSceneLaunchReceiver, OutputMeterSender,
     interactive_mixer_parameter_channel, interactive_scene_launch_channel, output_meter_channel,
+};
+use hyper_mixer_runtime::{
+    MixerBaseStateProjectionError, MixerParameterStateSnapshot, mixer_base_state_from_snapshot,
 };
 use hyper_native_device::{
     DeviceChain, DeviceChainError, NativeCompressorState, NativeDeviceInstance, NativeFilterState,
@@ -137,27 +139,27 @@ use hyper_playback_json::{
     AutomationTakeEditSerializationError, AutomationTakeReplacement, AutomationTargetSelection,
     CompiledMixerDestination, CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
     LoadError as PlaybackDocumentLoadError, LoaderLimits, MediaAssetFact, MixerBaseState,
-    MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
-    MixerStripReorderSerializationError, RecordedTakePlacementSerializationError,
-    ReturnSendSerializationError, RoutingBusCreationSerializationError,
-    RoutingBusDuplicationSerializationError, RoutingBusDuplicationSource,
-    RoutingBusKind as PlaybackRoutingBusKind, RoutingBusRemovalSerializationError,
-    RoutingBusRenameSerializationError, SceneAdditionSerializationError,
-    SceneDocumentSerializationError, SceneDuplicationSerializationError, SceneRemovalBlockers,
-    SceneRemovalSerializationError, SceneRenameSerializationError, SceneSlotEdit,
-    SceneSlotEditSerializationError, TempoSerializationError,
-    TimelineMarkerEdit as PlaybackTimelineMarkerEdit, TimelineMarkerSerializationError,
-    serialize_arrangement_loop_range, serialize_arrangement_placement_activation,
-    serialize_arrangement_placement_addition, serialize_arrangement_placement_crossfade,
-    serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
-    serialize_arrangement_placement_fades, serialize_arrangement_placement_front_trim,
-    serialize_arrangement_placement_gain, serialize_arrangement_placement_move,
-    serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
-    serialize_arrangement_scene_launch_additions, serialize_arrangement_scene_launch_move,
-    serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
-    serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
-    serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_removal,
-    serialize_audio_clip_rename, serialize_audio_clip_reverse, serialize_audio_clip_source_start,
+    MixerStateSerializationError, MixerStripReorderSerializationError,
+    RecordedTakePlacementSerializationError, ReturnSendSerializationError,
+    RoutingBusCreationSerializationError, RoutingBusDuplicationSerializationError,
+    RoutingBusDuplicationSource, RoutingBusKind as PlaybackRoutingBusKind,
+    RoutingBusRemovalSerializationError, RoutingBusRenameSerializationError,
+    SceneAdditionSerializationError, SceneDocumentSerializationError,
+    SceneDuplicationSerializationError, SceneRemovalBlockers, SceneRemovalSerializationError,
+    SceneRenameSerializationError, SceneSlotEdit, SceneSlotEditSerializationError,
+    TempoSerializationError, TimelineMarkerEdit as PlaybackTimelineMarkerEdit,
+    TimelineMarkerSerializationError, serialize_arrangement_loop_range,
+    serialize_arrangement_placement_activation, serialize_arrangement_placement_addition,
+    serialize_arrangement_placement_crossfade, serialize_arrangement_placement_duplication,
+    serialize_arrangement_placement_duration, serialize_arrangement_placement_fades,
+    serialize_arrangement_placement_front_trim, serialize_arrangement_placement_gain,
+    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
+    serialize_arrangement_placement_split, serialize_arrangement_scene_launch_additions,
+    serialize_arrangement_scene_launch_move, serialize_arrangement_scene_launch_removal,
+    serialize_arrangement_scene_launch_scene_edit, serialize_audio_clip_activation,
+    serialize_audio_clip_duplication, serialize_audio_clip_fades, serialize_audio_clip_gain,
+    serialize_audio_clip_loop, serialize_audio_clip_removal, serialize_audio_clip_rename,
+    serialize_audio_clip_reverse, serialize_audio_clip_source_start,
     serialize_audio_clip_source_view, serialize_audio_clip_source_view_duplication,
     serialize_audio_clip_source_view_duplication_placement, serialize_audio_primary_route_change,
     serialize_audio_track_activation, serialize_audio_track_addition,
@@ -176,6 +178,9 @@ use hyper_playback_json::{
     serialize_timeline_map_edit, serialize_timeline_marker_edit, serialize_timeline_meter,
     serialize_timeline_tempo,
 };
+
+#[cfg(test)]
+use hyper_playback_json::MixerChannelBaseState;
 pub use hyper_playback_json::{
     AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
     AutomationSendParameter, AutomationTarget, AutomationValue, TimelineMapEdit,
@@ -244,10 +249,11 @@ pub use worker::{
     IdeMixerAutomationCaptureError, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerSend,
     IdeNativeCompressor, IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError,
     IdeRecordingCaptureKind, IdeRecordingState, IdeRecordingTake, IdeRunningObservation,
-    IdeRuntimePreparationError, IdeRuntimeScenePerformanceImportError, IdeScene,
-    IdeScenePerformanceCaptureError, IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand,
-    IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError,
-    IdeWorkerJoinError, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeRuntimeMixerUpdateImportError, IdeRuntimePreparationError,
+    IdeRuntimeScenePerformanceImportError, IdeScene, IdeScenePerformanceCaptureError,
+    IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure,
+    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
+    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
     IdeWorkerShutdownReport, IdeWorkerStartError, MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS,
     desktop_ide_worker_supervisor_snapshot,
 };
@@ -10439,6 +10445,20 @@ enum IdePlaybackSessionOwner {
     Test(TestPlaybackSession),
 }
 
+/// Exact result of checking one coherent playback-recovery snapshot for a
+/// Runtime mixer-update import.
+///
+/// This remains separate from the general save fence because an external
+/// update must refuse both unknown and locally changed mixer state instead of
+/// serializing it into the project.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeMixerUpdateFenceStatus {
+    Pending,
+    Clean,
+    LocalMixerChanges,
+    Unavailable,
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 struct TestPlaybackSession {
@@ -10508,6 +10528,28 @@ impl Default for TestPlaybackSession {
     }
 }
 
+fn mixer_update_import_fence_status_from_native(
+    session: &DesktopPlaybackSession,
+    sequence: u64,
+) -> RuntimeMixerUpdateFenceStatus {
+    let Some(project) = session.prepared_project() else {
+        return RuntimeMixerUpdateFenceStatus::Unavailable;
+    };
+    let checkpoint = session.recovery_checkpoint().snapshot();
+    if checkpoint.committed_mixer_fence() < sequence {
+        return RuntimeMixerUpdateFenceStatus::Pending;
+    }
+    let Some(state) = checkpoint.mixer_parameter_state() else {
+        return RuntimeMixerUpdateFenceStatus::Unavailable;
+    };
+    let (_, mixer, _, _) = project.session().parts();
+    match live_mixer_state_is_dirty(mixer, &state) {
+        Some(false) => RuntimeMixerUpdateFenceStatus::Clean,
+        Some(true) => RuntimeMixerUpdateFenceStatus::LocalMixerChanges,
+        None => RuntimeMixerUpdateFenceStatus::Unavailable,
+    }
+}
+
 impl RunningDesktopIdeApplication {
     #[must_use]
     pub(crate) fn output_state(&self) -> OutputStreamState {
@@ -10537,6 +10579,62 @@ impl RunningDesktopIdeApplication {
         {
             Some(state) => live_mixer_state_is_dirty(mixer, &state),
             None => Some(false),
+        }
+    }
+
+    /// Returns whether an external Runtime mixer update would overwrite the
+    /// current session-local mixer state.
+    ///
+    /// Unlike a normal project close, an absent mixer state is not treated as
+    /// clean: importing an external update needs a positive committed state
+    /// observation before it can alter project contents.
+    pub(crate) fn mixer_update_import_requires_discard(&self) -> Option<bool> {
+        #[cfg(test)]
+        let session = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            IdePlaybackSessionOwner::Test(session) => return session.close_requires_discard,
+        };
+        #[cfg(not(test))]
+        let IdePlaybackSessionOwner::Native(session) = &self.session;
+        let project = session.prepared_project()?;
+        let (_, mixer, _, _) = project.session().parts();
+        let checkpoint = session.recovery_checkpoint().snapshot();
+        let state = checkpoint.mixer_parameter_state()?;
+        live_mixer_state_is_dirty(mixer, &state)
+    }
+
+    /// Checks the mixer fence and dirty state from one recovery snapshot.
+    ///
+    /// A clean result proves that the exact callback boundary acknowledging
+    /// `sequence` also saw no local mixer divergence. It deliberately does
+    /// not perform a second checkpoint read after the fence comparison.
+    pub(crate) fn mixer_update_import_fence_status(
+        &self,
+        sequence: u64,
+    ) -> RuntimeMixerUpdateFenceStatus {
+        #[cfg(test)]
+        {
+            match &self.session {
+                IdePlaybackSessionOwner::Native(session) => {
+                    mixer_update_import_fence_status_from_native(session, sequence)
+                }
+                IdePlaybackSessionOwner::Test(session) => {
+                    if session.committed_mixer_fence < sequence {
+                        RuntimeMixerUpdateFenceStatus::Pending
+                    } else {
+                        match session.close_requires_discard {
+                            Some(false) => RuntimeMixerUpdateFenceStatus::Clean,
+                            Some(true) => RuntimeMixerUpdateFenceStatus::LocalMixerChanges,
+                            None => RuntimeMixerUpdateFenceStatus::Unavailable,
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let IdePlaybackSessionOwner::Native(session) = &self.session;
+            mixer_update_import_fence_status_from_native(session, sequence)
         }
     }
 
@@ -10610,50 +10708,13 @@ impl RunningDesktopIdeApplication {
         mixer: &CompiledMixerGraph,
         live: &MixerParameterStateSnapshot,
     ) -> Result<MixerBaseState, IdeProjectSaveError> {
-        if live.channel_count() != mixer.slots().len() {
-            return Err(IdeProjectSaveError::MixerLayoutMismatch);
-        }
-        let mut channels = Vec::new();
-        channels
-            .try_reserve_exact(mixer.slots().len())
-            .map_err(|_| IdeProjectSaveError::CapacityUnavailable)?;
-        for (channel_index, slot) in mixer.slots().iter().enumerate() {
-            let channel = live
-                .channel(channel_index)
-                .ok_or(IdeProjectSaveError::MixerLayoutMismatch)?;
-            if channel.send_count() != slot.sends().len() {
-                return Err(IdeProjectSaveError::MixerLayoutMismatch);
+        mixer_base_state_from_snapshot(mixer, live).map_err(|error| match error {
+            MixerBaseStateProjectionError::LayoutMismatch => {
+                IdeProjectSaveError::MixerLayoutMismatch
             }
-            let mut sends = Vec::new();
-            sends
-                .try_reserve_exact(slot.sends().len())
-                .map_err(|_| IdeProjectSaveError::CapacityUnavailable)?;
-            for (send_index, compiled_send) in slot.sends().iter().enumerate() {
-                let send = channel
-                    .send(send_index)
-                    .ok_or(IdeProjectSaveError::MixerLayoutMismatch)?;
-                let parameters = send.parameters();
-                sends.push(MixerSendBaseState {
-                    id: try_save_owned(compiled_send.id())?,
-                    gain: parameters.gain,
-                    pan: parameters.pan,
-                    enabled: send.enabled(),
-                });
+            MixerBaseStateProjectionError::CapacityUnavailable => {
+                IdeProjectSaveError::CapacityUnavailable
             }
-            let parameters = channel.parameters();
-            channels.push(MixerChannelBaseState {
-                track_id: try_save_owned(slot.track_id())?,
-                gain: parameters.gain,
-                pan: parameters.pan,
-                muted: channel.muted(),
-                solo: channel.solo(),
-                sends,
-            });
-        }
-        Ok(MixerBaseState {
-            channels,
-            main_gain: live.main_gain(),
-            main_muted: live.main_muted(),
         })
     }
 
@@ -10673,6 +10734,26 @@ impl RunningDesktopIdeApplication {
         project: &PreparedProjectPlayback,
         checkpoint: &PlaybackRecoverySnapshot,
     ) -> Result<IdeMixerSavePlan, IdeProjectSaveError> {
+        let live = checkpoint
+            .mixer_parameter_state()
+            .ok_or(IdeProjectSaveError::MixerStateUnavailable)?;
+        let (_, mixer, _, _) = project.session().parts();
+        if live.channel_count() != mixer.slots().len() {
+            return Err(IdeProjectSaveError::MixerLayoutMismatch);
+        }
+        let state = Self::live_mixer_base_state(mixer, &live)?;
+        Self::prepare_mixer_base_state_save(application, project, &state)
+    }
+
+    /// Creates a canonical mixer-resource publication plan from an already
+    /// verified complete base state. The caller chooses the state; this helper
+    /// remains the one place that binds it to the project's sole mixer
+    /// resource and manifest identity.
+    fn prepare_mixer_base_state_save(
+        application: &DesktopIdeApplication,
+        project: &PreparedProjectPlayback,
+        state: &MixerBaseState,
+    ) -> Result<IdeMixerSavePlan, IdeProjectSaveError> {
         let package = project.package();
         let mut mixer_descriptors = package
             .manifest()
@@ -10688,19 +10769,11 @@ impl RunningDesktopIdeApplication {
         let source = package
             .read_resource(descriptor.id())
             .map_err(IdeProjectSaveError::Storage)?;
-        let live = checkpoint
-            .mixer_parameter_state()
-            .ok_or(IdeProjectSaveError::MixerStateUnavailable)?;
-        let (_, mixer, _, _) = project.session().parts();
-        if live.channel_count() != mixer.slots().len() {
-            return Err(IdeProjectSaveError::MixerLayoutMismatch);
-        }
-        let state = Self::live_mixer_base_state(mixer, &live)?;
         let resource_bytes = serialize_mixer_base_state(
             &source,
             package.manifest().project_id(),
             descriptor.id(),
-            &state,
+            state,
             application.config.project_limits.session.documents,
         )
         .map_err(IdeProjectSaveError::Serialization)?;
@@ -10710,6 +10783,27 @@ impl RunningDesktopIdeApplication {
             resource_id: try_save_owned(descriptor.id())?,
             resource_bytes,
         })
+    }
+
+    /// Validates and plans an external Runtime mixer state before any audio
+    /// fence or project close is requested.
+    pub(crate) fn prepare_runtime_mixer_update_import(
+        &self,
+        state: &MixerBaseState,
+    ) -> Result<IdeMixerSavePlan, IdeProjectSaveError> {
+        #[cfg(test)]
+        let session = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            IdePlaybackSessionOwner::Test(_) => {
+                return Err(IdeProjectSaveError::ProjectSnapshotUnavailable);
+            }
+        };
+        #[cfg(not(test))]
+        let IdePlaybackSessionOwner::Native(session) = &self.session;
+        let project = session
+            .prepared_project()
+            .ok_or(IdeProjectSaveError::ProjectSnapshotUnavailable)?;
+        Self::prepare_mixer_base_state_save(&self.application, project, state)
     }
 
     fn store_mixer_recovery_snapshot(&self) -> Result<(), IdeProjectSaveError> {

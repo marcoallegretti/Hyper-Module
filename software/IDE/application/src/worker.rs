@@ -33,6 +33,10 @@ use hyper_runtime_bundle_builder::{
     DEFAULT_MAXIMUM_RUNTIME_BUNDLE_BYTES, PublishedRuntimeBundle, RuntimeBundleBuildError,
     build_project_runtime_bundle,
 };
+use hyper_runtime_mixer_update::{
+    RuntimeMixerUpdate, RuntimeMixerUpdateError, read_runtime_mixer_update,
+    sha256_hex as runtime_mixer_update_sha256_hex,
+};
 use hyper_scene_performance::{
     RuntimeScenePerformanceUpdate, RuntimeScenePerformanceUpdateError,
     ScenePerformanceCapture as SharedScenePerformanceCapture,
@@ -69,26 +73,26 @@ use super::{
     IdeControlMappingEditError, IdeHistoryOperation, IdeInputDiscoveryError, IdeInputSelection,
     IdeInputSelectionError, IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessCommandError,
     IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
-    IdeMixerMainState, IdeMixerPrimaryDestination, IdeMixerStripReorderError, IdeMonitoringCommand,
-    IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure, IdeNativeFilterEdit,
-    IdeNativeFilterEditError, IdeOutputDiscoveryError, IdeOutputMeterObservation,
-    IdeOutputSelection, IdeOutputSelectionError, IdeOutputTestError, IdeOutputTestSnapshot,
-    IdeOutputTestStartOutcome, IdeOutputTestStopOutcome, IdePendingCloseWait,
-    IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait, IdePendingSaveCloseWait,
-    IdeProjectExportError, IdeProjectExportFormat, IdeProjectOpenError, IdeProjectSaveError,
-    IdeRecordingAbortError, IdeRecordingAbortOutcome, IdeRecordingClipCreationError,
-    IdeRecordingDiscardError, IdeRecordingError, IdeRecordingImportOutcome,
-    IdeRecordingObservation, IdeResourceRestoreError, IdeReturnSendEditError,
-    IdeRoutingBusCreationError, IdeRoutingBusKind, IdeRoutingBusRemovalError,
-    IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability, IdeSceneCreationError,
-    IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRemovalError,
-    IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError, IdeTempoEditError,
-    IdeTimelineMarker, IdeTimelineMarkerEdit, IdeTimelineMarkerLocateError,
+    IdeMixerMainState, IdeMixerPrimaryDestination, IdeMixerSavePlan, IdeMixerStripReorderError,
+    IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure,
+    IdeNativeFilterEdit, IdeNativeFilterEditError, IdeOutputDiscoveryError,
+    IdeOutputMeterObservation, IdeOutputSelection, IdeOutputSelectionError, IdeOutputTestError,
+    IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
+    IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
+    IdePendingSaveCloseWait, IdeProjectExportError, IdeProjectExportFormat, IdeProjectOpenError,
+    IdeProjectSaveError, IdeRecordingAbortError, IdeRecordingAbortOutcome,
+    IdeRecordingClipCreationError, IdeRecordingDiscardError, IdeRecordingError,
+    IdeRecordingImportOutcome, IdeRecordingObservation, IdeResourceRestoreError,
+    IdeReturnSendEditError, IdeRoutingBusCreationError, IdeRoutingBusKind,
+    IdeRoutingBusRemovalError, IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability,
+    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization,
+    IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError,
+    IdeTempoEditError, IdeTimelineMarker, IdeTimelineMarkerEdit, IdeTimelineMarkerLocateError,
     IdeTrackFreezeHistoryAuthority, IdeTransportSeekError, IdeUnusedSampleCleanupError,
     IdeUnusedSampleCleanupSummary, InputInventoryError, LocateState, MAX_DEVICES_PER_CHAIN,
     NativeFilterMode, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
     OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication, RunningIdeSnapshot,
-    TimelineMapEdit, control_binding_references_scene,
+    RuntimeMixerUpdateFenceStatus, TimelineMapEdit, control_binding_references_scene,
 };
 
 #[cfg(test)]
@@ -276,6 +280,7 @@ pub enum IdeWorkerCommandKind {
     StopRecording,
     AbortRecording,
     ImportRuntimeScenePerformance,
+    ImportRuntimeMixerUpdate,
     CaptureScenePerformance,
     CaptureMixerAutomation,
     StartAudioPreview,
@@ -632,6 +637,9 @@ pub enum IdeWorkerCommand {
     ImportRuntimeScenePerformance {
         path: PathBuf,
     },
+    ImportRuntimeMixerUpdate {
+        path: PathBuf,
+    },
     StartScenePerformanceCapture,
     StopScenePerformanceCapture,
     StartMixerAutomationCapture {
@@ -804,6 +812,7 @@ impl IdeWorkerCommand {
             Self::ImportRuntimeScenePerformance { .. } => {
                 IdeWorkerCommandKind::ImportRuntimeScenePerformance
             }
+            Self::ImportRuntimeMixerUpdate { .. } => IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
             Self::StartScenePerformanceCapture | Self::StopScenePerformanceCapture => {
                 IdeWorkerCommandKind::CaptureScenePerformance
             }
@@ -2552,6 +2561,123 @@ impl Error for IdeRuntimeScenePerformanceImportError {
     }
 }
 
+/// Why an explicit Runtime mixer update could not become one canonical mixer
+/// publication in the currently open project.
+///
+/// The artifact is external input rather than project authority. Its exact
+/// source is verified before any fence is requested, and its state is refused
+/// whenever the same acknowledged fence reports local mixer divergence.
+#[derive(Debug)]
+pub enum IdeRuntimeMixerUpdateImportError {
+    ProjectSnapshotUnavailable,
+    Artifact(Box<RuntimeMixerUpdateError>),
+    ProjectIdentityMismatch,
+    ProjectRevisionMismatch {
+        update_revision: u64,
+        project_revision: u64,
+    },
+    ProjectManifestMismatch,
+    MixerIdentityMismatch,
+    LocalMixerChanges,
+    MixerCheckpointUnavailable,
+    MixerSave(Box<IdeProjectSaveError>),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeRuntimeMixerUpdateImportError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: Box<hyper_storage_engine::ProjectResourcePublicationOutcome>,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<hyper_storage_engine::ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeRuntimeMixerUpdateImportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProjectSnapshotUnavailable => {
+                formatter.write_str("running playback exposes no verified project snapshot")
+            }
+            Self::Artifact(source) => {
+                write!(formatter, "selected Runtime mixer update was refused: {source}")
+            }
+            Self::ProjectIdentityMismatch => {
+                formatter.write_str("selected Runtime mixer update belongs to another project")
+            }
+            Self::ProjectRevisionMismatch {
+                update_revision,
+                project_revision,
+            } => write!(
+                formatter,
+                "selected Runtime mixer update targets project revision {update_revision}, but the open project is revision {project_revision}"
+            ),
+            Self::ProjectManifestMismatch => formatter.write_str(
+                "selected Runtime mixer update does not match the exact verified project contents",
+            ),
+            Self::MixerIdentityMismatch => formatter.write_str(
+                "selected Runtime mixer update targets a different mixer resource than the open project",
+            ),
+            Self::LocalMixerChanges => formatter.write_str(
+                "selected Runtime mixer update would overwrite local session mixer changes",
+            ),
+            Self::MixerCheckpointUnavailable => formatter.write_str(
+                "a committed Runtime mixer checkpoint is required before importing an external mixer update",
+            ),
+            Self::MixerSave(source) => source.fmt(formatter),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before importing the Runtime mixer update ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "Runtime mixer update import failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "Runtime mixer update was imported through project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "Runtime mixer update import failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeRuntimeMixerUpdateImportError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Artifact(source) => Some(source.as_ref()),
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::ProjectSnapshotUnavailable
+            | Self::ProjectIdentityMismatch
+            | Self::ProjectRevisionMismatch { .. }
+            | Self::ProjectManifestMismatch
+            | Self::MixerIdentityMismatch
+            | Self::LocalMixerChanges
+            | Self::MixerCheckpointUnavailable => None,
+        }
+    }
+}
+
 /// Why a bounded live mixer-automation capture could not be completed.
 ///
 /// Version 1 captures exactly one resolved mixer parameter from committed,
@@ -2792,6 +2918,7 @@ pub enum IdeWorkerCommandFailure {
     SceneActivation(Box<IdeSceneEditError>),
     Recording(IdeRecordingError),
     RuntimeScenePerformanceImport(Box<IdeRuntimeScenePerformanceImportError>),
+    RuntimeMixerUpdateImport(Box<IdeRuntimeMixerUpdateImportError>),
     ScenePerformanceCapture(Box<IdeScenePerformanceCaptureError>),
     MixerAutomationCapture(Box<IdeMixerAutomationCaptureError>),
     AudioPreview(IdeAudioPreviewError),
@@ -2967,6 +3094,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::SceneRename(source) | Self::SceneActivation(source) => source.fmt(formatter),
             Self::Recording(source) => source.fmt(formatter),
             Self::RuntimeScenePerformanceImport(source) => source.fmt(formatter),
+            Self::RuntimeMixerUpdateImport(source) => source.fmt(formatter),
             Self::ScenePerformanceCapture(source) => source.fmt(formatter),
             Self::MixerAutomationCapture(source) => source.fmt(formatter),
             Self::AudioPreview(source) => source.fmt(formatter),
@@ -3073,6 +3201,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::SceneRename(source) | Self::SceneActivation(source) => Some(source),
             Self::Recording(source) => Some(source),
             Self::RuntimeScenePerformanceImport(source) => Some(source),
+            Self::RuntimeMixerUpdateImport(source) => Some(source),
             Self::ScenePerformanceCapture(source) => Some(source),
             Self::MixerAutomationCapture(source) => Some(source),
             Self::AudioPreview(source) => Some(source),
@@ -3611,6 +3740,11 @@ pub enum IdeWorkerEvent {
     RuntimeScenePerformanceImported {
         revision: u64,
         launch_count: usize,
+    },
+    RuntimeMixerUpdateImporting,
+    RuntimeMixerUpdateImported {
+        revision: u64,
+        changed: bool,
     },
     ScenePerformanceCaptureStarted {
         maximum_launch_count: usize,
@@ -4804,6 +4938,9 @@ enum ProjectMutation {
     ImportRuntimeScenePerformance {
         launches: Vec<ScenePerformanceLaunch>,
     },
+    ImportRuntimeMixerUpdate {
+        plan: IdeMixerSavePlan,
+    },
     CaptureScenePerformance {
         launches: Vec<ScenePerformanceLaunch>,
     },
@@ -5025,6 +5162,7 @@ impl ProjectMutation {
             Self::ImportRuntimeScenePerformance { .. } => {
                 IdeWorkerCommandKind::ImportRuntimeScenePerformance
             }
+            Self::ImportRuntimeMixerUpdate { .. } => IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
             Self::CaptureScenePerformance { .. } => IdeWorkerCommandKind::CaptureScenePerformance,
             Self::MoveArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::MoveArrangementSceneLaunch
@@ -5152,6 +5290,7 @@ impl ProjectMutation {
                     launch_count: launches.len(),
                 }
             }
+            Self::ImportRuntimeMixerUpdate { .. } => IdeWorkerEvent::RuntimeMixerUpdateImporting,
             Self::CaptureScenePerformance { launches, .. } => {
                 IdeWorkerEvent::ScenePerformanceCaptureSaving {
                     launch_count: launches.len(),
@@ -5479,6 +5618,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::AddArrangementPlacement => "placement",
         IdeWorkerCommandKind::AddArrangementSceneLaunch => "scene marker",
         IdeWorkerCommandKind::ImportRuntimeScenePerformance => "Runtime scene performance import",
+        IdeWorkerCommandKind::ImportRuntimeMixerUpdate => "Runtime mixer update import",
         IdeWorkerCommandKind::CaptureScenePerformance => "scene performance capture",
         IdeWorkerCommandKind::CaptureMixerAutomation => "mixer automation capture",
         IdeWorkerCommandKind::DuplicateArrangementPlacement => "placement duplication",
@@ -5882,6 +6022,7 @@ fn process_command(
         | IdeWorkerCommand::SetAudioTrackActive { .. }
         | IdeWorkerCommand::ImportAudio { .. }
         | IdeWorkerCommand::ImportRuntimeScenePerformance { .. }
+        | IdeWorkerCommand::ImportRuntimeMixerUpdate { .. }
         | IdeWorkerCommand::CreateAudioClipFromTake { .. }
         | IdeWorkerCommand::CreateAndPlaceAudioClipFromTake { .. }
         | IdeWorkerCommand::DuplicateAudioClip { .. }
@@ -6170,6 +6311,9 @@ fn process_project_mutation_command(
         IdeWorkerCommand::ImportRuntimeScenePerformance { path } => {
             import_runtime_scene_performance(state, events, &path)
         }
+        IdeWorkerCommand::ImportRuntimeMixerUpdate { path } => {
+            import_runtime_mixer_update(state, events, &path)
+        }
         IdeWorkerCommand::CreateAudioClipFromTake { recording_id, name } => {
             create_audio_clip_from_take(state, events, &recording_id, &name)
         }
@@ -6332,6 +6476,17 @@ fn publish_runtime_scene_performance_import_failure(
     )
 }
 
+fn publish_runtime_mixer_update_import_failure(
+    events: &SyncSender<IdeWorkerEvent>,
+    reason: IdeRuntimeMixerUpdateImportError,
+) -> bool {
+    publish_failure(
+        events,
+        IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+        IdeWorkerCommandFailure::RuntimeMixerUpdateImport(Box::new(reason)),
+    )
+}
+
 fn validate_runtime_scene_performance_update(
     update: &RuntimeScenePerformanceUpdate,
     project_id: &str,
@@ -6352,6 +6507,28 @@ fn validate_runtime_scene_performance_update(
     }
     if source.project_sha256() != sha256_hex(project_manifest_sha256) {
         return Err(IdeRuntimeScenePerformanceImportError::ProjectManifestMismatch);
+    }
+    Ok(())
+}
+
+fn validate_runtime_mixer_update(
+    update: &RuntimeMixerUpdate,
+    project_id: &str,
+    project_revision: u64,
+    project_manifest_sha256: &[u8; 32],
+) -> Result<(), IdeRuntimeMixerUpdateImportError> {
+    let source = update.source();
+    if source.project_id() != project_id {
+        return Err(IdeRuntimeMixerUpdateImportError::ProjectIdentityMismatch);
+    }
+    if source.project_revision() != project_revision {
+        return Err(IdeRuntimeMixerUpdateImportError::ProjectRevisionMismatch {
+            update_revision: source.project_revision(),
+            project_revision,
+        });
+    }
+    if source.project_sha256() != runtime_mixer_update_sha256_hex(project_manifest_sha256) {
+        return Err(IdeRuntimeMixerUpdateImportError::ProjectManifestMismatch);
     }
     Ok(())
 }
@@ -6417,6 +6594,85 @@ fn import_runtime_scene_performance(
         ProjectMutation::ImportRuntimeScenePerformance {
             launches: update.into_launches(),
         },
+    )
+}
+
+fn import_runtime_mixer_update(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    path: &Path,
+) -> bool {
+    let WorkerState::Running(application) = state else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    };
+    let (project_id, project_revision, project_manifest_sha256) = match application.snapshot() {
+        Some(snapshot) => (
+            snapshot.project_id.to_owned(),
+            snapshot.project_revision,
+            snapshot.project_manifest_sha256,
+        ),
+        None => {
+            return publish_runtime_mixer_update_import_failure(
+                events,
+                IdeRuntimeMixerUpdateImportError::ProjectSnapshotUnavailable,
+            );
+        }
+    };
+    let update = match read_runtime_mixer_update(path) {
+        Ok(update) => update,
+        Err(source) => {
+            return publish_runtime_mixer_update_import_failure(
+                events,
+                IdeRuntimeMixerUpdateImportError::Artifact(Box::new(source)),
+            );
+        }
+    };
+    if let Err(reason) = validate_runtime_mixer_update(
+        &update,
+        &project_id,
+        project_revision,
+        &project_manifest_sha256,
+    ) {
+        return publish_runtime_mixer_update_import_failure(events, reason);
+    }
+    let plan = match application.prepare_runtime_mixer_update_import(update.state()) {
+        Ok(plan) => plan,
+        Err(source) => {
+            return publish_runtime_mixer_update_import_failure(
+                events,
+                IdeRuntimeMixerUpdateImportError::MixerSave(Box::new(source)),
+            );
+        }
+    };
+    if plan.resource_id != update.mixer_id() {
+        return publish_runtime_mixer_update_import_failure(
+            events,
+            IdeRuntimeMixerUpdateImportError::MixerIdentityMismatch,
+        );
+    }
+    match application.mixer_update_import_requires_discard() {
+        Some(false) => {}
+        Some(true) => {
+            return publish_runtime_mixer_update_import_failure(
+                events,
+                IdeRuntimeMixerUpdateImportError::LocalMixerChanges,
+            );
+        }
+        None => {
+            return publish_runtime_mixer_update_import_failure(
+                events,
+                IdeRuntimeMixerUpdateImportError::MixerCheckpointUnavailable,
+            );
+        }
+    }
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::ImportRuntimeMixerUpdate { plan },
     )
 }
 
@@ -10770,6 +11026,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             result: Ok(outcome),
             ..
         }
+        | ProjectMutationAttempt::ImportRuntimeMixerUpdate(Ok(outcome))
         | ProjectMutationAttempt::CaptureScenePerformance {
             result: Ok(outcome),
             ..
@@ -11036,6 +11293,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::AddArrangementPlacement { result: Err(_), .. }
         | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::ImportRuntimeScenePerformance { result: Err(_), .. }
+        | ProjectMutationAttempt::ImportRuntimeMixerUpdate(Err(_))
         | ProjectMutationAttempt::CaptureScenePerformance { result: Err(_), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::SetArrangementLoopRange { result: Err(_) }
@@ -12100,6 +12358,11 @@ fn project_mutation_save_failure(
                 )),
             ))
         }
+        ProjectMutation::ImportRuntimeMixerUpdate { .. } => {
+            IdeWorkerCommandFailure::RuntimeMixerUpdateImport(Box::new(
+                IdeRuntimeMixerUpdateImportError::MixerSave(Box::new(reason)),
+            ))
+        }
         ProjectMutation::CaptureScenePerformance { .. } => {
             IdeWorkerCommandFailure::ScenePerformanceCapture(Box::new(
                 IdeScenePerformanceCaptureError::Arrangement(Box::new(
@@ -12452,6 +12715,13 @@ fn project_mutation_native_close_failure(
             IdeWorkerCommandFailure::RuntimeScenePerformanceImport(Box::new(
                 IdeRuntimeScenePerformanceImportError::Arrangement(Box::new(
                     IdeArrangementPlacementEditError::NativeClose(failure),
+                )),
+            ))
+        }
+        ProjectMutation::ImportRuntimeMixerUpdate { .. } => {
+            IdeWorkerCommandFailure::RuntimeMixerUpdateImport(Box::new(
+                IdeRuntimeMixerUpdateImportError::MixerSave(Box::new(
+                    IdeProjectSaveError::NativeClose(failure),
                 )),
             ))
         }
@@ -12819,6 +13089,9 @@ enum ProjectMutationAttempt {
             IdeArrangementPlacementEditError,
         >,
     },
+    ImportRuntimeMixerUpdate(
+        Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeProjectSaveError>,
+    ),
     CaptureScenePerformance {
         launch_count: usize,
         result: Result<
@@ -14021,6 +14294,20 @@ fn complete_project_mutation(
                             IdeRuntimeScenePerformanceImportError::Arrangement(reason),
                         ))
                     },
+                ),
+                ProjectMutationAttempt::ImportRuntimeMixerUpdate(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::RuntimeMixerUpdateImported {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                    },
+                ),
+                ProjectMutationAttempt::ImportRuntimeMixerUpdate(Err(reason)) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+                    IdeWorkerCommandFailure::RuntimeMixerUpdateImport(Box::new(
+                        IdeRuntimeMixerUpdateImportError::MixerSave(Box::new(reason)),
+                    )),
                 ),
                 ProjectMutationAttempt::CaptureScenePerformance {
                     launch_count,
@@ -15641,6 +15928,16 @@ fn attempt_project_mutation(
                     native_failure,
                 ),
             }
+        }
+        ProjectMutation::ImportRuntimeMixerUpdate { plan } => {
+            ProjectMutationAttempt::ImportRuntimeMixerUpdate(
+                if let Some(failure) = native_failure {
+                    Err(IdeProjectSaveError::NativeClose(failure))
+                } else {
+                    plan.publish()
+                        .map_err(|source| IdeProjectSaveError::Publication(Box::new(source)))
+                },
+            )
         }
         ProjectMutation::CaptureScenePerformance { launches } => {
             ProjectMutationAttempt::CaptureScenePerformance {
@@ -17518,6 +17815,40 @@ fn project_mutation_reopen_failure(
                 ))
             })
         }
+        ProjectMutationAttempt::ImportRuntimeMixerUpdate(Ok(outcome)) => {
+            IdeWorkerCommandFailure::RuntimeMixerUpdateImport(Box::new(
+                IdeRuntimeMixerUpdateImportError::ReopenAfterPublication {
+                    outcome: Box::new(outcome),
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::ImportRuntimeMixerUpdate(Err(
+            IdeProjectSaveError::Publication(publication),
+        )) => IdeWorkerCommandFailure::RuntimeMixerUpdateImport(Box::new(
+            IdeRuntimeMixerUpdateImportError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::ImportRuntimeMixerUpdate(Err(
+            IdeProjectSaveError::NativeClose(close),
+        )) => IdeWorkerCommandFailure::RuntimeMixerUpdateImport(Box::new(
+            IdeRuntimeMixerUpdateImportError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::ImportRuntimeMixerUpdate(Err(preparation)) => {
+            IdeWorkerCommandFailure::RuntimeMixerUpdateImport(Box::new(
+                IdeRuntimeMixerUpdateImportError::ReopenAfterPreparation {
+                    preparation: Box::new(IdeRuntimeMixerUpdateImportError::MixerSave(Box::new(
+                        preparation,
+                    ))),
+                    reopen: Box::new(reopen),
+                },
+            ))
+        }
         ProjectMutationAttempt::CaptureScenePerformance { result, .. } => {
             arrangement_placement_edit_reopen_failure(result, reopen, |reason| {
                 IdeWorkerCommandFailure::ScenePerformanceCapture(Box::new(
@@ -18771,7 +19102,50 @@ fn poll_pending_state(
             sequence,
             deadline,
         } => {
-            if application.committed_mixer_fence() >= sequence {
+            if matches!(&operation, ProjectMutation::ImportRuntimeMixerUpdate { .. }) {
+                match application.mixer_update_import_fence_status(sequence) {
+                    RuntimeMixerUpdateFenceStatus::Clean => begin_save_close(
+                        state,
+                        application,
+                        operation,
+                        events,
+                        history,
+                        project_history,
+                    ),
+                    RuntimeMixerUpdateFenceStatus::LocalMixerChanges => {
+                        *state = WorkerState::Running(application);
+                        publish_runtime_mixer_update_import_failure(
+                            events,
+                            IdeRuntimeMixerUpdateImportError::LocalMixerChanges,
+                        )
+                    }
+                    RuntimeMixerUpdateFenceStatus::Unavailable => {
+                        *state = WorkerState::Running(application);
+                        publish_runtime_mixer_update_import_failure(
+                            events,
+                            IdeRuntimeMixerUpdateImportError::MixerCheckpointUnavailable,
+                        )
+                    }
+                    RuntimeMixerUpdateFenceStatus::Pending if Instant::now() >= deadline => {
+                        let command = operation.command();
+                        let reason = project_mutation_save_failure(
+                            &operation,
+                            IdeProjectSaveError::MixerCommitTimeout,
+                        );
+                        *state = WorkerState::Running(application);
+                        publish_failure(events, command, reason)
+                    }
+                    RuntimeMixerUpdateFenceStatus::Pending => {
+                        *state = WorkerState::SaveFence {
+                            application,
+                            operation,
+                            sequence,
+                            deadline,
+                        };
+                        true
+                    }
+                }
+            } else if application.committed_mixer_fence() >= sequence {
                 begin_save_close(
                     state,
                     application,
@@ -19654,12 +20028,17 @@ mod tests {
         IdeOutputTestState, IdePlaybackExtent, IdePlaybackSessionOwner,
         OutputTestingDesktopIdeApplication, TestPlaybackSession,
     };
+    use hyper_audio_engine::{LinearGain, Pan};
     use hyper_audio_source::{AudioContainer, DecodeLimits, decode_bytes};
     use hyper_media_cache::CacheLimits;
     use hyper_mixer_runtime::output_meter_snapshot_for_test;
-    use hyper_playback_json::{LoaderLimits, RoutingBusRemovalSerializationError};
+    use hyper_playback_json::{
+        LoaderLimits, MixerBaseState, MixerChannelBaseState, MixerSendBaseState,
+        RoutingBusRemovalSerializationError,
+    };
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
     use hyper_project_loader::ProjectPlaybackLimits;
+    use hyper_runtime_mixer_update::{RuntimeMixerUpdateDirectory, RuntimeMixerUpdateSource};
     use hyper_scene_performance::{
         RuntimeScenePerformanceSource, RuntimeScenePerformanceUpdateDirectory,
     };
@@ -19682,6 +20061,8 @@ mod tests {
     const CAPTURE_SCENE_B: &str = "018f47a2-6b2d-7c11-8a44-001122334461";
     const RUNTIME_UPDATE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334462";
     const RUNTIME_PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334463";
+    const RUNTIME_MIXER_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334464";
+    const RUNTIME_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334465";
 
     fn runtime_scene_performance_update() -> RuntimeScenePerformanceUpdate {
         let source = hyper_scene_performance::RuntimeScenePerformanceSource::try_new(
@@ -19697,6 +20078,69 @@ mod tests {
             source,
             vec![ScenePerformanceLaunch::try_new(CAPTURE_SCENE_A.to_owned(), 960).unwrap()],
             1,
+        )
+        .unwrap()
+    }
+
+    fn runtime_mixer_base_state(main_gain_millionths: u32) -> MixerBaseState {
+        MixerBaseState {
+            channels: Vec::new(),
+            main_gain: LinearGain::from_millionths(main_gain_millionths).unwrap(),
+            main_muted: false,
+        }
+    }
+
+    fn runtime_mixer_base_state_for_project(
+        project: &Path,
+        main_gain_millionths: u32,
+    ) -> MixerBaseState {
+        let prepared = hyper_project_loader::prepare_project_playback(
+            project,
+            audio_import_application().config.project_limits,
+        )
+        .unwrap();
+        let (_, mixer, _, _) = prepared.session().parts();
+        MixerBaseState {
+            channels: mixer
+                .slots()
+                .iter()
+                .map(|slot| MixerChannelBaseState {
+                    track_id: slot.track_id().to_owned(),
+                    gain: slot.parameters().gain,
+                    pan: slot.parameters().pan,
+                    muted: slot.muted(),
+                    solo: slot.solo(),
+                    sends: slot
+                        .sends()
+                        .iter()
+                        .map(|send| MixerSendBaseState {
+                            id: send.id().to_owned(),
+                            gain: send.parameters().gain,
+                            pan: send.parameters().pan,
+                            enabled: send.enabled(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            main_gain: LinearGain::from_millionths(main_gain_millionths).unwrap(),
+            main_muted: mixer.main_muted(),
+        }
+    }
+
+    fn runtime_mixer_update() -> RuntimeMixerUpdate {
+        let source = RuntimeMixerUpdateSource::try_new(
+            RUNTIME_PROJECT_ID.to_owned(),
+            7,
+            runtime_mixer_update_sha256_hex(&[0xaa; 32]),
+            runtime_mixer_update_sha256_hex(&[0xbb; 32]),
+            3,
+        )
+        .unwrap();
+        RuntimeMixerUpdate::try_new(
+            RUNTIME_UPDATE_ID.to_owned(),
+            source,
+            RUNTIME_MIXER_ID.to_owned(),
+            runtime_mixer_base_state(500_000),
         )
         .unwrap()
     }
@@ -19725,6 +20169,30 @@ mod tests {
         assert!(matches!(
             validate_runtime_scene_performance_update(&update, RUNTIME_PROJECT_ID, 7, &[0xcc; 32],),
             Err(IdeRuntimeScenePerformanceImportError::ProjectManifestMismatch)
+        ));
+    }
+
+    #[test]
+    fn runtime_mixer_update_import_requires_exact_project_provenance() {
+        let update = runtime_mixer_update();
+
+        assert!(
+            validate_runtime_mixer_update(&update, RUNTIME_PROJECT_ID, 7, &[0xaa; 32],).is_ok()
+        );
+        assert!(matches!(
+            validate_runtime_mixer_update(&update, CAPTURE_SCENE_A, 7, &[0xaa; 32]),
+            Err(IdeRuntimeMixerUpdateImportError::ProjectIdentityMismatch)
+        ));
+        assert!(matches!(
+            validate_runtime_mixer_update(&update, RUNTIME_PROJECT_ID, 8, &[0xaa; 32],),
+            Err(IdeRuntimeMixerUpdateImportError::ProjectRevisionMismatch {
+                update_revision: 7,
+                project_revision: 8,
+            })
+        ));
+        assert!(matches!(
+            validate_runtime_mixer_update(&update, RUNTIME_PROJECT_ID, 7, &[0xcc; 32],),
+            Err(IdeRuntimeMixerUpdateImportError::ProjectManifestMismatch)
         ));
     }
 
@@ -19877,6 +20345,343 @@ mod tests {
         );
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    fn publish_runtime_mixer_update_for_test(
+        directory: &Path,
+        project: &Path,
+        state: MixerBaseState,
+    ) -> PathBuf {
+        let verified = verify_project_package(project).unwrap();
+        let mut mixers = verified
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Mixer);
+        let mixer_id = mixers
+            .next()
+            .expect("the verified fixture project must have one mixer resource")
+            .id()
+            .to_owned();
+        assert!(
+            mixers.next().is_none(),
+            "the verified fixture project must have only one mixer resource"
+        );
+        let source = RuntimeMixerUpdateSource::try_new(
+            verified.manifest().project_id().to_owned(),
+            verified.manifest().revision(),
+            runtime_mixer_update_sha256_hex(verified.manifest_sha256()),
+            runtime_mixer_update_sha256_hex(&[0xbb; 32]),
+            1,
+        )
+        .unwrap();
+        drop(verified);
+        let update =
+            RuntimeMixerUpdate::try_new(uuid::Uuid::new_v4().to_string(), source, mixer_id, state)
+                .unwrap();
+        RuntimeMixerUpdateDirectory::open(directory)
+            .unwrap()
+            .publish(&update)
+            .unwrap()
+    }
+
+    fn open_project_for_runtime_mixer_update_import(
+        worker: &DesktopIdeWorker,
+        project: PathBuf,
+    ) -> IdeRunningObservation {
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(worker) else {
+            panic!("the project must open before importing a Runtime mixer update");
+        };
+        opened
+    }
+
+    fn import_runtime_mixer_update_for_test(
+        worker: &DesktopIdeWorker,
+        update_path: &Path,
+        expected_revision: u64,
+    ) -> IdeRunningObservation {
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeMixerUpdate {
+                path: update_path.to_path_buf(),
+            })
+            .unwrap();
+        let event = recv(worker);
+        assert!(
+            matches!(event, IdeWorkerEvent::RuntimeMixerUpdateImporting),
+            "the import must reach its guarded fence after valid preflight: {event:?}"
+        );
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("Runtime mixer update import"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(imported) = recv(worker) else {
+            panic!("the project must reopen before reporting the Runtime mixer update import");
+        };
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::RuntimeMixerUpdateImported {
+                revision,
+                changed: true,
+            } if revision == expected_revision
+        ));
+        imported
+    }
+
+    #[test]
+    fn runtime_mixer_update_import_publishes_once_and_refuses_its_stale_artifact() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-runtime-mixer-update-import-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+
+        let verified_before = verify_project_package(&project).unwrap();
+        let initial_revision = verified_before.manifest().revision();
+        let mixer_id = verified_before
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .expect("the fixture project must expose one mixer resource")
+            .id()
+            .to_owned();
+        let initial_mixer_bytes = verified_before.read_resource(&mixer_id).unwrap();
+        drop(verified_before);
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 5)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        let _opened = open_project_for_runtime_mixer_update_import(&worker, project.clone());
+
+        let updates = fixture.join("updates");
+        std::fs::create_dir(&updates).unwrap();
+        let update_path = publish_runtime_mixer_update_for_test(
+            &updates,
+            &project,
+            runtime_mixer_base_state_for_project(&project, 500_000),
+        );
+        let imported =
+            import_runtime_mixer_update_for_test(&worker, &update_path, initial_revision + 1);
+        let imported_main = imported
+            .mixer_main()
+            .expect("the reopened project must expose its imported main mixer state");
+        assert!((imported_main.gain - 0.5).abs() <= f32::EPSILON);
+        assert!(!imported_main.muted);
+        assert!(update_path.is_file());
+
+        let verified_after = verify_project_package(&project).unwrap();
+        assert_eq!(verified_after.manifest().revision(), initial_revision + 1);
+        assert_ne!(
+            verified_after.read_resource(&mixer_id).unwrap(),
+            initial_mixer_bytes
+        );
+        drop(verified_after);
+
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeMixerUpdate { path: update_path })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeMixerUpdateImport(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeRuntimeMixerUpdateImportError::ProjectRevisionMismatch {
+                    update_revision,
+                    project_revision,
+                } if *update_revision == initial_revision
+                    && *project_revision == initial_revision + 1
+            )
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn runtime_mixer_update_import_rejects_incompatible_topology_before_fencing() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-runtime-mixer-update-topology-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let initial_revision = verify_project_package(&project)
+            .unwrap()
+            .manifest()
+            .revision();
+
+        let updates = fixture.join("updates");
+        std::fs::create_dir(&updates).unwrap();
+        let incompatible = MixerBaseState {
+            channels: vec![MixerChannelBaseState {
+                track_id: RUNTIME_TRACK_ID.to_owned(),
+                gain: LinearGain::UNITY,
+                pan: Pan::CENTER,
+                muted: false,
+                solo: false,
+                sends: Vec::new(),
+            }],
+            main_gain: LinearGain::UNITY,
+            main_muted: false,
+        };
+        let update_path = publish_runtime_mixer_update_for_test(&updates, &project, incompatible);
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 5)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        let _opened = open_project_for_runtime_mixer_update_import(&worker, project.clone());
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeMixerUpdate {
+                path: update_path.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeMixerUpdateImport(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeRuntimeMixerUpdateImportError::MixerSave(source)
+                    if matches!(source.as_ref(), IdeProjectSaveError::Serialization(_))
+            )
+        ));
+        assert!(update_path.is_file());
+        assert_eq!(
+            verify_project_package(&project)
+                .unwrap()
+                .manifest()
+                .revision(),
+            initial_revision
+        );
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    fn runtime_mixer_update_import_mutation() -> ProjectMutation {
+        ProjectMutation::ImportRuntimeMixerUpdate {
+            plan: IdeMixerSavePlan {
+                project_path: std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
+                expected_project_sha256: [0; 32],
+                resource_id: RUNTIME_MIXER_ID.to_owned(),
+                resource_bytes: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn runtime_mixer_update_import_final_fence_refuses_dirty_or_missing_checkpoints() {
+        for close_requires_discard in [Some(true), None] {
+            let running = RunningDesktopIdeApplication {
+                application: closed_application(),
+                session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                    committed_mixer_fence: 7,
+                    close_requires_discard,
+                    ..TestPlaybackSession::default()
+                }),
+            };
+            let mut state = WorkerState::SaveFence {
+                application: running,
+                operation: runtime_mixer_update_import_mutation(),
+                sequence: 7,
+                deadline: Instant::now() + Duration::from_secs(1),
+            };
+            let (events, receiver) = sync_channel(1);
+            let mut unpublished_native_failure = None;
+            let mut history = UndoHistory::default();
+
+            assert!(poll_pending_state(
+                &mut state,
+                &events,
+                &mut unpublished_native_failure,
+                &mut history,
+                None,
+            ));
+            assert!(matches!(state, WorkerState::Running(_)));
+            assert!(matches!(
+                receiver.recv_timeout(WAIT).unwrap(),
+                IdeWorkerEvent::CommandFailed {
+                    command: IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+                    reason: IdeWorkerCommandFailure::RuntimeMixerUpdateImport(reason),
+                } if matches!(
+                    (close_requires_discard, reason.as_ref()),
+                    (Some(true), IdeRuntimeMixerUpdateImportError::LocalMixerChanges)
+                        | (None, IdeRuntimeMixerUpdateImportError::MixerCheckpointUnavailable)
+                )
+            ));
+            assert_eq!(unpublished_native_failure, None);
+        }
+    }
+
+    #[test]
+    fn runtime_mixer_update_import_fence_rejects_concurrent_mixer_commands() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let mut state = WorkerState::SaveFence {
+            application: running,
+            operation: runtime_mixer_update_import_mutation(),
+            sequence: 7,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let (events, receiver) = sync_channel(1);
+        let mut unpublished_native_failure = None;
+        let mut history = UndoHistory::default();
+
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::Mixer(IdeMixerCommand::MainGain {
+                gain_millionths: 500_000,
+            }),
+            &events,
+            &mut unpublished_native_failure,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(WAIT).unwrap(),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Mixer,
+                reason: IdeWorkerCommandFailure::InvalidState,
+            }
+        ));
+        let WorkerState::SaveFence { application, .. } = &state else {
+            panic!("the import fence must retain sole application ownership");
+        };
+        let IdePlaybackSessionOwner::Test(session) = &application.session else {
+            panic!("the test state must retain the test playback session");
+        };
+        assert!(session.mixer_commands.is_empty());
+        assert_eq!(unpublished_native_failure, None);
     }
 
     fn capture_scene(id: &str, grid_quantized: bool) -> ScenePerformanceScene {

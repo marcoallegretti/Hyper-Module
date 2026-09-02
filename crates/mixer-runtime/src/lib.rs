@@ -26,7 +26,8 @@ use hyper_playback_compiler::scene::{SceneRuntimeCheckpoint, SceneRuntimeError};
 use hyper_playback_json::{
     AutomationChannelParameter, AutomationMainParameter, AutomationSendParameter, AutomationTarget,
     AutomationValue, CompiledAutomation, CompiledMainMixer, CompiledMixerDestination,
-    CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
+    CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind, MixerBaseState,
+    MixerChannelBaseState, MixerSendBaseState,
 };
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use sha2::{Digest, Sha256};
@@ -1006,6 +1007,100 @@ pub struct MixerParameterStateSnapshot {
 }
 
 impl Eq for MixerParameterStateSnapshot {}
+
+/// Why one live mixer snapshot cannot become a complete persisted base state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MixerBaseStateProjectionError {
+    /// The snapshot and compiled mixer name different channel or send layouts.
+    LayoutMismatch,
+    /// Copying the verified topology into owned persisted state could not reserve memory.
+    CapacityUnavailable,
+}
+
+impl fmt::Display for MixerBaseStateProjectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::LayoutMismatch => {
+                "live mixer state does not match the verified compiled mixer layout"
+            }
+            Self::CapacityUnavailable => "mixer state projection capacity is unavailable",
+        })
+    }
+}
+
+impl Error for MixerBaseStateProjectionError {}
+
+/// Projects an audible mixer snapshot onto its verified compiled topology.
+///
+/// The snapshot carries only runtime slot positions. The compiled graph is the
+/// authority for persisted track and send identities, so this function never
+/// invents, reorders, or accepts a topology the live runtime did not compile.
+/// It is deliberately outside the audio callback: producing owned project
+/// state may allocate and belongs to an explicit control operation.
+///
+/// # Errors
+///
+/// Returns [`MixerBaseStateProjectionError`] if the complete channel/send
+/// topology differs or owned state cannot be reserved.
+pub fn mixer_base_state_from_snapshot(
+    mixer: &CompiledMixerGraph,
+    snapshot: &MixerParameterStateSnapshot,
+) -> Result<MixerBaseState, MixerBaseStateProjectionError> {
+    if snapshot.channel_count() != mixer.slots().len() {
+        return Err(MixerBaseStateProjectionError::LayoutMismatch);
+    }
+    let mut channels = Vec::new();
+    channels
+        .try_reserve_exact(mixer.slots().len())
+        .map_err(|_| MixerBaseStateProjectionError::CapacityUnavailable)?;
+    for (channel_index, slot) in mixer.slots().iter().enumerate() {
+        let channel = snapshot
+            .channel(channel_index)
+            .ok_or(MixerBaseStateProjectionError::LayoutMismatch)?;
+        if channel.send_count() != slot.sends().len() {
+            return Err(MixerBaseStateProjectionError::LayoutMismatch);
+        }
+        let mut sends = Vec::new();
+        sends
+            .try_reserve_exact(slot.sends().len())
+            .map_err(|_| MixerBaseStateProjectionError::CapacityUnavailable)?;
+        for (send_index, compiled_send) in slot.sends().iter().enumerate() {
+            let send = channel
+                .send(send_index)
+                .ok_or(MixerBaseStateProjectionError::LayoutMismatch)?;
+            let parameters = send.parameters();
+            sends.push(MixerSendBaseState {
+                id: try_projected_mixer_identity(compiled_send.id())?,
+                gain: parameters.gain,
+                pan: parameters.pan,
+                enabled: send.enabled(),
+            });
+        }
+        let parameters = channel.parameters();
+        channels.push(MixerChannelBaseState {
+            track_id: try_projected_mixer_identity(slot.track_id())?,
+            gain: parameters.gain,
+            pan: parameters.pan,
+            muted: channel.muted(),
+            solo: channel.solo(),
+            sends,
+        });
+    }
+    Ok(MixerBaseState {
+        channels,
+        main_gain: snapshot.main_gain(),
+        main_muted: snapshot.main_muted(),
+    })
+}
+
+fn try_projected_mixer_identity(value: &str) -> Result<String, MixerBaseStateProjectionError> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| MixerBaseStateProjectionError::CapacityUnavailable)?;
+    owned.push_str(value);
+    Ok(owned)
+}
 
 impl MixerParameterStateSnapshot {
     #[must_use]

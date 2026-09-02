@@ -70,6 +70,7 @@ export enum AppMode {
     creating-clip,
     importing-audio,
     importing-runtime-scene-performance,
+    importing-runtime-mixer-update,
     preparing-preview,
     previewing,
     saving,
@@ -327,6 +328,7 @@ export global IdeActions {
     callback start-scene-performance-capture();
     callback stop-scene-performance-capture();
     callback import-runtime-scene-performance();
+    callback import-runtime-mixer-update();
     callback start-mixer-automation-capture(string, int);
     callback stop-mixer-automation-capture();
     callback transport-seek(float);
@@ -2991,6 +2993,33 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle { height: 1px; background: #27313d; }
+
+                    HorizontalLayout {
+                        height: 30px;
+                        spacing: 8px;
+                        Text {
+                            text: "RUNTIME MIXER UPDATE";
+                            color: #6f8197;
+                            font-size: 9px;
+                            font-weight: 700;
+                            letter-spacing: 1px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            horizontal-stretch: 1;
+                            text: "Select one exported update; it is never synchronized automatically.";
+                            color: #8fa0b4;
+                            font-size: 9px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Button {
+                            text: "Import update…";
+                            accessible-label: "Select one Runtime mixer update and import its provenance-checked base mixer state";
+                            enabled: root.app-mode == AppMode.running;
+                            clicked => { IdeActions.import-runtime-mixer-update(); }
+                        }
+                    }
 
                     HorizontalLayout {
                         spacing: 6px;

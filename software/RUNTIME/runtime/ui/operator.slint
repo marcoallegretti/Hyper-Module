@@ -549,6 +549,8 @@ export component OperatorWindow inherits Window {
     in property <bool> main-muted: false;
     in property <bool> main-mute-enabled: false;
     in property <string> mixer-state: "Mixer state unavailable";
+    in property <string> mixer-update-state: "Mixer update unavailable";
+    in property <bool> mixer-update-export-enabled: false;
     in property <string> diagnostic;
 
     callback start-requested();
@@ -589,6 +591,7 @@ export component OperatorWindow inherits Window {
     callback set-mixer-send-pan-requested(int, float);
     callback set-main-gain-requested(float);
     callback toggle-main-mute-requested();
+    callback export-mixer-update-requested();
     callback launch-scene-requested(int);
     callback select-scene-requested(int);
     callback move-scene-selection-requested(int);
@@ -901,12 +904,20 @@ export component OperatorWindow inherits Window {
                 padding: 12px;
                 spacing: 7px;
                 HorizontalLayout {
-                    Text { text: "LIVE MIXER · SESSION ONLY · POST-FADER PEAK"; color: #8d99ad; font-size: 11px; font-weight: 700; }
+                    Text { text: "LIVE MIXER · POST-FADER PEAK"; color: #8d99ad; font-size: 11px; font-weight: 700; }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
                     Text { text: root.mixer-state; color: #8d99ad; font-size: 10px; overflow: elide; }
                 }
                 HorizontalLayout {
                     spacing: 8px;
+                    Text {
+                        text: root.mixer-update-state;
+                        color: #8d99ad;
+                        font-size: 10px;
+                        overflow: elide;
+                        width: 180px;
+                        vertical-alignment: center;
+                    }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
                     Text { text: "MAIN " + Math.round(root.main-gain-percent) + "%"; color: #8d99ad; font-size: 9px; }
                     CommittedSlider {
@@ -923,6 +934,12 @@ export component OperatorWindow inherits Window {
                         accessible-label: self.text;
                         enabled: root.main-mute-enabled;
                         clicked => { root.toggle-main-mute-requested(); }
+                    }
+                    Button {
+                        text: "Export mixer update";
+                        accessible-label: "Export the committed mixer state as an external update";
+                        enabled: root.mixer-update-export-enabled;
+                        clicked => { root.export-mixer-update-requested(); }
                     }
                 }
                 ListView {

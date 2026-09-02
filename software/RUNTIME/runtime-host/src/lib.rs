@@ -81,6 +81,7 @@ pub struct RuntimeArguments {
     deployment_root: PathBuf,
     panel_listen: Option<SocketAddr>,
     performance_updates: Option<PathBuf>,
+    mixer_updates: Option<PathBuf>,
     operator_ui: bool,
 }
 
@@ -128,6 +129,7 @@ impl RuntimeArguments {
         let mut deployment_root = None;
         let mut panel_listen = None;
         let mut performance_updates = None;
+        let mut mixer_updates = None;
         let mut operator_ui = false;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -160,6 +162,15 @@ impl RuntimeArguments {
                         .ok_or(ArgumentError::MissingValue("--performance-updates"))?;
                     performance_updates = Some(PathBuf::from(value));
                 }
+                "--mixer-updates" => {
+                    if mixer_updates.is_some() {
+                        return Err(ArgumentError::Repeated("--mixer-updates"));
+                    }
+                    let value = arguments
+                        .next()
+                        .ok_or(ArgumentError::MissingValue("--mixer-updates"))?;
+                    mixer_updates = Some(PathBuf::from(value));
+                }
                 option if option.starts_with("--") => {
                     return Err(ArgumentError::UnknownOption(option.to_owned()));
                 }
@@ -175,6 +186,7 @@ impl RuntimeArguments {
             deployment_root: deployment_root.ok_or(ArgumentError::MissingDeploymentRoot)?,
             panel_listen,
             performance_updates,
+            mixer_updates,
             operator_ui,
         })
     }
@@ -195,9 +207,62 @@ impl RuntimeArguments {
         self.performance_updates.as_deref()
     }
 
+    /// Returns the explicit Runtime mixer-update directory, when enabled.
+    #[must_use]
+    pub fn mixer_updates(&self) -> Option<&Path> {
+        self.mixer_updates.as_deref()
+    }
+
     #[must_use]
     pub const fn operator_ui(&self) -> bool {
         self.operator_ui
+    }
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+
+    #[test]
+    fn parses_independent_external_update_directories() {
+        let arguments = RuntimeArguments::parse([
+            "--performance-updates".to_owned(),
+            "scene-updates".to_owned(),
+            "--mixer-updates".to_owned(),
+            "mixer-updates".to_owned(),
+            "deployment".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(arguments.deployment_root(), Path::new("deployment"));
+        assert_eq!(
+            arguments.performance_updates(),
+            Some(Path::new("scene-updates"))
+        );
+        assert_eq!(arguments.mixer_updates(), Some(Path::new("mixer-updates")));
+    }
+
+    #[test]
+    fn refuses_repeated_or_value_less_mixer_update_options() {
+        assert_eq!(
+            RuntimeArguments::parse([
+                "--mixer-updates".to_owned(),
+                "first".to_owned(),
+                "--mixer-updates".to_owned(),
+                "second".to_owned(),
+                "deployment".to_owned(),
+            ]),
+            Err(ArgumentError::Repeated("--mixer-updates"))
+        );
+        assert_eq!(
+            RuntimeArguments::parse(["--mixer-updates".to_owned(), "deployment".to_owned()]),
+            Err(ArgumentError::MissingDeploymentRoot),
+            "an option's immediate next token is its value, even if it resembles a path"
+        );
+        assert_eq!(
+            RuntimeArguments::parse(["--mixer-updates".to_owned()]),
+            Err(ArgumentError::MissingValue("--mixer-updates"))
+        );
     }
 }
 

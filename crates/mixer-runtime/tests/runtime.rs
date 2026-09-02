@@ -25,8 +25,8 @@ use hyper_mixer_runtime::{
     TransportCommand, TransportCommandApplyError, TransportCommandSendError, TransportCycle,
     TransportLoopRange, TransportLoopRangeError, TransportOutputCreationError,
     TransportOutputProcessor, TransportState, interactive_mixer_parameter_channel,
-    interactive_scene_launch_channel, loudness_command_channel, output_meter_channel,
-    playback_recovery_channel,
+    interactive_scene_launch_channel, loudness_command_channel, mixer_base_state_from_snapshot,
+    output_meter_channel, playback_recovery_channel,
 };
 use hyper_native_device::{
     DeviceChain, NativeCompressorState, NativeDeviceInstance, NativeDeviceState, NativeFilterMode,
@@ -3285,6 +3285,37 @@ fn live_mixer_command_queue_validates_targets_backpressure_and_disconnection() {
         })
     );
     drop(foreign_transport);
+}
+
+#[test]
+fn live_mixer_snapshot_projects_through_the_verified_compiled_topology() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (_transport_sender, _mixer_sender, transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+
+    let state = mixer_base_state_from_snapshot(&fixture.mixer, &transport.mixer_parameter_state())
+        .expect("the runtime snapshot and its own compiled mixer agree");
+
+    assert_eq!(state.channels.len(), fixture.mixer.slots().len());
+    for (state_channel, compiled_channel) in state.channels.iter().zip(fixture.mixer.slots()) {
+        assert_eq!(state_channel.track_id, compiled_channel.track_id());
+        assert_eq!(state_channel.gain, compiled_channel.parameters().gain);
+        assert_eq!(state_channel.pan, compiled_channel.parameters().pan);
+        assert_eq!(state_channel.muted, compiled_channel.muted());
+        assert_eq!(state_channel.solo, compiled_channel.solo());
+        assert_eq!(state_channel.sends.len(), compiled_channel.sends().len());
+        for (state_send, compiled_send) in state_channel.sends.iter().zip(compiled_channel.sends())
+        {
+            assert_eq!(state_send.id, compiled_send.id());
+            assert_eq!(state_send.gain, compiled_send.parameters().gain);
+            assert_eq!(state_send.pan, compiled_send.parameters().pan);
+            assert_eq!(state_send.enabled, compiled_send.enabled());
+        }
+    }
+    assert_eq!(state.main_gain, fixture.mixer.main_gain());
+    assert_eq!(state.main_muted, fixture.mixer.main_muted());
 }
 
 #[test]

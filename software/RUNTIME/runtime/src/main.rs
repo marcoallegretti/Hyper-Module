@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+mod mixer_update;
 mod scene_performance;
 
 use std::cell::{Cell, RefCell};
@@ -47,11 +48,16 @@ use hyper_playback_session::{PlaybackExtent, PlaybackSessionAssemblyLimits};
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackLimits};
 use hyper_runtime_deployment::resolve_runtime_deployment;
 use hyper_runtime_host::{PanelHost, RuntimeArguments, ServedPanel, serve_panels_with_idle};
+use hyper_runtime_mixer_update::{RuntimeMixerUpdateDirectory, RuntimeMixerUpdateSource};
 use hyper_scene_performance::{
     RuntimeScenePerformanceSource, RuntimeScenePerformanceUpdateDirectory, sha256_hex,
 };
 use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
 
+use mixer_update::{
+    RuntimeMixerUpdateConfiguration, RuntimeMixerUpdateController, RuntimeMixerUpdateObservation,
+    RuntimeMixerUpdatePoll,
+};
 use scene_performance::{
     RuntimeScenePerformanceCaptureConfiguration, RuntimeScenePerformanceCaptureController,
     RuntimeScenePerformanceCaptureObservation, RuntimeScenePerformanceCapturePoll,
@@ -80,6 +86,7 @@ const HEARTBEAT_TIMEOUT_MS: u32 = 500;
 /// sole control runtime, so it is the only thing that can answer these.
 struct SessionHost {
     session: DesktopPlaybackSession,
+    mixer_update: RuntimeMixerUpdateController,
     scene_performance: RuntimeScenePerformanceCaptureController,
     panel_connected: Arc<AtomicBool>,
 }
@@ -143,7 +150,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let arguments = RuntimeArguments::parse(std::env::args().skip(1)).map_err(|error| {
         format!(
-            "{error}\nusage: hyper-runtime <deployment-target-directory> [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--operator-ui]"
+            "{error}\nusage: hyper-runtime <deployment-target-directory> [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--mixer-updates DIRECTORY] [--operator-ui]"
         )
     })?;
 
@@ -230,6 +237,7 @@ struct RuntimeObservers {
     output_counters: OutputStreamCounters,
     recovery: PlaybackRecoveryCheckpoint,
     panel_connected: Arc<AtomicBool>,
+    mixer_update: Arc<Mutex<RuntimeMixerUpdateObservation>>,
     scene_performance: Arc<Mutex<RuntimeScenePerformanceCaptureObservation>>,
 }
 
@@ -360,6 +368,7 @@ struct StartedRuntime {
 enum OperatorCommand {
     Start,
     Stop,
+    ExportMixerUpdate,
     StartScenePerformanceCapture,
     StopScenePerformanceCapture,
     ReturnToStart,
@@ -506,6 +515,13 @@ trait RuntimeScenePerformanceControl {
     fn poll_scene_performance_capture(&mut self) -> Option<String>;
 }
 
+/// Mixer-update export remains with the same owner as live mixer commands.
+trait RuntimeMixerUpdateControl {
+    fn export_mixer_update(&mut self) -> Result<String, String>;
+
+    fn poll_mixer_update_export(&mut self) -> Option<String>;
+}
+
 trait RuntimeOutputObservation {
     fn output_state(&self) -> OutputStreamState;
 }
@@ -587,6 +603,39 @@ impl RuntimeScenePerformanceControl for SessionHost {
     }
 }
 
+impl RuntimeMixerUpdateControl for SessionHost {
+    fn export_mixer_update(&mut self) -> Result<String, String> {
+        let update = &mut self.mixer_update;
+        let session = &mut self.session;
+        update.request_export(session).map_or_else(
+            |error| Err(error.to_string()),
+            |fence_sequence| {
+                Ok(format!(
+                    "mixer-update export queued at committed mixer fence {fence_sequence}"
+                ))
+            },
+        )
+    }
+
+    fn poll_mixer_update_export(&mut self) -> Option<String> {
+        let update = &mut self.mixer_update;
+        let session = &mut self.session;
+        match update.poll(session) {
+            Some(RuntimeMixerUpdatePoll::Saved(saved)) => Some(format!(
+                "mixer update published to {}",
+                saved.path.display()
+            )),
+            Some(RuntimeMixerUpdatePoll::NoChanges) => {
+                Some("mixer update not published: no committed mixer changes".to_owned())
+            }
+            Some(RuntimeMixerUpdatePoll::Failed(error)) => {
+                Some(format!("mixer-update export failed: {error}"))
+            }
+            None => None,
+        }
+    }
+}
+
 fn operator_timeline_marker_catalog(
     markers: &[LoadedTimelineMarker],
     timeline: &RuntimeMusicalTimeline,
@@ -624,6 +673,7 @@ fn operator_timeline_marker(
 struct PreparedRuntimeStartup {
     facts: RuntimeFacts,
     project: PreparedProjectPlayback,
+    mixer_update: RuntimeMixerUpdateConfiguration,
     scene_performance: RuntimeScenePerformanceCaptureConfiguration,
 }
 
@@ -642,8 +692,10 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
         )
     })?;
     let scene_performance_output = open_runtime_scene_performance_output(arguments)?;
-    let manifest = deployment.bundle().project().package().manifest();
-    let (project, ..) = deployment.bundle().project().session().parts();
+    let mixer_update_output = open_runtime_mixer_update_output(arguments)?;
+    let prepared_project = deployment.bundle().project();
+    let manifest = prepared_project.package().manifest();
+    let (project, ..) = prepared_project.session().parts();
     let musical_timeline = RuntimeMusicalTimeline::try_new(
         project.sample_rate_hz(),
         project.tempo_events(),
@@ -671,6 +723,24 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
     .map_err(|error| {
         format!("verified Runtime scene-performance configuration could not be prepared: {error}")
     })?;
+    let mixer_update_source = RuntimeMixerUpdateSource::try_new(
+        manifest.project_id().to_owned(),
+        manifest.revision(),
+        sha256_hex(prepared_project.package().manifest_sha256()),
+        bundle_identity.clone(),
+        deployment.generation(),
+    )
+    .map_err(|error| {
+        format!("verified Runtime mixer-update source could not be prepared: {error}")
+    })?;
+    let mixer_update = RuntimeMixerUpdateConfiguration::try_new(
+        mixer_update_source,
+        prepared_project,
+        mixer_update_output,
+    )
+    .map_err(|error| {
+        format!("verified Runtime mixer-update configuration could not be prepared: {error}")
+    })?;
     let facts = RuntimeFacts {
         bundle_identity,
         deployment_generation: deployment.generation(),
@@ -685,34 +755,45 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
     Ok(PreparedRuntimeStartup {
         facts,
         project: deployment.into_bundle().into_project(),
+        mixer_update,
         scene_performance,
     })
 }
 
 fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String> {
-    let (facts, session, scene_performance, scene_performance_observation) =
-        prepare_output_and_host(
-            || prepare_runtime_startup(arguments),
-            || {
-                DesktopOutputConfig::try_new(SAMPLE_RATE_HZ, MAXIMUM_BLOCK_FRAMES)
-                    .map_err(|error| format!("output configuration is invalid: {error}"))
-            },
-            |output, startup| {
-                let mut session = DesktopPlaybackSession::start_project(output, startup.project)
-                    .map_err(|error| format!("verified bundle could not be hosted: {error}"))?;
-                let receiver = session.take_scene_launch_receiver().ok_or_else(|| {
-                    "verified bundle could not transfer committed scene-launch authority".to_owned()
-                })?;
-                let scene_performance = startup.scene_performance.attach(receiver);
-                let scene_performance_observation = scene_performance.observation();
-                Ok((
-                    startup.facts,
-                    session,
-                    scene_performance,
-                    scene_performance_observation,
-                ))
-            },
-        )?;
+    let (
+        facts,
+        session,
+        mixer_update,
+        mixer_update_observation,
+        scene_performance,
+        scene_performance_observation,
+    ) = prepare_output_and_host(
+        || prepare_runtime_startup(arguments),
+        || {
+            DesktopOutputConfig::try_new(SAMPLE_RATE_HZ, MAXIMUM_BLOCK_FRAMES)
+                .map_err(|error| format!("output configuration is invalid: {error}"))
+        },
+        |output, startup| {
+            let mut session = DesktopPlaybackSession::start_project(output, startup.project)
+                .map_err(|error| format!("verified bundle could not be hosted: {error}"))?;
+            let receiver = session.take_scene_launch_receiver().ok_or_else(|| {
+                "verified bundle could not transfer committed scene-launch authority".to_owned()
+            })?;
+            let scene_performance = startup.scene_performance.attach(receiver);
+            let scene_performance_observation = scene_performance.observation();
+            let mixer_update = startup.mixer_update.attach();
+            let mixer_update_observation = mixer_update.observation();
+            Ok((
+                startup.facts,
+                session,
+                mixer_update,
+                mixer_update_observation,
+                scene_performance,
+                scene_performance_observation,
+            ))
+        },
+    )?;
     let panel_connected = Arc::new(AtomicBool::new(false));
     let observers = RuntimeObservers {
         facts,
@@ -720,11 +801,13 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         output_counters: session.counters(),
         recovery: session.recovery_checkpoint(),
         panel_connected: Arc::clone(&panel_connected),
+        mixer_update: mixer_update_observation,
         scene_performance: scene_performance_observation,
     };
     Ok(StartedRuntime {
         host: SessionHost {
             session,
+            mixer_update,
             scene_performance,
             panel_connected,
         },
@@ -762,6 +845,43 @@ fn open_runtime_scene_performance_output(
     if output_root.starts_with(&deployment_root) {
         return Err(format!(
             "scene-performance output directory {} must be outside deployment target {}",
+            output.root_path().display(),
+            arguments.deployment_root().display()
+        ));
+    }
+    Ok(Some(output))
+}
+
+/// Opens an explicit Runtime mixer-update directory only when it is outside
+/// the verified deployment tree. The Runtime never writes an update into its
+/// deployment, bundle, or embedded project package.
+fn open_runtime_mixer_update_output(
+    arguments: &RuntimeArguments,
+) -> Result<Option<RuntimeMixerUpdateDirectory>, String> {
+    let Some(path) = arguments.mixer_updates() else {
+        return Ok(None);
+    };
+    let output = RuntimeMixerUpdateDirectory::open(path).map_err(|error| {
+        format!(
+            "mixer-update output directory {} is invalid: {error}",
+            path.display()
+        )
+    })?;
+    let deployment_root = std::fs::canonicalize(arguments.deployment_root()).map_err(|error| {
+        format!(
+            "verified deployment root {} cannot be canonicalized for mixer-update output isolation: {error}",
+            arguments.deployment_root().display()
+        )
+    })?;
+    let output_root = std::fs::canonicalize(output.root_path()).map_err(|error| {
+        format!(
+            "mixer-update output directory {} cannot be canonicalized: {error}",
+            output.root_path().display()
+        )
+    })?;
+    if output_root.starts_with(&deployment_root) {
+        return Err(format!(
+            "mixer-update output directory {} must be outside deployment target {}",
             output.root_path().display(),
             arguments.deployment_root().display()
         ));
@@ -811,7 +931,10 @@ fn host_runtime<H, O>(
     diagnostic: &dyn Fn(String),
 ) -> Result<(), String>
 where
-    H: PanelHost + RuntimeOperatorControl + RuntimeScenePerformanceControl,
+    H: PanelHost
+        + RuntimeMixerUpdateControl
+        + RuntimeOperatorControl
+        + RuntimeScenePerformanceControl,
     O: RuntimeOutputObservation,
 {
     let mut owner_turn = |host: &mut H| {
@@ -823,6 +946,9 @@ where
             drain_operator_commands(host, commands, stop, diagnostic);
         }
         if let Some(message) = host.poll_scene_performance_capture() {
+            diagnostic(message);
+        }
+        if let Some(message) = host.poll_mixer_update_export() {
             diagnostic(message);
         }
     };
@@ -935,7 +1061,9 @@ fn finish_runtime_output<O: RuntimeOutputObservation>(
     clippy::too_many_lines,
     reason = "the bounded operator command dispatcher keeps every queue outcome explicit"
 )]
-fn drain_operator_commands<H: RuntimeOperatorControl + RuntimeScenePerformanceControl>(
+fn drain_operator_commands<
+    H: RuntimeMixerUpdateControl + RuntimeOperatorControl + RuntimeScenePerformanceControl,
+>(
     host: &mut H,
     commands: &Receiver<OperatorCommand>,
     stop: &AtomicBool,
@@ -958,6 +1086,10 @@ fn drain_operator_commands<H: RuntimeOperatorControl + RuntimeScenePerformanceCo
             OperatorCommand::Stop => match host.queue_transport(TransportCommand::Stop) {
                 Ok(()) => diagnostic("transport stop queued".to_owned()),
                 Err(error) => diagnostic(format!("transport stop refused: {error}")),
+            },
+            OperatorCommand::ExportMixerUpdate => match host.export_mixer_update() {
+                Ok(message) => diagnostic(message),
+                Err(error) => diagnostic(format!("mixer-update export refused: {error}")),
             },
             OperatorCommand::StartScenePerformanceCapture => {
                 match host.start_scene_performance_capture() {
@@ -1577,6 +1709,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_peak_reset(&ui, &meter_observer, &loudness_authority);
     wire_operator_loudness_controls(&ui, &commands_tx, &diagnostic, &loudness_authority);
     wire_operator_mixer_controls(&ui, &commands_tx, &diagnostic, &mixer_authority);
+    wire_operator_mixer_update_export(&ui, &commands_tx, &diagnostic, &observers.mixer_update);
     wire_operator_native_device_controls(
         &ui,
         &commands_tx,
@@ -1648,6 +1781,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         false,
     );
     apply_operator_scene_performance_observation(&ui, observers.scene_performance.as_ref(), false);
+    apply_operator_mixer_update_observation(&ui, observers.mixer_update.as_ref(), false);
 
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
@@ -1669,6 +1803,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_native_device_model = Rc::clone(&native_device_model);
     let timer_native_device_authority = Rc::clone(&native_device_authority);
     let timer_scene_performance = Arc::clone(&observers.scene_performance);
+    let timer_mixer_update = Arc::clone(&observers.mixer_update);
     let timer_native_devices = native_devices;
     let timer_mixer_channels = mixer_channels;
     let timer_mixer_sends = mixer_sends;
@@ -1724,6 +1859,11 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
             apply_operator_scene_performance_observation(
                 &ui,
                 timer_scene_performance.as_ref(),
+                terminal_latched,
+            );
+            apply_operator_mixer_update_observation(
+                &ui,
+                timer_mixer_update.as_ref(),
                 terminal_latched,
             );
             if !completion_observed
@@ -2434,6 +2574,41 @@ fn wire_operator_scene_performance_capture(
             OperatorCommand::StopScenePerformanceCapture,
             &stop_diagnostic,
         );
+    });
+}
+
+/// Forwards only an export that the Runtime-owned mixer observation enables.
+///
+/// The UI neither snapshots nor persists mixer state itself. It simply queues
+/// an explicit request for the sole Runtime owner, which publishes the next
+/// observation after accepting or refusing it.
+fn wire_operator_mixer_update_export(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    observation: &Arc<Mutex<RuntimeMixerUpdateObservation>>,
+) {
+    let sender = sender.clone();
+    let diagnostic = Arc::clone(diagnostic);
+    let observation = Arc::clone(observation);
+    let weak = ui.as_weak();
+    ui.on_export_mixer_update_requested(move || {
+        let export_enabled = weak
+            .upgrade()
+            .is_some_and(|ui| ui.get_mixer_update_export_enabled())
+            && observation
+                .lock()
+                .map(|observation| observation.export_enabled)
+                .unwrap_or(false);
+        if !export_enabled {
+            set_diagnostic(
+                &diagnostic,
+                "mixer-update export refused: committed Runtime mixer state is unavailable"
+                    .to_owned(),
+            );
+            return;
+        }
+        send_operator_command(&sender, OperatorCommand::ExportMixerUpdate, &diagnostic);
     });
 }
 
@@ -4249,6 +4424,29 @@ fn apply_operator_scene_performance_observation(
     ui.set_scene_performance_stop_enabled(observation.stop_enabled);
 }
 
+fn apply_operator_mixer_update_observation(
+    ui: &OperatorWindow,
+    observation: &Mutex<RuntimeMixerUpdateObservation>,
+    terminal_latched: bool,
+) {
+    if terminal_latched {
+        revoke_operator_mixer_update_authority(ui);
+        return;
+    }
+    let Ok(observation) = observation.lock() else {
+        ui.set_mixer_update_state("Runtime mixer-update state unavailable".into());
+        ui.set_mixer_update_export_enabled(false);
+        return;
+    };
+    ui.set_mixer_update_state(observation.state.clone().into());
+    ui.set_mixer_update_export_enabled(observation.export_enabled);
+}
+
+fn revoke_operator_mixer_update_authority(ui: &OperatorWindow) {
+    ui.set_mixer_update_state("Runtime stopped · mixer update unavailable".into());
+    ui.set_mixer_update_export_enabled(false);
+}
+
 fn revoke_operator_scene_performance_authority(ui: &OperatorWindow) {
     ui.set_scene_performance_state("Runtime stopped · capture unavailable".into());
     ui.set_scene_performance_start_enabled(false);
@@ -4881,6 +5079,13 @@ mod tests {
         }))
     }
 
+    fn test_mixer_update_observation() -> Arc<Mutex<RuntimeMixerUpdateObservation>> {
+        Arc::new(Mutex::new(RuntimeMixerUpdateObservation {
+            state: "fixture mixer-update state".to_owned(),
+            export_enabled: false,
+        }))
+    }
+
     struct RuntimeTemporaryDirectory {
         path: PathBuf,
     }
@@ -4920,6 +5125,19 @@ mod tests {
         let mut arguments = Vec::new();
         if let Some(output) = output {
             arguments.push("--performance-updates".to_owned());
+            arguments.push(output.display().to_string());
+        }
+        arguments.push(deployment.display().to_string());
+        RuntimeArguments::parse(arguments).expect("construct Runtime arguments")
+    }
+
+    fn runtime_arguments_with_mixer_update_output(
+        deployment: &Path,
+        output: Option<&Path>,
+    ) -> RuntimeArguments {
+        let mut arguments = Vec::new();
+        if let Some(output) = output {
+            arguments.push("--mixer-updates".to_owned());
             arguments.push(output.display().to_string());
         }
         arguments.push(deployment.display().to_string());
@@ -5345,6 +5563,48 @@ mod tests {
     }
 
     #[test]
+    fn mixer_update_output_is_explicit_and_outside_the_deployment_tree() {
+        let temporary = RuntimeTemporaryDirectory::new();
+        let deployment = temporary.child("deployment");
+        let output = temporary.child("mixer-updates");
+        fs::create_dir(&deployment).unwrap();
+        fs::create_dir(&output).unwrap();
+
+        let disabled = runtime_arguments_with_mixer_update_output(&deployment, None);
+        assert!(
+            open_runtime_mixer_update_output(&disabled)
+                .unwrap()
+                .is_none()
+        );
+
+        let arguments = runtime_arguments_with_mixer_update_output(&deployment, Some(&output));
+        let retained = open_runtime_mixer_update_output(&arguments)
+            .unwrap()
+            .expect("the explicit external directory is retained");
+        assert_eq!(retained.root_path(), output);
+        assert!(retained.root_path().starts_with(temporary.path()));
+    }
+
+    #[test]
+    fn mixer_update_output_never_targets_the_deployment_tree() {
+        let temporary = RuntimeTemporaryDirectory::new();
+        let deployment = temporary.child("deployment");
+        let output = deployment.join("mixer-updates");
+        fs::create_dir(&deployment).unwrap();
+        fs::create_dir(&output).unwrap();
+        let arguments = runtime_arguments_with_mixer_update_output(&deployment, Some(&output));
+
+        let Err(error) = open_runtime_mixer_update_output(&arguments) else {
+            panic!("a deployment child cannot be used for mixer updates");
+        };
+        assert!(
+            error.contains("must be outside deployment target"),
+            "{error}"
+        );
+        assert!(fs::read_dir(&output).unwrap().next().is_none());
+    }
+
+    #[test]
     fn an_unavailable_panel_listener_keeps_the_runtime_owner_until_quit() {
         let occupied = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = occupied.local_addr().unwrap();
@@ -5428,6 +5688,8 @@ mod tests {
         loudness_commands: Vec<LoudnessMeasurementCommand>,
         mixer_commands: Vec<MixerParameterCommand>,
         native_device_commands: Vec<NativeDeviceCommand>,
+        mixer_update_commands: usize,
+        mixer_update_poll: Option<String>,
         scene_performance_commands: Vec<OperatorScenePerformanceAction>,
         scene_performance_poll: Option<String>,
         reject: bool,
@@ -5501,6 +5763,21 @@ mod tests {
 
         fn poll_scene_performance_capture(&mut self) -> Option<String> {
             self.scene_performance_poll.take()
+        }
+    }
+
+    impl RuntimeMixerUpdateControl for OperatorControl {
+        fn export_mixer_update(&mut self) -> Result<String, String> {
+            if self.reject {
+                Err("owner busy".to_owned())
+            } else {
+                self.mixer_update_commands = self.mixer_update_commands.saturating_add(1);
+                Ok("mixer-update export queued".to_owned())
+            }
+        }
+
+        fn poll_mixer_update_export(&mut self) -> Option<String> {
+            self.mixer_update_poll.take()
         }
     }
 
@@ -5583,6 +5860,7 @@ mod tests {
         sender
             .send(OperatorCommand::StopScenePerformanceCapture)
             .unwrap();
+        sender.send(OperatorCommand::ExportMixerUpdate).unwrap();
         sender.send(OperatorCommand::ResetLoudness).unwrap();
         drain_operator_commands(&mut owner, &receiver, &stop, &|message| {
             diagnostics.borrow_mut().push(message);
@@ -5620,6 +5898,7 @@ mod tests {
                 OperatorScenePerformanceAction::Stop,
             ]
         );
+        assert_eq!(owner.mixer_update_commands, 1);
         assert_eq!(
             diagnostics.into_inner(),
             [
@@ -5633,6 +5912,7 @@ mod tests {
                 "programme loudness standby queued",
                 "scene-performance capture started",
                 "scene-performance capture stop requested",
+                "mixer-update export queued",
                 "programme loudness reset queued",
             ]
         );
@@ -5704,6 +5984,50 @@ mod tests {
         assert_eq!(
             diagnostic.lock().unwrap().as_str(),
             "scene-performance capture stop refused: committed Runtime capture state is unavailable"
+        );
+    }
+
+    #[test]
+    fn mixer_update_export_control_follows_committed_runtime_observation() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = OperatorWindow::new().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let diagnostic = Arc::new(Mutex::new(String::new()));
+        let observation = test_mixer_update_observation();
+        wire_operator_mixer_update_export(&ui, &sender, &diagnostic, &observation);
+        apply_operator_mixer_update_observation(&ui, observation.as_ref(), false);
+
+        ui.invoke_export_mixer_update_requested();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "mixer-update export refused: committed Runtime mixer state is unavailable"
+        );
+
+        *observation.lock().unwrap() = RuntimeMixerUpdateObservation {
+            state: "Ready to export the committed mixer state".to_owned(),
+            export_enabled: true,
+        };
+        apply_operator_mixer_update_observation(&ui, observation.as_ref(), false);
+        assert_eq!(
+            ui.get_mixer_update_state().as_str(),
+            "Ready to export the committed mixer state"
+        );
+        assert!(ui.get_mixer_update_export_enabled());
+
+        ui.invoke_export_mixer_update_requested();
+        assert_eq!(receiver.try_recv(), Ok(OperatorCommand::ExportMixerUpdate));
+        assert!(
+            ui.get_mixer_update_export_enabled(),
+            "the UI retains the committed presentation until Runtime publishes another one"
+        );
+
+        revoke_operator_mixer_update_authority(&ui);
+        ui.invoke_export_mixer_update_requested();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "mixer-update export refused: committed Runtime mixer state is unavailable"
         );
     }
 
@@ -5979,6 +6303,7 @@ mod tests {
             output_counters: OutputStreamCounters::default(),
             recovery: PlaybackRecoveryCheckpoint::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
+            mixer_update: test_mixer_update_observation(),
             scene_performance: test_scene_performance_observation(),
         };
         let marker_model = Rc::new(VecModel::from(operator_timeline_marker_rows(&markers)));
@@ -8605,6 +8930,7 @@ mod tests {
             output_counters: OutputStreamCounters::default(),
             recovery: recovery.clone(),
             panel_connected: Arc::new(AtomicBool::new(false)),
+            mixer_update: test_mixer_update_observation(),
             scene_performance: test_scene_performance_observation(),
         };
         let _ = apply_observations(
@@ -8710,6 +9036,7 @@ mod tests {
             output_counters: OutputStreamCounters::default(),
             recovery: PlaybackRecoveryCheckpoint::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
+            mixer_update: test_mixer_update_observation(),
             scene_performance: test_scene_performance_observation(),
         };
         apply_static_facts(&ui, &facts);
@@ -8956,6 +9283,7 @@ mod tests {
             output_counters: OutputStreamCounters::default(),
             recovery: terminal_recovery,
             panel_connected: Arc::new(AtomicBool::new(false)),
+            mixer_update: test_mixer_update_observation(),
             scene_performance: test_scene_performance_observation(),
         };
         let terminal_operator_scenes = [OperatorScene {

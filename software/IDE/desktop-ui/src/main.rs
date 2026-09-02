@@ -53,9 +53,9 @@ use hyper_desktop_ide::{
     IdeArrangementPlacementEditError, IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError,
     IdeAudioClipLoopEditError, IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
     IdeAudioClipSourceTrimEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
-    IdeAudioImportError, IdeAutomationTakeEditError, IdeRuntimeScenePerformanceImportError,
-    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneRemovalError, IdeSceneRenameError,
-    IdeSceneSlotEditError, IdeTempoEditError,
+    IdeAudioImportError, IdeAutomationTakeEditError, IdeRuntimeMixerUpdateImportError,
+    IdeRuntimeScenePerformanceImportError, IdeSceneCreationError, IdeSceneDuplicationError,
+    IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEditError, IdeTempoEditError,
 };
 #[cfg(test)]
 use hyper_mixer_runtime::PlaybackRecoverySnapshot;
@@ -83,6 +83,7 @@ const FINAL_OUTPUT_METER_FLOOR_DBFS: f32 = -60.0;
 const INPUT_METER_FLOOR_DBFS: f32 = -60.0;
 const MIXER_STRIP_METER_FLOOR_DBFS: f32 = -60.0;
 const RUNTIME_SCENE_PERFORMANCE_IMPORT_FILTER_LABEL: &str = "Runtime scene-performance updates";
+const RUNTIME_MIXER_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime mixer updates";
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
@@ -102,6 +103,12 @@ enum AudioImportChoice {
 
 #[derive(Debug)]
 enum RuntimeScenePerformanceImportChoice {
+    Selected(PathBuf),
+    Cancelled,
+}
+
+#[derive(Debug)]
+enum RuntimeMixerUpdateImportChoice {
     Selected(PathBuf),
     Cancelled,
 }
@@ -563,6 +570,7 @@ fn bind_callbacks(
     bind_recording_callbacks(ui, worker, &routes.recordings);
     bind_scene_performance_capture_callbacks(ui, worker);
     bind_runtime_scene_performance_import_callback(ui, worker);
+    bind_runtime_mixer_update_import_callback(ui, worker);
     bind_audio_preview_callbacks(ui, worker, &routes.takes);
     bind_audio_import_callback(ui, worker, &routes.audio_imports);
 }
@@ -1481,6 +1489,83 @@ fn bind_runtime_scene_performance_import_callback_with(
         }
         ui.set_app_mode(AppMode::ImportingRuntimeScenePerformance);
         ui.set_status_text("Waiting for a Runtime scene-performance update…".into());
+        ui.set_error_text(SharedString::default());
+        choose(weak.clone(), Rc::clone(&worker));
+    });
+}
+
+fn bind_runtime_mixer_update_import_callback(ui: &MainWindow, worker: &WorkerCell) {
+    bind_runtime_mixer_update_import_callback_with(ui, worker, |weak, worker| {
+        let weak_for_dialog = weak.clone();
+        let spawn_result = slint::spawn_local(async move {
+            let selection = rfd::AsyncFileDialog::new()
+                .set_title("Import Runtime mixer update")
+                .add_filter(RUNTIME_MIXER_UPDATE_IMPORT_FILTER_LABEL, &["json"])
+                .pick_file()
+                .await;
+            let Some(ui) = weak_for_dialog.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::ImportingRuntimeMixerUpdate {
+                return;
+            }
+            let choice = selection.map_or(RuntimeMixerUpdateImportChoice::Cancelled, |selection| {
+                RuntimeMixerUpdateImportChoice::Selected(selection.path().to_path_buf())
+            });
+            complete_runtime_mixer_update_import_choice(&ui, &worker, choice);
+        });
+        if spawn_result.is_err()
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime mixer-update selection is unavailable".into());
+        }
+    });
+}
+
+fn complete_runtime_mixer_update_import_choice(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    choice: RuntimeMixerUpdateImportChoice,
+) {
+    complete_runtime_mixer_update_import_choice_with(ui, choice, |command| {
+        submit_to_ui(ui, worker, command);
+    });
+}
+
+fn complete_runtime_mixer_update_import_choice_with(
+    ui: &MainWindow,
+    choice: RuntimeMixerUpdateImportChoice,
+    submit: impl FnOnce(IdeWorkerCommand),
+) {
+    match choice {
+        RuntimeMixerUpdateImportChoice::Selected(path) => {
+            submit(IdeWorkerCommand::ImportRuntimeMixerUpdate { path });
+        }
+        RuntimeMixerUpdateImportChoice::Cancelled => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime mixer update import cancelled".into());
+        }
+    }
+}
+
+fn bind_runtime_mixer_update_import_callback_with(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell) + 'static,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    actions.on_import_runtime_mixer_update(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        ui.set_app_mode(AppMode::ImportingRuntimeMixerUpdate);
+        ui.set_status_text("Waiting for a Runtime mixer update…".into());
         ui.set_error_text(SharedString::default());
         choose(weak.clone(), Rc::clone(&worker));
     });
@@ -6403,6 +6488,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::ImportRuntimeScenePerformance => {
             AppMode::ImportingRuntimeScenePerformance
         }
+        IdeWorkerCommandKind::ImportRuntimeMixerUpdate => AppMode::ImportingRuntimeMixerUpdate,
         IdeWorkerCommandKind::SetArrangementPlacementActive
         | IdeWorkerCommandKind::MoveArrangementPlacement
         | IdeWorkerCommandKind::SetArrangementPlacementDuration
@@ -6638,6 +6724,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::ImportRuntimeScenePerformance => {
             "Verifying Runtime scene performance and reopening project after one arrangement edit…"
+        }
+        IdeWorkerCommandKind::ImportRuntimeMixerUpdate => {
+            "Verifying the Runtime mixer update and waiting for a clean committed mixer checkpoint…"
         }
         IdeWorkerCommandKind::SetArrangementPlacementActive => {
             "Preserving mixer state, updating the arrangement placement, and reopening project…"
@@ -7437,6 +7526,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::RuntimeScenePerformanceImporting { .. }
         | IdeWorkerEvent::RuntimeScenePerformanceImported { .. }) => {
             apply_runtime_scene_performance_import_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::RuntimeMixerUpdateImporting
+        | IdeWorkerEvent::RuntimeMixerUpdateImported { .. }) => {
+            apply_runtime_mixer_update_import_event(ui, &event);
         }
         event @ (IdeWorkerEvent::ScenePerformanceCaptureStarted { .. }
         | IdeWorkerEvent::ScenePerformanceCaptureProgress { .. }
@@ -10581,6 +10674,34 @@ fn apply_runtime_scene_performance_import_event(ui: &MainWindow, event: &IdeWork
     }
 }
 
+fn apply_runtime_mixer_update_import_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::RuntimeMixerUpdateImporting => {
+            ui.set_app_mode(AppMode::ImportingRuntimeMixerUpdate);
+            ui.set_status_text(
+                "Verifying the Runtime mixer update and waiting for a clean committed mixer checkpoint…"
+                    .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RuntimeMixerUpdateImported { revision, changed } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(
+                if *changed {
+                    format!("Imported Runtime mixer update in project revision {revision}")
+                } else {
+                    format!(
+                        "Runtime mixer update already matches project revision {revision}; project unchanged"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("Runtime mixer-update import dispatcher received another event"),
+    }
+}
+
 fn apply_mixer_automation_capture_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::MixerAutomationCaptureStarted {
@@ -11451,6 +11572,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::ImportAudio if current == AppMode::ImportingAudio => AppMode::Running,
         IdeWorkerCommandKind::ImportRuntimeScenePerformance
             if current == AppMode::ImportingRuntimeScenePerformance =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::ImportRuntimeMixerUpdate
+            if current == AppMode::ImportingRuntimeMixerUpdate =>
         {
             AppMode::Running
         }
@@ -25629,6 +25755,7 @@ mod tests {
         assert_recent_project_window_contract(ui);
         assert_audio_import_window_contract(ui);
         assert_runtime_scene_performance_import_window_contract(ui);
+        assert_runtime_mixer_update_import_window_contract(ui);
         assert_audio_track_content_removal_window_contract(ui);
         assert_audio_track_freeze_window_contract(ui);
         assert_audio_track_flatten_window_contract(ui);
@@ -25748,6 +25875,11 @@ mod tests {
     fn assert_runtime_scene_performance_import_window_contract(ui: &MainWindow) {
         assert_runtime_scene_performance_import_callback_contract(ui);
         assert_runtime_scene_performance_import_event_contract(ui);
+    }
+
+    fn assert_runtime_mixer_update_import_window_contract(ui: &MainWindow) {
+        assert_runtime_mixer_update_import_callback_contract(ui);
+        assert_runtime_mixer_update_import_event_contract(ui);
     }
 
     fn assert_runtime_scene_performance_import_callback_contract(ui: &MainWindow) {
@@ -25877,6 +26009,156 @@ mod tests {
             mode_after_failure(
                 AppMode::ImportingRuntimeScenePerformance,
                 IdeWorkerCommandKind::ImportRuntimeScenePerformance,
+            ),
+            AppMode::Running
+        );
+    }
+
+    fn assert_runtime_mixer_update_import_callback_contract(ui: &MainWindow) {
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        bind_runtime_mixer_update_import_callback_with(ui, &worker, move |weak, _| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_mixer_update_import_choice_with(
+                &ui,
+                RuntimeMixerUpdateImportChoice::Selected(PathBuf::from(
+                    "mixer.hyper-mixer-update.json",
+                )),
+                |command| submitted_by_callback.borrow_mut().push(command),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.set_error_text("stale error".into());
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_mixer_update();
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::ImportRuntimeMixerUpdate { path }]
+                if path == &PathBuf::from("mixer.hyper-mixer-update.json")
+        ));
+        assert_eq!(ui.get_app_mode(), AppMode::ImportingRuntimeMixerUpdate);
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::Closed);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_mixer_update();
+        assert_eq!(
+            submitted.borrow().len(),
+            1,
+            "Closed mode owns no Runtime mixer-update import action"
+        );
+
+        bind_runtime_mixer_update_import_callback_with(ui, &worker, move |weak, _| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_mixer_update_import_choice_with(
+                &ui,
+                RuntimeMixerUpdateImportChoice::Cancelled,
+                |_| panic!("a cancelled chooser must not submit a command"),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_mixer_update();
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime mixer update import cancelled"
+        );
+
+        bind_runtime_mixer_update_import_callback_with(ui, &worker, move |weak, worker| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_mixer_update_import_choice(
+                &ui,
+                &worker,
+                RuntimeMixerUpdateImportChoice::Selected(PathBuf::from(
+                    "mixer.hyper-mixer-update.json",
+                )),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_mixer_update();
+        assert_eq!(ui.get_app_mode(), AppMode::Unavailable);
+        assert!(ui.get_error_text().contains("no longer available"));
+    }
+
+    fn assert_runtime_mixer_update_import_event_contract(ui: &MainWindow) {
+        let routes = UiRoutes::default();
+        let project_state = Rc::new(ProjectUiState::default());
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeMixerUpdateImporting,
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::ImportingRuntimeMixerUpdate);
+        assert_eq!(
+            ui.get_status_text(),
+            "Verifying the Runtime mixer update and waiting for a clean committed mixer checkpoint…"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeMixerUpdateImported {
+                revision: 8,
+                changed: true,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Imported Runtime mixer update in project revision 8"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeMixerUpdateImported {
+                revision: 8,
+                changed: false,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime mixer update already matches project revision 8; project unchanged"
+        );
+
+        ui.set_app_mode(AppMode::ImportingRuntimeMixerUpdate);
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeMixerUpdateImport(Box::new(
+                    IdeRuntimeMixerUpdateImportError::LocalMixerChanges,
+                )),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(
+            ui.get_error_text()
+                .contains("overwrite local session mixer changes")
+        );
+
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+            ),
+            AppMode::ImportingRuntimeMixerUpdate
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ImportingRuntimeMixerUpdate,
+                IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
             ),
             AppMode::Running
         );
