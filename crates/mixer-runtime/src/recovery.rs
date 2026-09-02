@@ -28,6 +28,7 @@ pub struct PlaybackRecoverySnapshot {
     position_frame: usize,
     committed_cycle_count: u64,
     committed_capture_start_sequence: u64,
+    committed_transport_fence: u64,
     committed_mixer_fence: u64,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
@@ -48,6 +49,7 @@ impl PlaybackRecoverySnapshot {
             position_frame,
             committed_cycle_count: 0,
             committed_capture_start_sequence: 0,
+            committed_transport_fence: 0,
             committed_mixer_fence: 0,
             loop_range: None,
             loop_enabled: false,
@@ -76,6 +78,16 @@ impl PlaybackRecoverySnapshot {
     #[must_use]
     pub const fn committed_capture_start_sequence(&self) -> u64 {
         self.committed_capture_start_sequence
+    }
+
+    /// Returns the greatest transport fence represented by this coherent
+    /// successful-output snapshot.
+    ///
+    /// The acknowledgement belongs to the current transport queue owner and
+    /// is reset when recovery creates a new playback session.
+    #[must_use]
+    pub const fn committed_transport_fence(&self) -> u64 {
+        self.committed_transport_fence
     }
 
     /// Returns the greatest live mixer fence represented by this coherent
@@ -168,6 +180,7 @@ pub struct PlaybackCycleObservation {
     position_frame: usize,
     committed_cycle_count: u64,
     committed_capture_start_sequence: u64,
+    committed_transport_fence: u64,
     committed_mixer_fence: u64,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
@@ -200,6 +213,13 @@ impl PlaybackCycleObservation {
     #[must_use]
     pub const fn committed_capture_start_sequence(self) -> u64 {
         self.committed_capture_start_sequence
+    }
+
+    /// Returns the greatest transport fence represented by this coherent
+    /// successful-output observation.
+    #[must_use]
+    pub const fn committed_transport_fence(self) -> u64 {
+        self.committed_transport_fence
     }
 
     /// Returns the greatest live mixer fence represented by this coherent
@@ -725,6 +745,7 @@ struct PlaybackRecoveryState {
     position_frame: AtomicUsize,
     transport_state: AtomicU8,
     capture_start_sequence: AtomicU64,
+    transport_fence: AtomicU64,
     mixer_fence: AtomicU64,
     loop_observation: AtomicLoopObservation,
     metronome_observation: AtomicMetronomeObservation,
@@ -766,6 +787,7 @@ impl PlaybackRecoveryCheckpoint {
             let state = decode_state(self.inner.transport_state.load(Ordering::Relaxed));
             let committed_capture_start_sequence =
                 self.inner.capture_start_sequence.load(Ordering::Relaxed);
+            let committed_transport_fence = self.inner.transport_fence.load(Ordering::Relaxed);
             let committed_mixer_fence = self.inner.mixer_fence.load(Ordering::Relaxed);
             let (loop_range, loop_enabled) = self.inner.loop_observation.load();
             let mixer_parameter_state = self.inner.mixer_parameters.load();
@@ -778,6 +800,7 @@ impl PlaybackRecoveryCheckpoint {
                     position_frame,
                     committed_cycle_count: after / 2,
                     committed_capture_start_sequence,
+                    committed_transport_fence,
                     committed_mixer_fence,
                     loop_range,
                     loop_enabled,
@@ -803,6 +826,7 @@ impl PlaybackRecoveryCheckpoint {
             let state = decode_state(self.inner.transport_state.load(Ordering::Relaxed));
             let committed_capture_start_sequence =
                 self.inner.capture_start_sequence.load(Ordering::Relaxed);
+            let committed_transport_fence = self.inner.transport_fence.load(Ordering::Relaxed);
             let committed_mixer_fence = self.inner.mixer_fence.load(Ordering::Relaxed);
             let (loop_range, loop_enabled) = self.inner.loop_observation.load();
             let (metronome_available, metronome_enabled, metronome_gain) =
@@ -817,6 +841,7 @@ impl PlaybackRecoveryCheckpoint {
                     position_frame,
                     committed_cycle_count: after / 2,
                     committed_capture_start_sequence,
+                    committed_transport_fence,
                     committed_mixer_fence,
                     loop_range,
                     loop_enabled,
@@ -855,6 +880,7 @@ struct PlaybackCyclePublication {
     state: PlaybackRecoveryTransportState,
     position_frame: usize,
     capture_start_sequence: u64,
+    committed_transport_fence: u64,
     committed_mixer_fence: u64,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
@@ -893,6 +919,7 @@ impl PlaybackRecoveryPublisher {
                 },
                 position_frame: cycle.position_frame(),
                 capture_start_sequence: cycle.capture_start_sequence(),
+                committed_transport_fence: cycle.committed_transport_fence(),
                 committed_mixer_fence: cycle.committed_mixer_fence(),
                 loop_range: cycle.loop_range(),
                 loop_enabled: cycle.loop_enabled(),
@@ -920,6 +947,7 @@ impl PlaybackRecoveryPublisher {
                 state,
                 position_frame,
                 capture_start_sequence: 0,
+                committed_transport_fence: 0,
                 committed_mixer_fence: 0,
                 loop_range: None,
                 loop_enabled: false,
@@ -953,6 +981,11 @@ impl PlaybackRecoveryPublisher {
             self.inner
                 .capture_start_sequence
                 .fetch_max(publication.capture_start_sequence, Ordering::Relaxed);
+        }
+        if publication.committed_transport_fence != 0 {
+            self.inner
+                .transport_fence
+                .fetch_max(publication.committed_transport_fence, Ordering::Relaxed);
         }
         if publication.committed_mixer_fence != 0 {
             self.inner
@@ -1079,6 +1112,9 @@ pub fn playback_recovery_channel_with_initial_loop_metronome_and_native_device_s
         // Capture-start acknowledgement sequences belong to this queue owner,
         // so they must not survive a recovered playback session.
         capture_start_sequence: AtomicU64::new(0),
+        // Transport fences belong to the same queue owner and must not
+        // acknowledge commands issued by a prior native playback session.
+        transport_fence: AtomicU64::new(0),
         // Mixer fences belong to the same queue owner and must not acknowledge
         // commands issued by a prior native playback session.
         mixer_fence: AtomicU64::new(0),
@@ -1235,6 +1271,7 @@ mod tests {
             scene_launch_state: hyper_playback_compiler::scene::SceneLaunchState::default(),
             applied_command_count: 0,
             capture_start_sequence: 0,
+            committed_transport_fence: 0,
             command_sender_disconnected: false,
             applied_mixer_parameter_command_count: 0,
             committed_mixer_fence: 0,
@@ -1253,6 +1290,7 @@ mod tests {
                 position_frame: 0,
                 committed_cycle_count: 0,
                 committed_capture_start_sequence: 0,
+                committed_transport_fence: 0,
                 committed_mixer_fence: 0,
                 loop_range: None,
                 loop_enabled: false,
@@ -1267,6 +1305,7 @@ mod tests {
                 position_frame: 0,
                 committed_cycle_count: 0,
                 committed_capture_start_sequence: 0,
+                committed_transport_fence: 0,
                 committed_mixer_fence: 0,
                 loop_range: None,
                 loop_enabled: false,
@@ -1328,6 +1367,7 @@ mod tests {
                 position_frame: 256,
                 committed_cycle_count: 1,
                 committed_capture_start_sequence: 0,
+                committed_transport_fence: 0,
                 committed_mixer_fence: 0,
                 loop_range: None,
                 loop_enabled: false,
@@ -1350,6 +1390,7 @@ mod tests {
                 position_frame: 256,
                 committed_cycle_count: 2,
                 committed_capture_start_sequence: 0,
+                committed_transport_fence: 0,
                 committed_mixer_fence: 0,
                 loop_range: None,
                 loop_enabled: false,
@@ -1451,6 +1492,7 @@ mod tests {
                         state,
                         position_frame: generation,
                         capture_start_sequence: 0,
+                        committed_transport_fence: generation as u64,
                         committed_mixer_fence: generation as u64,
                         loop_range,
                         loop_enabled,
@@ -1476,6 +1518,7 @@ mod tests {
             if observation.committed_cycle_count() > 0 {
                 let generation = observation.position_frame();
                 assert_eq!(observation.committed_cycle_count(), generation as u64);
+                assert_eq!(observation.committed_transport_fence(), generation as u64);
                 assert_eq!(observation.committed_mixer_fence(), generation as u64);
                 let expected_state = if generation.is_multiple_of(2) {
                     PlaybackRecoveryTransportState::Stopped
@@ -1530,6 +1573,7 @@ mod tests {
             assert_eq!(snapshot.state(), expected);
             if snapshot.committed_cycle_count() > 0 {
                 assert_eq!(snapshot.committed_cycle_count(), generation as u64);
+                assert_eq!(snapshot.committed_transport_fence(), generation as u64);
                 assert_eq!(snapshot.committed_mixer_fence(), generation as u64);
                 let expected_loop = (!generation.is_multiple_of(4))
                     .then(|| TransportLoopRange::new(generation, generation + 10).unwrap());
@@ -1551,6 +1595,7 @@ mod tests {
             position_frame: 512,
             committed_cycle_count: 7,
             committed_capture_start_sequence: 0,
+            committed_transport_fence: 0,
             committed_mixer_fence: 0,
             loop_range: Some(TransportLoopRange::new(128, 640).unwrap()),
             loop_enabled: true,
@@ -1568,6 +1613,7 @@ mod tests {
                 position_frame: 512,
                 committed_cycle_count: 7,
                 committed_capture_start_sequence: 0,
+                committed_transport_fence: 0,
                 committed_mixer_fence: 0,
                 loop_range: Some(TransportLoopRange::new(128, 640).unwrap()),
                 loop_enabled: true,
@@ -1609,6 +1655,29 @@ mod tests {
 
         let (_reopened_publisher, reopened) = playback_recovery_channel(Some(&acknowledged), None);
         assert_eq!(reopened.snapshot().committed_mixer_fence(), 0);
+    }
+
+    #[test]
+    fn transport_fence_acknowledgement_is_coherent_and_session_local() {
+        let (mut publisher, checkpoint) = playback_recovery_channel(None, None);
+        let range = TransportLoopRange::new(64, 128).unwrap();
+        let mut cycle = transport_cycle_for_test();
+        cycle.committed_transport_fence = 7;
+        cycle.loop_range = Some(range);
+        cycle.loop_enabled = true;
+        publisher.publish_cycle(cycle, None);
+
+        let acknowledged = checkpoint.snapshot();
+        assert_eq!(acknowledged.committed_transport_fence(), 7);
+        assert_eq!(acknowledged.loop_range(), Some(range));
+        assert!(acknowledged.loop_enabled());
+        assert_eq!(checkpoint.observe_cycle().committed_transport_fence(), 7);
+
+        publisher.publish(PlaybackRecoveryTransportState::Stopped, 128, None);
+        assert_eq!(checkpoint.snapshot().committed_transport_fence(), 7);
+
+        let (_reopened_publisher, reopened) = playback_recovery_channel(Some(&acknowledged), None);
+        assert_eq!(reopened.snapshot().committed_transport_fence(), 0);
     }
 
     #[test]

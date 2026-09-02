@@ -702,6 +702,10 @@ impl SessionControlHandles {
         self.runtime_mut().sink_mut().try_send_mixer_fence()
     }
 
+    fn try_send_transport_fence(&mut self) -> Result<Option<u64>, DesktopDirectControlError> {
+        self.runtime_mut().sink_mut().try_send_transport_fence()
+    }
+
     fn committed_mixer_fence(&self) -> u64 {
         self.mixer().committed_fence()
     }
@@ -2139,6 +2143,18 @@ impl DesktopPlaybackSession {
     /// or a bounded-queue/disconnection rejection.
     pub fn try_send_mixer_fence(&mut self) -> Result<Option<u64>, DesktopDirectControlError> {
         self.controls.try_send_mixer_fence()
+    }
+
+    /// Allocates and enqueues a FIFO fence after all previously accepted
+    /// transport commands. Its sequence reaches recovery only after a
+    /// successful process cycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ok(None)` only after the nonzero sequence space is exhausted,
+    /// or a bounded-queue/disconnection rejection.
+    pub fn try_send_transport_fence(&mut self) -> Result<Option<u64>, DesktopDirectControlError> {
+        self.controls.try_send_transport_fence()
     }
 
     /// Returns the greatest mixer fence committed by a successful process
@@ -3610,6 +3626,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(controls.try_start_capture_transport().unwrap(), 1);
+        assert_eq!(controls.try_send_transport_fence().unwrap(), Some(1));
         assert_eq!(controls.try_send_mixer_fence().unwrap(), Some(1));
         assert_eq!(controls.committed_mixer_fence(), 0);
         assert_eq!(controls.mapping_statuses().len(), 1);

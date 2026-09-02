@@ -13,7 +13,7 @@ use hyper_mixer_runtime::{
     MixerParameterCommandSender, MixerParameterResolveError, MixerParameterStateSnapshot,
     MixerParameterTargetError, MixerSendHandle, NativeDeviceCommand, NativeDeviceCommandSendError,
     NativeDeviceCommandSender, PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState,
-    TransportCommand, TransportCommandSendError, TransportCommandSender,
+    TransportCommand, TransportCommandSendError, TransportCommandSender, TransportFenceSendError,
 };
 
 pub type DesktopControlMappingRuntime = ControlRuntime<DesktopControlSink>;
@@ -93,6 +93,7 @@ pub enum DesktopDirectControlError {
     NativeDevice(NativeDeviceCommandSendError),
     NativeDeviceUnavailable,
     Transport(TransportCommandSendError),
+    TransportFence(TransportFenceSendError),
     CaptureStartSequenceExhausted,
 }
 
@@ -105,6 +106,7 @@ impl fmt::Display for DesktopDirectControlError {
                 formatter.write_str("native device control is unavailable for this session")
             }
             Self::Transport(source) => source.fmt(formatter),
+            Self::TransportFence(source) => source.fmt(formatter),
             Self::CaptureStartSequenceExhausted => {
                 formatter.write_str("capture-start sequence space is exhausted")
             }
@@ -119,6 +121,7 @@ impl Error for DesktopDirectControlError {
             Self::NativeDevice(source) => Some(source),
             Self::NativeDeviceUnavailable | Self::CaptureStartSequenceExhausted => None,
             Self::Transport(source) => Some(source),
+            Self::TransportFence(source) => Some(source),
         }
     }
 }
@@ -242,6 +245,14 @@ impl DesktopControlSink {
         self.mixer
             .try_send_fence()
             .map_err(DesktopDirectControlError::Mixer)
+    }
+
+    pub(crate) fn try_send_transport_fence(
+        &mut self,
+    ) -> Result<Option<u64>, DesktopDirectControlError> {
+        self.transport
+            .try_send_fence()
+            .map_err(DesktopDirectControlError::TransportFence)
     }
 
     pub(crate) fn take_capture_start_sequence(&mut self) -> Option<u64> {

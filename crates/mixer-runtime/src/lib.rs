@@ -492,6 +492,32 @@ impl fmt::Display for TransportCommandSendError {
 
 impl Error for TransportCommandSendError {}
 
+/// A bounded-queue rejection while enqueuing an opaque transport fence.
+///
+/// Transport fences are not [`TransportCommand`] values: they acknowledge
+/// ordering without changing transport state. Keeping their rejection separate
+/// prevents an observer from mistaking a failed fence for a failed transport
+/// command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportFenceSendError {
+    Full,
+    Disconnected,
+}
+
+impl fmt::Display for TransportFenceSendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => {
+                formatter.write_str("transport command queue is full while enqueuing a fence")
+            }
+            Self::Disconnected => formatter
+                .write_str("transport command receiver is disconnected while enqueuing a fence"),
+        }
+    }
+}
+
+impl Error for TransportFenceSendError {}
+
 /// A synchronous transport-command application failure.
 ///
 /// This is distinct from [`TransportCommandSendError`]: direct callers do not
@@ -1918,6 +1944,7 @@ pub fn loudness_command_channel() -> (LoudnessCommandSender, LoudnessCommandRece
 enum QueuedTransportCommand {
     Transport(TransportCommand),
     CaptureStart { sequence: u64 },
+    Fence { sequence: u64 },
 }
 
 /// Application-thread half of the bounded transport command queue.
@@ -1931,6 +1958,7 @@ pub struct TransportCommandSender {
     scene_consolidation_mask: u8,
     metronome_available: bool,
     next_capture_start_sequence: u64,
+    next_fence_sequence: u64,
 }
 
 impl TransportCommandSender {
@@ -1976,6 +2004,36 @@ impl TransportCommandSender {
             .push(QueuedTransportCommand::CaptureStart { sequence })
             .map_err(|_| TransportCommandSendError::Full(TransportCommand::Start))?;
         self.next_capture_start_sequence = sequence.checked_add(1).unwrap_or(0);
+        Ok(Some(sequence))
+    }
+
+    /// Allocates and enqueues the next FIFO transport fence without waiting or
+    /// allocating.
+    ///
+    /// A successful process cycle exposes the sequence through
+    /// [`TransportCycle::committed_transport_fence`]. The fence carries no
+    /// transport mutation; it only proves that every accepted command before
+    /// it has reached the same successful cycle.
+    ///
+    /// Returns `Ok(None)` only after the nonzero sequence space is exhausted.
+    /// Queue rejection does not consume a sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded-queue or receiver-disconnection rejection without
+    /// changing transport state.
+    pub fn try_send_fence(&mut self) -> Result<Option<u64>, TransportFenceSendError> {
+        let sequence = self.next_fence_sequence;
+        if sequence == 0 {
+            return Ok(None);
+        }
+        if self.is_disconnected() {
+            return Err(TransportFenceSendError::Disconnected);
+        }
+        self.producer
+            .push(QueuedTransportCommand::Fence { sequence })
+            .map_err(|_| TransportFenceSendError::Full)?;
+        self.next_fence_sequence = sequence.checked_add(1).unwrap_or(0);
         Ok(Some(sequence))
     }
 
@@ -2090,6 +2148,7 @@ pub struct TransportCycle {
     scene_launch_state: SceneLaunchState,
     applied_command_count: usize,
     capture_start_sequence: u64,
+    committed_transport_fence: u64,
     command_sender_disconnected: bool,
     applied_mixer_parameter_command_count: usize,
     committed_mixer_fence: u64,
@@ -2184,6 +2243,18 @@ impl TransportCycle {
     #[must_use]
     pub const fn capture_start_sequence(self) -> u64 {
         self.capture_start_sequence
+    }
+
+    /// Returns the greatest transport fence represented by this successful
+    /// process cycle.
+    ///
+    /// A recovery publication of this cycle therefore contains loop and
+    /// transport state that is no earlier than every command ordered before
+    /// this fence. The acknowledgement is scoped to the current transport
+    /// queue owner.
+    #[must_use]
+    pub const fn committed_transport_fence(self) -> u64 {
+        self.committed_transport_fence
     }
 
     #[must_use]
@@ -2462,6 +2533,7 @@ pub fn output_meter_snapshot_for_test(
             scene_launch_state: SceneLaunchState::default(),
             applied_command_count: 0,
             capture_start_sequence: 0,
+            committed_transport_fence: 0,
             command_sender_disconnected: false,
             applied_mixer_parameter_command_count: 0,
             committed_mixer_fence: 0,
@@ -4699,6 +4771,7 @@ struct MixerParameterDrain {
 struct TransportCommandDrain {
     applied_command_count: usize,
     capture_start_sequence: u64,
+    greatest_fence: u64,
 }
 
 #[derive(Debug)]
@@ -4750,6 +4823,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 scene_consolidation_mask,
                 metronome_available: false,
                 next_capture_start_sequence: 1,
+                next_fence_sequence: 1,
             },
             Self {
                 runtime,
@@ -4810,6 +4884,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 scene_consolidation_mask,
                 metronome_available: false,
                 next_capture_start_sequence: 1,
+                next_fence_sequence: 1,
             },
             MixerParameterCommandSender {
                 producer: parameter_producer,
@@ -5259,6 +5334,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                     scene_launch_state: self.runtime.scene_launch_state(),
                     applied_command_count,
                     capture_start_sequence: transport_command_drain.capture_start_sequence,
+                    committed_transport_fence: transport_command_drain.greatest_fence,
                     command_sender_disconnected,
                     applied_mixer_parameter_command_count,
                     committed_mixer_fence,
@@ -5311,6 +5387,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 scene_launch_state: self.runtime.scene_launch_state(),
                 applied_command_count,
                 capture_start_sequence: transport_command_drain.capture_start_sequence,
+                committed_transport_fence: transport_command_drain.greatest_fence,
                 command_sender_disconnected,
                 applied_mixer_parameter_command_count,
                 committed_mixer_fence,
@@ -5457,6 +5534,9 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 QueuedTransportCommand::CaptureStart { sequence } => {
                     self.apply_command(TransportCommand::Start)?;
                     drained.capture_start_sequence = drained.capture_start_sequence.max(sequence);
+                }
+                QueuedTransportCommand::Fence { sequence } => {
+                    drained.greatest_fence = drained.greatest_fence.max(sequence);
                 }
             }
             drained.applied_command_count += 1;

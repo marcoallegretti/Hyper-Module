@@ -23,10 +23,11 @@ use hyper_mixer_runtime::{
     RuntimeCreationError, RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig,
     SceneLaunchState, StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot,
     TransportCommand, TransportCommandApplyError, TransportCommandSendError, TransportCycle,
-    TransportLoopRange, TransportLoopRangeError, TransportOutputCreationError,
-    TransportOutputProcessor, TransportState, interactive_mixer_parameter_channel,
-    interactive_scene_launch_channel, loudness_command_channel, mixer_base_state_from_snapshot,
-    output_meter_channel, playback_recovery_channel,
+    TransportFenceSendError, TransportLoopRange, TransportLoopRangeError,
+    TransportOutputCreationError, TransportOutputProcessor, TransportState,
+    interactive_mixer_parameter_channel, interactive_scene_launch_channel,
+    loudness_command_channel, mixer_base_state_from_snapshot, output_meter_channel,
+    playback_recovery_channel,
 };
 use hyper_native_device::{
     DeviceChain, NativeCompressorState, NativeDeviceInstance, NativeDeviceState, NativeFilterMode,
@@ -3110,6 +3111,89 @@ fn capture_start_sequence_respects_backpressure_and_disconnection() {
             TransportCommand::Start
         ))
     );
+}
+
+#[test]
+fn transport_fence_sequence_respects_backpressure_and_disconnection() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
+
+    assert_eq!(sender.try_send_fence().unwrap(), Some(1));
+    for _ in 1..sender.capacity() {
+        sender.try_send(TransportCommand::Stop).unwrap();
+    }
+    assert_eq!(sender.try_send_fence(), Err(TransportFenceSendError::Full));
+
+    let mut left = [0.0_f32; 1];
+    let mut right = [0.0_f32; 1];
+    process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(sender.try_send_fence().unwrap(), Some(2));
+
+    drop(transport);
+    assert_eq!(
+        sender.try_send_fence(),
+        Err(TransportFenceSendError::Disconnected)
+    );
+}
+
+#[test]
+fn transport_fence_acknowledges_loop_state_only_after_a_successful_cycle() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
+    let (mut recovery_publisher, recovery) = playback_recovery_channel(None, None);
+    let range = TransportLoopRange::new(16, 64).unwrap();
+    let mut left = [9.0_f32; 1];
+    let mut right = [9.0_f32; 1];
+
+    sender.try_send(TransportCommand::Start).unwrap();
+    sender
+        .try_send(TransportCommand::SetLoopRange(Some(range)))
+        .unwrap();
+    sender
+        .try_send(TransportCommand::SetLoopEnabled(true))
+        .unwrap();
+    assert_eq!(sender.try_send_fence().unwrap(), Some(1));
+    let mut incomplete = [];
+    assert!(matches!(
+        transport.process_cycle(
+            &mut incomplete,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        ),
+        Err(RuntimeProcessError::Render(_))
+    ));
+    assert_eq!(transport.loop_range(), None);
+    assert!(!transport.loop_enabled());
+    assert_eq!(recovery.snapshot().committed_transport_fence(), 0);
+
+    let after_failure = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(after_failure.committed_transport_fence(), 0);
+    recovery_publisher.publish_cycle(after_failure, None);
+    assert_eq!(recovery.snapshot().committed_transport_fence(), 0);
+
+    sender
+        .try_send(TransportCommand::SetLoopRange(Some(range)))
+        .unwrap();
+    sender
+        .try_send(TransportCommand::SetLoopEnabled(true))
+        .unwrap();
+    assert_eq!(sender.try_send_fence().unwrap(), Some(2));
+    let committed = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(committed.applied_command_count(), 3);
+    assert_eq!(committed.committed_transport_fence(), 2);
+    assert_eq!(committed.loop_range(), Some(range));
+    assert!(committed.loop_enabled());
+    recovery_publisher.publish_cycle(committed, None);
+    let snapshot = recovery.snapshot();
+    assert_eq!(snapshot.committed_transport_fence(), 2);
+    assert_eq!(snapshot.loop_range(), Some(range));
+    assert!(snapshot.loop_enabled());
 }
 
 #[test]

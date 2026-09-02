@@ -736,6 +736,7 @@ mod tests {
                 scene_launch_state: SceneLaunchState::default(),
                 applied_command_count: 0,
                 capture_start_sequence: 0,
+                committed_transport_fence: 0,
                 command_sender_disconnected: false,
                 applied_mixer_parameter_command_count: 0,
                 committed_mixer_fence: 0,
