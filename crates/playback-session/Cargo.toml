@@ -12,5 +12,11 @@ hyper-media-cache = { path = "../media-cache" }
 hyper-playback-compiler = { path = "../playback-compiler" }
 hyper-playback-json = { path = "../playback-json" }
 
+[features]
+# Exposes constructors for immutable playback automation views to consumer
+# tests. Off by default, so production builds receive only runtime-owned
+# observations.
+test-support = []
+
 [lints]
 workspace = true

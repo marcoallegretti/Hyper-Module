@@ -4099,6 +4099,7 @@ export component MainWindow inherits Window {
                                         horizontal-stretch: 1;
                                         Text { text: "Selected tick"; color: #8fa0b4; font-size: 9px; }
                                         IdeLineEdit {
+                                            accessible-label: "Selected automation point tick";
                                             text <=> root.automation-edit-selected-point-tick;
                                             input-type: number;
                                             enabled: root.app-mode == AppMode.running
@@ -4109,6 +4110,7 @@ export component MainWindow inherits Window {
                                         horizontal-stretch: 1;
                                         Text { text: "Selected value"; color: #8fa0b4; font-size: 9px; }
                                         IdeLineEdit {
+                                            accessible-label: "Selected automation point value";
                                             text <=> root.automation-edit-selected-point-value;
                                             enabled: root.app-mode == AppMode.running
                                                 && root.automation-edit-selected-point-index >= 0;
@@ -4144,6 +4146,7 @@ export component MainWindow inherits Window {
                                         horizontal-stretch: 1;
                                         Text { text: "New tick"; color: #8fa0b4; font-size: 9px; }
                                         IdeLineEdit {
+                                            accessible-label: "New automation point tick";
                                             text <=> root.automation-edit-new-point-tick;
                                             input-type: number;
                                             enabled: root.app-mode == AppMode.running;
@@ -4153,6 +4156,7 @@ export component MainWindow inherits Window {
                                         horizontal-stretch: 1;
                                         Text { text: "New value"; color: #8fa0b4; font-size: 9px; }
                                         IdeLineEdit {
+                                            accessible-label: "New automation point value";
                                             text <=> root.automation-edit-new-point-value;
                                             enabled: root.app-mode == AppMode.running;
                                         }

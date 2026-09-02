@@ -386,6 +386,25 @@ pub struct PlaybackAutomationLane {
 }
 
 impl PlaybackAutomationLane {
+    /// Builds an immutable automation-lane view for consumer tests.
+    ///
+    /// Production views remain owned by verified playback-session assembly.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn for_test(
+        id: &str,
+        target: AutomationTarget,
+        interpolation: AutomationInterpolation,
+        points: Vec<AutomationPoint>,
+    ) -> Self {
+        Self {
+            id: id.to_owned(),
+            target,
+            interpolation,
+            points,
+        }
+    }
+
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
@@ -423,6 +442,29 @@ pub struct PlaybackAutomationTake {
 }
 
 impl PlaybackAutomationTake {
+    /// Builds an immutable automation-take view for consumer tests.
+    ///
+    /// Production views remain owned by verified playback-session assembly.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn for_test(
+        id: &str,
+        name: &str,
+        enabled: bool,
+        start_tick: u64,
+        end_tick: u64,
+        lanes: Vec<PlaybackAutomationLane>,
+    ) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            enabled,
+            start_tick,
+            end_tick,
+            lanes,
+        }
+    }
+
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
@@ -462,6 +504,15 @@ pub struct PlaybackAutomation {
 }
 
 impl PlaybackAutomation {
+    /// Builds immutable playback automation views for consumer tests.
+    ///
+    /// Production views remain owned by verified playback-session assembly.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn for_test(takes: Vec<PlaybackAutomationTake>) -> Self {
+        Self { takes }
+    }
+
     #[must_use]
     pub fn takes(&self) -> &[PlaybackAutomationTake] {
         &self.takes

@@ -59,6 +59,8 @@ use hyper_desktop_ide::{
 };
 #[cfg(test)]
 use hyper_mixer_runtime::PlaybackRecoverySnapshot;
+#[cfg(test)]
+use hyper_playback_session::{PlaybackAutomation, PlaybackAutomationLane, PlaybackAutomationTake};
 use slint::platform::PlatformError;
 use slint::{
     CloseRequestResponse, ComponentHandle, Model, ModelRc, ModelTracker, SharedString, Timer,
@@ -23166,6 +23168,94 @@ mod tests {
         assert_eq!(ui.get_automation_edit_selected_point_index(), -1);
         assert!(ui.get_automation_edit_selected_point_tick().is_empty());
         assert!(ui.get_automation_edit_new_point_tick().is_empty());
+    }
+
+    #[test]
+    fn automation_point_callbacks_keep_exact_drafts_local_and_require_reload() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+
+        let channels = automation_channel_fixture();
+        let project_state = Rc::new(ProjectUiState::default());
+        set_automation_targets(&ui, &project_state, &channels);
+        let owner = Arc::new(PlaybackAutomation::for_test(vec![
+            PlaybackAutomationTake::for_test(
+                "take-a",
+                "Drums gain",
+                true,
+                0,
+                1_920,
+                vec![PlaybackAutomationLane::for_test(
+                    "lane-a",
+                    AutomationTarget::Channel {
+                        slot: 0,
+                        parameter: AutomationChannelParameter::Gain,
+                    },
+                    AutomationInterpolation::Linear,
+                    vec![
+                        AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+                        AutomationPoint::new(960, AutomationValue::Integer(0)),
+                    ],
+                )],
+            ),
+        ]));
+        *project_state.automation.borrow_mut() = Some(Arc::clone(&owner));
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        bind_automation_take_edit_callbacks(&ui, &worker, &project_state);
+
+        let actions = ui.global::<IdeActions>();
+        actions.invoke_begin_edit_automation_take("take-a".into());
+        assert!(ui.get_automation_edit_visible());
+        assert_eq!(ui.get_automation_edit_points(), "0=1000000, 960=0");
+        assert_eq!(ui.get_automation_edit_point_rows().row_count(), 2);
+        assert_eq!(ui.get_automation_edit_selected_point_index(), 0);
+
+        actions.invoke_select_automation_edit_point(1);
+        assert_eq!(ui.get_automation_edit_selected_point_tick(), "960");
+        assert_eq!(ui.get_automation_edit_selected_point_value(), "0");
+
+        ui.set_automation_edit_selected_point_tick("720".into());
+        ui.set_automation_edit_selected_point_value("250000".into());
+        actions.invoke_update_automation_edit_point();
+        assert_eq!(ui.get_automation_edit_points(), "0=1000000, 720=250000");
+        assert_eq!(ui.get_automation_edit_selected_point_index(), 1);
+        assert_eq!(ui.get_automation_edit_selected_point_original_tick(), "720");
+
+        ui.set_automation_edit_new_point_tick("960".into());
+        ui.set_automation_edit_new_point_value("0".into());
+        actions.invoke_add_automation_edit_point();
+        assert_eq!(
+            ui.get_automation_edit_points(),
+            "0=1000000, 720=250000, 960=0"
+        );
+        assert_eq!(ui.get_automation_edit_point_rows().row_count(), 3);
+        assert_eq!(ui.get_automation_edit_selected_point_index(), 2);
+        assert!(ui.get_automation_edit_new_point_tick().is_empty());
+
+        actions.invoke_remove_automation_edit_point();
+        assert_eq!(ui.get_automation_edit_points(), "0=1000000, 720=250000");
+        assert_eq!(ui.get_automation_edit_point_rows().row_count(), 2);
+        assert_eq!(ui.get_automation_edit_selected_point_index(), 1);
+
+        ui.set_automation_edit_points("0=1000000, 480=500000, 720=250000".into());
+        actions.invoke_select_automation_edit_point(0);
+        assert_eq!(
+            ui.get_error_text(),
+            "The point table is stale; reload the exact draft before changing a point"
+        );
+        assert_eq!(ui.get_automation_edit_point_rows().row_count(), 2);
+
+        actions.invoke_reload_automation_edit_point_draft();
+        assert_eq!(ui.get_automation_edit_point_rows().row_count(), 3);
+        assert_eq!(ui.get_automation_edit_selected_point_index(), 0);
+        assert!(ui.get_error_text().is_empty());
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(Arc::ptr_eq(
+            project_state.automation.borrow().as_ref().unwrap(),
+            &owner
+        ));
     }
 
     #[test]
