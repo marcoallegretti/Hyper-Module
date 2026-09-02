@@ -33,6 +33,10 @@ use hyper_runtime_bundle_builder::{
     DEFAULT_MAXIMUM_RUNTIME_BUNDLE_BYTES, PublishedRuntimeBundle, RuntimeBundleBuildError,
     build_project_runtime_bundle,
 };
+use hyper_runtime_loop_update::{
+    RuntimeLoopUpdate, RuntimeLoopUpdateError, read_runtime_loop_update,
+    sha256_hex as runtime_loop_update_sha256_hex,
+};
 use hyper_runtime_mixer_update::{
     RuntimeMixerUpdate, RuntimeMixerUpdateError, read_runtime_mixer_update,
     sha256_hex as runtime_mixer_update_sha256_hex,
@@ -281,6 +285,7 @@ pub enum IdeWorkerCommandKind {
     AbortRecording,
     ImportRuntimeScenePerformance,
     ImportRuntimeMixerUpdate,
+    ImportRuntimeLoopUpdate,
     CaptureScenePerformance,
     CaptureMixerAutomation,
     StartAudioPreview,
@@ -640,6 +645,9 @@ pub enum IdeWorkerCommand {
     ImportRuntimeMixerUpdate {
         path: PathBuf,
     },
+    ImportRuntimeLoopUpdate {
+        path: PathBuf,
+    },
     StartScenePerformanceCapture,
     StopScenePerformanceCapture,
     StartMixerAutomationCapture {
@@ -813,6 +821,7 @@ impl IdeWorkerCommand {
                 IdeWorkerCommandKind::ImportRuntimeScenePerformance
             }
             Self::ImportRuntimeMixerUpdate { .. } => IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+            Self::ImportRuntimeLoopUpdate { .. } => IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
             Self::StartScenePerformanceCapture | Self::StopScenePerformanceCapture => {
                 IdeWorkerCommandKind::CaptureScenePerformance
             }
@@ -2678,6 +2687,70 @@ impl Error for IdeRuntimeMixerUpdateImportError {
     }
 }
 
+/// Why one explicit Runtime loop update could not become a durable arrangement
+/// loop edit in the currently open project.
+///
+/// The selected artifact remains external input. The IDE verifies its stable
+/// contents and exact source project before it enters the normal project
+/// publication lifecycle.
+#[derive(Debug)]
+pub enum IdeRuntimeLoopUpdateImportError {
+    ProjectSnapshotUnavailable,
+    Artifact(Box<RuntimeLoopUpdateError>),
+    ProjectIdentityMismatch,
+    ProjectRevisionMismatch {
+        update_revision: u64,
+        project_revision: u64,
+    },
+    ProjectManifestMismatch,
+    FramePositionUnavailable,
+    Arrangement(Box<IdeArrangementPlacementEditError>),
+}
+
+impl fmt::Display for IdeRuntimeLoopUpdateImportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProjectSnapshotUnavailable => {
+                formatter.write_str("running playback exposes no verified project snapshot")
+            }
+            Self::Artifact(source) => {
+                write!(formatter, "selected Runtime loop update was refused: {source}")
+            }
+            Self::ProjectIdentityMismatch => {
+                formatter.write_str("selected Runtime loop update belongs to another project")
+            }
+            Self::ProjectRevisionMismatch {
+                update_revision,
+                project_revision,
+            } => write!(
+                formatter,
+                "selected Runtime loop update targets project revision {update_revision}, but the open project is revision {project_revision}"
+            ),
+            Self::ProjectManifestMismatch => formatter.write_str(
+                "selected Runtime loop update does not match the exact verified project contents",
+            ),
+            Self::FramePositionUnavailable => formatter.write_str(
+                "selected Runtime loop update contains a frame position unavailable on this platform",
+            ),
+            Self::Arrangement(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeRuntimeLoopUpdateImportError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Artifact(source) => Some(source.as_ref()),
+            Self::Arrangement(source) => Some(source.as_ref()),
+            Self::ProjectSnapshotUnavailable
+            | Self::ProjectIdentityMismatch
+            | Self::ProjectRevisionMismatch { .. }
+            | Self::ProjectManifestMismatch
+            | Self::FramePositionUnavailable => None,
+        }
+    }
+}
+
 /// Why a bounded live mixer-automation capture could not be completed.
 ///
 /// Version 1 captures exactly one resolved mixer parameter from committed,
@@ -2919,6 +2992,7 @@ pub enum IdeWorkerCommandFailure {
     Recording(IdeRecordingError),
     RuntimeScenePerformanceImport(Box<IdeRuntimeScenePerformanceImportError>),
     RuntimeMixerUpdateImport(Box<IdeRuntimeMixerUpdateImportError>),
+    RuntimeLoopUpdateImport(Box<IdeRuntimeLoopUpdateImportError>),
     ScenePerformanceCapture(Box<IdeScenePerformanceCaptureError>),
     MixerAutomationCapture(Box<IdeMixerAutomationCaptureError>),
     AudioPreview(IdeAudioPreviewError),
@@ -3095,6 +3169,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::Recording(source) => source.fmt(formatter),
             Self::RuntimeScenePerformanceImport(source) => source.fmt(formatter),
             Self::RuntimeMixerUpdateImport(source) => source.fmt(formatter),
+            Self::RuntimeLoopUpdateImport(source) => source.fmt(formatter),
             Self::ScenePerformanceCapture(source) => source.fmt(formatter),
             Self::MixerAutomationCapture(source) => source.fmt(formatter),
             Self::AudioPreview(source) => source.fmt(formatter),
@@ -3202,6 +3277,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::Recording(source) => Some(source),
             Self::RuntimeScenePerformanceImport(source) => Some(source),
             Self::RuntimeMixerUpdateImport(source) => Some(source),
+            Self::RuntimeLoopUpdateImport(source) => Some(source),
             Self::ScenePerformanceCapture(source) => Some(source),
             Self::MixerAutomationCapture(source) => Some(source),
             Self::AudioPreview(source) => Some(source),
@@ -3743,6 +3819,11 @@ pub enum IdeWorkerEvent {
     },
     RuntimeMixerUpdateImporting,
     RuntimeMixerUpdateImported {
+        revision: u64,
+        changed: bool,
+    },
+    RuntimeLoopUpdateImporting,
+    RuntimeLoopUpdateImported {
         revision: u64,
         changed: bool,
     },
@@ -4941,6 +5022,9 @@ enum ProjectMutation {
     ImportRuntimeMixerUpdate {
         plan: IdeMixerSavePlan,
     },
+    ImportRuntimeLoopUpdate {
+        range: Option<IdeLoopRangeFrames>,
+    },
     CaptureScenePerformance {
         launches: Vec<ScenePerformanceLaunch>,
     },
@@ -5163,6 +5247,7 @@ impl ProjectMutation {
                 IdeWorkerCommandKind::ImportRuntimeScenePerformance
             }
             Self::ImportRuntimeMixerUpdate { .. } => IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+            Self::ImportRuntimeLoopUpdate { .. } => IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
             Self::CaptureScenePerformance { .. } => IdeWorkerCommandKind::CaptureScenePerformance,
             Self::MoveArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::MoveArrangementSceneLaunch
@@ -5291,6 +5376,7 @@ impl ProjectMutation {
                 }
             }
             Self::ImportRuntimeMixerUpdate { .. } => IdeWorkerEvent::RuntimeMixerUpdateImporting,
+            Self::ImportRuntimeLoopUpdate { .. } => IdeWorkerEvent::RuntimeLoopUpdateImporting,
             Self::CaptureScenePerformance { launches, .. } => {
                 IdeWorkerEvent::ScenePerformanceCaptureSaving {
                     launch_count: launches.len(),
@@ -5619,6 +5705,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::AddArrangementSceneLaunch => "scene marker",
         IdeWorkerCommandKind::ImportRuntimeScenePerformance => "Runtime scene performance import",
         IdeWorkerCommandKind::ImportRuntimeMixerUpdate => "Runtime mixer update import",
+        IdeWorkerCommandKind::ImportRuntimeLoopUpdate => "Runtime loop update import",
         IdeWorkerCommandKind::CaptureScenePerformance => "scene performance capture",
         IdeWorkerCommandKind::CaptureMixerAutomation => "mixer automation capture",
         IdeWorkerCommandKind::DuplicateArrangementPlacement => "placement duplication",
@@ -6023,6 +6110,7 @@ fn process_command(
         | IdeWorkerCommand::ImportAudio { .. }
         | IdeWorkerCommand::ImportRuntimeScenePerformance { .. }
         | IdeWorkerCommand::ImportRuntimeMixerUpdate { .. }
+        | IdeWorkerCommand::ImportRuntimeLoopUpdate { .. }
         | IdeWorkerCommand::CreateAudioClipFromTake { .. }
         | IdeWorkerCommand::CreateAndPlaceAudioClipFromTake { .. }
         | IdeWorkerCommand::DuplicateAudioClip { .. }
@@ -6314,6 +6402,9 @@ fn process_project_mutation_command(
         IdeWorkerCommand::ImportRuntimeMixerUpdate { path } => {
             import_runtime_mixer_update(state, events, &path)
         }
+        IdeWorkerCommand::ImportRuntimeLoopUpdate { path } => {
+            import_runtime_loop_update(state, events, &path)
+        }
         IdeWorkerCommand::CreateAudioClipFromTake { recording_id, name } => {
             create_audio_clip_from_take(state, events, &recording_id, &name)
         }
@@ -6487,6 +6578,17 @@ fn publish_runtime_mixer_update_import_failure(
     )
 }
 
+fn publish_runtime_loop_update_import_failure(
+    events: &SyncSender<IdeWorkerEvent>,
+    reason: IdeRuntimeLoopUpdateImportError,
+) -> bool {
+    publish_failure(
+        events,
+        IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+        IdeWorkerCommandFailure::RuntimeLoopUpdateImport(Box::new(reason)),
+    )
+}
+
 fn validate_runtime_scene_performance_update(
     update: &RuntimeScenePerformanceUpdate,
     project_id: &str,
@@ -6531,6 +6633,47 @@ fn validate_runtime_mixer_update(
         return Err(IdeRuntimeMixerUpdateImportError::ProjectManifestMismatch);
     }
     Ok(())
+}
+
+fn validate_runtime_loop_update(
+    update: &RuntimeLoopUpdate,
+    project_id: &str,
+    project_revision: u64,
+    project_manifest_sha256: &[u8; 32],
+) -> Result<(), IdeRuntimeLoopUpdateImportError> {
+    let source = update.source();
+    if source.project_id() != project_id {
+        return Err(IdeRuntimeLoopUpdateImportError::ProjectIdentityMismatch);
+    }
+    if source.project_revision() != project_revision {
+        return Err(IdeRuntimeLoopUpdateImportError::ProjectRevisionMismatch {
+            update_revision: source.project_revision(),
+            project_revision,
+        });
+    }
+    if source.project_sha256() != runtime_loop_update_sha256_hex(project_manifest_sha256) {
+        return Err(IdeRuntimeLoopUpdateImportError::ProjectManifestMismatch);
+    }
+    Ok(())
+}
+
+fn runtime_loop_update_range(
+    update: &RuntimeLoopUpdate,
+) -> Result<Option<IdeLoopRangeFrames>, IdeRuntimeLoopUpdateImportError> {
+    update
+        .loop_range()
+        .map(|range| {
+            let start_frame = usize::try_from(range.start_frame())
+                .map_err(|_| IdeRuntimeLoopUpdateImportError::FramePositionUnavailable)?;
+            let end_frame = usize::try_from(range.end_frame())
+                .map_err(|_| IdeRuntimeLoopUpdateImportError::FramePositionUnavailable)?;
+            Ok(IdeLoopRangeFrames {
+                start_frame,
+                end_frame,
+                enabled: range.enabled(),
+            })
+        })
+        .transpose()
 }
 
 fn import_runtime_scene_performance(
@@ -6673,6 +6816,59 @@ fn import_runtime_mixer_update(
         state,
         events,
         ProjectMutation::ImportRuntimeMixerUpdate { plan },
+    )
+}
+
+fn import_runtime_loop_update(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    path: &Path,
+) -> bool {
+    let WorkerState::Running(application) = state else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    };
+    let (project_id, project_revision, project_manifest_sha256) = match application.snapshot() {
+        Some(snapshot) => (
+            snapshot.project_id.to_owned(),
+            snapshot.project_revision,
+            snapshot.project_manifest_sha256,
+        ),
+        None => {
+            return publish_runtime_loop_update_import_failure(
+                events,
+                IdeRuntimeLoopUpdateImportError::ProjectSnapshotUnavailable,
+            );
+        }
+    };
+    let update = match read_runtime_loop_update(path) {
+        Ok(update) => update,
+        Err(source) => {
+            return publish_runtime_loop_update_import_failure(
+                events,
+                IdeRuntimeLoopUpdateImportError::Artifact(Box::new(source)),
+            );
+        }
+    };
+    if let Err(reason) = validate_runtime_loop_update(
+        &update,
+        &project_id,
+        project_revision,
+        &project_manifest_sha256,
+    ) {
+        return publish_runtime_loop_update_import_failure(events, reason);
+    }
+    let range = match runtime_loop_update_range(&update) {
+        Ok(range) => range,
+        Err(reason) => return publish_runtime_loop_update_import_failure(events, reason),
+    };
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::ImportRuntimeLoopUpdate { range },
     )
 }
 
@@ -11027,6 +11223,9 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             ..
         }
         | ProjectMutationAttempt::ImportRuntimeMixerUpdate(Ok(outcome))
+        | ProjectMutationAttempt::ImportRuntimeLoopUpdate {
+            result: Ok(outcome),
+        }
         | ProjectMutationAttempt::CaptureScenePerformance {
             result: Ok(outcome),
             ..
@@ -11294,6 +11493,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::ImportRuntimeScenePerformance { result: Err(_), .. }
         | ProjectMutationAttempt::ImportRuntimeMixerUpdate(Err(_))
+        | ProjectMutationAttempt::ImportRuntimeLoopUpdate { result: Err(_) }
         | ProjectMutationAttempt::CaptureScenePerformance { result: Err(_), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::SetArrangementLoopRange { result: Err(_) }
@@ -12363,6 +12563,13 @@ fn project_mutation_save_failure(
                 IdeRuntimeMixerUpdateImportError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::ImportRuntimeLoopUpdate { .. } => {
+            IdeWorkerCommandFailure::RuntimeLoopUpdateImport(Box::new(
+                IdeRuntimeLoopUpdateImportError::Arrangement(Box::new(
+                    IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
+                )),
+            ))
+        }
         ProjectMutation::CaptureScenePerformance { .. } => {
             IdeWorkerCommandFailure::ScenePerformanceCapture(Box::new(
                 IdeScenePerformanceCaptureError::Arrangement(Box::new(
@@ -12722,6 +12929,13 @@ fn project_mutation_native_close_failure(
             IdeWorkerCommandFailure::RuntimeMixerUpdateImport(Box::new(
                 IdeRuntimeMixerUpdateImportError::MixerSave(Box::new(
                     IdeProjectSaveError::NativeClose(failure),
+                )),
+            ))
+        }
+        ProjectMutation::ImportRuntimeLoopUpdate { .. } => {
+            IdeWorkerCommandFailure::RuntimeLoopUpdateImport(Box::new(
+                IdeRuntimeLoopUpdateImportError::Arrangement(Box::new(
+                    IdeArrangementPlacementEditError::NativeClose(failure),
                 )),
             ))
         }
@@ -13092,6 +13306,12 @@ enum ProjectMutationAttempt {
     ImportRuntimeMixerUpdate(
         Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeProjectSaveError>,
     ),
+    ImportRuntimeLoopUpdate {
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeArrangementPlacementEditError,
+        >,
+    },
     CaptureScenePerformance {
         launch_count: usize,
         result: Result<
@@ -14308,6 +14528,27 @@ fn complete_project_mutation(
                     IdeWorkerCommandFailure::RuntimeMixerUpdateImport(Box::new(
                         IdeRuntimeMixerUpdateImportError::MixerSave(Box::new(reason)),
                     )),
+                ),
+                ProjectMutationAttempt::ImportRuntimeLoopUpdate {
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::RuntimeLoopUpdateImported {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                    },
+                ),
+                ProjectMutationAttempt::ImportRuntimeLoopUpdate {
+                    result: Err(reason),
+                } => publish_arrangement_edit_failure(
+                    events,
+                    IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+                    reason,
+                    |reason| {
+                        IdeWorkerCommandFailure::RuntimeLoopUpdateImport(Box::new(
+                            IdeRuntimeLoopUpdateImportError::Arrangement(reason),
+                        ))
+                    },
                 ),
                 ProjectMutationAttempt::CaptureScenePerformance {
                     launch_count,
@@ -15938,6 +16179,16 @@ fn attempt_project_mutation(
                         .map_err(|source| IdeProjectSaveError::Publication(Box::new(source)))
                 },
             )
+        }
+        ProjectMutation::ImportRuntimeLoopUpdate { range } => {
+            ProjectMutationAttempt::ImportRuntimeLoopUpdate {
+                result: attempt_arrangement_loop_range(
+                    application,
+                    recovery,
+                    range,
+                    native_failure,
+                ),
+            }
         }
         ProjectMutation::CaptureScenePerformance { launches } => {
             ProjectMutationAttempt::CaptureScenePerformance {
@@ -17848,6 +18099,13 @@ fn project_mutation_reopen_failure(
                     reopen: Box::new(reopen),
                 },
             ))
+        }
+        ProjectMutationAttempt::ImportRuntimeLoopUpdate { result } => {
+            arrangement_placement_edit_reopen_failure(result, reopen, |reason| {
+                IdeWorkerCommandFailure::RuntimeLoopUpdateImport(Box::new(
+                    IdeRuntimeLoopUpdateImportError::Arrangement(reason),
+                ))
+            })
         }
         ProjectMutationAttempt::CaptureScenePerformance { result, .. } => {
             arrangement_placement_edit_reopen_failure(result, reopen, |reason| {
@@ -20038,6 +20296,9 @@ mod tests {
     };
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
     use hyper_project_loader::ProjectPlaybackLimits;
+    use hyper_runtime_loop_update::{
+        RuntimeLoopRange, RuntimeLoopUpdateDirectory, RuntimeLoopUpdateSource,
+    };
     use hyper_runtime_mixer_update::{RuntimeMixerUpdateDirectory, RuntimeMixerUpdateSource};
     use hyper_scene_performance::{
         RuntimeScenePerformanceSource, RuntimeScenePerformanceUpdateDirectory,
@@ -20145,6 +20406,18 @@ mod tests {
         .unwrap()
     }
 
+    fn runtime_loop_update(range: Option<RuntimeLoopRange>) -> RuntimeLoopUpdate {
+        let source = RuntimeLoopUpdateSource::try_new(
+            RUNTIME_PROJECT_ID.to_owned(),
+            7,
+            runtime_loop_update_sha256_hex(&[0xaa; 32]),
+            runtime_loop_update_sha256_hex(&[0xbb; 32]),
+            3,
+        )
+        .unwrap();
+        RuntimeLoopUpdate::try_new(RUNTIME_UPDATE_ID.to_owned(), source, range).unwrap()
+    }
+
     #[test]
     fn runtime_scene_performance_import_requires_exact_project_provenance() {
         let update = runtime_scene_performance_update();
@@ -20193,6 +20466,28 @@ mod tests {
         assert!(matches!(
             validate_runtime_mixer_update(&update, RUNTIME_PROJECT_ID, 7, &[0xcc; 32],),
             Err(IdeRuntimeMixerUpdateImportError::ProjectManifestMismatch)
+        ));
+    }
+
+    #[test]
+    fn runtime_loop_update_import_requires_exact_project_provenance() {
+        let update = runtime_loop_update(Some(RuntimeLoopRange::try_new(0, 48_000, true).unwrap()));
+
+        assert!(validate_runtime_loop_update(&update, RUNTIME_PROJECT_ID, 7, &[0xaa; 32],).is_ok());
+        assert!(matches!(
+            validate_runtime_loop_update(&update, CAPTURE_SCENE_A, 7, &[0xaa; 32]),
+            Err(IdeRuntimeLoopUpdateImportError::ProjectIdentityMismatch)
+        ));
+        assert!(matches!(
+            validate_runtime_loop_update(&update, RUNTIME_PROJECT_ID, 8, &[0xaa; 32],),
+            Err(IdeRuntimeLoopUpdateImportError::ProjectRevisionMismatch {
+                update_revision: 7,
+                project_revision: 8,
+            })
+        ));
+        assert!(matches!(
+            validate_runtime_loop_update(&update, RUNTIME_PROJECT_ID, 7, &[0xcc; 32],),
+            Err(IdeRuntimeLoopUpdateImportError::ProjectManifestMismatch)
         ));
     }
 
@@ -20342,6 +20637,251 @@ mod tests {
                 .manifest()
                 .revision(),
             scene_revision + 1
+        );
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    fn publish_runtime_loop_update_for_test(
+        directory: &Path,
+        project: &Path,
+        range: Option<RuntimeLoopRange>,
+    ) -> PathBuf {
+        let verified = verify_project_package(project).unwrap();
+        let source = RuntimeLoopUpdateSource::try_new(
+            verified.manifest().project_id().to_owned(),
+            verified.manifest().revision(),
+            runtime_loop_update_sha256_hex(verified.manifest_sha256()),
+            runtime_loop_update_sha256_hex(&[0xbb; 32]),
+            1,
+        )
+        .unwrap();
+        drop(verified);
+        let update =
+            RuntimeLoopUpdate::try_new(uuid::Uuid::new_v4().to_string(), source, range).unwrap();
+        RuntimeLoopUpdateDirectory::open(directory)
+            .unwrap()
+            .publish(&update)
+            .unwrap()
+    }
+
+    fn import_runtime_loop_update_for_test(
+        worker: &DesktopIdeWorker,
+        update_path: &Path,
+        expected_revision: u64,
+        changed: bool,
+        history_changed: bool,
+    ) -> IdeRunningObservation {
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeLoopUpdate {
+                path: update_path.to_path_buf(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::RuntimeLoopUpdateImporting
+        ));
+        if history_changed {
+            assert!(matches!(
+                recv(worker),
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: Some("Runtime loop update import"),
+                    redo_label: None,
+                }
+            ));
+        }
+        let IdeWorkerEvent::Running(imported) = recv(worker) else {
+            panic!("the project must reopen before reporting the Runtime loop update import");
+        };
+        let event = recv(worker);
+        assert!(
+            matches!(
+                event,
+                IdeWorkerEvent::RuntimeLoopUpdateImported {
+                    revision,
+                    changed: observed_changed,
+                } if revision == expected_revision && observed_changed == changed
+            ),
+            "the import must report its exact durable outcome: {event:?}"
+        );
+        imported
+    }
+
+    fn prepare_arranged_runtime_loop_import_project(
+        fixture: &Path,
+    ) -> (PathBuf, DesktopIdeWorker, u64) {
+        let created = create_project_package(
+            fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+
+        let source = fixture.join("loop-source.wav");
+        let samples = vec![500_i16; 48_000];
+        std::fs::write(&source, mono_pcm16_wav(48_000, &samples)).unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 5)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        let opened = open_project_for_runtime_mixer_update_import(&worker, project.clone());
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the created project must expose one audio track")
+            .id()
+            .to_owned();
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: vec![source],
+                track_id,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioImporting { files: 1 }
+        ));
+        let IdeWorkerEvent::Running(imported_audio) = recv(&worker) else {
+            panic!("the imported loop source must reopen before placement");
+        };
+        let clip_id = imported_audio
+            .audio_clips()
+            .first()
+            .expect("the imported loop source must create one clip")
+            .id()
+            .to_owned();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioImported(ref outcome) if outcome.imported() == 1
+        ));
+        worker
+            .try_send(IdeWorkerCommand::AddArrangementPlacement {
+                clip_id,
+                start_tick: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ArrangementPlacementAdding { start_tick: 0 }
+        ));
+        let IdeWorkerEvent::Running(arranged) = recv(&worker) else {
+            panic!("the loop source placement must reopen before Runtime import");
+        };
+        assert_eq!(arranged.arrangement().placements().len(), 1);
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ArrangementPlacementAdded { start_tick: 0, .. }
+        ));
+        let revision = verify_project_package(&project)
+            .unwrap()
+            .manifest()
+            .revision();
+        (project, worker, revision)
+    }
+
+    fn assert_imported_runtime_loop_range(
+        observation: &IdeRunningObservation,
+        expected_enabled: bool,
+    ) {
+        let range = observation
+            .arrangement()
+            .loop_range()
+            .expect("the imported Runtime loop range must be retained");
+        assert_eq!(range.start_frame(), 0);
+        assert_eq!(range.end_frame(), 24_000);
+        assert_eq!(range.enabled(), expected_enabled);
+    }
+
+    #[test]
+    fn runtime_loop_update_import_preserves_enabled_disabled_and_clear_states() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-runtime-loop-update-import-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let (project, worker, initial_revision) =
+            prepare_arranged_runtime_loop_import_project(&fixture);
+        let updates = fixture.join("updates");
+        std::fs::create_dir(&updates).unwrap();
+        let enabled_path = publish_runtime_loop_update_for_test(
+            &updates,
+            &project,
+            Some(RuntimeLoopRange::try_new(0, 24_000, true).unwrap()),
+        );
+        let enabled = import_runtime_loop_update_for_test(
+            &worker,
+            &enabled_path,
+            initial_revision + 1,
+            true,
+            true,
+        );
+        assert_imported_runtime_loop_range(&enabled, true);
+        assert!(enabled_path.is_file());
+
+        let disabled_path = publish_runtime_loop_update_for_test(
+            &updates,
+            &project,
+            Some(RuntimeLoopRange::try_new(0, 24_000, false).unwrap()),
+        );
+        let disabled = import_runtime_loop_update_for_test(
+            &worker,
+            &disabled_path,
+            initial_revision + 2,
+            true,
+            true,
+        );
+        assert_imported_runtime_loop_range(&disabled, false);
+        assert!(disabled_path.is_file());
+
+        let clear_path = publish_runtime_loop_update_for_test(&updates, &project, None);
+        let cleared = import_runtime_loop_update_for_test(
+            &worker,
+            &clear_path,
+            initial_revision + 3,
+            true,
+            true,
+        );
+        assert_eq!(cleared.arrangement().loop_range(), None);
+        assert!(clear_path.is_file());
+
+        let no_op_path = publish_runtime_loop_update_for_test(&updates, &project, None);
+        let unchanged = import_runtime_loop_update_for_test(
+            &worker,
+            &no_op_path,
+            initial_revision + 3,
+            false,
+            false,
+        );
+        assert_eq!(unchanged.arrangement().loop_range(), None);
+        assert!(no_op_path.is_file());
+
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeLoopUpdate { path: enabled_path })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeLoopUpdateImport(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeRuntimeLoopUpdateImportError::ProjectRevisionMismatch {
+                    update_revision,
+                    project_revision,
+                } if *update_revision == initial_revision && *project_revision == initial_revision + 3
+            )
+        ));
+        assert_eq!(
+            verify_project_package(&project)
+                .unwrap()
+                .manifest()
+                .revision(),
+            initial_revision + 3
         );
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();

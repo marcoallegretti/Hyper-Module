@@ -2210,6 +2210,7 @@ dependencies = [
  "hyper-recording-metadata",
  "hyper-recording-worker",
  "hyper-runtime-bundle-builder",
+ "hyper-runtime-loop-update",
  "hyper-runtime-mixer-update",
  "hyper-scene-performance",
  "hyper-storage-engine",

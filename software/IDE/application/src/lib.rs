@@ -249,7 +249,7 @@ pub use worker::{
     IdeMixerAutomationCaptureError, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerSend,
     IdeNativeCompressor, IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError,
     IdeRecordingCaptureKind, IdeRecordingState, IdeRecordingTake, IdeRunningObservation,
-    IdeRuntimeMixerUpdateImportError, IdeRuntimePreparationError,
+    IdeRuntimeLoopUpdateImportError, IdeRuntimeMixerUpdateImportError, IdeRuntimePreparationError,
     IdeRuntimeScenePerformanceImportError, IdeScene, IdeScenePerformanceCaptureError,
     IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure,
     IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,

@@ -53,9 +53,10 @@ use hyper_desktop_ide::{
     IdeArrangementPlacementEditError, IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError,
     IdeAudioClipLoopEditError, IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
     IdeAudioClipSourceTrimEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
-    IdeAudioImportError, IdeAutomationTakeEditError, IdeRuntimeMixerUpdateImportError,
-    IdeRuntimeScenePerformanceImportError, IdeSceneCreationError, IdeSceneDuplicationError,
-    IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEditError, IdeTempoEditError,
+    IdeAudioImportError, IdeAutomationTakeEditError, IdeRuntimeLoopUpdateImportError,
+    IdeRuntimeMixerUpdateImportError, IdeRuntimeScenePerformanceImportError, IdeSceneCreationError,
+    IdeSceneDuplicationError, IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEditError,
+    IdeTempoEditError,
 };
 #[cfg(test)]
 use hyper_mixer_runtime::PlaybackRecoverySnapshot;
@@ -84,6 +85,7 @@ const INPUT_METER_FLOOR_DBFS: f32 = -60.0;
 const MIXER_STRIP_METER_FLOOR_DBFS: f32 = -60.0;
 const RUNTIME_SCENE_PERFORMANCE_IMPORT_FILTER_LABEL: &str = "Runtime scene-performance updates";
 const RUNTIME_MIXER_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime mixer updates";
+const RUNTIME_LOOP_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime loop updates";
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
@@ -109,6 +111,12 @@ enum RuntimeScenePerformanceImportChoice {
 
 #[derive(Debug)]
 enum RuntimeMixerUpdateImportChoice {
+    Selected(PathBuf),
+    Cancelled,
+}
+
+#[derive(Debug)]
+enum RuntimeLoopUpdateImportChoice {
     Selected(PathBuf),
     Cancelled,
 }
@@ -160,6 +168,16 @@ struct NativeDeviceClipboard {
 struct LoopMarks {
     start: Option<usize>,
     end: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistedArrangementLoopState {
+    Clear,
+    Range {
+        start: usize,
+        end: usize,
+        enabled: bool,
+    },
 }
 
 impl LoopMarks {
@@ -571,6 +589,7 @@ fn bind_callbacks(
     bind_scene_performance_capture_callbacks(ui, worker);
     bind_runtime_scene_performance_import_callback(ui, worker);
     bind_runtime_mixer_update_import_callback(ui, worker);
+    bind_runtime_loop_update_import_callback(ui, worker, project_state);
     bind_audio_preview_callbacks(ui, worker, &routes.takes);
     bind_audio_import_callback(ui, worker, &routes.audio_imports);
 }
@@ -1566,6 +1585,99 @@ fn bind_runtime_mixer_update_import_callback_with(
         }
         ui.set_app_mode(AppMode::ImportingRuntimeMixerUpdate);
         ui.set_status_text("Waiting for a Runtime mixer update…".into());
+        ui.set_error_text(SharedString::default());
+        choose(weak.clone(), Rc::clone(&worker));
+    });
+}
+
+fn bind_runtime_loop_update_import_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let project_state_for_availability = Rc::clone(project_state);
+    bind_runtime_loop_update_import_callback_with(
+        ui,
+        worker,
+        move || runtime_loop_update_import_availability(&project_state_for_availability),
+        |weak, worker| {
+            let weak_for_dialog = weak.clone();
+            let spawn_result = slint::spawn_local(async move {
+                let selection = rfd::AsyncFileDialog::new()
+                    .set_title("Import Runtime loop update")
+                    .add_filter(RUNTIME_LOOP_UPDATE_IMPORT_FILTER_LABEL, &["json"])
+                    .pick_file()
+                    .await;
+                let Some(ui) = weak_for_dialog.upgrade() else {
+                    return;
+                };
+                if ui.get_app_mode() != AppMode::ImportingRuntimeLoopUpdate {
+                    return;
+                }
+                let choice =
+                    selection.map_or(RuntimeLoopUpdateImportChoice::Cancelled, |selection| {
+                        RuntimeLoopUpdateImportChoice::Selected(selection.path().to_path_buf())
+                    });
+                complete_runtime_loop_update_import_choice(&ui, &worker, choice);
+            });
+            if spawn_result.is_err()
+                && let Some(ui) = weak.upgrade()
+            {
+                ui.set_app_mode(AppMode::Running);
+                ui.set_status_text("Runtime loop-update selection is unavailable".into());
+            }
+        },
+    );
+}
+
+fn complete_runtime_loop_update_import_choice(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    choice: RuntimeLoopUpdateImportChoice,
+) {
+    complete_runtime_loop_update_import_choice_with(ui, choice, |command| {
+        submit_to_ui(ui, worker, command);
+    });
+}
+
+fn complete_runtime_loop_update_import_choice_with(
+    ui: &MainWindow,
+    choice: RuntimeLoopUpdateImportChoice,
+    submit: impl FnOnce(IdeWorkerCommand),
+) {
+    match choice {
+        RuntimeLoopUpdateImportChoice::Selected(path) => {
+            submit(IdeWorkerCommand::ImportRuntimeLoopUpdate { path });
+        }
+        RuntimeLoopUpdateImportChoice::Cancelled => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime loop update import cancelled".into());
+        }
+    }
+}
+
+fn bind_runtime_loop_update_import_callback_with(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    availability: impl Fn() -> Result<(), &'static str> + 'static,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell) + 'static,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    actions.on_import_runtime_loop_update(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        if let Err(message) = availability() {
+            ui.set_error_text(message.into());
+            return;
+        }
+        ui.set_app_mode(AppMode::ImportingRuntimeLoopUpdate);
+        ui.set_status_text("Waiting for a Runtime loop update…".into());
         ui.set_error_text(SharedString::default());
         choose(weak.clone(), Rc::clone(&worker));
     });
@@ -6489,6 +6601,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
             AppMode::ImportingRuntimeScenePerformance
         }
         IdeWorkerCommandKind::ImportRuntimeMixerUpdate => AppMode::ImportingRuntimeMixerUpdate,
+        IdeWorkerCommandKind::ImportRuntimeLoopUpdate => AppMode::ImportingRuntimeLoopUpdate,
         IdeWorkerCommandKind::SetArrangementPlacementActive
         | IdeWorkerCommandKind::MoveArrangementPlacement
         | IdeWorkerCommandKind::SetArrangementPlacementDuration
@@ -6727,6 +6840,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::ImportRuntimeMixerUpdate => {
             "Verifying the Runtime mixer update and waiting for a clean committed mixer checkpoint…"
+        }
+        IdeWorkerCommandKind::ImportRuntimeLoopUpdate => {
+            "Verifying the Runtime loop update and reopening project after one arrangement-loop edit…"
         }
         IdeWorkerCommandKind::SetArrangementPlacementActive => {
             "Preserving mixer state, updating the arrangement placement, and reopening project…"
@@ -7530,6 +7646,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::RuntimeMixerUpdateImporting
         | IdeWorkerEvent::RuntimeMixerUpdateImported { .. }) => {
             apply_runtime_mixer_update_import_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::RuntimeLoopUpdateImporting
+        | IdeWorkerEvent::RuntimeLoopUpdateImported { .. }) => {
+            apply_runtime_loop_update_import_event(ui, project_state, &event);
         }
         event @ (IdeWorkerEvent::ScenePerformanceCaptureStarted { .. }
         | IdeWorkerEvent::ScenePerformanceCaptureProgress { .. }
@@ -10702,6 +10822,43 @@ fn apply_runtime_mixer_update_import_event(ui: &MainWindow, event: &IdeWorkerEve
     }
 }
 
+fn apply_runtime_loop_update_import_event(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    event: &IdeWorkerEvent,
+) {
+    match event {
+        IdeWorkerEvent::RuntimeLoopUpdateImporting => {
+            ui.set_app_mode(AppMode::ImportingRuntimeLoopUpdate);
+            ui.set_status_text(
+                "Verifying the Runtime loop update and preparing one atomic arrangement-loop edit…"
+                    .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RuntimeLoopUpdateImported { revision, changed } => {
+            ui.set_app_mode(AppMode::Running);
+            let synchronized = resynchronize_loop_marks_from_arrangement(ui, project_state);
+            ui.set_status_text(
+                if *changed {
+                    format!("Imported Runtime loop update in project revision {revision}")
+                } else {
+                    format!(
+                        "Runtime loop update already matches project revision {revision}; project unchanged"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(if synchronized {
+                SharedString::default()
+            } else {
+                "The Runtime loop update was imported, but the reopened arrangement loop state is unavailable".into()
+            });
+        }
+        _ => unreachable!("Runtime loop-update import dispatcher received another event"),
+    }
+}
+
 fn apply_mixer_automation_capture_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::MixerAutomationCaptureStarted {
@@ -11577,6 +11734,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::ImportRuntimeMixerUpdate
             if current == AppMode::ImportingRuntimeMixerUpdate =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::ImportRuntimeLoopUpdate
+            if current == AppMode::ImportingRuntimeLoopUpdate =>
         {
             AppMode::Running
         }
@@ -15576,6 +15738,93 @@ fn current_persisted_loop_export_range(state: &ProjectUiStateCell) -> Option<Off
         .as_ref()
         .and_then(|binding| binding.owner.loop_range())
         .and_then(|range| offline_export_range_from_frames(range.start_frame(), range.end_frame()))
+}
+
+fn persisted_arrangement_loop_state(
+    state: &ProjectUiStateCell,
+) -> Option<PersistedArrangementLoopState> {
+    state.arrangement.borrow().as_ref().map(|binding| {
+        binding
+            .owner
+            .loop_range()
+            .map_or(PersistedArrangementLoopState::Clear, |range| {
+                PersistedArrangementLoopState::Range {
+                    start: range.start_frame(),
+                    end: range.end_frame(),
+                    enabled: range.enabled(),
+                }
+            })
+    })
+}
+
+fn loop_marks_match_persisted_state(
+    marks: LoopMarks,
+    engaged: bool,
+    persisted: PersistedArrangementLoopState,
+) -> bool {
+    let (expected_marks, expected_engaged) = match persisted {
+        PersistedArrangementLoopState::Clear => (LoopMarks::default(), false),
+        PersistedArrangementLoopState::Range {
+            start,
+            end,
+            enabled,
+        } => (
+            LoopMarks {
+                start: Some(start),
+                end: Some(end),
+            },
+            enabled,
+        ),
+    };
+    marks == expected_marks && engaged == expected_engaged
+}
+
+fn runtime_loop_update_import_availability(state: &ProjectUiStateCell) -> Result<(), &'static str> {
+    let Some(persisted) = persisted_arrangement_loop_state(state) else {
+        return Err(
+            "The current arrangement loop state is unavailable; wait for Runtime evidence before importing a Runtime loop update",
+        );
+    };
+    if loop_marks_match_persisted_state(state.loop_marks.get(), state.loop_engaged.get(), persisted)
+    {
+        Ok(())
+    } else {
+        Err("Save or clear the local loop marks before importing a Runtime loop update")
+    }
+}
+
+fn apply_persisted_loop_state(
+    ui: &MainWindow,
+    state: &ProjectUiStateCell,
+    persisted: PersistedArrangementLoopState,
+) {
+    let (marks, engaged, export_available) = match persisted {
+        PersistedArrangementLoopState::Clear => (LoopMarks::default(), false, false),
+        PersistedArrangementLoopState::Range {
+            start,
+            end,
+            enabled,
+        } => (
+            LoopMarks {
+                start: Some(start),
+                end: Some(end),
+            },
+            enabled,
+            true,
+        ),
+    };
+    state.loop_marks.set(marks);
+    state.loop_engaged.set(engaged);
+    ui.set_loop_export_available(export_available);
+    refresh_loop_controls(ui, state, state.sample_rate_hz.get());
+}
+
+fn resynchronize_loop_marks_from_arrangement(ui: &MainWindow, state: &ProjectUiStateCell) -> bool {
+    let Some(persisted) = persisted_arrangement_loop_state(state) else {
+        return false;
+    };
+    apply_persisted_loop_state(ui, state, persisted);
+    true
 }
 
 /// The marks a reopened project should show. The user's own marks win once they
@@ -25756,6 +26005,7 @@ mod tests {
         assert_audio_import_window_contract(ui);
         assert_runtime_scene_performance_import_window_contract(ui);
         assert_runtime_mixer_update_import_window_contract(ui);
+        assert_runtime_loop_update_import_window_contract(ui);
         assert_audio_track_content_removal_window_contract(ui);
         assert_audio_track_freeze_window_contract(ui);
         assert_audio_track_flatten_window_contract(ui);
@@ -25880,6 +26130,12 @@ mod tests {
     fn assert_runtime_mixer_update_import_window_contract(ui: &MainWindow) {
         assert_runtime_mixer_update_import_callback_contract(ui);
         assert_runtime_mixer_update_import_event_contract(ui);
+    }
+
+    fn assert_runtime_loop_update_import_window_contract(ui: &MainWindow) {
+        assert_runtime_loop_update_import_callback_contract(ui);
+        assert_runtime_loop_update_import_event_contract(ui);
+        assert_runtime_loop_update_resynchronization_contract(ui);
     }
 
     fn assert_runtime_scene_performance_import_callback_contract(ui: &MainWindow) {
@@ -26162,6 +26418,301 @@ mod tests {
             ),
             AppMode::Running
         );
+    }
+
+    fn runtime_loop_import_project_state() -> ProjectUiStateCell {
+        let project_state = Rc::new(ProjectUiState::default());
+        *project_state.arrangement.borrow_mut() = Some(ArrangementBinding {
+            project_id: "project-a".to_owned(),
+            owner: Arc::new(IdePlaybackArrangement::empty()),
+            sample_rate_hz: 48_000,
+            scene_ids: Vec::new(),
+        });
+        project_state
+    }
+
+    fn assert_runtime_loop_update_import_selection_contract(
+        ui: &MainWindow,
+        project_state: &ProjectUiStateCell,
+        worker: &WorkerCell,
+    ) {
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        let project_state_for_availability = Rc::clone(project_state);
+        bind_runtime_loop_update_import_callback_with(
+            ui,
+            worker,
+            move || runtime_loop_update_import_availability(&project_state_for_availability),
+            move |weak, _| {
+                let ui = weak.upgrade().unwrap();
+                complete_runtime_loop_update_import_choice_with(
+                    &ui,
+                    RuntimeLoopUpdateImportChoice::Selected(PathBuf::from(
+                        "loop.hyper-loop-update.json",
+                    )),
+                    |command| submitted_by_callback.borrow_mut().push(command),
+                );
+            },
+        );
+        ui.set_app_mode(AppMode::Running);
+        ui.set_error_text("stale error".into());
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_loop_update();
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::ImportRuntimeLoopUpdate { path }]
+                if path == &PathBuf::from("loop.hyper-loop-update.json")
+        ));
+        assert_eq!(ui.get_app_mode(), AppMode::ImportingRuntimeLoopUpdate);
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::Closed);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_loop_update();
+        assert_eq!(
+            submitted.borrow().len(),
+            1,
+            "Closed mode owns no Runtime loop-update import action"
+        );
+    }
+
+    fn assert_runtime_loop_update_import_cancellation_contract(
+        ui: &MainWindow,
+        project_state: &ProjectUiStateCell,
+        worker: &WorkerCell,
+    ) {
+        let project_state_for_availability = Rc::clone(project_state);
+        bind_runtime_loop_update_import_callback_with(
+            ui,
+            worker,
+            move || runtime_loop_update_import_availability(&project_state_for_availability),
+            move |weak, _| {
+                let ui = weak.upgrade().unwrap();
+                complete_runtime_loop_update_import_choice_with(
+                    &ui,
+                    RuntimeLoopUpdateImportChoice::Cancelled,
+                    |_| panic!("a cancelled chooser must not submit a command"),
+                );
+            },
+        );
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_loop_update();
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(ui.get_status_text(), "Runtime loop update import cancelled");
+    }
+
+    fn assert_runtime_loop_update_import_unavailable_worker_contract(
+        ui: &MainWindow,
+        project_state: &ProjectUiStateCell,
+        worker: &WorkerCell,
+    ) {
+        let project_state_for_availability = Rc::clone(project_state);
+        bind_runtime_loop_update_import_callback_with(
+            ui,
+            worker,
+            move || runtime_loop_update_import_availability(&project_state_for_availability),
+            move |weak, worker| {
+                let ui = weak.upgrade().unwrap();
+                complete_runtime_loop_update_import_choice(
+                    &ui,
+                    &worker,
+                    RuntimeLoopUpdateImportChoice::Selected(PathBuf::from(
+                        "loop.hyper-loop-update.json",
+                    )),
+                );
+            },
+        );
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_loop_update();
+        assert_eq!(ui.get_app_mode(), AppMode::Unavailable);
+        assert!(ui.get_error_text().contains("no longer available"));
+    }
+
+    fn assert_runtime_loop_update_import_drift_contract(
+        ui: &MainWindow,
+        project_state: &ProjectUiStateCell,
+        worker: &WorkerCell,
+    ) {
+        project_state.loop_marks.set(LoopMarks {
+            start: Some(480),
+            end: Some(960),
+        });
+        project_state.loop_engaged.set(true);
+        let project_state_for_availability = Rc::clone(project_state);
+        bind_runtime_loop_update_import_callback_with(
+            ui,
+            worker,
+            move || runtime_loop_update_import_availability(&project_state_for_availability),
+            |_, _| panic!("a local-loop conflict must not open the Runtime loop-update chooser"),
+        );
+        ui.set_app_mode(AppMode::Running);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_loop_update();
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_error_text(),
+            "Save or clear the local loop marks before importing a Runtime loop update"
+        );
+    }
+
+    fn assert_runtime_loop_update_import_callback_contract(ui: &MainWindow) {
+        let unavailable_state = Rc::new(ProjectUiState::default());
+        assert_eq!(
+            runtime_loop_update_import_availability(&unavailable_state),
+            Err(
+                "The current arrangement loop state is unavailable; wait for Runtime evidence before importing a Runtime loop update"
+            )
+        );
+        let project_state = runtime_loop_import_project_state();
+        assert!(runtime_loop_update_import_availability(&project_state).is_ok());
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        assert_runtime_loop_update_import_selection_contract(ui, &project_state, &worker);
+        assert_runtime_loop_update_import_cancellation_contract(ui, &project_state, &worker);
+        assert_runtime_loop_update_import_unavailable_worker_contract(ui, &project_state, &worker);
+        assert_runtime_loop_update_import_drift_contract(ui, &project_state, &worker);
+    }
+
+    fn assert_runtime_loop_update_import_event_contract(ui: &MainWindow) {
+        let routes = UiRoutes::default();
+        let unavailable_state = Rc::new(ProjectUiState::default());
+        apply_event(
+            ui,
+            &routes,
+            &unavailable_state,
+            IdeWorkerEvent::RuntimeLoopUpdateImporting,
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::ImportingRuntimeLoopUpdate);
+        assert_eq!(
+            ui.get_status_text(),
+            "Verifying the Runtime loop update and preparing one atomic arrangement-loop edit…"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        apply_event(
+            ui,
+            &routes,
+            &unavailable_state,
+            IdeWorkerEvent::RuntimeLoopUpdateImported {
+                revision: 8,
+                changed: true,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Imported Runtime loop update in project revision 8"
+        );
+        assert!(
+            ui.get_error_text()
+                .contains("reopened arrangement loop state is unavailable")
+        );
+
+        let project_state = runtime_loop_import_project_state();
+        project_state.loop_marks.set(LoopMarks {
+            start: Some(480),
+            end: Some(960),
+        });
+        project_state.loop_engaged.set(true);
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeLoopUpdateImported {
+                revision: 9,
+                changed: true,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Imported Runtime loop update in project revision 9"
+        );
+        assert!(ui.get_error_text().is_empty());
+        assert_eq!(project_state.loop_marks.get(), LoopMarks::default());
+        assert!(!project_state.loop_engaged.get());
+        assert!(!ui.get_loop_export_available());
+
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeLoopUpdateImported {
+                revision: 9,
+                changed: false,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime loop update already matches project revision 9; project unchanged"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::ImportingRuntimeLoopUpdate);
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeLoopUpdateImport(Box::new(
+                    IdeRuntimeLoopUpdateImportError::ProjectIdentityMismatch,
+                )),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(ui.get_error_text().contains("another project"));
+
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+            ),
+            AppMode::ImportingRuntimeLoopUpdate
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ImportingRuntimeLoopUpdate,
+                IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+            ),
+            AppMode::Running
+        );
+    }
+
+    fn assert_runtime_loop_update_resynchronization_contract(ui: &MainWindow) {
+        let project_state = Rc::new(ProjectUiState::default());
+        ui.set_app_mode(AppMode::Running);
+        project_state.sample_rate_hz.set(48_000);
+        apply_persisted_loop_state(
+            ui,
+            &project_state,
+            PersistedArrangementLoopState::Range {
+                start: 480,
+                end: 960,
+                enabled: false,
+            },
+        );
+        assert_eq!(
+            project_state.loop_marks.get(),
+            LoopMarks {
+                start: Some(480),
+                end: Some(960),
+            }
+        );
+        assert!(!project_state.loop_engaged.get());
+        assert!(!ui.get_loop_engaged());
+        assert!(ui.get_loop_export_available());
+        assert_eq!(ui.get_loop_summary(), "LOOP 00:00:00.010 → 00:00:00.020");
+
+        apply_persisted_loop_state(ui, &project_state, PersistedArrangementLoopState::Clear);
+        assert_eq!(project_state.loop_marks.get(), LoopMarks::default());
+        assert!(!project_state.loop_engaged.get());
+        assert!(!ui.get_loop_engaged());
+        assert!(!ui.get_loop_export_available());
+        assert!(ui.get_loop_summary().is_empty());
     }
 
     fn assert_audio_track_content_removal_window_contract(ui: &MainWindow) {

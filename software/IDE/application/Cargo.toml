@@ -29,6 +29,7 @@ hyper-project-history = { path = "../project-history" }
 hyper-recording-journal = { path = "../../../crates/recording-journal" }
 hyper-recording-metadata = { path = "../../../crates/recording-metadata" }
 hyper-recording-worker = { path = "../../../crates/recording-worker" }
+hyper-runtime-loop-update = { path = "../../../crates/runtime-loop-update" }
 hyper-runtime-mixer-update = { path = "../../../crates/runtime-mixer-update" }
 hyper-runtime-bundle-builder = { path = "../runtime-bundle-builder" }
 hyper-scene-performance = { path = "../../../crates/scene-performance" }
