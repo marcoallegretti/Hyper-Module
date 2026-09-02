@@ -19660,6 +19660,9 @@ mod tests {
     use hyper_playback_json::{LoaderLimits, RoutingBusRemovalSerializationError};
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
     use hyper_project_loader::ProjectPlaybackLimits;
+    use hyper_scene_performance::{
+        RuntimeScenePerformanceSource, RuntimeScenePerformanceUpdateDirectory,
+    };
     use hyper_storage_engine::{
         MixerRecoverySnapshotRequest, ProjectCreationErrorKind, store_mixer_recovery_snapshot,
         verify_project_package,
@@ -19723,6 +19726,157 @@ mod tests {
             validate_runtime_scene_performance_update(&update, RUNTIME_PROJECT_ID, 7, &[0xcc; 32],),
             Err(IdeRuntimeScenePerformanceImportError::ProjectManifestMismatch)
         ));
+    }
+
+    fn create_runtime_scene_for_import(worker: &DesktopIdeWorker) -> (u64, String) {
+        worker
+            .try_send(IdeWorkerCommand::AddScene {
+                name: "Runtime scene".to_owned(),
+                quantization: IdeSceneLaunchQuantization::Grid {
+                    quantum_ticks: 1_920,
+                },
+            })
+            .unwrap();
+        assert!(matches!(recv(worker), IdeWorkerEvent::SceneAdding));
+        let IdeWorkerEvent::Running(with_scene) = recv(worker) else {
+            panic!("the project must reopen with its created Runtime scene");
+        };
+        let IdeWorkerEvent::SceneAdded {
+            revision, scene_id, ..
+        } = recv(worker)
+        else {
+            panic!("the created Runtime scene must report its durable identity");
+        };
+        assert_eq!(with_scene.scene_count(), 1);
+        assert_eq!(with_scene.scenes()[0].id(), scene_id);
+        (revision, scene_id)
+    }
+
+    fn publish_runtime_scene_performance_update_for_test(
+        directory: &Path,
+        project: &Path,
+        scene_id: &str,
+    ) -> PathBuf {
+        let verified = verify_project_package(project).unwrap();
+        let source = RuntimeScenePerformanceSource::try_new(
+            verified.manifest().project_id().to_owned(),
+            verified.manifest().revision(),
+            sha256_hex(verified.manifest_sha256()),
+            sha256_hex(&[0xbb; 32]),
+            1,
+        )
+        .unwrap();
+        drop(verified);
+        let update = RuntimeScenePerformanceUpdate::try_new(
+            uuid::Uuid::new_v4().to_string(),
+            source,
+            vec![ScenePerformanceLaunch::try_new(scene_id.to_owned(), 1_920).unwrap()],
+            1,
+        )
+        .unwrap();
+        RuntimeScenePerformanceUpdateDirectory::open(directory)
+            .unwrap()
+            .publish(&update)
+            .unwrap()
+    }
+
+    fn import_runtime_scene_performance_update_for_test(
+        worker: &DesktopIdeWorker,
+        update_path: &Path,
+        expected_revision: u64,
+    ) -> IdeRunningObservation {
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeScenePerformance {
+                path: update_path.to_path_buf(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::RuntimeScenePerformanceImporting { launch_count: 1 }
+        ));
+        let IdeWorkerEvent::Running(imported) = recv(worker) else {
+            panic!("the project must reopen before reporting the Runtime import");
+        };
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::RuntimeScenePerformanceImported {
+                revision,
+                launch_count: 1,
+            } if revision == expected_revision
+        ));
+        imported
+    }
+
+    #[test]
+    fn runtime_scene_performance_import_publishes_once_and_refuses_its_stale_artifact() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-runtime-scene-performance-import-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 5)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the project must open before creating its Runtime scene");
+        };
+        assert_eq!(opened.scene_count(), 0);
+        let (scene_revision, scene_id) = create_runtime_scene_for_import(&worker);
+
+        let updates = fixture.join("updates");
+        std::fs::create_dir(&updates).unwrap();
+        let update_path =
+            publish_runtime_scene_performance_update_for_test(&updates, &project, &scene_id);
+        let imported = import_runtime_scene_performance_update_for_test(
+            &worker,
+            &update_path,
+            scene_revision + 1,
+        );
+        assert_eq!(imported.arrangement().scene_launches().len(), 1);
+        assert_eq!(imported.arrangement().scene_launches()[0].scene_index(), 0);
+        assert_eq!(imported.arrangement().scene_launches()[0].tick(), 1_920);
+        assert!(update_path.is_file());
+
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeScenePerformance { path: update_path })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeScenePerformance,
+                reason: IdeWorkerCommandFailure::RuntimeScenePerformanceImport(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeRuntimeScenePerformanceImportError::ProjectRevisionMismatch {
+                    update_revision,
+                    project_revision,
+                } if *update_revision == scene_revision && *project_revision == scene_revision + 1
+            )
+        ));
+        assert_eq!(
+            verify_project_package(&project)
+                .unwrap()
+                .manifest()
+                .revision(),
+            scene_revision + 1
+        );
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
     }
 
     fn capture_scene(id: &str, grid_quantized: bool) -> ScenePerformanceScene {
