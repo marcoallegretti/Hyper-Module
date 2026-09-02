@@ -3403,11 +3403,13 @@ fn mixer_fence_commits_after_every_earlier_command_in_a_successful_cycle() {
     let cycle = process_transport(&mut transport, &mut left, &mut right).unwrap();
 
     assert_eq!(cycle.applied_mixer_parameter_command_count(), 2);
+    assert_eq!(cycle.committed_mixer_fence(), 1);
     assert!(transport.mixer_parameter_state().main_muted());
     assert_eq!(parameter_sender.committed_fence(), 1);
 
     assert_eq!(parameter_sender.try_send_fence().unwrap(), Some(2));
-    process_transport(&mut transport, &mut left, &mut right).unwrap();
+    let cycle = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(cycle.committed_mixer_fence(), 2);
     assert_eq!(parameter_sender.committed_fence(), 2);
 }
 

@@ -1997,6 +1997,7 @@ pub struct TransportCycle {
     capture_start_sequence: u64,
     command_sender_disconnected: bool,
     applied_mixer_parameter_command_count: usize,
+    committed_mixer_fence: u64,
     mixer_parameter_command_sender_disconnected: bool,
     applied_native_device_command_count: usize,
     native_device_command_sender_disconnected: bool,
@@ -2099,6 +2100,18 @@ impl TransportCycle {
     /// Live mixer base-state commands applied at the beginning of this cycle.
     pub const fn applied_mixer_parameter_command_count(self) -> usize {
         self.applied_mixer_parameter_command_count
+    }
+
+    /// Returns the greatest live mixer fence represented by this successful
+    /// process cycle.
+    ///
+    /// A recovery publication of this cycle therefore contains mixer state
+    /// that is no earlier than every parameter command ordered before this
+    /// fence. The value is session-local and resets when a new transport queue
+    /// owner is created.
+    #[must_use]
+    pub const fn committed_mixer_fence(self) -> u64 {
+        self.committed_mixer_fence
     }
 
     #[must_use]
@@ -2356,6 +2369,7 @@ pub fn output_meter_snapshot_for_test(
             capture_start_sequence: 0,
             command_sender_disconnected: false,
             applied_mixer_parameter_command_count: 0,
+            committed_mixer_fence: 0,
             mixer_parameter_command_sender_disconnected: false,
             applied_native_device_command_count: 0,
             native_device_command_sender_disconnected: false,
@@ -5130,7 +5144,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         if self.state == TransportState::Stopped {
             output.left.fill(0.0);
             output.right.fill(0.0);
-            self.commit_mixer_parameter_fence(mixer_parameter_drain.greatest_fence);
+            let committed_mixer_fence =
+                self.commit_mixer_parameter_fence(mixer_parameter_drain.greatest_fence);
             let mixer_parameter_changes =
                 self.commit_mixer_parameter_changes(mixer_parameter_drain.changes);
             return Ok(ProcessedTransportCycle {
@@ -5151,6 +5166,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                     capture_start_sequence: transport_command_drain.capture_start_sequence,
                     command_sender_disconnected,
                     applied_mixer_parameter_command_count,
+                    committed_mixer_fence,
                     mixer_parameter_command_sender_disconnected,
                     applied_native_device_command_count,
                     native_device_command_sender_disconnected,
@@ -5180,7 +5196,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             }
         };
         self.position_frame = next_frame;
-        self.commit_mixer_parameter_fence(mixer_parameter_drain.greatest_fence);
+        let committed_mixer_fence =
+            self.commit_mixer_parameter_fence(mixer_parameter_drain.greatest_fence);
         let mixer_parameter_changes =
             self.commit_mixer_parameter_changes(mixer_parameter_drain.changes);
         Ok(ProcessedTransportCycle {
@@ -5201,6 +5218,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 capture_start_sequence: transport_command_drain.capture_start_sequence,
                 command_sender_disconnected,
                 applied_mixer_parameter_command_count,
+                committed_mixer_fence,
                 mixer_parameter_command_sender_disconnected,
                 applied_native_device_command_count,
                 native_device_command_sender_disconnected,
@@ -5384,12 +5402,16 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         drained
     }
 
-    fn commit_mixer_parameter_fence(&self, sequence: u64) {
-        if sequence != 0
-            && let Some(committed) = &self.mixer_parameter_fence
-        {
-            committed.fetch_max(sequence, Ordering::Release);
+    fn commit_mixer_parameter_fence(&self, sequence: u64) -> u64 {
+        let Some(committed) = &self.mixer_parameter_fence else {
+            return 0;
+        };
+        if sequence == 0 {
+            return committed.load(Ordering::Acquire);
         }
+        committed
+            .fetch_max(sequence, Ordering::Release)
+            .max(sequence)
     }
 
     fn commit_mixer_parameter_changes(

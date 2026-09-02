@@ -738,6 +738,7 @@ mod tests {
                 capture_start_sequence: 0,
                 command_sender_disconnected: false,
                 applied_mixer_parameter_command_count: 0,
+                committed_mixer_fence: 0,
                 mixer_parameter_command_sender_disconnected: false,
                 applied_native_device_command_count: 0,
                 native_device_command_sender_disconnected: false,
