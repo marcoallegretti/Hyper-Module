@@ -23,6 +23,7 @@ members = [
     "crates/recording-worker",
     "crates/runtime-mixer-update",
     "crates/runtime-loop-update",
+    "crates/runtime-native-device-update",
     "crates/scene-performance",
     "crates/storage-engine",
     "crates/strict-json",
