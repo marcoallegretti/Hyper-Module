@@ -100,7 +100,7 @@ use super::{
 };
 
 #[cfg(test)]
-use super::IdeAudioClipRemovalCommittedWarning;
+use super::{IdeArrangementPlacementEditPublicationError, IdeAudioClipRemovalCommittedWarning};
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
@@ -11438,6 +11438,9 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             result: Err(reason),
             ..
         } if reason.committed_clip_id().is_some() => HistoryEffect::Invalidate,
+        ProjectMutationAttempt::ImportRuntimeLoopUpdate {
+            result: Err(reason),
+        } if reason.publication_committed() => HistoryEffect::Invalidate,
         ProjectMutationAttempt::RemoveAudioTrackContent(Err(reason))
             if reason.publication_committed() =>
         {
@@ -31906,6 +31909,88 @@ mod tests {
             audio_clip_removal_failure_event(IdeAudioClipRemovalError::InvalidClipIdentity),
             IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::RemoveAudioClip,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn committed_runtime_loop_update_warning_invalidates_history_and_stays_truthful() {
+        let edit = captured_mixer_edit("runtime-loop-update-warning");
+        let committed_warning = || IdeArrangementPlacementEditError::Publication {
+            created_placement_id: None,
+            source: Box::new(IdeArrangementPlacementEditPublicationError::Arrangement {
+                mixer: Box::new(edit.outcome.clone()),
+                source: Box::new(
+                    hyper_storage_engine::ProjectResourcePublicationError::for_test(
+                        hyper_storage_engine::ProjectResourcePublicationErrorKind::Recovery,
+                        "simulated transaction cleanup warning",
+                        true,
+                    ),
+                ),
+            }),
+        };
+        let attempt = ProjectMutationAttempt::ImportRuntimeLoopUpdate {
+            result: Err(committed_warning()),
+        };
+        assert!(matches!(
+            history_effect(&attempt),
+            HistoryEffect::Invalidate
+        ));
+
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut history = UndoHistory::default();
+        history.record_edit(labelled("scene", "scene rename"));
+        history.record_restore(false, labelled("undone", "clip gain"));
+        observe_history(
+            &mut history,
+            &attempt,
+            IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+            &events,
+        );
+        assert!(history.undo.is_empty() && history.redo.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            })
+        ));
+
+        let warning_event = arrangement_edit_failure_event(
+            IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+            committed_warning(),
+            |reason| {
+                IdeWorkerCommandFailure::RuntimeLoopUpdateImport(Box::new(
+                    IdeRuntimeLoopUpdateImportError::Arrangement(reason),
+                ))
+            },
+        );
+        assert!(matches!(
+            warning_event,
+            IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning {
+                command: IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+                warning,
+            } if warning.publication_committed()
+                && warning.to_string().contains("arrangement edit was published")
+        ));
+
+        let unpublished = ProjectMutationAttempt::ImportRuntimeLoopUpdate {
+            result: Err(IdeArrangementPlacementEditError::ArrangementResourceMissing),
+        };
+        assert!(matches!(history_effect(&unpublished), HistoryEffect::None));
+        assert!(matches!(
+            arrangement_edit_failure_event(
+                IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+                IdeArrangementPlacementEditError::ArrangementResourceMissing,
+                |reason| {
+                    IdeWorkerCommandFailure::RuntimeLoopUpdateImport(Box::new(
+                        IdeRuntimeLoopUpdateImportError::Arrangement(reason),
+                    ))
+                },
+            ),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
                 ..
             }
         ));

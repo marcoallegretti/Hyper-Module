@@ -7332,7 +7332,7 @@ fn apply_event(
             apply_arrangement_placement_split_event(ui, &event);
         }
         event @ IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning { .. } => {
-            apply_arrangement_placement_committed_warning(ui, &event);
+            apply_arrangement_placement_committed_warning(ui, project_state, &event);
         }
         event @ (IdeWorkerEvent::AudioClipRenamed { .. } | IdeWorkerEvent::AudioClipRenaming) => {
             apply_audio_clip_rename_event(ui, &event);
@@ -8548,12 +8548,23 @@ fn apply_arrangement_placement_split_event(ui: &MainWindow, event: &IdeWorkerEve
     }
 }
 
-fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWorkerEvent) {
+fn apply_arrangement_placement_committed_warning(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    event: &IdeWorkerEvent,
+) {
     let IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning { command, warning } = event
     else {
         unreachable!("arrangement committed-warning dispatcher received another event");
     };
+    let loop_state_synchronized = match command {
+        IdeWorkerCommandKind::ImportRuntimeLoopUpdate => {
+            resynchronize_loop_marks_from_arrangement(ui, project_state)
+        }
+        _ => true,
+    };
     let action = match command {
+        IdeWorkerCommandKind::ImportRuntimeLoopUpdate => "Runtime loop update import".to_owned(),
         IdeWorkerCommandKind::ImportRuntimeScenePerformance => {
             "Runtime scene-performance import".to_owned()
         }
@@ -8609,7 +8620,14 @@ fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWor
         _ => "Arrangement placement edit".to_owned(),
     };
     ui.set_status_text(committed_warning_status(ui.get_app_mode(), &action).into());
-    ui.set_error_text(warning.to_string().into());
+    ui.set_error_text(
+        if loop_state_synchronized {
+            warning.to_string()
+        } else {
+            format!("{warning}; the reopened arrangement loop state is unavailable")
+        }
+        .into(),
+    );
 }
 
 fn reset_arrangement_placement_addition_form(ui: &MainWindow) {
@@ -23359,6 +23377,7 @@ mod tests {
     }
 
     fn assert_arrangement_scene_launch_committed_warnings(ui: &MainWindow) {
+        let project_state = Rc::new(ProjectUiState::default());
         ui.set_app_mode(AppMode::Running);
         ui.set_move_arrangement_scene_launch_visible(true);
         ui.set_move_arrangement_scene_launch_id("marker-a".into());
@@ -23367,6 +23386,7 @@ mod tests {
         ui.set_move_arrangement_scene_launch_tick("1920".into());
         apply_arrangement_placement_committed_warning(
             ui,
+            &project_state,
             &IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning {
                 command: IdeWorkerCommandKind::MoveArrangementSceneLaunch,
                 warning: Box::new(IdeArrangementPlacementEditError::InvalidSceneLaunchIdentity),
@@ -23388,6 +23408,7 @@ mod tests {
         ui.set_set_arrangement_scene_launch_scene_target_index(1);
         apply_arrangement_placement_committed_warning(
             ui,
+            &project_state,
             &IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning {
                 command: IdeWorkerCommandKind::SetArrangementSceneLaunchScene,
                 warning: Box::new(IdeArrangementPlacementEditError::InvalidSceneLaunchIdentity),
@@ -23410,6 +23431,7 @@ mod tests {
         ui.set_remove_arrangement_scene_launch_tick("1920".into());
         apply_arrangement_placement_committed_warning(
             ui,
+            &project_state,
             &IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning {
                 command: IdeWorkerCommandKind::RemoveArrangementSceneLaunch,
                 warning: Box::new(IdeArrangementPlacementEditError::InvalidSceneLaunchIdentity),
@@ -26135,6 +26157,7 @@ mod tests {
     fn assert_runtime_loop_update_import_window_contract(ui: &MainWindow) {
         assert_runtime_loop_update_import_callback_contract(ui);
         assert_runtime_loop_update_import_event_contract(ui);
+        assert_runtime_loop_update_committed_warning_resynchronization_contract(ui);
         assert_runtime_loop_update_resynchronization_contract(ui);
     }
 
@@ -26420,15 +26443,27 @@ mod tests {
         );
     }
 
-    fn runtime_loop_import_project_state() -> ProjectUiStateCell {
+    fn runtime_loop_import_project_state_with_arrangement(
+        owner: IdePlaybackArrangement,
+    ) -> ProjectUiStateCell {
         let project_state = Rc::new(ProjectUiState::default());
         *project_state.arrangement.borrow_mut() = Some(ArrangementBinding {
             project_id: "project-a".to_owned(),
-            owner: Arc::new(IdePlaybackArrangement::empty()),
+            owner: Arc::new(owner),
             sample_rate_hz: 48_000,
             scene_ids: Vec::new(),
         });
         project_state
+    }
+
+    fn runtime_loop_import_project_state() -> ProjectUiStateCell {
+        runtime_loop_import_project_state_with_arrangement(IdePlaybackArrangement::empty())
+    }
+
+    fn runtime_loop_import_project_state_with_loop(enabled: bool) -> ProjectUiStateCell {
+        runtime_loop_import_project_state_with_arrangement(
+            IdePlaybackArrangement::for_test_with_loop_range(0, 960, 0, 24_000, enabled),
+        )
     }
 
     fn assert_runtime_loop_update_import_selection_contract(
@@ -26713,6 +26748,90 @@ mod tests {
         assert!(!ui.get_loop_engaged());
         assert!(!ui.get_loop_export_available());
         assert!(ui.get_loop_summary().is_empty());
+    }
+
+    fn assert_runtime_loop_update_committed_warning_resynchronization_contract(ui: &MainWindow) {
+        fn warning_event() -> IdeWorkerEvent {
+            IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning {
+                command: IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+                warning: Box::new(IdeArrangementPlacementEditError::ArrangementResourceMissing),
+            }
+        }
+
+        let routes = UiRoutes::default();
+        let expected_range = LoopMarks {
+            start: Some(0),
+            end: Some(24_000),
+        };
+
+        let enabled = runtime_loop_import_project_state_with_loop(true);
+        enabled.loop_marks.set(LoopMarks {
+            start: Some(480),
+            end: Some(960),
+        });
+        enabled.loop_engaged.set(false);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_loop_export_available(false);
+        apply_event(ui, &routes, &enabled, warning_event());
+        assert_eq!(enabled.loop_marks.get(), expected_range);
+        assert!(enabled.loop_engaged.get());
+        assert!(ui.get_loop_engaged());
+        assert!(ui.get_loop_export_available());
+        assert!(runtime_loop_update_import_availability(&enabled).is_ok());
+        assert!(
+            ui.get_status_text()
+                .contains("Runtime loop update import committed and reopened")
+        );
+        assert!(
+            ui.get_error_text()
+                .contains("the verified project has no arrangement resource")
+        );
+
+        let disabled = runtime_loop_import_project_state_with_loop(false);
+        disabled.loop_marks.set(LoopMarks {
+            start: Some(480),
+            end: Some(960),
+        });
+        disabled.loop_engaged.set(true);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_loop_export_available(false);
+        apply_event(ui, &routes, &disabled, warning_event());
+        assert_eq!(disabled.loop_marks.get(), expected_range);
+        assert!(!disabled.loop_engaged.get());
+        assert!(!ui.get_loop_engaged());
+        assert!(ui.get_loop_export_available());
+        assert!(runtime_loop_update_import_availability(&disabled).is_ok());
+        assert!(
+            ui.get_status_text()
+                .contains("Runtime loop update import committed and reopened")
+        );
+        assert!(
+            ui.get_error_text()
+                .contains("the verified project has no arrangement resource")
+        );
+
+        let cleared = runtime_loop_import_project_state();
+        cleared.loop_marks.set(LoopMarks {
+            start: Some(480),
+            end: Some(960),
+        });
+        cleared.loop_engaged.set(true);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_loop_export_available(true);
+        apply_event(ui, &routes, &cleared, warning_event());
+        assert_eq!(cleared.loop_marks.get(), LoopMarks::default());
+        assert!(!cleared.loop_engaged.get());
+        assert!(!ui.get_loop_engaged());
+        assert!(!ui.get_loop_export_available());
+        assert!(runtime_loop_update_import_availability(&cleared).is_ok());
+        assert!(
+            ui.get_status_text()
+                .contains("Runtime loop update import committed and reopened")
+        );
+        assert!(
+            ui.get_error_text()
+                .contains("the verified project has no arrangement resource")
+        );
     }
 
     fn assert_audio_track_content_removal_window_contract(ui: &MainWindow) {

@@ -615,6 +615,49 @@ impl PlaybackArrangement {
         }
     }
 
+    /// Builds an immutable empty arrangement with a persisted loop for consumer tests.
+    ///
+    /// Production views remain owned by verified playback-session assembly. The
+    /// test fixture rejects inverted loop boundaries, matching the Runtime
+    /// loop-update contract.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either supplied loop boundary is inverted.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn for_test_with_loop_range(
+        start_tick: u64,
+        end_tick: u64,
+        start_frame: usize,
+        end_frame: usize,
+        enabled: bool,
+    ) -> Self {
+        assert!(
+            start_tick < end_tick,
+            "test loop range must end after it starts"
+        );
+        assert!(
+            start_frame < end_frame,
+            "test loop range must end after it starts"
+        );
+        Self {
+            track_names: Vec::new(),
+            clip_names: Vec::new(),
+            scene_names: Vec::new(),
+            placements: Vec::new(),
+            scene_launches: Vec::new(),
+            loop_range: Some(PlaybackArrangementLoopRange {
+                start_tick,
+                end_tick,
+                start_frame,
+                end_frame,
+                enabled,
+            }),
+            end_frame,
+        }
+    }
+
     #[must_use]
     pub fn track_name(&self, index: usize) -> Option<&str> {
         self.track_names.get(index).map(String::as_str)
