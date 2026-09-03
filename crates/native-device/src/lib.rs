@@ -708,8 +708,9 @@ impl DeviceChain {
                 "native device kind does not match the requested edit",
             ));
         }
-        *device =
-            NativeDeviceInstance::try_new_filter(device_instance_id.to_owned(), enabled, state)?;
+        device.enabled = enabled;
+        device.state = NativeDeviceState::Filter(state);
+        validate_device(device)?;
         self.try_with_devices(devices)
     }
 
@@ -740,11 +741,9 @@ impl DeviceChain {
                 "native device kind does not match the requested edit",
             ));
         }
-        *device = NativeDeviceInstance::try_new_compressor(
-            device_instance_id.to_owned(),
-            enabled,
-            state,
-        )?;
+        device.enabled = enabled;
+        device.state = NativeDeviceState::Compressor(state);
+        validate_device(device)?;
         self.try_with_devices(devices)
     }
 
@@ -2188,6 +2187,55 @@ mod tests {
             DeviceChainErrorKind::InvalidDomain
         );
         assert_eq!(full_target.to_canonical_vec().unwrap(), full_target_bytes);
+    }
+
+    #[test]
+    fn state_replacement_preserves_chain_and_device_extensions() {
+        let compressor_id = "018f47a2-6b2d-7c11-8a44-001122338019";
+        let source = chain(true)
+            .try_with_appended_compressor(compressor_id.to_owned(), true, compressor_state())
+            .unwrap();
+        let mut wire: Value = serde_json::from_slice(&source.to_canonical_vec().unwrap()).unwrap();
+        wire["extensions"] = serde_json::json!({"org.example.chain": {"retained": true}});
+        wire["devices"][0]["extensions"] =
+            serde_json::json!({"org.example.filter": {"retained": true}});
+        wire["devices"][1]["extensions"] =
+            serde_json::json!({"org.example.compressor": {"retained": true}});
+        let source = DeviceChain::parse(&serde_json_canonicalizer::to_vec(&wire).unwrap()).unwrap();
+
+        let retuned_filter = source
+            .try_with_filter_state(DEVICE_ID, false, state(NativeFilterMode::HighPass))
+            .unwrap();
+        assert_eq!(retuned_filter.extensions(), source.extensions());
+        assert_eq!(
+            retuned_filter.devices()[0].extensions(),
+            source.devices()[0].extensions()
+        );
+        assert_eq!(retuned_filter.devices()[1], source.devices()[1]);
+        assert!(!retuned_filter.devices()[0].enabled());
+        assert_eq!(
+            retuned_filter.devices()[0].filter_state().unwrap().mode(),
+            NativeFilterMode::HighPass
+        );
+        assert_eq!(
+            DeviceChain::parse(&retuned_filter.to_canonical_vec().unwrap()).unwrap(),
+            retuned_filter
+        );
+
+        let retuned_compressor = source
+            .try_with_compressor_state(compressor_id, false, compressor_state())
+            .unwrap();
+        assert_eq!(retuned_compressor.extensions(), source.extensions());
+        assert_eq!(retuned_compressor.devices()[0], source.devices()[0]);
+        assert_eq!(
+            retuned_compressor.devices()[1].extensions(),
+            source.devices()[1].extensions()
+        );
+        assert!(!retuned_compressor.devices()[1].enabled());
+        assert_eq!(
+            DeviceChain::parse(&retuned_compressor.to_canonical_vec().unwrap()).unwrap(),
+            retuned_compressor
+        );
     }
 
     #[test]
