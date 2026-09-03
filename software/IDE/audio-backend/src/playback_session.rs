@@ -1,5 +1,7 @@
 use super::audio_preview_session::DesktopAudioPreviewProcessor;
-use super::monitoring_session::{MonitoringConsumer, MonitoringCounters, try_monitoring_transport};
+use super::monitoring_session::{
+    MonitoringConsumer, MonitoringCounters, MonitoringProducer, try_monitoring_transport,
+};
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::pipewire_output::PipeWireThreadRunner;
 #[cfg(target_os = "windows")]
@@ -8,9 +10,10 @@ use super::{
     CheckpointedOutputProcessor, DesktopControlMappingRuntime, DesktopControlSink,
     DesktopControlSinkError, DesktopDirectControlCommand, DesktopDirectControlError,
     DesktopInputStartError, DesktopInputStopError, DesktopMonitoringConfig,
-    DesktopMonitoringControl, DesktopOutputConfig, InputMeterReceiver, MonitoringSnapshot,
-    OutputStreamCounters, OutputStreamStatus, PendingNativeShutdown, PendingNativeShutdownWait,
-    PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
+    DesktopMonitoringControl, DesktopMonitoringControlError, DesktopOutputConfig,
+    InputMeterReceiver, MonitoringSnapshot, OutputStreamCounters, OutputStreamStatus,
+    PendingNativeShutdown, PendingNativeShutdownWait, PlaybackRecoveryCheckpoint,
+    PlaybackRecoverySnapshot,
 };
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{PipeWireInputConfig as NativeInputConfig, PipeWireInputStream as NativeInputStream};
@@ -416,6 +419,7 @@ pub enum DesktopPlaybackSessionStartError {
     Output(DesktopOutputStartError),
     PublicationUnavailable,
     MonitoringCapacityUnavailable,
+    MonitoringControl(DesktopMonitoringControlError),
     Input(DesktopInputStartError),
     Monitored {
         source: Box<DesktopPlaybackSessionStartError>,
@@ -434,6 +438,7 @@ impl fmt::Display for DesktopPlaybackSessionStartError {
             Self::MonitoringCapacityUnavailable => {
                 formatter.write_str("playback monitoring capacity is unavailable")
             }
+            Self::MonitoringControl(source) => source.fmt(formatter),
             Self::Input(source) => write!(formatter, "playback monitoring input failed: {source}"),
             Self::Monitored {
                 source,
@@ -452,6 +457,7 @@ impl Error for DesktopPlaybackSessionStartError {
         match self {
             Self::Build(source) => Some(source),
             Self::Output(source) => Some(source),
+            Self::MonitoringControl(source) => Some(source),
             Self::Input(source) => Some(source),
             Self::Monitored { source, .. } => Some(source.as_ref()),
             Self::PublicationUnavailable | Self::MonitoringCapacityUnavailable => None,
@@ -838,6 +844,65 @@ struct PlaybackMonitoringSession {
     meter: InputMeterReceiver,
 }
 
+/// The monitor configuration and control state that must be established before
+/// either native stream is allowed to start.
+///
+/// This stays private to the playback owner because it is restart authority,
+/// not a separately addressable session configuration surface.
+#[derive(Clone, Debug, PartialEq)]
+struct PlaybackMonitoringStartup {
+    config: DesktopMonitoringConfig,
+    gain_linear: f32,
+    muted: bool,
+}
+
+impl PlaybackMonitoringStartup {
+    fn new(config: DesktopMonitoringConfig, gain_linear: f32, muted: bool) -> Self {
+        Self {
+            config,
+            gain_linear,
+            muted,
+        }
+    }
+
+    fn with_output(
+        mut self,
+        output: DesktopOutputConfig,
+    ) -> Result<Self, super::DesktopMonitoringConfigError> {
+        self.config = self.config.with_output(output)?;
+        Ok(self)
+    }
+}
+
+fn playback_monitoring_recovery_startup(
+    config: &DesktopMonitoringConfig,
+    control: &DesktopMonitoringControl,
+) -> PlaybackMonitoringStartup {
+    PlaybackMonitoringStartup::new(config.clone(), control.gain_linear(), control.muted())
+}
+
+fn prepare_playback_monitoring_transport(
+    monitoring: &PlaybackMonitoringStartup,
+) -> Result<
+    (
+        MonitoringProducer,
+        MonitoringConsumer,
+        MonitoringCounters,
+        DesktopMonitoringControl,
+        InputMeterReceiver,
+    ),
+    DesktopPlaybackSessionStartError,
+> {
+    let (producer, consumer, counters, control, meter) =
+        try_monitoring_transport(&monitoring.config)
+            .map_err(|_| DesktopPlaybackSessionStartError::MonitoringCapacityUnavailable)?;
+    control
+        .set_gain_linear(monitoring.gain_linear)
+        .map_err(DesktopPlaybackSessionStartError::MonitoringControl)?;
+    control.set_muted(monitoring.muted);
+    Ok((producer, consumer, counters, control, meter))
+}
+
 fn recover_and_prepare_project(
     root: &Path,
     limits: ProjectPlaybackLimits,
@@ -974,7 +1039,7 @@ impl<R: hyper_mixer_runtime::TrackWindowRenderer> CheckpointedOutputProcessor
 #[derive(Debug)]
 pub struct DesktopPlaybackRecovery {
     config: DesktopOutputConfig,
-    monitoring: Option<DesktopMonitoringConfig>,
+    monitoring: Option<PlaybackMonitoringStartup>,
     source: Option<Arc<dyn DesktopPlaybackSource>>,
     checkpoint: Box<PlaybackRecoverySnapshot>,
 }
@@ -1344,8 +1409,10 @@ impl DesktopPlaybackRecovery {
     }
 
     #[must_use]
-    pub const fn monitoring_config(&self) -> Option<&DesktopMonitoringConfig> {
-        self.monitoring.as_ref()
+    pub fn monitoring_config(&self) -> Option<&DesktopMonitoringConfig> {
+        self.monitoring
+            .as_ref()
+            .map(|monitoring| &monitoring.config)
     }
 
     /// Rebuilds playback against the same explicitly selected output.
@@ -1407,7 +1474,7 @@ impl DesktopPlaybackRecovery {
     fn failed_restart(
         &mut self,
         config: DesktopOutputConfig,
-        monitoring: Option<DesktopMonitoringConfig>,
+        monitoring: Option<PlaybackMonitoringStartup>,
         source: Arc<dyn DesktopPlaybackSource>,
         error: DesktopPlaybackSessionStartError,
     ) -> DesktopPlaybackRecoveryStartError {
@@ -1535,8 +1602,31 @@ impl DesktopPlaybackSession {
         root: impl AsRef<Path>,
         limits: ProjectPlaybackLimits,
     ) -> Result<Self, DesktopProjectOpenError> {
+        Self::open_project_monitored_with_monitor_state(monitoring, root, limits, 1.0, false)
+    }
+
+    /// Verifies and starts one project with bounded live input monitoring and
+    /// an initial monitor state applied before native stream publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns project loading or monitored playback startup errors without
+    /// publishing a partial session. An invalid initial monitor gain is
+    /// rejected before native input or output construction.
+    pub fn open_project_monitored_with_monitor_state(
+        monitoring: DesktopMonitoringConfig,
+        root: impl AsRef<Path>,
+        limits: ProjectPlaybackLimits,
+        monitor_gain: f32,
+        monitor_muted: bool,
+    ) -> Result<Self, DesktopProjectOpenError> {
         let (project, recovery) = recover_and_prepare_project(root.as_ref(), limits)?;
-        match Self::start_project_monitored(monitoring, project) {
+        match Self::start_project_monitored_with_monitor_state(
+            monitoring,
+            project,
+            monitor_gain,
+            monitor_muted,
+        ) {
             Ok(mut session) => {
                 session.project_open_recovery = Some(recovery);
                 Ok(session)
@@ -1573,11 +1663,32 @@ impl DesktopPlaybackSession {
         monitoring: DesktopMonitoringConfig,
         project: PreparedProjectPlayback,
     ) -> Result<Self, DesktopPlaybackSessionStartError> {
+        Self::start_project_monitored_with_monitor_state(monitoring, project, 1.0, false)
+    }
+
+    /// Starts an already verified project with one bounded input-monitor path
+    /// and applies monitor gain/mute before either native stream is published.
+    ///
+    /// # Errors
+    ///
+    /// Returns a playback, monitoring-control, monitoring-capacity, input, or
+    /// output startup error. An invalid initial gain is rejected before native
+    /// input or output construction.
+    pub fn start_project_monitored_with_monitor_state(
+        monitoring: DesktopMonitoringConfig,
+        project: PreparedProjectPlayback,
+        monitor_gain: f32,
+        monitor_muted: bool,
+    ) -> Result<Self, DesktopPlaybackSessionStartError> {
         Self::start_source(
             monitoring.output().clone(),
             Arc::new(project),
             None,
-            Some(monitoring),
+            Some(PlaybackMonitoringStartup::new(
+                monitoring,
+                monitor_gain,
+                monitor_muted,
+            )),
         )
     }
 
@@ -1607,11 +1718,30 @@ impl DesktopPlaybackSession {
         monitoring: DesktopMonitoringConfig,
         input: DesktopPlaybackSessionInput,
     ) -> Result<Self, DesktopPlaybackSessionStartError> {
+        Self::start_monitored_with_monitor_state(monitoring, input, 1.0, false)
+    }
+
+    /// Starts prepared playback with one bounded input-monitor path and an
+    /// initial monitor state applied before native stream publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::start_project_monitored_with_monitor_state`].
+    pub fn start_monitored_with_monitor_state(
+        monitoring: DesktopMonitoringConfig,
+        input: DesktopPlaybackSessionInput,
+        monitor_gain: f32,
+        monitor_muted: bool,
+    ) -> Result<Self, DesktopPlaybackSessionStartError> {
         Self::start_source(
             monitoring.output().clone(),
             Arc::new(input),
             None,
-            Some(monitoring),
+            Some(PlaybackMonitoringStartup::new(
+                monitoring,
+                monitor_gain,
+                monitor_muted,
+            )),
         )
     }
 
@@ -1619,16 +1749,15 @@ impl DesktopPlaybackSession {
         config: DesktopOutputConfig,
         source: Arc<dyn DesktopPlaybackSource>,
         initial_checkpoint: Option<Box<PlaybackRecoverySnapshot>>,
-        monitoring: Option<DesktopMonitoringConfig>,
+        monitoring: Option<PlaybackMonitoringStartup>,
     ) -> Result<Self, DesktopPlaybackSessionStartError> {
-        let Some(monitoring_config) = monitoring else {
+        let Some(monitoring) = monitoring else {
             return Self::start_output_source(config, source, initial_checkpoint, None);
         };
         let (mut producer, consumer, counters, control, meter) =
-            try_monitoring_transport(&monitoring_config)
-                .map_err(|_| DesktopPlaybackSessionStartError::MonitoringCapacityUnavailable)?;
+            prepare_playback_monitoring_transport(&monitoring)?;
         let input = NativeInputStream::start(
-            NativeInputConfig::from(monitoring_config.input()),
+            NativeInputConfig::from(monitoring.config.input()),
             move |samples: &[f32]| {
                 producer.push(samples);
                 Ok::<(), core::convert::Infallible>(())
@@ -1639,7 +1768,7 @@ impl DesktopPlaybackSession {
             Ok(mut session) => {
                 session.monitoring = Some(PlaybackMonitoringSession {
                     input,
-                    config: monitoring_config,
+                    config: monitoring.config,
                     counters,
                     control,
                     meter,
@@ -2432,9 +2561,9 @@ impl DesktopPlaybackSession {
             mixer_parameter_observations: _,
             scene_launches: _,
         } = self;
-        let monitoring_config = monitoring
-            .as_ref()
-            .map(|monitoring| monitoring.config.clone());
+        let monitoring_recovery = monitoring.as_ref().map(|monitoring| {
+            playback_monitoring_recovery_startup(&monitoring.config, &monitoring.control)
+        });
         let input = monitoring
             .map(|monitoring| monitoring.input.stop().map_err(DesktopInputStopError::from))
             .transpose()
@@ -2442,7 +2571,7 @@ impl DesktopPlaybackSession {
         let output = output.stop().err().map(DesktopOutputStopError::from);
         let recovery = DesktopPlaybackRecovery {
             config,
-            monitoring: monitoring_config,
+            monitoring: monitoring_recovery,
             source: Some(source),
             checkpoint: Box::new(recovery.snapshot()),
         };
@@ -3137,21 +3266,66 @@ mod tests {
         }
     }
 
-    fn monitoring_transport() -> (
-        super::super::monitoring_session::MonitoringProducer,
-        MonitoringConsumer,
-        MonitoringCounters,
-    ) {
-        let config = DesktopMonitoringConfig::try_new(
+    fn monitoring_config() -> DesktopMonitoringConfig {
+        DesktopMonitoringConfig::try_new(
             super::super::DesktopInputConfig::try_new(48_000, 128).unwrap(),
             DesktopOutputConfig::try_new(48_000, 128).unwrap(),
             1_024,
             256,
             64,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn monitoring_transport() -> (
+        super::super::monitoring_session::MonitoringProducer,
+        MonitoringConsumer,
+        MonitoringCounters,
+    ) {
+        let config = monitoring_config();
         let (producer, consumer, counters, _, _meter) = try_monitoring_transport(&config).unwrap();
         (producer, consumer, counters)
+    }
+
+    #[test]
+    fn initial_playback_monitor_state_is_applied_before_native_startup() {
+        let startup = PlaybackMonitoringStartup::new(monitoring_config(), 0.25, true);
+        let (_producer, _consumer, _counters, control, _meter) =
+            prepare_playback_monitoring_transport(&startup).unwrap();
+
+        assert!((control.gain_linear() - 0.25).abs() <= f32::EPSILON);
+        assert!(control.muted());
+
+        let invalid = PlaybackMonitoringStartup::new(monitoring_config(), f32::NAN, false);
+        assert!(matches!(
+            prepare_playback_monitoring_transport(&invalid),
+            Err(DesktopPlaybackSessionStartError::MonitoringControl(
+                DesktopMonitoringControlError::NonFiniteGain
+            ))
+        ));
+    }
+
+    #[test]
+    fn playback_monitor_recovery_retains_the_committed_control_state() {
+        let config = monitoring_config();
+        let startup = PlaybackMonitoringStartup::new(config.clone(), 1.0, true);
+        let (_producer, _consumer, _counters, control, _meter) =
+            prepare_playback_monitoring_transport(&startup).unwrap();
+        control.set_gain_linear(0.625).unwrap();
+        control.set_muted(false);
+
+        let recovery = playback_monitoring_recovery_startup(&config, &control);
+        assert!((recovery.gain_linear - 0.625).abs() <= f32::EPSILON);
+        assert!(!recovery.muted);
+        assert_eq!(recovery.config, config);
+
+        let replacement = DesktopOutputConfig::try_new(48_000, 128)
+            .unwrap()
+            .with_routing_id("replacement-output")
+            .unwrap();
+        let rebound = recovery.with_output(replacement).unwrap();
+        assert!((rebound.gain_linear - 0.625).abs() <= f32::EPSILON);
+        assert!(!rebound.muted);
     }
 
     #[test]
@@ -4020,7 +4194,7 @@ mod tests {
         .unwrap();
         let mut original = DesktopPlaybackRecovery {
             config: pinned.clone(),
-            monitoring: Some(monitoring),
+            monitoring: Some(PlaybackMonitoringStartup::new(monitoring, 1.0, false)),
             source: None,
             checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
@@ -4069,7 +4243,11 @@ mod tests {
         .unwrap();
         let mut original = DesktopPlaybackRecovery {
             config: pinned.clone(),
-            monitoring: Some(monitoring.clone()),
+            monitoring: Some(PlaybackMonitoringStartup::new(
+                monitoring.clone(),
+                1.0,
+                false,
+            )),
             source: None,
             checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
@@ -4080,7 +4258,7 @@ mod tests {
 
         let error = original.failed_restart(
             pinned,
-            Some(monitoring),
+            Some(PlaybackMonitoringStartup::new(monitoring, 1.0, false)),
             source,
             DesktopPlaybackSessionStartError::Monitored {
                 source: Box::new(DesktopPlaybackSessionStartError::Output(
@@ -4163,7 +4341,11 @@ mod tests {
         let source: Arc<dyn DesktopPlaybackSource> = Arc::new(UnusedPlaybackSource);
         let mut recovery = DesktopPlaybackRecovery {
             config: original_output.clone(),
-            monitoring: Some(monitoring.clone()),
+            monitoring: Some(PlaybackMonitoringStartup::new(
+                monitoring.clone(),
+                1.0,
+                false,
+            )),
             source: Some(source),
             checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
