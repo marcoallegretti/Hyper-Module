@@ -30,6 +30,7 @@ pub struct PlaybackRecoverySnapshot {
     committed_capture_start_sequence: u64,
     committed_transport_fence: u64,
     committed_mixer_fence: u64,
+    committed_native_device_fence: u64,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
     mixer_parameter_state: Option<MixerParameterStateSnapshot>,
@@ -51,6 +52,7 @@ impl PlaybackRecoverySnapshot {
             committed_capture_start_sequence: 0,
             committed_transport_fence: 0,
             committed_mixer_fence: 0,
+            committed_native_device_fence: 0,
             loop_range: None,
             loop_enabled: false,
             mixer_parameter_state: None,
@@ -98,6 +100,16 @@ impl PlaybackRecoverySnapshot {
     #[must_use]
     pub const fn committed_mixer_fence(&self) -> u64 {
         self.committed_mixer_fence
+    }
+
+    /// Returns the greatest live native-device fence represented by this
+    /// coherent successful-output snapshot.
+    ///
+    /// The acknowledgement belongs to the current playback session and is
+    /// reset when recovery creates a new queue owner.
+    #[must_use]
+    pub const fn committed_native_device_fence(&self) -> u64 {
+        self.committed_native_device_fence
     }
 
     #[must_use]
@@ -182,6 +194,7 @@ pub struct PlaybackCycleObservation {
     committed_capture_start_sequence: u64,
     committed_transport_fence: u64,
     committed_mixer_fence: u64,
+    committed_native_device_fence: u64,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
     metronome_available: bool,
@@ -227,6 +240,13 @@ impl PlaybackCycleObservation {
     #[must_use]
     pub const fn committed_mixer_fence(self) -> u64 {
         self.committed_mixer_fence
+    }
+
+    /// Returns the greatest live native-device fence represented by this
+    /// coherent successful-output observation.
+    #[must_use]
+    pub const fn committed_native_device_fence(self) -> u64 {
+        self.committed_native_device_fence
     }
 
     #[must_use]
@@ -747,6 +767,7 @@ struct PlaybackRecoveryState {
     capture_start_sequence: AtomicU64,
     transport_fence: AtomicU64,
     mixer_fence: AtomicU64,
+    native_device_fence: AtomicU64,
     loop_observation: AtomicLoopObservation,
     metronome_observation: AtomicMetronomeObservation,
     scene_launch: AtomicSceneLaunchObservation,
@@ -789,6 +810,8 @@ impl PlaybackRecoveryCheckpoint {
                 self.inner.capture_start_sequence.load(Ordering::Relaxed);
             let committed_transport_fence = self.inner.transport_fence.load(Ordering::Relaxed);
             let committed_mixer_fence = self.inner.mixer_fence.load(Ordering::Relaxed);
+            let committed_native_device_fence =
+                self.inner.native_device_fence.load(Ordering::Relaxed);
             let (loop_range, loop_enabled) = self.inner.loop_observation.load();
             let mixer_parameter_state = self.inner.mixer_parameters.load();
             let native_device_state = self.inner.native_device_state.load();
@@ -802,6 +825,7 @@ impl PlaybackRecoveryCheckpoint {
                     committed_capture_start_sequence,
                     committed_transport_fence,
                     committed_mixer_fence,
+                    committed_native_device_fence,
                     loop_range,
                     loop_enabled,
                     mixer_parameter_state,
@@ -828,6 +852,8 @@ impl PlaybackRecoveryCheckpoint {
                 self.inner.capture_start_sequence.load(Ordering::Relaxed);
             let committed_transport_fence = self.inner.transport_fence.load(Ordering::Relaxed);
             let committed_mixer_fence = self.inner.mixer_fence.load(Ordering::Relaxed);
+            let committed_native_device_fence =
+                self.inner.native_device_fence.load(Ordering::Relaxed);
             let (loop_range, loop_enabled) = self.inner.loop_observation.load();
             let (metronome_available, metronome_enabled, metronome_gain) =
                 self.inner.metronome_observation.load();
@@ -843,6 +869,7 @@ impl PlaybackRecoveryCheckpoint {
                     committed_capture_start_sequence,
                     committed_transport_fence,
                     committed_mixer_fence,
+                    committed_native_device_fence,
                     loop_range,
                     loop_enabled,
                     metronome_available,
@@ -882,6 +909,7 @@ struct PlaybackCyclePublication {
     capture_start_sequence: u64,
     committed_transport_fence: u64,
     committed_mixer_fence: u64,
+    committed_native_device_fence: u64,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
     metronome_available: bool,
@@ -921,6 +949,7 @@ impl PlaybackRecoveryPublisher {
                 capture_start_sequence: cycle.capture_start_sequence(),
                 committed_transport_fence: cycle.committed_transport_fence(),
                 committed_mixer_fence: cycle.committed_mixer_fence(),
+                committed_native_device_fence: cycle.committed_native_device_fence(),
                 loop_range: cycle.loop_range(),
                 loop_enabled: cycle.loop_enabled(),
                 metronome_available: cycle.metronome_available(),
@@ -949,6 +978,7 @@ impl PlaybackRecoveryPublisher {
                 capture_start_sequence: 0,
                 committed_transport_fence: 0,
                 committed_mixer_fence: 0,
+                committed_native_device_fence: 0,
                 loop_range: None,
                 loop_enabled: false,
                 metronome_available: false,
@@ -991,6 +1021,11 @@ impl PlaybackRecoveryPublisher {
             self.inner
                 .mixer_fence
                 .fetch_max(publication.committed_mixer_fence, Ordering::Relaxed);
+        }
+        if publication.committed_native_device_fence != 0 {
+            self.inner
+                .native_device_fence
+                .fetch_max(publication.committed_native_device_fence, Ordering::Relaxed);
         }
         self.inner
             .loop_observation
@@ -1118,6 +1153,9 @@ pub fn playback_recovery_channel_with_initial_loop_metronome_and_native_device_s
         // Mixer fences belong to the same queue owner and must not acknowledge
         // commands issued by a prior native playback session.
         mixer_fence: AtomicU64::new(0),
+        // Native-device fences belong to the same queue owner and must not
+        // acknowledge commands issued by a prior native playback session.
+        native_device_fence: AtomicU64::new(0),
         loop_observation: {
             let observation = AtomicLoopObservation::default();
             let (range, enabled) = snapshot
@@ -1277,6 +1315,7 @@ mod tests {
             committed_mixer_fence: 0,
             mixer_parameter_command_sender_disconnected: false,
             applied_native_device_command_count: 1,
+            committed_native_device_fence: 0,
             native_device_command_sender_disconnected: false,
         }
     }
@@ -1292,6 +1331,7 @@ mod tests {
                 committed_capture_start_sequence: 0,
                 committed_transport_fence: 0,
                 committed_mixer_fence: 0,
+                committed_native_device_fence: 0,
                 loop_range: None,
                 loop_enabled: false,
                 mixer_parameter_state: None,
@@ -1307,6 +1347,7 @@ mod tests {
                 committed_capture_start_sequence: 0,
                 committed_transport_fence: 0,
                 committed_mixer_fence: 0,
+                committed_native_device_fence: 0,
                 loop_range: None,
                 loop_enabled: false,
                 metronome_available: false,
@@ -1369,6 +1410,7 @@ mod tests {
                 committed_capture_start_sequence: 0,
                 committed_transport_fence: 0,
                 committed_mixer_fence: 0,
+                committed_native_device_fence: 0,
                 loop_range: None,
                 loop_enabled: false,
                 mixer_parameter_state: None,
@@ -1392,6 +1434,7 @@ mod tests {
                 committed_capture_start_sequence: 0,
                 committed_transport_fence: 0,
                 committed_mixer_fence: 0,
+                committed_native_device_fence: 0,
                 loop_range: None,
                 loop_enabled: false,
                 mixer_parameter_state: None,
@@ -1494,6 +1537,7 @@ mod tests {
                         capture_start_sequence: 0,
                         committed_transport_fence: generation as u64,
                         committed_mixer_fence: generation as u64,
+                        committed_native_device_fence: generation as u64,
                         loop_range,
                         loop_enabled,
                         metronome_available: !generation.is_multiple_of(3),
@@ -1520,6 +1564,10 @@ mod tests {
                 assert_eq!(observation.committed_cycle_count(), generation as u64);
                 assert_eq!(observation.committed_transport_fence(), generation as u64);
                 assert_eq!(observation.committed_mixer_fence(), generation as u64);
+                assert_eq!(
+                    observation.committed_native_device_fence(),
+                    generation as u64
+                );
                 let expected_state = if generation.is_multiple_of(2) {
                     PlaybackRecoveryTransportState::Stopped
                 } else {
@@ -1575,6 +1623,7 @@ mod tests {
                 assert_eq!(snapshot.committed_cycle_count(), generation as u64);
                 assert_eq!(snapshot.committed_transport_fence(), generation as u64);
                 assert_eq!(snapshot.committed_mixer_fence(), generation as u64);
+                assert_eq!(snapshot.committed_native_device_fence(), generation as u64);
                 let expected_loop = (!generation.is_multiple_of(4))
                     .then(|| TransportLoopRange::new(generation, generation + 10).unwrap());
                 assert_eq!(snapshot.loop_range(), expected_loop);
@@ -1597,6 +1646,7 @@ mod tests {
             committed_capture_start_sequence: 0,
             committed_transport_fence: 0,
             committed_mixer_fence: 0,
+            committed_native_device_fence: 0,
             loop_range: Some(TransportLoopRange::new(128, 640).unwrap()),
             loop_enabled: true,
             mixer_parameter_state: Some(mixer),
@@ -1615,6 +1665,7 @@ mod tests {
                 committed_capture_start_sequence: 0,
                 committed_transport_fence: 0,
                 committed_mixer_fence: 0,
+                committed_native_device_fence: 0,
                 loop_range: Some(TransportLoopRange::new(128, 640).unwrap()),
                 loop_enabled: true,
                 mixer_parameter_state: Some(mixer),
@@ -1655,6 +1706,36 @@ mod tests {
 
         let (_reopened_publisher, reopened) = playback_recovery_channel(Some(&acknowledged), None);
         assert_eq!(reopened.snapshot().committed_mixer_fence(), 0);
+    }
+
+    #[test]
+    fn native_device_fence_acknowledgement_is_coherent_and_session_local() {
+        let (mut publisher, checkpoint) = playback_recovery_channel(None, None);
+        let native = native_device_state(
+            false,
+            NativeDeviceState::Compressor(
+                NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 6_000).unwrap(),
+            ),
+        );
+        let mut cycle = transport_cycle_for_test();
+        cycle.committed_native_device_fence = 7;
+        publisher.publish_cycle_with_native_device_state(cycle, None, Some(&native));
+
+        let acknowledged = checkpoint.snapshot();
+        assert_eq!(acknowledged.committed_native_device_fence(), 7);
+        assert_eq!(acknowledged.native_device_state(), Some(native));
+        assert_eq!(
+            checkpoint.observe_cycle().committed_native_device_fence(),
+            7
+        );
+
+        publisher.publish(PlaybackRecoveryTransportState::Stopped, 128, None);
+        assert_eq!(checkpoint.snapshot().committed_native_device_fence(), 7);
+
+        let (_reopened_publisher, reopened) = playback_recovery_channel(Some(&acknowledged), None);
+        let reopened = reopened.snapshot();
+        assert_eq!(reopened.committed_native_device_fence(), 0);
+        assert_eq!(reopened.native_device_state(), Some(native));
     }
 
     #[test]

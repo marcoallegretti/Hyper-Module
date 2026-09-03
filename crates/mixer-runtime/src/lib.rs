@@ -598,6 +598,19 @@ pub enum NativeDeviceCommand {
         device: NativeDeviceHandle,
         state: NativeDeviceState,
     },
+    /// Opaque FIFO barrier allocated by the sole command producer.
+    #[doc(hidden)]
+    Fence(NativeDeviceFence),
+}
+
+/// Opaque native-device barrier carried through the realtime command queue.
+///
+/// Only [`NativeDeviceCommandSender::try_send_fence`] can construct a value,
+/// which keeps the monotonically increasing sequence namespace single-owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct NativeDeviceFence {
+    sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1487,6 +1500,7 @@ impl NativeDeviceLayout {
         let device = match command {
             NativeDeviceCommand::SetEnabled { device, .. }
             | NativeDeviceCommand::SetState { device, .. } => device,
+            NativeDeviceCommand::Fence(_) => return Ok(()),
         };
         let resolved = self
             .slots
@@ -1511,6 +1525,7 @@ impl NativeDeviceLayout {
             NativeDeviceCommand::SetState { .. } => {
                 Err(NativeDeviceTargetError::DeviceKindMismatch { device })
             }
+            NativeDeviceCommand::Fence(_) => unreachable!("a native-device fence has no target"),
         }
     }
 }
@@ -1593,6 +1608,8 @@ impl NativeDeviceStateSnapshot {
 pub struct NativeDeviceCommandSender {
     producer: Producer<NativeDeviceCommand>,
     layout: NativeDeviceLayout,
+    committed_fence: Arc<AtomicU64>,
+    next_fence_sequence: u64,
 }
 
 impl NativeDeviceCommandSender {
@@ -1608,6 +1625,32 @@ impl NativeDeviceCommandSender {
             fence(Ordering::Acquire);
         }
         disconnected
+    }
+
+    /// Returns the greatest fence sequence committed by a successful process
+    /// cycle. Acquire ordering pairs with process-thread publication.
+    #[must_use]
+    pub fn committed_fence(&self) -> u64 {
+        self.committed_fence.load(Ordering::Acquire)
+    }
+
+    /// Allocates and enqueues the next FIFO fence without waiting or allocating.
+    ///
+    /// Returns `Ok(None)` only after the nonzero sequence space is exhausted.
+    /// Queue rejection does not consume a sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the opaque fence command when the bounded queue is full or the
+    /// receiving runtime has been destroyed.
+    pub fn try_send_fence(&mut self) -> Result<Option<u64>, NativeDeviceCommandSendError> {
+        let sequence = self.next_fence_sequence;
+        if sequence == 0 {
+            return Ok(None);
+        }
+        self.try_send(NativeDeviceCommand::Fence(NativeDeviceFence { sequence }))?;
+        self.next_fence_sequence = sequence.checked_add(1).unwrap_or(0);
+        Ok(Some(sequence))
     }
 
     /// Resolves a persisted device identity within its persisted owning track.
@@ -2154,6 +2197,7 @@ pub struct TransportCycle {
     committed_mixer_fence: u64,
     mixer_parameter_command_sender_disconnected: bool,
     applied_native_device_command_count: usize,
+    committed_native_device_fence: u64,
     native_device_command_sender_disconnected: bool,
 }
 
@@ -2293,6 +2337,18 @@ impl TransportCycle {
     #[must_use]
     pub const fn applied_native_device_command_count(self) -> usize {
         self.applied_native_device_command_count
+    }
+
+    /// Returns the greatest live native-device fence represented by this
+    /// successful process cycle.
+    ///
+    /// A recovery publication of this cycle therefore contains session-only
+    /// native-device state that is no earlier than every command ordered before
+    /// this fence. The value is session-local and resets when a new transport
+    /// queue owner is created.
+    #[must_use]
+    pub const fn committed_native_device_fence(self) -> u64 {
+        self.committed_native_device_fence
     }
 
     #[must_use]
@@ -2539,6 +2595,7 @@ pub fn output_meter_snapshot_for_test(
             committed_mixer_fence: 0,
             mixer_parameter_command_sender_disconnected: false,
             applied_native_device_command_count: 0,
+            committed_native_device_fence: 0,
             native_device_command_sender_disconnected: false,
         },
         meter,
@@ -4005,6 +4062,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
         let device = match command {
             NativeDeviceCommand::SetEnabled { device, .. }
             | NativeDeviceCommand::SetState { device, .. } => device,
+            NativeDeviceCommand::Fence(_) => return,
         };
         let processor = self.slots[device.slot]
             .device
@@ -4021,6 +4079,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 processor.processor.set_device_state(device.device, state),
                 "a validated native device command targets a prepared device kind"
             ),
+            NativeDeviceCommand::Fence(_) => unreachable!("a native-device fence has no target"),
         }
     }
 
@@ -4751,6 +4810,7 @@ pub struct RoutedTransportRuntime<R> {
     mixer_parameter_command_consumer: Option<Consumer<MixerParameterCommand>>,
     native_device_command_consumer: Option<Consumer<NativeDeviceCommand>>,
     mixer_parameter_fence: Option<Arc<AtomicU64>>,
+    native_device_fence: Option<Arc<AtomicU64>>,
     committed_mixer_parameter_change_sequence: u64,
 }
 
@@ -4765,6 +4825,12 @@ struct MixerParameterDrain {
     applied_command_count: usize,
     greatest_fence: u64,
     changes: MixerParameterChanges,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativeDeviceDrain {
+    applied_command_count: usize,
+    greatest_fence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -4800,6 +4866,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             mixer_parameter_command_consumer: None,
             native_device_command_consumer: None,
             mixer_parameter_fence: None,
+            native_device_fence: None,
             committed_mixer_parameter_change_sequence: 0,
         }
     }
@@ -4836,6 +4903,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 mixer_parameter_command_consumer: None,
                 native_device_command_consumer: None,
                 mixer_parameter_fence: None,
+                native_device_fence: None,
                 committed_mixer_parameter_change_sequence: 0,
             },
         )
@@ -4903,6 +4971,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 mixer_parameter_command_consumer: Some(parameter_consumer),
                 native_device_command_consumer: None,
                 mixer_parameter_fence: Some(committed_fence),
+                native_device_fence: None,
                 committed_mixer_parameter_change_sequence: 0,
             },
         )
@@ -4938,11 +5007,18 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         let (transport_commands, mixer_commands, mut transport) =
             Self::with_command_queues(runtime);
         let (producer, consumer) = RingBuffer::new(MAX_QUEUED_NATIVE_DEVICE_COMMANDS);
+        let committed_fence = Arc::new(AtomicU64::new(0));
         transport.native_device_command_consumer = Some(consumer);
+        transport.native_device_fence = Some(Arc::clone(&committed_fence));
         (
             transport_commands,
             mixer_commands,
-            NativeDeviceCommandSender { producer, layout },
+            NativeDeviceCommandSender {
+                producer,
+                layout,
+                committed_fence,
+                next_fence_sequence: 1,
+            },
             transport,
         )
     }
@@ -5307,7 +5383,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         let applied_mixer_parameter_command_count = mixer_parameter_drain.applied_command_count;
         let mixer_parameter_command_sender_disconnected =
             self.mixer_parameter_command_sender_disconnected();
-        let applied_native_device_command_count = self.drain_native_device_commands();
+        let native_device_drain = self.drain_native_device_commands();
+        let applied_native_device_command_count = native_device_drain.applied_command_count;
         let native_device_command_sender_disconnected =
             self.native_device_command_sender_disconnected();
         let start_frame = self.position_frame;
@@ -5316,6 +5393,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             output.right.fill(0.0);
             let committed_mixer_fence =
                 self.commit_mixer_parameter_fence(mixer_parameter_drain.greatest_fence);
+            let committed_native_device_fence =
+                self.commit_native_device_fence(native_device_drain.greatest_fence);
             let mixer_parameter_changes =
                 self.commit_mixer_parameter_changes(mixer_parameter_drain.changes);
             return Ok(ProcessedTransportCycle {
@@ -5340,6 +5419,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                     committed_mixer_fence,
                     mixer_parameter_command_sender_disconnected,
                     applied_native_device_command_count,
+                    committed_native_device_fence,
                     native_device_command_sender_disconnected,
                 },
                 mixer_parameter_changes,
@@ -5369,6 +5449,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         self.position_frame = next_frame;
         let committed_mixer_fence =
             self.commit_mixer_parameter_fence(mixer_parameter_drain.greatest_fence);
+        let committed_native_device_fence =
+            self.commit_native_device_fence(native_device_drain.greatest_fence);
         let mixer_parameter_changes =
             self.commit_mixer_parameter_changes(mixer_parameter_drain.changes);
         Ok(ProcessedTransportCycle {
@@ -5393,6 +5475,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 committed_mixer_fence,
                 mixer_parameter_command_sender_disconnected,
                 applied_native_device_command_count,
+                committed_native_device_fence,
                 native_device_command_sender_disconnected,
             },
             mixer_parameter_changes,
@@ -5614,8 +5697,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         disconnected
     }
 
-    fn drain_native_device_commands(&mut self) -> usize {
-        let mut accepted = 0;
+    fn drain_native_device_commands(&mut self) -> NativeDeviceDrain {
+        let mut drained = NativeDeviceDrain::default();
         let mut pending_states = [None; MAX_QUEUED_NATIVE_DEVICE_COMMANDS];
         let mut pending_state_count = 0;
         for _ in 0..MAX_QUEUED_NATIVE_DEVICE_COMMANDS {
@@ -5626,7 +5709,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             let Some(command) = command else {
                 break;
             };
-            accepted += 1;
+            drained.applied_command_count += 1;
             match command {
                 NativeDeviceCommand::SetState { device, state } => {
                     if let Some(index) =
@@ -5663,13 +5746,28 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                             enabled,
                         });
                 }
+                NativeDeviceCommand::Fence(fence) => {
+                    drained.greatest_fence = drained.greatest_fence.max(fence.sequence);
+                }
             }
         }
         for (device, state) in pending_states.into_iter().flatten() {
             self.runtime
                 .apply_native_device_command(NativeDeviceCommand::SetState { device, state });
         }
-        accepted
+        drained
+    }
+
+    fn commit_native_device_fence(&self, sequence: u64) -> u64 {
+        let Some(committed) = &self.native_device_fence else {
+            return 0;
+        };
+        if sequence == 0 {
+            return committed.load(Ordering::Acquire);
+        }
+        committed
+            .fetch_max(sequence, Ordering::Release)
+            .max(sequence)
     }
 
     fn native_device_command_sender_disconnected(&self) -> bool {

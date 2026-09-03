@@ -579,6 +579,7 @@ fn native_device_commands_are_bound_to_the_prepared_graph_and_commit_at_the_cycl
         sender.resolve_device(ARRANGEMENT_TRACK_ID, "missing"),
         Err(NativeDeviceResolveError::DeviceNotFound)
     );
+    assert_eq!(sender.committed_fence(), 0);
 
     let mut arrangement_left = [0.0_f32; 64];
     let mut arrangement_right = [0.0_f32; 64];
@@ -597,6 +598,7 @@ fn native_device_commands_are_bound_to_the_prepared_graph_and_commit_at_the_cycl
             enabled: false,
         })
         .unwrap();
+    assert_eq!(sender.try_send_fence().unwrap(), Some(1));
     transport.apply_command(TransportCommand::Start).unwrap();
     let bypassed = transport
         .process_cycle(
@@ -607,7 +609,9 @@ fn native_device_commands_are_bound_to_the_prepared_graph_and_commit_at_the_cycl
             },
         )
         .unwrap();
-    assert_eq!(bypassed.applied_native_device_command_count(), 1);
+    assert_eq!(bypassed.applied_native_device_command_count(), 2);
+    assert_eq!(bypassed.committed_native_device_fence(), 1);
+    assert_eq!(sender.committed_fence(), 1);
     assert!(!bypassed.native_device_command_sender_disconnected());
     assert_eq!(transport.native_device_state().enabled(0, 0), Some(false));
     let baseline = render_with_device_chain(None);
@@ -698,6 +702,7 @@ fn native_device_commands_are_bound_to_the_prepared_graph_and_commit_at_the_cycl
             state: intermediate,
         })
         .unwrap();
+    assert_eq!(sender.try_send_fence().unwrap(), Some(2));
     sender
         .try_send(NativeDeviceCommand::SetState {
             device,
@@ -713,7 +718,9 @@ fn native_device_commands_are_bound_to_the_prepared_graph_and_commit_at_the_cycl
             },
         )
         .unwrap();
-    assert_eq!(coalesced_cycle.applied_native_device_command_count(), 2);
+    assert_eq!(coalesced_cycle.applied_native_device_command_count(), 3);
+    assert_eq!(coalesced_cycle.committed_native_device_fence(), 2);
+    assert_eq!(sender.committed_fence(), 2);
     assert_eq!(transport.native_device_state().state(0, 0), Some(latest));
     assert!(left.iter().all(|sample| sample.is_finite()));
     assert!(right.iter().all(|sample| sample.is_finite()));
@@ -765,9 +772,271 @@ fn native_device_commands_are_bound_to_the_prepared_graph_and_commit_at_the_cycl
         }),
         Err(NativeDeviceCommandSendError::Full(_))
     ));
+    assert!(matches!(
+        sender.try_send_fence(),
+        Err(NativeDeviceCommandSendError::Full(
+            NativeDeviceCommand::Fence(_)
+        ))
+    ));
+    transport.apply_command(TransportCommand::Stop).unwrap();
+    let drained = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        drained.applied_native_device_command_count(),
+        MAX_QUEUED_NATIVE_DEVICE_COMMANDS
+    );
+    assert_eq!(sender.try_send_fence().unwrap(), Some(3));
     drop(transport);
     assert!(sender.is_disconnected());
+    assert!(matches!(
+        sender.try_send_fence(),
+        Err(NativeDeviceCommandSendError::Disconnected(
+            NativeDeviceCommand::Fence(_)
+        ))
+    ));
     drop(foreign_runtime);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "paired prepared sessions make the native fence coalescing contract observable at the audio boundary"
+)]
+fn native_device_fence_preserves_state_coalescing_across_its_boundary() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let chain = native_filter_chain(true);
+    let first_runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        core::slice::from_ref(&chain),
+        64,
+    )
+    .unwrap();
+    let second_runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        core::slice::from_ref(&chain),
+        64,
+    )
+    .unwrap();
+    let (_first_transport_sender, _first_mixer_sender, mut first_sender, mut first_transport) =
+        PreparedPlaybackTransportRuntime::with_command_queues_and_native_device_commands(
+            first_runtime,
+        );
+    let (_second_transport_sender, _second_mixer_sender, mut second_sender, mut second_transport) =
+        PreparedPlaybackTransportRuntime::with_command_queues_and_native_device_commands(
+            second_runtime,
+        );
+    let first_device = first_sender
+        .resolve_device(ARRANGEMENT_TRACK_ID, chain.devices()[0].id())
+        .unwrap();
+    let second_device = second_sender
+        .resolve_device(ARRANGEMENT_TRACK_ID, chain.devices()[0].id())
+        .unwrap();
+
+    first_transport
+        .apply_command(TransportCommand::Start)
+        .unwrap();
+    second_transport
+        .apply_command(TransportCommand::Start)
+        .unwrap();
+    let mut first_arrangement_left = [0.0_f32; 64];
+    let mut first_arrangement_right = [0.0_f32; 64];
+    let mut first_scene_left = [0.0_f32; 64];
+    let mut first_scene_right = [0.0_f32; 64];
+    let mut first_scratch = [
+        RenderScratchSlot::new(&mut first_arrangement_left, &mut first_arrangement_right),
+        RenderScratchSlot::new(&mut first_scene_left, &mut first_scene_right),
+    ];
+    let mut second_arrangement_left = [0.0_f32; 64];
+    let mut second_arrangement_right = [0.0_f32; 64];
+    let mut second_scene_left = [0.0_f32; 64];
+    let mut second_scene_right = [0.0_f32; 64];
+    let mut second_scratch = [
+        RenderScratchSlot::new(&mut second_arrangement_left, &mut second_arrangement_right),
+        RenderScratchSlot::new(&mut second_scene_left, &mut second_scene_right),
+    ];
+    let mut first_left = [0.0_f32; 64];
+    let mut first_right = [0.0_f32; 64];
+    let mut second_left = [0.0_f32; 64];
+    let mut second_right = [0.0_f32; 64];
+
+    first_transport
+        .process_cycle(
+            &mut first_scratch,
+            StereoOutput {
+                left: &mut first_left,
+                right: &mut first_right,
+            },
+        )
+        .unwrap();
+    second_transport
+        .process_cycle(
+            &mut second_scratch,
+            StereoOutput {
+                left: &mut second_left,
+                right: &mut second_right,
+            },
+        )
+        .unwrap();
+    assert_eq!(first_left.map(f32::to_bits), second_left.map(f32::to_bits));
+    assert_eq!(
+        first_right.map(f32::to_bits),
+        second_right.map(f32::to_bits)
+    );
+
+    let intermediate = NativeDeviceState::Filter(
+        NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 500_000).unwrap(),
+    );
+    let latest = NativeDeviceState::Filter(
+        NativeFilterState::try_new(NativeFilterMode::HighPass, 8_000_000, 2_000_000).unwrap(),
+    );
+    first_sender
+        .try_send(NativeDeviceCommand::SetState {
+            device: first_device,
+            state: intermediate,
+        })
+        .unwrap();
+    assert_eq!(first_sender.try_send_fence().unwrap(), Some(1));
+    first_sender
+        .try_send(NativeDeviceCommand::SetState {
+            device: first_device,
+            state: latest,
+        })
+        .unwrap();
+    second_sender
+        .try_send(NativeDeviceCommand::SetState {
+            device: second_device,
+            state: latest,
+        })
+        .unwrap();
+
+    let first_cycle = first_transport
+        .process_cycle(
+            &mut first_scratch,
+            StereoOutput {
+                left: &mut first_left,
+                right: &mut first_right,
+            },
+        )
+        .unwrap();
+    let second_cycle = second_transport
+        .process_cycle(
+            &mut second_scratch,
+            StereoOutput {
+                left: &mut second_left,
+                right: &mut second_right,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(first_cycle.applied_native_device_command_count(), 3);
+    assert_eq!(first_cycle.committed_native_device_fence(), 1);
+    assert_eq!(first_sender.committed_fence(), 1);
+    assert_eq!(second_cycle.applied_native_device_command_count(), 1);
+    assert_eq!(second_cycle.committed_native_device_fence(), 0);
+    assert_eq!(
+        first_transport.native_device_state().state(0, 0),
+        Some(latest)
+    );
+    assert_eq!(
+        second_transport.native_device_state().state(0, 0),
+        Some(latest)
+    );
+    assert_eq!(first_left.map(f32::to_bits), second_left.map(f32::to_bits));
+    assert_eq!(
+        first_right.map(f32::to_bits),
+        second_right.map(f32::to_bits)
+    );
+}
+
+#[test]
+fn native_device_state_and_fence_are_rolled_back_when_later_cycle_work_fails() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let chain = native_filter_chain(true);
+    let runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        core::slice::from_ref(&chain),
+        64,
+    )
+    .unwrap();
+    let (mut transport_sender, _mixer_sender, mut native_sender, mut transport) =
+        PreparedPlaybackTransportRuntime::with_command_queues_and_native_device_commands(runtime);
+    let device = native_sender
+        .resolve_device(ARRANGEMENT_TRACK_ID, chain.devices()[0].id())
+        .unwrap();
+    transport_sender.try_send(TransportCommand::Start).unwrap();
+    native_sender
+        .try_send(NativeDeviceCommand::SetEnabled {
+            device,
+            enabled: false,
+        })
+        .unwrap();
+    assert_eq!(native_sender.try_send_fence().unwrap(), Some(1));
+    let mut incomplete_scratch = [];
+    let mut failed_left = [9.0_f32; 1];
+    let mut failed_right = [9.0_f32; 1];
+
+    assert!(matches!(
+        transport.process_cycle(
+            &mut incomplete_scratch,
+            StereoOutput {
+                left: &mut failed_left,
+                right: &mut failed_right,
+            },
+        ),
+        Err(RuntimeProcessError::PlaybackRender(_))
+    ));
+    assert_eq!(transport.state(), TransportState::Stopped);
+    assert_eq!(native_sender.committed_fence(), 0);
+    assert_eq!(transport.native_device_state().enabled(0, 0), Some(true));
+
+    transport_sender.try_send(TransportCommand::Start).unwrap();
+    let mut arrangement_left = [0.0_f32; 64];
+    let mut arrangement_right = [0.0_f32; 64];
+    let mut scene_left = [0.0_f32; 64];
+    let mut scene_right = [0.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut left = [0.0_f32; 64];
+    let mut right = [0.0_f32; 64];
+    let recovered = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+    assert_eq!(recovered.applied_native_device_command_count(), 0);
+    assert_eq!(recovered.committed_native_device_fence(), 0);
+    assert_eq!(native_sender.committed_fence(), 0);
+    let recovered_native_state = transport.native_device_state();
+    assert_eq!(recovered_native_state.enabled(0, 0), Some(true));
+    let (mut recovery_publisher, recovery) = playback_recovery_channel(None, None);
+    recovery_publisher.publish_cycle_with_native_device_state(
+        recovered,
+        None,
+        Some(&recovered_native_state),
+    );
+    let snapshot = recovery.snapshot();
+    assert_eq!(snapshot.committed_native_device_fence(), 0);
+    assert_eq!(snapshot.native_device_state(), Some(recovered_native_state));
 }
 
 #[test]

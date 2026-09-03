@@ -280,6 +280,7 @@ fn native_filter_retarget_performs_zero_heap_allocations() {
             ),
         })
         .unwrap();
+    assert_eq!(device_sender.try_send_fence().unwrap(), Some(1));
     transport.apply_command(TransportCommand::Start).unwrap();
     let mut arrangement_left = [0.0_f32; 64];
     let mut arrangement_right = [0.0_f32; 64];
@@ -302,7 +303,10 @@ fn native_filter_retarget_performs_zero_heap_allocations() {
     );
     let heap_operations = measurement.finish();
 
-    assert_eq!(result.unwrap().applied_native_device_command_count(), 1);
+    let cycle = result.unwrap();
+    assert_eq!(cycle.applied_native_device_command_count(), 2);
+    assert_eq!(cycle.committed_native_device_fence(), 1);
+    assert_eq!(device_sender.committed_fence(), 1);
     assert_eq!(heap_operations, 0);
     assert!(output_left.iter().all(|sample| sample.is_finite()));
     assert!(output_right.iter().all(|sample| sample.is_finite()));

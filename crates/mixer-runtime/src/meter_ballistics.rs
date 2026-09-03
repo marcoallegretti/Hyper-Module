@@ -742,6 +742,7 @@ mod tests {
                 committed_mixer_fence: 0,
                 mixer_parameter_command_sender_disconnected: false,
                 applied_native_device_command_count: 0,
+                committed_native_device_fence: 0,
                 native_device_command_sender_disconnected: false,
             },
             meter,
