@@ -49,6 +49,7 @@ slint-build = "=1.17.1"
 [dev-dependencies]
 hyper-arrangement-renderer = { path = "../../../crates/arrangement-renderer" }
 hyper-audio-engine = { path = "../../../crates/audio-engine" }
+hyper-desktop-audio = { path = "../../IDE/audio-backend", features = ["test-support"] }
 hyper-playback-compiler = { path = "../../../crates/playback-compiler" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime", features = ["test-support"] }
 i-slint-backend-testing = "=1.17.1"

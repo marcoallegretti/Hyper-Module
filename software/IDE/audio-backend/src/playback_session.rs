@@ -841,7 +841,7 @@ struct PlaybackMonitoringSession {
     config: DesktopMonitoringConfig,
     counters: MonitoringCounters,
     control: DesktopMonitoringControl,
-    meter: InputMeterReceiver,
+    meter: Option<InputMeterReceiver>,
 }
 
 /// The monitor configuration and control state that must be established before
@@ -1771,7 +1771,7 @@ impl DesktopPlaybackSession {
                     config: monitoring.config,
                     counters,
                     control,
-                    meter,
+                    meter: Some(meter),
                 });
                 Ok(session)
             }
@@ -2512,7 +2512,19 @@ impl DesktopPlaybackSession {
     pub fn monitoring_input_meter_receiver(&mut self) -> Option<&mut InputMeterReceiver> {
         self.monitoring
             .as_mut()
-            .map(|monitoring| &mut monitoring.meter)
+            .and_then(|monitoring| monitoring.meter.as_mut())
+    }
+
+    /// Transfers the accepted-input meter receiver to one presentation owner.
+    ///
+    /// The capture callback keeps the only producer. This deliberately moves
+    /// only display telemetry; it does not transfer input, output, or monitor
+    /// control authority.
+    #[must_use]
+    pub fn take_monitoring_input_meter_receiver(&mut self) -> Option<InputMeterReceiver> {
+        self.monitoring
+            .as_mut()
+            .and_then(|monitoring| monitoring.meter.take())
     }
 
     #[must_use]

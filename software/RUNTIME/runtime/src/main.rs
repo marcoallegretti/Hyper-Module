@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+mod input;
 mod loop_update;
 mod mixer_update;
 mod native_device_update;
@@ -25,9 +26,10 @@ use hyper_control_runtime::{
     PanelDisplay, PanelReleaseFailure,
 };
 use hyper_desktop_audio::{
-    DesktopControlSinkError, DesktopMixerSendTap, DesktopNativeDevice, DesktopPlaybackSession,
-    DesktopSceneAvailability, OutputStreamCounters, OutputStreamSnapshot, OutputStreamState,
-    OutputStreamStatus,
+    CaptureStreamCounters, DesktopControlSinkError, DesktopMixerSendTap, DesktopMonitoringConfig,
+    DesktopMonitoringControl, DesktopNativeDevice, DesktopPlaybackSession,
+    DesktopSceneAvailability, InputMeterReceiver, OutputStreamCounters, OutputStreamSnapshot,
+    OutputStreamState, OutputStreamStatus, StreamState, StreamStatus,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
@@ -38,7 +40,8 @@ use hyper_mixer_runtime::{
     NativeDeviceCommand, NativeDeviceHandle, NativeDeviceStateSnapshot, OutputMeterReceiver,
     PlaybackCycleObservation, PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
     PlaybackRecoveryTransportState, SamplePeakBallisticsConfig, ScaledLoudnessValue,
-    StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot, TransportCommand,
+    StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot,
+    StereoSamplePeakDisplayBallistics, StereoSamplePeakDisplayBallisticsSnapshot, TransportCommand,
     TransportLoopRange,
 };
 use hyper_native_device::{
@@ -61,6 +64,7 @@ use hyper_scene_performance::{
 };
 use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
 
+use input::{RuntimeInputRoute, discover_runtime_input_targets, prepare_runtime_input};
 use loop_update::{
     RuntimeLoopUpdateConfiguration, RuntimeLoopUpdateController, RuntimeLoopUpdateObservation,
     RuntimeLoopUpdatePoll,
@@ -94,6 +98,9 @@ const MAX_PROJECT_DECODED_BYTES: usize = 1_024 * 1_024 * 1_024;
 const MAX_RUNTIME_BUNDLE_BYTES: u64 = 1_024 * 1_024 * 1_024;
 const OUTPUT_METER_FLOOR_DBFS: f32 = -90.0;
 const OUTPUT_METER_FALLOFF_DB_PER_SECOND: f32 = 13.3;
+const INPUT_MONITORING_TRANSPORT_FRAMES: usize = MAXIMUM_BLOCK_FRAMES * 2;
+const INPUT_MONITORING_TARGET_FRAMES: usize = 256;
+const INPUT_MONITORING_CHUNK_FRAMES: usize = 64;
 
 const HEARTBEAT_INTERVAL_MS: u32 = 50;
 const HEARTBEAT_TIMEOUT_MS: u32 = 500;
@@ -153,6 +160,10 @@ impl SessionHost {
     fn take_meter_receiver(&mut self) -> Option<OutputMeterReceiver> {
         self.session.take_meter_receiver()
     }
+
+    fn take_input_meter_receiver(&mut self) -> Option<InputMeterReceiver> {
+        self.session.take_monitoring_input_meter_receiver()
+    }
 }
 
 fn main() -> ExitCode {
@@ -168,10 +179,11 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     match parse_runtime_invocation(std::env::args().skip(1)).map_err(|error| {
         format!(
-            "{error}\nusage:\n  hyper-runtime --list-audio-outputs\n  hyper-runtime <deployment-target-directory> [--audio-output ROUTING_ID] [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--mixer-updates DIRECTORY] [--native-device-updates DIRECTORY] [--loop-updates DIRECTORY] [--operator-ui]"
+            "{error}\nusage:\n  hyper-runtime --list-audio-outputs\n  hyper-runtime --list-audio-inputs\n  hyper-runtime <deployment-target-directory> [--audio-output ROUTING_ID] [--audio-input ROUTING_ID] [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--mixer-updates DIRECTORY] [--native-device-updates DIRECTORY] [--loop-updates DIRECTORY] [--operator-ui]"
         )
     })? {
         RuntimeInvocation::ListAudioOutputs => list_runtime_audio_outputs(),
+        RuntimeInvocation::ListAudioInputs => list_runtime_audio_inputs(),
         RuntimeInvocation::Host(arguments) if arguments.operator_ui() => run_operator_ui(*arguments),
         RuntimeInvocation::Host(arguments) => run_headless(&arguments),
     }
@@ -180,6 +192,7 @@ fn run() -> Result<(), String> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimeInvocation {
     ListAudioOutputs,
+    ListAudioInputs,
     Host(Box<RuntimeArguments>),
 }
 
@@ -191,11 +204,14 @@ where
     if matches!(arguments.as_slice(), [option] if option == "--list-audio-outputs") {
         return Ok(RuntimeInvocation::ListAudioOutputs);
     }
+    if matches!(arguments.as_slice(), [option] if option == "--list-audio-inputs") {
+        return Ok(RuntimeInvocation::ListAudioInputs);
+    }
     if arguments
         .iter()
-        .any(|argument| argument == "--list-audio-outputs")
+        .any(|argument| argument == "--list-audio-outputs" || argument == "--list-audio-inputs")
     {
-        return Err("--list-audio-outputs must be used by itself".to_owned());
+        return Err("audio target listing options must be used by themselves".to_owned());
     }
     RuntimeArguments::parse(arguments)
         .map(|arguments| RuntimeInvocation::Host(Box::new(arguments)))
@@ -216,6 +232,20 @@ fn list_runtime_audio_outputs() -> Result<(), String> {
     Ok(())
 }
 
+fn list_runtime_audio_inputs() -> Result<(), String> {
+    let targets = discover_runtime_input_targets()
+        .map_err(|error| format!("desktop audio-input discovery failed: {error}"))?;
+    if targets.is_empty() {
+        println!("no routable desktop audio inputs found");
+        return Ok(());
+    }
+    println!("ROUTING ID\tINPUT");
+    for target in targets {
+        println!("{}\t{}", target.routing_id(), target.display_name());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct RuntimeFacts {
     bundle_identity: String,
@@ -225,6 +255,7 @@ struct RuntimeFacts {
     project_id: String,
     project_revision: u64,
     output_route: RuntimeOutputRoute,
+    input_route: RuntimeInputRoute,
     playback_extent: PlaybackExtent,
     musical_timeline: RuntimeMusicalTimeline,
     timeline_markers: Arc<[OperatorTimelineMarker]>,
@@ -291,6 +322,9 @@ struct RuntimeObservers {
     facts: RuntimeFacts,
     output_status: OutputStreamStatus,
     output_counters: OutputStreamCounters,
+    input_status: Option<StreamStatus>,
+    input_counters: Option<CaptureStreamCounters>,
+    input_control: Option<DesktopMonitoringControl>,
     recovery: PlaybackRecoveryCheckpoint,
     panel_connected: Arc<AtomicBool>,
     mixer_update: Arc<Mutex<RuntimeMixerUpdateObservation>>,
@@ -302,6 +336,7 @@ struct RuntimeObservers {
 struct OperatorReady {
     observers: RuntimeObservers,
     meters: OutputMeterReceiver,
+    input_meters: Option<InputMeterReceiver>,
     scenes: Vec<OperatorScene>,
     mixer_channels: Vec<OperatorMixerChannel>,
     mixer_sends: Vec<OperatorMixerSend>,
@@ -369,6 +404,54 @@ struct OperatorMeterObserver {
     coalesced_snapshot_count: u64,
     dropped_snapshot_count: u64,
     sender_disconnected: bool,
+}
+
+/// Presentation-only owner for raw accepted-input meter evidence. It has no
+/// capture, monitor, output, or transport authority.
+struct OperatorInputMeterObserver {
+    receiver: InputMeterReceiver,
+    ballistics: StereoSamplePeakDisplayBallistics,
+    latest: Option<StereoSamplePeakDisplayBallisticsSnapshot>,
+    coalesced_snapshot_count: u64,
+    dropped_snapshot_count: u64,
+    sender_disconnected: bool,
+}
+
+impl OperatorInputMeterObserver {
+    fn new(receiver: InputMeterReceiver, config: SamplePeakBallisticsConfig) -> Self {
+        Self {
+            receiver,
+            ballistics: StereoSamplePeakDisplayBallistics::new(config),
+            latest: None,
+            coalesced_snapshot_count: 0,
+            dropped_snapshot_count: 0,
+            sender_disconnected: false,
+        }
+    }
+
+    fn observe(&mut self) -> OperatorInputMeterPresentation {
+        let read = self.receiver.read_display(&mut self.ballistics);
+        let latest = read.latest();
+        self.coalesced_snapshot_count = self
+            .coalesced_snapshot_count
+            .saturating_add(u64::try_from(latest.coalesced_snapshot_count()).unwrap_or(u64::MAX));
+        self.dropped_snapshot_count = self
+            .dropped_snapshot_count
+            .saturating_add(u64::try_from(latest.dropped_snapshot_count()).unwrap_or(u64::MAX));
+        self.sender_disconnected |= latest.sender_disconnected();
+        if self.sender_disconnected {
+            self.ballistics.reset();
+            self.latest = None;
+        } else if let Some(snapshot) = read.display() {
+            self.latest = Some(snapshot);
+        }
+        operator_input_meter_presentation(
+            self.latest,
+            self.coalesced_snapshot_count,
+            self.dropped_snapshot_count,
+            self.sender_disconnected,
+        )
+    }
 }
 
 impl OperatorMeterObserver {
@@ -466,6 +549,12 @@ enum OperatorCommand {
     },
     SetMetronomeGain {
         gain: MetronomeGain,
+    },
+    SetInputMonitorGain {
+        gain_millionths: u32,
+    },
+    SetInputMonitorMuted {
+        muted: bool,
     },
     SetLoudnessState {
         state: LoudnessMeasurementState,
@@ -579,6 +668,10 @@ trait RuntimeOperatorControl {
     fn queue_loudness(&mut self, command: LoudnessMeasurementCommand) -> Result<(), String>;
     fn queue_mixer(&mut self, command: MixerParameterCommand) -> Result<(), String>;
     fn queue_native_device(&mut self, command: NativeDeviceCommand) -> Result<(), String>;
+
+    fn set_input_monitor_gain(&mut self, gain: f32) -> Result<(), String>;
+
+    fn set_input_monitor_muted(&mut self, muted: bool) -> Result<(), String>;
 }
 
 /// Runtime scene-performance commands remain with the same owner as transport.
@@ -646,6 +739,23 @@ impl RuntimeOperatorControl for SessionHost {
         self.session
             .try_send_native_device_command(command)
             .map_err(|error| error.to_string())
+    }
+
+    fn set_input_monitor_gain(&mut self, gain: f32) -> Result<(), String> {
+        self.session
+            .monitoring_control()
+            .ok_or_else(|| "Runtime input monitor is unavailable".to_owned())?
+            .set_gain_linear(gain)
+            .map_err(|error| error.to_string())
+    }
+
+    fn set_input_monitor_muted(&mut self, muted: bool) -> Result<(), String> {
+        let control = self
+            .session
+            .monitoring_control()
+            .ok_or_else(|| "Runtime input monitor is unavailable".to_owned())?;
+        control.set_muted(muted);
+        Ok(())
     }
 }
 
@@ -835,6 +945,60 @@ struct PreparedRuntimeStartup {
     scene_performance: RuntimeScenePerformanceCaptureConfiguration,
 }
 
+/// Complete audio authority preflighted before either native stream is opened.
+struct RuntimeAudioConfiguration {
+    output: hyper_desktop_audio::DesktopOutputConfig,
+    output_route: RuntimeOutputRoute,
+    input_route: RuntimeInputRoute,
+    monitoring: Option<DesktopMonitoringConfig>,
+}
+
+fn prepare_runtime_audio(
+    arguments: &RuntimeArguments,
+) -> Result<RuntimeAudioConfiguration, String> {
+    let output = prepare_runtime_output(
+        arguments.audio_output(),
+        SAMPLE_RATE_HZ,
+        MAXIMUM_BLOCK_FRAMES,
+    )
+    .map_err(|error| format!("Runtime audio-output preflight failed: {error}"))?;
+    let input = prepare_runtime_input(
+        arguments.audio_input(),
+        SAMPLE_RATE_HZ,
+        MAXIMUM_BLOCK_FRAMES,
+    )
+    .map_err(|error| format!("Runtime audio-input preflight failed: {error}"))?;
+    let (output, output_route) = output.into_parts();
+    let (input, input_route) = input.into_parts();
+    configure_runtime_audio(output, output_route, input, input_route)
+}
+
+fn configure_runtime_audio(
+    output: hyper_desktop_audio::DesktopOutputConfig,
+    output_route: RuntimeOutputRoute,
+    input: Option<hyper_desktop_audio::DesktopInputConfig>,
+    input_route: RuntimeInputRoute,
+) -> Result<RuntimeAudioConfiguration, String> {
+    let monitoring = input
+        .map(|input| {
+            DesktopMonitoringConfig::try_new(
+                input,
+                output.clone(),
+                INPUT_MONITORING_TRANSPORT_FRAMES,
+                INPUT_MONITORING_TARGET_FRAMES,
+                INPUT_MONITORING_CHUNK_FRAMES,
+            )
+        })
+        .transpose()
+        .map_err(|error| format!("Runtime input-monitor policy is invalid: {error}"))?;
+    Ok(RuntimeAudioConfiguration {
+        output,
+        output_route,
+        input_route,
+        monitoring,
+    })
+}
+
 /// Prepares the immutable provenance and source-loop baseline for one Runtime
 /// handback before the native audio owner starts.
 fn prepare_runtime_loop_update_configuration(
@@ -857,6 +1021,32 @@ fn prepare_runtime_loop_update_configuration(
     RuntimeLoopUpdateConfiguration::try_new(source, project, output_directory).map_err(|error| {
         format!("verified Runtime loop-update configuration could not be prepared: {error}")
     })
+}
+
+fn prepare_runtime_scene_performance_configuration(
+    project: &PreparedProjectPlayback,
+    bundle_identity: &str,
+    deployment_generation: u64,
+    output_directory: Option<RuntimeScenePerformanceUpdateDirectory>,
+) -> Result<RuntimeScenePerformanceCaptureConfiguration, String> {
+    let manifest = project.package().manifest();
+    let (loaded_project, ..) = project.session().parts();
+    let source = RuntimeScenePerformanceSource::try_new(
+        manifest.project_id().to_owned(),
+        manifest.revision(),
+        sha256_hex(project.package().manifest_sha256()),
+        bundle_identity.to_owned(),
+        deployment_generation,
+    )
+    .map_err(|error| {
+        format!("verified Runtime scene-performance source could not be prepared: {error}")
+    })?;
+    RuntimeScenePerformanceCaptureConfiguration::try_new(source, loaded_project, output_directory)
+        .map_err(|error| {
+            format!(
+                "verified Runtime scene-performance configuration could not be prepared: {error}"
+            )
+        })
 }
 
 /// Prepares immutable provenance and chain-selection facts before the native
@@ -918,24 +1108,12 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
     let timeline_markers =
         operator_timeline_marker_catalog(project.timeline_markers(), &musical_timeline)?;
     let bundle_identity = sha256_hex(deployment.bundle().bundle_sha256());
-    let scene_performance_source = RuntimeScenePerformanceSource::try_new(
-        manifest.project_id().to_owned(),
-        manifest.revision(),
-        sha256_hex(deployment.bundle().project().package().manifest_sha256()),
-        bundle_identity.clone(),
+    let scene_performance = prepare_runtime_scene_performance_configuration(
+        prepared_project,
+        &bundle_identity,
         deployment.generation(),
-    )
-    .map_err(|error| {
-        format!("verified Runtime scene-performance source could not be prepared: {error}")
-    })?;
-    let scene_performance = RuntimeScenePerformanceCaptureConfiguration::try_new(
-        scene_performance_source,
-        project,
         scene_performance_output,
-    )
-    .map_err(|error| {
-        format!("verified Runtime scene-performance configuration could not be prepared: {error}")
-    })?;
+    )?;
     let mixer_update_source = RuntimeMixerUpdateSource::try_new(
         manifest.project_id().to_owned(),
         manifest.revision(),
@@ -976,6 +1154,7 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
         project_id: manifest.project_id().to_owned(),
         project_revision: manifest.revision(),
         output_route: RuntimeOutputRoute::SystemDefault,
+        input_route: RuntimeInputRoute::Disabled,
         playback_extent: deployment.bundle().project().session().extent(),
         musical_timeline,
         timeline_markers: timeline_markers.into(),
@@ -1006,20 +1185,29 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         native_device_chains,
     ) = prepare_output_and_host(
         || prepare_runtime_startup(arguments),
-        || {
-            prepare_runtime_output(
-                arguments.audio_output(),
-                SAMPLE_RATE_HZ,
-                MAXIMUM_BLOCK_FRAMES,
-            )
-            .map_err(|error| format!("Runtime audio-output preflight failed: {error}"))
-        },
-        |output, startup| {
-            let (output, output_route) = output.into_parts();
+        || prepare_runtime_audio(arguments),
+        |audio, startup| {
+            let RuntimeAudioConfiguration {
+                output,
+                output_route,
+                input_route,
+                monitoring,
+            } = audio;
             let mut facts = startup.facts;
             facts.output_route = output_route;
-            let mut session = DesktopPlaybackSession::start_project(output, startup.project)
-                .map_err(|error| format!("verified bundle could not be hosted: {error}"))?;
+            facts.input_route = input_route;
+            let mut session = match monitoring {
+                Some(monitoring) => {
+                    DesktopPlaybackSession::start_project_monitored_with_monitor_state(
+                        monitoring,
+                        startup.project,
+                        1.0,
+                        true,
+                    )
+                }
+                None => DesktopPlaybackSession::start_project(output, startup.project),
+            }
+            .map_err(|error| format!("verified bundle could not be hosted: {error}"))?;
             let receiver = session.take_scene_launch_receiver().ok_or_else(|| {
                 "verified bundle could not transfer committed scene-launch authority".to_owned()
             })?;
@@ -1051,6 +1239,9 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         facts,
         output_status: session.output_status(),
         output_counters: session.counters(),
+        input_status: session.monitoring_input_status(),
+        input_counters: session.monitoring_input_counters(),
+        input_control: session.monitoring_control(),
         recovery: session.recovery_checkpoint(),
         panel_connected: Arc::clone(&panel_connected),
         mixer_update: mixer_update_observation,
@@ -1222,12 +1413,13 @@ fn open_runtime_loop_update_output(
 
 fn announce_runtime(arguments: &RuntimeArguments, runtime: &StartedRuntime) {
     println!(
-        "hosting deployment generation {} bundle {} from {} with {} mixer channels via {}",
+        "hosting deployment generation {} bundle {} from {} with {} mixer channels via {} output and {} input",
         runtime.observers.facts.deployment_generation,
         runtime.observers.facts.bundle_identity,
         arguments.deployment_root().display(),
         runtime.host.mixer_channel_count(),
-        runtime.observers.facts.output_route
+        runtime.observers.facts.output_route,
+        runtime.observers.facts.input_route,
     );
     if let Some(recovered) = &runtime.observers.facts.recovered_from {
         println!("recovered from rejected bundle {recovered}");
@@ -1517,6 +1709,27 @@ fn drain_operator_commands<
                 match host.queue_transport(TransportCommand::SetMetronomeGain(gain)) {
                     Ok(()) => diagnostic("metronome level queued".to_owned()),
                     Err(error) => diagnostic(format!("metronome level refused: {error}")),
+                }
+            }
+            OperatorCommand::SetInputMonitorGain { gain_millionths } => {
+                let Some(gain) = operator_input_monitor_gain_from_millionths(gain_millionths)
+                else {
+                    diagnostic("input monitor level refused: value is outside 0..=100%".to_owned());
+                    continue;
+                };
+                match host.set_input_monitor_gain(gain) {
+                    Ok(()) => diagnostic("input monitor level applied".to_owned()),
+                    Err(error) => diagnostic(format!("input monitor level refused: {error}")),
+                }
+            }
+            OperatorCommand::SetInputMonitorMuted { muted } => {
+                match host.set_input_monitor_muted(muted) {
+                    Ok(()) => diagnostic(if muted {
+                        "input monitor mute applied".to_owned()
+                    } else {
+                        "input monitor unmute applied".to_owned()
+                    }),
+                    Err(error) => diagnostic(format!("input monitor mute refused: {error}")),
                 }
             }
             OperatorCommand::SetLoudnessState { state } => {
@@ -1971,14 +2184,19 @@ fn spawn_operator_worker(
                                     runtime
                                         .host
                                         .take_meter_receiver()
-                                        .map(|meters| OperatorReady {
-                                            observers: runtime.observers.clone(),
-                                            meters,
-                                            scenes,
-                                            mixer_channels,
-                                            mixer_sends,
-                                            native_devices,
-                                            native_device_chains,
+                                        .map(|meters| {
+                                            let input_meters =
+                                                runtime.host.take_input_meter_receiver();
+                                            OperatorReady {
+                                                observers: runtime.observers.clone(),
+                                                meters,
+                                                input_meters,
+                                                scenes,
+                                                mixer_channels,
+                                                mixer_sends,
+                                                native_devices,
+                                                native_device_chains,
+                                            }
                                         })
                                         .ok_or_else(|| {
                                             "operator output meter authority was already transferred"
@@ -2063,6 +2281,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let OperatorReady {
         observers,
         meters,
+        input_meters,
         scenes,
         mixer_channels,
         mixer_sends,
@@ -2073,6 +2292,12 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         meters,
         meter_config,
     )));
+    let input_meter_observer = input_meters.map(|meters| {
+        Rc::new(RefCell::new(OperatorInputMeterObserver::new(
+            meters,
+            meter_config,
+        )))
+    });
     let timeline_marker_model = Rc::new(VecModel::from(operator_timeline_marker_rows(
         &observers.facts.timeline_markers,
     )));
@@ -2150,6 +2375,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_loop_range(&ui, &commands_tx, &diagnostic, &loop_authority);
     wire_operator_metronome_toggle(&ui, &commands_tx, &diagnostic, &metronome_authority);
     wire_operator_metronome_level(&ui, &commands_tx, &diagnostic, &metronome_authority);
+    wire_operator_input_monitor_controls(&ui, &commands_tx, &diagnostic);
 
     let output_state = observers.output_status.state();
     apply_operator_cycle_observation(
@@ -2175,6 +2401,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &loudness_authority,
         false,
     );
+    apply_operator_input_monitor_observation(&ui, &observers, input_meter_observer.as_ref(), false);
     apply_operator_mixer_observation(
         &ui,
         &mixer_model,
@@ -2205,6 +2432,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
     let timer_meter_observer = Rc::clone(&meter_observer);
+    let timer_input_meter_observer = input_meter_observer.clone();
     let timer_scene_model = Rc::clone(&scene_model);
     let timer_scene_launch_authority = Rc::clone(&scene_launch_authority);
     let timer_scene_selection = Rc::clone(&scene_selection);
@@ -2257,6 +2485,12 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &ui,
                 &mut timer_meter_observer.borrow_mut(),
                 &timer_loudness_authority,
+                terminal_latched,
+            );
+            apply_operator_input_monitor_observation(
+                &ui,
+                &timer_observers,
+                timer_input_meter_observer.as_ref(),
                 terminal_latched,
             );
             apply_operator_mixer_observation(
@@ -3901,6 +4135,28 @@ fn operator_metronome_percent_to_gain(percent: f32) -> Result<MetronomeGain, ()>
 }
 
 #[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "the bounded zero-through-unity millionths domain is converted only after validation"
+)]
+fn operator_input_monitor_gain_from_millionths(gain_millionths: u32) -> Option<f32> {
+    (gain_millionths <= 1_000_000).then_some(gain_millionths as f32 / 1_000_000.0)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "finite Runtime input-monitor percent is range-checked before quantization"
+)]
+fn operator_input_monitor_percent_to_millionths(percent: f32) -> Result<u32, ()> {
+    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+        return Err(());
+    }
+    Ok((percent * 10_000.0).round() as u32)
+}
+
+#[allow(
     clippy::cast_precision_loss,
     reason = "the exact zero-through-unity metronome millionths domain is presented as a bounded percentage"
 )]
@@ -4022,6 +4278,65 @@ fn wire_operator_metronome_level(
             &sender,
             OperatorCommand::SetMetronomeGain { gain },
             &diagnostic,
+        );
+    });
+}
+
+/// Sends bounded monitor-control requests without changing the surface until
+/// the shared desktop control reports its actual state on the next observation.
+fn wire_operator_input_monitor_controls(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+) {
+    let gain_ui = ui.as_weak();
+    let gain_sender = sender.clone();
+    let gain_diagnostic = Arc::clone(diagnostic);
+    ui.on_set_input_monitor_gain_requested(move |percent| {
+        let Some(ui) = gain_ui.upgrade() else {
+            return;
+        };
+        if !ui.get_input_monitor_controls_enabled() {
+            set_diagnostic(
+                &gain_diagnostic,
+                "input monitor level refused: accepted input authority is unavailable".to_owned(),
+            );
+            return;
+        }
+        let Ok(gain_millionths) = operator_input_monitor_percent_to_millionths(percent) else {
+            set_diagnostic(
+                &gain_diagnostic,
+                "input monitor level refused: value is outside 0..=100%".to_owned(),
+            );
+            return;
+        };
+        send_operator_command(
+            &gain_sender,
+            OperatorCommand::SetInputMonitorGain { gain_millionths },
+            &gain_diagnostic,
+        );
+    });
+
+    let mute_ui = ui.as_weak();
+    let mute_sender = sender.clone();
+    let mute_diagnostic = Arc::clone(diagnostic);
+    ui.on_toggle_input_monitor_mute_requested(move || {
+        let Some(ui) = mute_ui.upgrade() else {
+            return;
+        };
+        if !ui.get_input_monitor_controls_enabled() {
+            set_diagnostic(
+                &mute_diagnostic,
+                "input monitor mute refused: accepted input authority is unavailable".to_owned(),
+            );
+            return;
+        }
+        send_operator_command(
+            &mute_sender,
+            OperatorCommand::SetInputMonitorMuted {
+                muted: !ui.get_input_monitor_muted(),
+            },
+            &mute_diagnostic,
         );
     });
 }
@@ -5100,6 +5415,7 @@ fn apply_static_facts(ui: &OperatorWindow, facts: &RuntimeFacts) {
     ui.set_deployment_generation(facts.deployment_generation.to_string().into());
     ui.set_bundle_identity(facts.bundle_identity.clone().into());
     ui.set_output_route(facts.output_route.to_string().into());
+    ui.set_input_route(facts.input_route.to_string().into());
     ui.set_timeline_marker_navigation_state(
         operator_timeline_marker_navigation_state(&facts.timeline_markers, false).into(),
     );
@@ -5147,6 +5463,61 @@ struct OperatorMeterPresentation {
 struct OperatorMeterObservation {
     presentation: OperatorMeterPresentation,
     strip_meters: Option<MixerStripSamplePeakBallisticsSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperatorInputMonitorAuthority {
+    Disabled,
+    Unavailable,
+    Observed {
+        stream_state: StreamState,
+        terminal_latched: bool,
+    },
+}
+
+impl OperatorInputMonitorAuthority {
+    const fn configured(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    const fn state(self) -> &'static str {
+        match self {
+            Self::Disabled => "DISABLED",
+            Self::Unavailable => "UNAVAILABLE",
+            Self::Observed { stream_state, .. } => operator_input_stream_state_text(stream_state),
+        }
+    }
+
+    const fn running(self) -> bool {
+        matches!(
+            self,
+            Self::Observed {
+                stream_state: StreamState::Running,
+                terminal_latched: false,
+            }
+        )
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct OperatorInputMonitorPresentation {
+    authority: OperatorInputMonitorAuthority,
+    callback_count: String,
+    captured_frame_count: String,
+    dropped_frame_count: String,
+    gain_percent: f32,
+    muted: bool,
+}
+
+#[derive(Debug, PartialEq)]
+struct OperatorInputMeterPresentation {
+    left_level: f32,
+    left_reading: String,
+    right_level: f32,
+    right_reading: String,
+    state: String,
+    telemetry: String,
+    live: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -5214,6 +5585,110 @@ fn operator_meter_presentation(
         ),
         loudness: operator_loudness_presentation(loudness),
     }
+}
+
+fn operator_input_monitor_presentation(
+    configured: bool,
+    status: Option<&StreamStatus>,
+    counters: Option<&CaptureStreamCounters>,
+    control: Option<&DesktopMonitoringControl>,
+    terminal_latched: bool,
+) -> OperatorInputMonitorPresentation {
+    if !configured {
+        return OperatorInputMonitorPresentation {
+            authority: OperatorInputMonitorAuthority::Disabled,
+            callback_count: "—".to_owned(),
+            captured_frame_count: "—".to_owned(),
+            dropped_frame_count: "—".to_owned(),
+            gain_percent: 0.0,
+            muted: true,
+        };
+    }
+    let (Some(status), Some(counters), Some(control)) = (status, counters, control) else {
+        return OperatorInputMonitorPresentation {
+            authority: OperatorInputMonitorAuthority::Unavailable,
+            callback_count: "—".to_owned(),
+            captured_frame_count: "—".to_owned(),
+            dropped_frame_count: "—".to_owned(),
+            gain_percent: 0.0,
+            muted: true,
+        };
+    };
+    let stream_state = status.state();
+    let counters = counters.snapshot();
+    OperatorInputMonitorPresentation {
+        authority: OperatorInputMonitorAuthority::Observed {
+            stream_state,
+            terminal_latched,
+        },
+        callback_count: counters.callback_count.to_string(),
+        captured_frame_count: counters.captured_frame_count.to_string(),
+        dropped_frame_count: counters.dropped_frame_count.to_string(),
+        gain_percent: control.gain_linear() * 100.0,
+        muted: control.muted(),
+    }
+}
+
+const fn operator_input_stream_state_text(state: StreamState) -> &'static str {
+    match state {
+        StreamState::Starting => "STARTING",
+        StreamState::Running => "RUNNING",
+        StreamState::StopRequested => "STOP REQUESTED",
+        StreamState::Stopped => "STOPPED",
+        StreamState::Failed => "FAILED",
+    }
+}
+
+fn operator_input_meter_presentation(
+    snapshot: Option<StereoSamplePeakDisplayBallisticsSnapshot>,
+    coalesced_snapshot_count: u64,
+    dropped_snapshot_count: u64,
+    sender_disconnected: bool,
+) -> OperatorInputMeterPresentation {
+    let (left, right, frame) = snapshot.map_or_else(
+        || {
+            (
+                operator_input_meter_channel_presentation(None),
+                operator_input_meter_channel_presentation(None),
+                None,
+            )
+        },
+        |snapshot| {
+            (
+                operator_input_meter_channel_presentation(Some(snapshot.left())),
+                operator_input_meter_channel_presentation(Some(snapshot.right())),
+                Some(snapshot.frame_end()),
+            )
+        },
+    );
+    let state = match (snapshot.is_some(), sender_disconnected) {
+        (false, false) => "Waiting for accepted input evidence".to_owned(),
+        (false | true, true) => "Input meter producer ended".to_owned(),
+        (true, false) => "Raw accepted-input sample peak".to_owned(),
+    };
+    let frame = frame.map_or_else(|| "unavailable".to_owned(), |frame| frame.to_string());
+    OperatorInputMeterPresentation {
+        left_level: left.0,
+        left_reading: left.1,
+        right_level: right.0,
+        right_reading: right.1,
+        state,
+        telemetry: format!(
+            "accepted frame {frame} · {coalesced_snapshot_count} coalesced · {dropped_snapshot_count} dropped display snapshots"
+        ),
+        live: !sender_disconnected,
+    }
+}
+
+fn operator_input_meter_channel_presentation(
+    channel: Option<hyper_mixer_runtime::ChannelSamplePeakDisplay>,
+) -> (f32, String) {
+    channel.map_or_else(
+        || operator_meter_level_presentation(false, f32::NAN),
+        |channel| {
+            operator_meter_level_presentation(channel.measurement_available(), channel.level_dbfs())
+        },
+    )
 }
 
 fn operator_loudness_presentation(
@@ -5483,6 +5958,67 @@ fn apply_operator_meter_observation(
     ui.set_loudness_reset_enabled(authority.is_some());
 }
 
+fn apply_operator_input_monitor_observation(
+    ui: &OperatorWindow,
+    observers: &RuntimeObservers,
+    meter_observer: Option<&Rc<RefCell<OperatorInputMeterObserver>>>,
+    terminal_latched: bool,
+) {
+    let configured = matches!(
+        &observers.facts.input_route,
+        RuntimeInputRoute::Pinned { .. }
+    );
+    let presentation = operator_input_monitor_presentation(
+        configured,
+        observers.input_status.as_ref(),
+        observers.input_counters.as_ref(),
+        observers.input_control.as_ref(),
+        terminal_latched,
+    );
+    ui.set_input_monitor_configured(presentation.authority.configured());
+    ui.set_input_monitor_state(presentation.authority.state().into());
+    ui.set_input_callback_count(presentation.callback_count.into());
+    ui.set_input_captured_frame_count(presentation.captured_frame_count.into());
+    ui.set_input_dropped_frame_count(presentation.dropped_frame_count.into());
+    ui.set_input_monitor_gain_percent(presentation.gain_percent);
+    ui.set_input_monitor_muted(presentation.muted);
+    ui.set_input_monitor_controls_enabled(presentation.authority.running());
+
+    if !presentation.authority.configured() {
+        clear_operator_input_meter(ui, "No input monitoring requested");
+        return;
+    }
+    if !presentation.authority.running() {
+        clear_operator_input_meter(
+            ui,
+            "Raw input meter unavailable while capture is not running",
+        );
+        return;
+    }
+    let Some(meter_observer) = meter_observer else {
+        clear_operator_input_meter(ui, "Raw input-meter authority is unavailable");
+        return;
+    };
+    let meter = meter_observer.borrow_mut().observe();
+    ui.set_left_input_level(meter.left_level);
+    ui.set_left_input_reading(meter.left_reading.into());
+    ui.set_right_input_level(meter.right_level);
+    ui.set_right_input_reading(meter.right_reading.into());
+    ui.set_input_meter_live(meter.live);
+    ui.set_input_meter_state(meter.state.into());
+    ui.set_input_meter_telemetry(meter.telemetry.into());
+}
+
+fn clear_operator_input_meter(ui: &OperatorWindow, state: &str) {
+    ui.set_left_input_level(0.0);
+    ui.set_left_input_reading("— dBFS".into());
+    ui.set_right_input_level(0.0);
+    ui.set_right_input_reading("— dBFS".into());
+    ui.set_input_meter_live(false);
+    ui.set_input_meter_state(state.into());
+    ui.set_input_meter_telemetry("—".into());
+}
+
 fn apply_operator_strip_meter_observation(
     ui: &OperatorWindow,
     strip_meters: Option<MixerStripSamplePeakBallisticsSnapshot>,
@@ -5535,15 +6071,15 @@ fn clear_operator_strip_meter_observation(model: &ModelRc<OperatorMixerRow>) {
 }
 
 /// Enforces the process startup boundary: artifact acceptance and semantic
-/// preparation finish before the native output owner can be constructed.
-fn prepare_output_and_host<P, O, S>(
+/// preparation finish before a native audio owner can be constructed.
+fn prepare_output_and_host<P, A, S>(
     prepare: impl FnOnce() -> Result<P, String>,
-    open_output: impl FnOnce() -> Result<O, String>,
-    host: impl FnOnce(O, P) -> Result<S, String>,
+    prepare_audio: impl FnOnce() -> Result<A, String>,
+    host: impl FnOnce(A, P) -> Result<S, String>,
 ) -> Result<S, String> {
     let prepared = prepare()?;
-    let output = open_output()?;
-    host(output, prepared)
+    let audio = prepare_audio()?;
+    host(audio, prepared)
 }
 
 fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
@@ -5632,6 +6168,7 @@ mod tests {
     use hyper_arrangement_renderer::RenderScratchSlot;
     use hyper_audio_engine::{InterleavedStereoCallback, StereoOutput};
     use hyper_audio_source::DecodedAudio;
+    use hyper_desktop_audio::{InputMeterTestPublication, input_meter_channel_for_test};
     use hyper_mixer_runtime::{PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime};
     use hyper_playback_compiler::{MeterEvent, TempoEvent, graph::GraphLimits, scene::SceneLimits};
     use hyper_playback_session::{
@@ -5679,27 +6216,238 @@ mod tests {
         }))
     }
 
+    fn test_timeline_marker_observers(
+        timeline: RuntimeMusicalTimeline,
+        markers: Arc<[OperatorTimelineMarker]>,
+    ) -> RuntimeObservers {
+        RuntimeObservers {
+            facts: RuntimeFacts {
+                bundle_identity: "marker-fixture".to_owned(),
+                deployment_generation: 1,
+                recovered_from: None,
+                project_name: "Marker fixture".to_owned(),
+                project_id: "project-marker-fixture".to_owned(),
+                project_revision: 1,
+                output_route: RuntimeOutputRoute::SystemDefault,
+                input_route: RuntimeInputRoute::Disabled,
+                playback_extent: PlaybackExtent::Unbounded,
+                musical_timeline: timeline,
+                timeline_markers: markers,
+            },
+            output_status: OutputStreamStatus::default(),
+            output_counters: OutputStreamCounters::default(),
+            input_status: None,
+            input_counters: None,
+            input_control: None,
+            recovery: PlaybackRecoveryCheckpoint::default(),
+            panel_connected: Arc::new(AtomicBool::new(false)),
+            mixer_update: test_mixer_update_observation(),
+            native_device_update: test_native_device_update_observation(),
+            loop_update: test_loop_update_observation(),
+            scene_performance: test_scene_performance_observation(),
+        }
+    }
+
     #[test]
-    fn audio_output_listing_is_a_standalone_invocation() {
+    fn audio_target_listings_are_standalone_invocations() {
         assert_eq!(
             parse_runtime_invocation(["--list-audio-outputs".to_owned()]),
             Ok(RuntimeInvocation::ListAudioOutputs)
+        );
+        assert_eq!(
+            parse_runtime_invocation(["--list-audio-inputs".to_owned()]),
+            Ok(RuntimeInvocation::ListAudioInputs)
         );
 
         let RuntimeInvocation::Host(arguments) = parse_runtime_invocation([
             "--audio-output".to_owned(),
             "studio-right".to_owned(),
+            "--audio-input".to_owned(),
+            "studio-left".to_owned(),
             "deployment".to_owned(),
         ])
         .unwrap() else {
             panic!("a deployment invocation must remain a host invocation");
         };
         assert_eq!(arguments.audio_output(), Some("studio-right"));
+        assert_eq!(arguments.audio_input(), Some("studio-left"));
 
         assert_eq!(
             parse_runtime_invocation(["--list-audio-outputs".to_owned(), "deployment".to_owned(),]),
-            Err("--list-audio-outputs must be used by itself".to_owned())
+            Err("audio target listing options must be used by themselves".to_owned())
         );
+        assert_eq!(
+            parse_runtime_invocation([
+                "--list-audio-inputs".to_owned(),
+                "--list-audio-outputs".to_owned(),
+            ]),
+            Err("audio target listing options must be used by themselves".to_owned())
+        );
+    }
+
+    #[test]
+    fn selected_input_becomes_the_bounded_monitoring_authority() {
+        let output = hyper_desktop_audio::DesktopOutputConfig::try_new(48_000, 1_024)
+            .unwrap()
+            .with_routing_id("studio-output")
+            .unwrap();
+        let input = hyper_desktop_audio::DesktopInputConfig::try_new(48_000, 1_024)
+            .unwrap()
+            .with_routing_id("studio-input")
+            .unwrap();
+
+        let audio = configure_runtime_audio(
+            output.clone(),
+            RuntimeOutputRoute::Pinned {
+                display_name: "Studio Output".to_owned(),
+            },
+            Some(input),
+            RuntimeInputRoute::Pinned {
+                display_name: "Studio Input".to_owned(),
+            },
+        )
+        .unwrap();
+        let monitoring = audio.monitoring.expect("selected input must be consumed");
+
+        assert_eq!(audio.output, output);
+        assert_eq!(audio.output_route.to_string(), "Pinned: Studio Output");
+        assert_eq!(audio.input_route.to_string(), "Pinned: Studio Input");
+        assert_eq!(monitoring.input().routing_id(), Some("studio-input"));
+        assert_eq!(monitoring.output(), &audio.output);
+        assert_eq!(
+            monitoring.transport_capacity_frames(),
+            INPUT_MONITORING_TRANSPORT_FRAMES
+        );
+        assert_eq!(
+            monitoring.target_latency_frames(),
+            INPUT_MONITORING_TARGET_FRAMES
+        );
+        assert_eq!(
+            monitoring.processing_chunk_frames(),
+            INPUT_MONITORING_CHUNK_FRAMES
+        );
+    }
+
+    #[test]
+    fn disabled_input_does_not_construct_monitoring_authority() {
+        let output = hyper_desktop_audio::DesktopOutputConfig::try_new(48_000, 1_024).unwrap();
+
+        let audio = configure_runtime_audio(
+            output,
+            RuntimeOutputRoute::SystemDefault,
+            None,
+            RuntimeInputRoute::Disabled,
+        )
+        .unwrap();
+
+        assert!(audio.monitoring.is_none());
+        assert_eq!(audio.input_route, RuntimeInputRoute::Disabled);
+    }
+
+    #[test]
+    fn input_monitor_controls_queue_without_optimistic_ui_state() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = OperatorWindow::new().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_input_monitor_controls(&ui, &sender, &diagnostic);
+        ui.set_input_monitor_muted(true);
+        ui.set_input_monitor_gain_percent(50.0);
+
+        ui.invoke_set_input_monitor_gain_requested(72.5);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "input monitor level refused: accepted input authority is unavailable"
+        );
+
+        ui.set_input_monitor_controls_enabled(true);
+        ui.invoke_set_input_monitor_gain_requested(72.5);
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::SetInputMonitorGain {
+                gain_millionths: 725_000,
+            })
+        );
+        assert_operator_float(ui.get_input_monitor_gain_percent(), 50.0);
+
+        ui.invoke_toggle_input_monitor_mute_requested();
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::SetInputMonitorMuted { muted: false })
+        );
+        assert!(ui.get_input_monitor_muted());
+
+        ui.invoke_set_input_monitor_gain_requested(f32::NAN);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "input monitor level refused: value is outside 0..=100%"
+        );
+    }
+
+    #[test]
+    fn input_monitor_presentation_fails_closed_without_capture_authority() {
+        let disabled = operator_input_monitor_presentation(false, None, None, None, false);
+        assert_eq!(disabled.authority, OperatorInputMonitorAuthority::Disabled);
+        assert!(!disabled.authority.configured());
+        assert_eq!(disabled.authority.state(), "DISABLED");
+        assert!(!disabled.authority.running());
+
+        let unavailable = operator_input_monitor_presentation(true, None, None, None, false);
+        assert_eq!(
+            unavailable.authority,
+            OperatorInputMonitorAuthority::Unavailable
+        );
+        assert!(unavailable.authority.configured());
+        assert_eq!(unavailable.authority.state(), "UNAVAILABLE");
+        assert!(!unavailable.authority.running());
+    }
+
+    #[test]
+    fn input_meter_presentation_labels_raw_evidence_and_disconnects() {
+        let config = SamplePeakBallisticsConfig::try_new(48_000, -90.0, 13.3, 0).unwrap();
+        let snapshot = StereoSamplePeakDisplayBallistics::new(config)
+            .update(7, 480, Some(0.5), Some(0.25))
+            .snapshot();
+
+        let live = operator_input_meter_presentation(Some(snapshot), 2, 3, false);
+        assert!(live.live);
+        assert_eq!(live.state, "Raw accepted-input sample peak");
+        assert_eq!(live.left_reading, "-6.0 dBFS");
+        assert_eq!(live.right_reading, "-12.0 dBFS");
+        assert_eq!(
+            live.telemetry,
+            "accepted frame 480 · 2 coalesced · 3 dropped display snapshots"
+        );
+
+        let ended = operator_input_meter_presentation(Some(snapshot), 2, 3, true);
+        assert!(!ended.live);
+        assert_eq!(ended.state, "Input meter producer ended");
+    }
+
+    #[test]
+    fn input_meter_observer_preserves_raw_capture_scope_and_clears_on_disconnect() {
+        let (mut publisher, receiver) = input_meter_channel_for_test().unwrap();
+        let config = SamplePeakBallisticsConfig::try_new(48_000, -90.0, 13.3, 0).unwrap();
+        let mut observer = OperatorInputMeterObserver::new(receiver, config);
+        assert_eq!(
+            publisher.publish(&[0.5, 0.25]),
+            InputMeterTestPublication::Published
+        );
+
+        let live = observer.observe();
+        assert!(live.live);
+        assert_eq!(live.state, "Raw accepted-input sample peak");
+        assert_eq!(live.left_reading, "-6.0 dBFS");
+        assert_eq!(live.right_reading, "-12.0 dBFS");
+
+        drop(publisher);
+        let ended = observer.observe();
+        assert!(!ended.live);
+        assert_eq!(ended.state, "Input meter producer ended");
+        assert_eq!(ended.left_reading, "— dBFS");
+        assert_eq!(ended.right_reading, "— dBFS");
     }
 
     struct RuntimeTemporaryDirectory {
@@ -6416,6 +7164,8 @@ mod tests {
         loudness_commands: Vec<LoudnessMeasurementCommand>,
         mixer_commands: Vec<MixerParameterCommand>,
         native_device_commands: Vec<NativeDeviceCommand>,
+        input_monitor_gains: Vec<f32>,
+        input_monitor_mutes: Vec<bool>,
         mixer_update_commands: usize,
         mixer_update_poll: Option<String>,
         native_device_update_commands: Vec<usize>,
@@ -6467,6 +7217,24 @@ mod tests {
                 Err("owner busy".to_owned())
             } else {
                 self.native_device_commands.push(command);
+                Ok(())
+            }
+        }
+
+        fn set_input_monitor_gain(&mut self, gain: f32) -> Result<(), String> {
+            if self.reject {
+                Err("owner busy".to_owned())
+            } else {
+                self.input_monitor_gains.push(gain);
+                Ok(())
+            }
+        }
+
+        fn set_input_monitor_muted(&mut self, muted: bool) -> Result<(), String> {
+            if self.reject {
+                Err("owner busy".to_owned())
+            } else {
+                self.input_monitor_mutes.push(muted);
                 Ok(())
             }
         }
@@ -6575,6 +7343,40 @@ mod tests {
         }
 
         fn panel_display(&mut self, _out: &mut Vec<PanelDisplay>) {}
+    }
+
+    #[test]
+    fn input_monitor_commands_are_bounded_and_applied_by_the_owner() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        sender
+            .send(OperatorCommand::SetInputMonitorGain {
+                gain_millionths: 725_000,
+            })
+            .unwrap();
+        sender
+            .send(OperatorCommand::SetInputMonitorMuted { muted: false })
+            .unwrap();
+        sender
+            .send(OperatorCommand::SetInputMonitorGain {
+                gain_millionths: 1_000_001,
+            })
+            .unwrap();
+        let stop = AtomicBool::new(false);
+        let mut owner = OperatorControl::default();
+        let diagnostics = RefCell::new(Vec::new());
+
+        drain_operator_commands(&mut owner, &receiver, &stop, &|message| {
+            diagnostics.borrow_mut().push(message);
+        });
+
+        assert_eq!(owner.input_monitor_gains.len(), 1);
+        assert_operator_float(owner.input_monitor_gains[0], 0.725);
+        assert_eq!(owner.input_monitor_mutes, [false]);
+        assert_eq!(
+            diagnostics.borrow().last().map(String::as_str),
+            Some("input monitor level refused: value is outside 0..=100%")
+        );
+        assert!(!stop.load(Ordering::Acquire));
     }
 
     struct OutputObservation(OutputStreamState);
@@ -7178,29 +7980,7 @@ mod tests {
             960,
             &timeline,
         )]);
-        let facts = RuntimeFacts {
-            bundle_identity: "marker-fixture".to_owned(),
-            deployment_generation: 1,
-            recovered_from: None,
-            project_name: "Marker fixture".to_owned(),
-            project_id: "project-marker-fixture".to_owned(),
-            project_revision: 1,
-            output_route: RuntimeOutputRoute::SystemDefault,
-            playback_extent: PlaybackExtent::Unbounded,
-            musical_timeline: timeline,
-            timeline_markers: Arc::clone(&markers),
-        };
-        let observers = RuntimeObservers {
-            facts,
-            output_status: OutputStreamStatus::default(),
-            output_counters: OutputStreamCounters::default(),
-            recovery: PlaybackRecoveryCheckpoint::default(),
-            panel_connected: Arc::new(AtomicBool::new(false)),
-            mixer_update: test_mixer_update_observation(),
-            native_device_update: test_native_device_update_observation(),
-            loop_update: test_loop_update_observation(),
-            scene_performance: test_scene_performance_observation(),
-        };
+        let observers = test_timeline_marker_observers(timeline, Arc::clone(&markers));
         let marker_model = Rc::new(VecModel::from(operator_timeline_marker_rows(&markers)));
         let marker_authority = Rc::new(RefCell::new(None));
         let scene_model = Rc::new(VecModel::from(Vec::<OperatorSceneRow>::new()));
@@ -9818,12 +10598,16 @@ mod tests {
                 project_id: PROJECT_ID.to_owned(),
                 project_revision: 1,
                 output_route: RuntimeOutputRoute::SystemDefault,
+                input_route: RuntimeInputRoute::Disabled,
                 playback_extent: PlaybackExtent::Bounded { end_frame: 1_500 },
                 musical_timeline: runtime_musical_timeline.clone(),
                 timeline_markers: Arc::from([]),
             },
             output_status: OutputStreamStatus::default(),
             output_counters: OutputStreamCounters::default(),
+            input_status: None,
+            input_counters: None,
+            input_control: None,
             recovery: recovery.clone(),
             panel_connected: Arc::new(AtomicBool::new(false)),
             mixer_update: test_mixer_update_observation(),
@@ -9927,6 +10711,7 @@ mod tests {
             output_route: RuntimeOutputRoute::Pinned {
                 display_name: "Studio Output".to_owned(),
             },
+            input_route: RuntimeInputRoute::Disabled,
             playback_extent: PlaybackExtent::Bounded { end_frame: 1_500 },
             musical_timeline: test_musical_timeline(),
             timeline_markers: Arc::from([]),
@@ -9935,6 +10720,9 @@ mod tests {
             facts: facts.clone(),
             output_status: OutputStreamStatus::default(),
             output_counters: OutputStreamCounters::default(),
+            input_status: None,
+            input_counters: None,
+            input_control: None,
             recovery: PlaybackRecoveryCheckpoint::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
             mixer_update: test_mixer_update_observation(),
@@ -10185,6 +10973,9 @@ mod tests {
             facts: facts.clone(),
             output_status: OutputStreamStatus::default(),
             output_counters: OutputStreamCounters::default(),
+            input_status: None,
+            input_counters: None,
+            input_control: None,
             recovery: terminal_recovery,
             panel_connected: Arc::new(AtomicBool::new(false)),
             mixer_update: test_mixer_update_observation(),

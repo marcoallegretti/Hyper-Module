@@ -85,6 +85,7 @@ pub struct RuntimeArguments {
     loop_updates: Option<PathBuf>,
     native_device_updates: Option<PathBuf>,
     audio_output: Option<String>,
+    audio_input: Option<String>,
     operator_ui: bool,
 }
 
@@ -118,6 +119,22 @@ impl fmt::Display for ArgumentError {
 
 impl Error for ArgumentError {}
 
+fn assign_unique_option<T>(
+    arguments: &mut impl Iterator<Item = String>,
+    destination: &mut Option<T>,
+    option: &'static str,
+    parse: impl FnOnce(String) -> Result<T, ArgumentError>,
+) -> Result<(), ArgumentError> {
+    if destination.is_some() {
+        return Err(ArgumentError::Repeated(option));
+    }
+    let value = arguments
+        .next()
+        .ok_or(ArgumentError::MissingValue(option))?;
+    *destination = Some(parse(value)?);
+    Ok(())
+}
+
 impl RuntimeArguments {
     /// Reads the arguments following the program name.
     ///
@@ -136,6 +153,7 @@ impl RuntimeArguments {
         let mut loop_updates = None;
         let mut native_device_updates = None;
         let mut audio_output = None;
+        let mut audio_input = None;
         let mut operator_ui = false;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -147,63 +165,54 @@ impl RuntimeArguments {
                     operator_ui = true;
                 }
                 "--panel-listen" => {
-                    if panel_listen.is_some() {
-                        return Err(ArgumentError::Repeated("--panel-listen"));
-                    }
-                    let value = arguments
-                        .next()
-                        .ok_or(ArgumentError::MissingValue("--panel-listen"))?;
-                    panel_listen = Some(
-                        value
-                            .parse::<SocketAddr>()
-                            .map_err(|_| ArgumentError::UnreadableAddress(value))?,
-                    );
+                    assign_unique_option(
+                        &mut arguments,
+                        &mut panel_listen,
+                        "--panel-listen",
+                        |value| {
+                            value
+                                .parse::<SocketAddr>()
+                                .map_err(|_| ArgumentError::UnreadableAddress(value))
+                        },
+                    )?;
                 }
                 "--performance-updates" => {
-                    if performance_updates.is_some() {
-                        return Err(ArgumentError::Repeated("--performance-updates"));
-                    }
-                    let value = arguments
-                        .next()
-                        .ok_or(ArgumentError::MissingValue("--performance-updates"))?;
-                    performance_updates = Some(PathBuf::from(value));
+                    assign_unique_option(
+                        &mut arguments,
+                        &mut performance_updates,
+                        "--performance-updates",
+                        |value| Ok(PathBuf::from(value)),
+                    )?;
                 }
                 "--mixer-updates" => {
-                    if mixer_updates.is_some() {
-                        return Err(ArgumentError::Repeated("--mixer-updates"));
-                    }
-                    let value = arguments
-                        .next()
-                        .ok_or(ArgumentError::MissingValue("--mixer-updates"))?;
-                    mixer_updates = Some(PathBuf::from(value));
+                    assign_unique_option(
+                        &mut arguments,
+                        &mut mixer_updates,
+                        "--mixer-updates",
+                        |value| Ok(PathBuf::from(value)),
+                    )?;
                 }
                 "--loop-updates" => {
-                    if loop_updates.is_some() {
-                        return Err(ArgumentError::Repeated("--loop-updates"));
-                    }
-                    let value = arguments
-                        .next()
-                        .ok_or(ArgumentError::MissingValue("--loop-updates"))?;
-                    loop_updates = Some(PathBuf::from(value));
+                    assign_unique_option(
+                        &mut arguments,
+                        &mut loop_updates,
+                        "--loop-updates",
+                        |value| Ok(PathBuf::from(value)),
+                    )?;
                 }
                 "--native-device-updates" => {
-                    if native_device_updates.is_some() {
-                        return Err(ArgumentError::Repeated("--native-device-updates"));
-                    }
-                    let value = arguments
-                        .next()
-                        .ok_or(ArgumentError::MissingValue("--native-device-updates"))?;
-                    native_device_updates = Some(PathBuf::from(value));
+                    assign_unique_option(
+                        &mut arguments,
+                        &mut native_device_updates,
+                        "--native-device-updates",
+                        |value| Ok(PathBuf::from(value)),
+                    )?;
                 }
                 "--audio-output" => {
-                    if audio_output.is_some() {
-                        return Err(ArgumentError::Repeated("--audio-output"));
-                    }
-                    audio_output = Some(
-                        arguments
-                            .next()
-                            .ok_or(ArgumentError::MissingValue("--audio-output"))?,
-                    );
+                    assign_unique_option(&mut arguments, &mut audio_output, "--audio-output", Ok)?;
+                }
+                "--audio-input" => {
+                    assign_unique_option(&mut arguments, &mut audio_input, "--audio-input", Ok)?;
                 }
                 option if option.starts_with("--") => {
                     return Err(ArgumentError::UnknownOption(option.to_owned()));
@@ -224,6 +233,7 @@ impl RuntimeArguments {
             loop_updates,
             native_device_updates,
             audio_output,
+            audio_input,
             operator_ui,
         })
     }
@@ -269,6 +279,13 @@ impl RuntimeArguments {
         self.audio_output.as_deref()
     }
 
+    /// Returns the opaque desktop input routing identity requested for this
+    /// Runtime launch, if one was explicitly selected.
+    #[must_use]
+    pub fn audio_input(&self) -> Option<&str> {
+        self.audio_input.as_deref()
+    }
+
     #[must_use]
     pub const fn operator_ui(&self) -> bool {
         self.operator_ui
@@ -280,7 +297,7 @@ mod argument_tests {
     use super::*;
 
     #[test]
-    fn parses_independent_external_update_directories_and_audio_output() {
+    fn parses_independent_external_update_directories_and_audio_routes() {
         let arguments = RuntimeArguments::parse([
             "--performance-updates".to_owned(),
             "scene-updates".to_owned(),
@@ -292,6 +309,8 @@ mod argument_tests {
             "native-device-updates".to_owned(),
             "--audio-output".to_owned(),
             "studio-right".to_owned(),
+            "--audio-input".to_owned(),
+            "studio-left".to_owned(),
             "deployment".to_owned(),
         ])
         .unwrap();
@@ -308,6 +327,7 @@ mod argument_tests {
             Some(Path::new("native-device-updates"))
         );
         assert_eq!(arguments.audio_output(), Some("studio-right"));
+        assert_eq!(arguments.audio_input(), Some("studio-left"));
     }
 
     #[test]
@@ -372,6 +392,20 @@ mod argument_tests {
         assert_eq!(
             RuntimeArguments::parse(["--audio-output".to_owned()]),
             Err(ArgumentError::MissingValue("--audio-output"))
+        );
+        assert_eq!(
+            RuntimeArguments::parse([
+                "--audio-input".to_owned(),
+                "first".to_owned(),
+                "--audio-input".to_owned(),
+                "second".to_owned(),
+                "deployment".to_owned(),
+            ]),
+            Err(ArgumentError::Repeated("--audio-input"))
+        );
+        assert_eq!(
+            RuntimeArguments::parse(["--audio-input".to_owned()]),
+            Err(ArgumentError::MissingValue("--audio-input"))
         );
     }
 }
