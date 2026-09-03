@@ -3974,6 +3974,9 @@ pub enum IdeWorkerEvent {
         revision: u64,
         changed: bool,
     },
+    RuntimeNativeDeviceUpdateImportCommittedWithWarning {
+        warning: Box<IdeRuntimeNativeDeviceUpdateImportError>,
+    },
     RuntimeLoopUpdateImporting,
     RuntimeLoopUpdateImported {
         revision: u64,
@@ -6750,11 +6753,25 @@ fn publish_runtime_native_device_update_import_failure(
     events: &SyncSender<IdeWorkerEvent>,
     reason: IdeRuntimeNativeDeviceUpdateImportError,
 ) -> bool {
-    publish_failure(
+    send_event(
         events,
-        IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
-        IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(Box::new(reason)),
+        runtime_native_device_update_import_failure_event(reason),
     )
+}
+
+fn runtime_native_device_update_import_failure_event(
+    reason: IdeRuntimeNativeDeviceUpdateImportError,
+) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::RuntimeNativeDeviceUpdateImportCommittedWithWarning {
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
+            reason: IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(Box::new(reason)),
+        }
+    }
 }
 
 fn publish_runtime_loop_update_import_failure(
@@ -7064,11 +7081,24 @@ fn import_runtime_native_device_update(
     ) {
         return publish_runtime_native_device_update_import_failure(events, reason);
     }
-    if let Err(source) = application.validate_runtime_native_device_update_import(&update) {
-        return publish_runtime_native_device_update_import_failure(
-            events,
-            IdeRuntimeNativeDeviceUpdateImportError::Preparation(Box::new(source)),
-        );
+    let no_op = match application.runtime_native_device_update_import_is_noop(&update) {
+        Ok(no_op) => no_op,
+        Err(source) => {
+            return publish_runtime_native_device_update_import_failure(
+                events,
+                IdeRuntimeNativeDeviceUpdateImportError::Preparation(Box::new(source)),
+            );
+        }
+    };
+    if no_op {
+        return send_event(events, IdeWorkerEvent::RuntimeNativeDeviceUpdateImporting)
+            && send_event(
+                events,
+                IdeWorkerEvent::RuntimeNativeDeviceUpdateImported {
+                    revision: project_revision,
+                    changed: false,
+                },
+            );
     }
     begin_project_mutation_request(
         state,
@@ -15671,7 +15701,12 @@ fn complete_project_mutation(
                 return false;
             }
             let reason = project_mutation_reopen_failure(attempt, reopen);
-            publish_failure(events, command, reason)
+            match reason {
+                IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(reason) => {
+                    publish_runtime_native_device_update_import_failure(events, *reason)
+                }
+                reason => publish_failure(events, command, reason),
+            }
         }
     }
 }
@@ -20773,6 +20808,43 @@ mod tests {
         RuntimeLoopUpdate::try_new(RUNTIME_UPDATE_ID.to_owned(), source, range).unwrap()
     }
 
+    fn runtime_native_device_update() -> RuntimeNativeDeviceUpdate {
+        let source = RuntimeNativeDeviceUpdateSource::try_new(
+            RUNTIME_PROJECT_ID.to_owned(),
+            7,
+            runtime_native_device_update_sha256_hex(&[0xaa; 32]),
+            runtime_native_device_update_sha256_hex(&[0xbb; 32]),
+            3,
+        )
+        .unwrap();
+        RuntimeNativeDeviceUpdate::try_new(
+            RUNTIME_UPDATE_ID.to_owned(),
+            source,
+            RUNTIME_MIXER_ID.to_owned(),
+            RUNTIME_TRACK_ID.to_owned(),
+            runtime_native_device_update_sha256_hex(&[0xcc; 32]),
+            vec![
+                RuntimeNativeDeviceUpdateDevice::try_new(
+                    CAPTURE_SCENE_B.to_owned(),
+                    hyper_native_device::NATIVE_FILTER_DEVICE_ID.to_owned(),
+                    hyper_native_device::NATIVE_FILTER_STATE_VERSION,
+                    hyper_native_device::NATIVE_FILTER_DSP_VERSION,
+                    true,
+                    hyper_native_device::NativeDeviceState::Filter(
+                        hyper_native_device::NativeFilterState::try_new(
+                            NativeFilterMode::LowPass,
+                            1_000_000,
+                            707_107,
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn runtime_scene_performance_import_requires_exact_project_provenance() {
         let update = runtime_scene_performance_update();
@@ -20821,6 +20893,33 @@ mod tests {
         assert!(matches!(
             validate_runtime_mixer_update(&update, RUNTIME_PROJECT_ID, 7, &[0xcc; 32],),
             Err(IdeRuntimeMixerUpdateImportError::ProjectManifestMismatch)
+        ));
+    }
+
+    #[test]
+    fn runtime_native_device_update_import_requires_exact_project_provenance() {
+        let update = runtime_native_device_update();
+
+        assert!(
+            validate_runtime_native_device_update(&update, RUNTIME_PROJECT_ID, 7, &[0xaa; 32],)
+                .is_ok()
+        );
+        assert!(matches!(
+            validate_runtime_native_device_update(&update, CAPTURE_SCENE_A, 7, &[0xaa; 32]),
+            Err(IdeRuntimeNativeDeviceUpdateImportError::ProjectIdentityMismatch)
+        ));
+        assert!(matches!(
+            validate_runtime_native_device_update(&update, RUNTIME_PROJECT_ID, 8, &[0xaa; 32],),
+            Err(
+                IdeRuntimeNativeDeviceUpdateImportError::ProjectRevisionMismatch {
+                    update_revision: 7,
+                    project_revision: 8,
+                }
+            )
+        ));
+        assert!(matches!(
+            validate_runtime_native_device_update(&update, RUNTIME_PROJECT_ID, 7, &[0xcc; 32],),
+            Err(IdeRuntimeNativeDeviceUpdateImportError::ProjectManifestMismatch)
         ));
     }
 
@@ -21806,6 +21905,19 @@ mod tests {
         let restored_revision = restored_package.manifest().revision();
         drop(restored_package);
 
+        let (mixer_id, persisted_mixer_bytes) = project_mixer_bytes(&project);
+        worker
+            .try_send(IdeWorkerCommand::Mixer(IdeMixerCommand::MainGain {
+                gain_millionths: 500_000,
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::MixerQueued(IdeMixerCommand::MainGain {
+                gain_millionths: 500_000,
+            })
+        ));
+
         let (no_op_path, _, _) =
             publish_runtime_native_device_update_for_test(&updates, &project, false, None);
         worker
@@ -21817,22 +21929,23 @@ mod tests {
         ));
         assert!(matches!(
             recv_native_mutation(&worker),
-            IdeWorkerEvent::Running(_)
-        ));
-        assert!(matches!(
-            recv_native_mutation(&worker),
             IdeWorkerEvent::RuntimeNativeDeviceUpdateImported {
                 revision,
                 changed: false,
             } if revision == restored_revision
         ));
+        let unchanged = verify_project_package(&project).unwrap();
+        assert_eq!(unchanged.manifest().revision(), restored_revision);
         assert_eq!(
-            verify_project_package(&project)
-                .unwrap()
-                .manifest()
-                .revision(),
-            restored_revision
+            unchanged.read_resource(&mixer_id).unwrap(),
+            persisted_mixer_bytes,
+            "a no-op device update must not silently persist session-only mixer state"
         );
+        assert!(
+            worker.events.as_ref().unwrap().try_recv().is_err(),
+            "a no-op device update must not create a history transition"
+        );
+        drop(unchanged);
 
         worker
             .try_send(IdeWorkerCommand::ImportRuntimeNativeDeviceUpdate { path: changed_path })
@@ -32645,6 +32758,107 @@ mod tests {
             ),
             IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn committed_runtime_native_device_update_warning_invalidates_history_and_stays_truthful() {
+        let edit = captured_mixer_edit("runtime-native-device-update-warning");
+        let mixer_only_commit = || {
+            IdeRuntimeNativeDeviceUpdateImportError::Publication(Box::new(
+                IdeRuntimeNativeDeviceUpdatePublicationError::DeviceChain {
+                    mixer: Box::new(edit.outcome.clone()),
+                    source: Box::new(
+                        hyper_storage_engine::ProjectResourcePublicationError::for_test(
+                            hyper_storage_engine::ProjectResourcePublicationErrorKind::Recovery,
+                            "simulated device-chain refusal after mixer preservation",
+                            false,
+                        ),
+                    ),
+                },
+            ))
+        };
+        let attempt =
+            ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Err(mixer_only_commit()));
+        assert!(matches!(
+            history_effect(&attempt),
+            HistoryEffect::Invalidate
+        ));
+
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut history = UndoHistory::default();
+        history.record_edit(labelled("scene", "scene rename"));
+        history.record_restore(false, labelled("undone", "clip gain"));
+        observe_history(
+            &mut history,
+            &attempt,
+            IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
+            &events,
+        );
+        assert!(history.undo.is_empty() && history.redo.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            })
+        ));
+
+        assert!(matches!(
+            runtime_native_device_update_import_failure_event(mixer_only_commit()),
+            IdeWorkerEvent::RuntimeNativeDeviceUpdateImportCommittedWithWarning { warning }
+                if warning.publication_committed()
+                    && warning.to_string().contains("live mixer state was preserved")
+        ));
+
+        let chain_may_have_committed = || {
+            IdeRuntimeNativeDeviceUpdateImportError::Publication(Box::new(
+                IdeRuntimeNativeDeviceUpdatePublicationError::DeviceChain {
+                    mixer: Box::new(edit.outcome.clone()),
+                    source: Box::new(
+                        hyper_storage_engine::ProjectResourcePublicationError::for_test(
+                            hyper_storage_engine::ProjectResourcePublicationErrorKind::Recovery,
+                            "simulated post-manifest device-chain recovery warning",
+                            true,
+                        ),
+                    ),
+                },
+            ))
+        };
+        assert!(matches!(
+            runtime_native_device_update_import_failure_event(chain_may_have_committed()),
+            IdeWorkerEvent::RuntimeNativeDeviceUpdateImportCommittedWithWarning { warning }
+                if warning.publication_committed()
+                    && warning.to_string().contains("may have committed")
+        ));
+
+        let reopen = project_mutation_reopen_failure(
+            ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Ok(edit.outcome.clone())),
+            IdeProjectOpenError::SelectedOutputUnavailable,
+        );
+        let IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(reopen) = reopen else {
+            panic!("native-device reopen failure must retain its typed import error");
+        };
+        assert!(matches!(
+            runtime_native_device_update_import_failure_event(*reopen),
+            IdeWorkerEvent::RuntimeNativeDeviceUpdateImportCommittedWithWarning { warning }
+                if warning.publication_committed()
+                    && warning.to_string().contains("was imported through project revision")
+                    && warning.to_string().contains("could not be reopened")
+        ));
+
+        let unpublished = ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Err(
+            IdeRuntimeNativeDeviceUpdateImportError::ProjectIdentityMismatch,
+        ));
+        assert!(matches!(history_effect(&unpublished), HistoryEffect::None));
+        assert!(matches!(
+            runtime_native_device_update_import_failure_event(
+                IdeRuntimeNativeDeviceUpdateImportError::ProjectIdentityMismatch,
+            ),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
                 ..
             }
         ));

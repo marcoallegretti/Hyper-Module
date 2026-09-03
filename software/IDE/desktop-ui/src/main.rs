@@ -7742,7 +7742,8 @@ fn apply_event(
             apply_runtime_mixer_update_import_event(ui, &event);
         }
         event @ (IdeWorkerEvent::RuntimeNativeDeviceUpdateImporting
-        | IdeWorkerEvent::RuntimeNativeDeviceUpdateImported { .. }) => {
+        | IdeWorkerEvent::RuntimeNativeDeviceUpdateImported { .. }
+        | IdeWorkerEvent::RuntimeNativeDeviceUpdateImportCommittedWithWarning { .. }) => {
             apply_runtime_native_device_update_import_event(ui, &event);
         }
         event @ (IdeWorkerEvent::RuntimeLoopUpdateImporting
@@ -10961,6 +10962,12 @@ fn apply_runtime_native_device_update_import_event(ui: &MainWindow, event: &IdeW
                 .into(),
             );
             ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RuntimeNativeDeviceUpdateImportCommittedWithWarning { warning } => {
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), "Runtime native-device import").into(),
+            );
+            ui.set_error_text(warning.to_string().into());
         }
         _ => unreachable!("Runtime native-device update import dispatcher received another event"),
     }
@@ -26702,6 +26709,12 @@ mod tests {
             "Runtime native-device update already matches project revision 8; project unchanged"
         );
 
+        assert_runtime_native_device_update_import_committed_warning_contract(
+            ui,
+            &routes,
+            &project_state,
+        );
+
         ui.set_app_mode(AppMode::ImportingRuntimeNativeDeviceUpdate);
         apply_event(
             ui,
@@ -26730,6 +26743,42 @@ mod tests {
                 IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
             ),
             AppMode::Running
+        );
+    }
+
+    fn assert_runtime_native_device_update_import_committed_warning_contract(
+        ui: &MainWindow,
+        routes: &UiRoutes,
+        project_state: &ProjectUiStateCell,
+    ) {
+        apply_event(
+            ui,
+            routes,
+            project_state,
+            IdeWorkerEvent::RuntimeNativeDeviceUpdateImportCommittedWithWarning {
+                warning: Box::new(IdeRuntimeNativeDeviceUpdateImportError::ProjectIdentityMismatch),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime native-device import committed and reopened with a project recovery warning"
+        );
+        assert!(ui.get_error_text().contains("another project"));
+
+        ui.set_app_mode(AppMode::Closed);
+        apply_event(
+            ui,
+            routes,
+            project_state,
+            IdeWorkerEvent::RuntimeNativeDeviceUpdateImportCommittedWithWarning {
+                warning: Box::new(IdeRuntimeNativeDeviceUpdateImportError::ProjectIdentityMismatch),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Closed);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime native-device import committed, but the project could not be reopened"
         );
     }
 

@@ -11125,12 +11125,18 @@ impl RunningDesktopIdeApplication {
         Self::prepare_mixer_base_state_save(&self.application, project, state)
     }
 
-    /// Performs the non-mutating source binding required before the worker
-    /// fences playback for an external Runtime native-device update.
-    pub(crate) fn validate_runtime_native_device_update_import(
+    /// Validates an external Runtime native-device update before the worker
+    /// fences playback, returning whether it already matches its exact source
+    /// chain.
+    ///
+    /// A verified no-op must not enter the generic close-and-save lifecycle:
+    /// that lifecycle preserves live mixer state before replacing a resource,
+    /// while this import has no device-chain change to justify persisting an
+    /// unrelated session-only mixer edit.
+    pub(crate) fn runtime_native_device_update_import_is_noop(
         &self,
         update: &RuntimeNativeDeviceUpdate,
-    ) -> Result<(), IdeRuntimeNativeDeviceUpdatePreparationError> {
+    ) -> Result<bool, IdeRuntimeNativeDeviceUpdatePreparationError> {
         #[cfg(test)]
         let session = match &self.session {
             IdePlaybackSessionOwner::Native(session) => session,
@@ -11145,8 +11151,15 @@ impl RunningDesktopIdeApplication {
         let prepared = session
             .prepared_project()
             .ok_or(IdeRuntimeNativeDeviceUpdatePreparationError::ProjectSnapshotUnavailable)?;
-        let _ = runtime_native_device_update_source_chain(prepared, update)?;
-        Ok(())
+        let source_chain = runtime_native_device_update_source_chain(prepared, update)?;
+        let candidate = runtime_native_device_update_candidate(source_chain, update)?;
+        let source_bytes = source_chain
+            .to_canonical_vec()
+            .map_err(IdeRuntimeNativeDeviceUpdatePreparationError::Serialization)?;
+        let candidate_bytes = candidate
+            .to_canonical_vec()
+            .map_err(IdeRuntimeNativeDeviceUpdatePreparationError::Serialization)?;
+        Ok(candidate_bytes == source_bytes)
     }
 
     /// Rebinds a preflighted Runtime native-device update to the recovered
