@@ -71,6 +71,7 @@ export enum AppMode {
     importing-audio,
     importing-runtime-scene-performance,
     importing-runtime-mixer-update,
+    importing-runtime-native-device-update,
     importing-runtime-loop-update,
     preparing-preview,
     previewing,
@@ -330,6 +331,7 @@ export global IdeActions {
     callback stop-scene-performance-capture();
     callback import-runtime-scene-performance();
     callback import-runtime-mixer-update();
+    callback import-runtime-native-device-update();
     callback import-runtime-loop-update();
     callback start-mixer-automation-capture(string, int);
     callback stop-mixer-automation-capture();
@@ -1326,6 +1328,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.importing-audio ? "◌  IMPORTING AUDIO"
                         : root.app-mode == AppMode.importing-runtime-scene-performance ? "◌  IMPORTING SCENES"
                         : root.app-mode == AppMode.importing-runtime-mixer-update ? "◌  IMPORTING MIXER"
+                        : root.app-mode == AppMode.importing-runtime-native-device-update ? "◌  IMPORTING DEVICES"
                         : root.app-mode == AppMode.importing-runtime-loop-update ? "◌  IMPORTING LOOP"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
                         : root.app-mode == AppMode.closing ? "◌  CLOSING"
@@ -3239,7 +3242,7 @@ export component MainWindow inherits Window {
                             spacing: 8px;
                             VerticalLayout {
                                 Text { text: "NATIVE DEVICES"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: "Portable pre-fader filters and compressors · identical project state in IDE and Runtime"; color: #aebccc; font-size: 12px; }
+                                Text { text: "Portable pre-fader devices shared by IDE and Runtime"; color: #aebccc; font-size: 12px; }
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button {
@@ -3252,6 +3255,12 @@ export component MainWindow inherits Window {
                                     root.native-filter-remove-confirming-index = -1;
                                     root.mixer-native-filter-visible = false;
                                 }
+                            }
+                            Button {
+                                text: "Import…";
+                                accessible-label: "Select one Runtime native-device update for its exact provenance-checked device chain";
+                                enabled: root.app-mode == AppMode.running && !root.local-edit-form-visible;
+                                clicked => { IdeActions.import-runtime-native-device-update(); }
                             }
                             Button {
                                 text: "Add filter";

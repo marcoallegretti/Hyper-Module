@@ -41,6 +41,10 @@ use hyper_runtime_mixer_update::{
     RuntimeMixerUpdate, RuntimeMixerUpdateError, read_runtime_mixer_update,
     sha256_hex as runtime_mixer_update_sha256_hex,
 };
+use hyper_runtime_native_device_update::{
+    RuntimeNativeDeviceUpdate, RuntimeNativeDeviceUpdateError, read_runtime_native_device_update,
+    sha256_hex as runtime_native_device_update_sha256_hex,
+};
 use hyper_scene_performance::{
     RuntimeScenePerformanceUpdate, RuntimeScenePerformanceUpdateError,
     ScenePerformanceCapture as SharedScenePerformanceCapture,
@@ -88,13 +92,15 @@ use super::{
     IdeRecordingClipCreationError, IdeRecordingDiscardError, IdeRecordingError,
     IdeRecordingImportOutcome, IdeRecordingObservation, IdeResourceRestoreError,
     IdeReturnSendEditError, IdeRoutingBusCreationError, IdeRoutingBusKind,
-    IdeRoutingBusRemovalError, IdeRoutingBusRenameError, IdeSaveCloseOutcome, IdeSceneAvailability,
-    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization,
-    IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError,
-    IdeTempoEditError, IdeTimelineMarker, IdeTimelineMarkerEdit, IdeTimelineMarkerLocateError,
-    IdeTrackFreezeHistoryAuthority, IdeTransportSeekError, IdeUnusedSampleCleanupError,
-    IdeUnusedSampleCleanupSummary, InputInventoryError, LocateState, MAX_DEVICES_PER_CHAIN,
-    NativeFilterMode, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
+    IdeRoutingBusRemovalError, IdeRoutingBusRenameError,
+    IdeRuntimeNativeDeviceUpdatePreparationError, IdeRuntimeNativeDeviceUpdatePublicationError,
+    IdeSaveCloseOutcome, IdeSceneAvailability, IdeSceneCreationError, IdeSceneDuplicationError,
+    IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRemovalError, IdeSceneRenameError,
+    IdeSceneSlotEdit, IdeSceneSlotEditError, IdeTempoEditError, IdeTimelineMarker,
+    IdeTimelineMarkerEdit, IdeTimelineMarkerLocateError, IdeTrackFreezeHistoryAuthority,
+    IdeTransportSeekError, IdeUnusedSampleCleanupError, IdeUnusedSampleCleanupSummary,
+    InputInventoryError, LocateState, MAX_DEVICES_PER_CHAIN, NativeFilterMode,
+    OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
     OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication, RunningIdeSnapshot,
     RuntimeMixerUpdateFenceStatus, TimelineMapEdit, control_binding_references_scene,
 };
@@ -285,6 +291,7 @@ pub enum IdeWorkerCommandKind {
     AbortRecording,
     ImportRuntimeScenePerformance,
     ImportRuntimeMixerUpdate,
+    ImportRuntimeNativeDeviceUpdate,
     ImportRuntimeLoopUpdate,
     CaptureScenePerformance,
     CaptureMixerAutomation,
@@ -645,6 +652,9 @@ pub enum IdeWorkerCommand {
     ImportRuntimeMixerUpdate {
         path: PathBuf,
     },
+    ImportRuntimeNativeDeviceUpdate {
+        path: PathBuf,
+    },
     ImportRuntimeLoopUpdate {
         path: PathBuf,
     },
@@ -821,6 +831,9 @@ impl IdeWorkerCommand {
                 IdeWorkerCommandKind::ImportRuntimeScenePerformance
             }
             Self::ImportRuntimeMixerUpdate { .. } => IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+            Self::ImportRuntimeNativeDeviceUpdate { .. } => {
+                IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate
+            }
             Self::ImportRuntimeLoopUpdate { .. } => IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
             Self::StartScenePerformanceCapture | Self::StopScenePerformanceCapture => {
                 IdeWorkerCommandKind::CaptureScenePerformance
@@ -2687,6 +2700,137 @@ impl Error for IdeRuntimeMixerUpdateImportError {
     }
 }
 
+/// Why an explicit Runtime native-device update could not become a durable
+/// state-only replacement for its exact source device chain.
+///
+/// The artifact is external input. Its project provenance is checked before a
+/// playback fence, and its device-chain authority is rebound after close before
+/// the normal project publication lifecycle may replace anything.
+#[derive(Debug)]
+pub enum IdeRuntimeNativeDeviceUpdateImportError {
+    ProjectSnapshotUnavailable,
+    Artifact(Box<RuntimeNativeDeviceUpdateError>),
+    ProjectIdentityMismatch,
+    ProjectRevisionMismatch {
+        update_revision: u64,
+        project_revision: u64,
+    },
+    ProjectManifestMismatch,
+    Preparation(Box<IdeRuntimeNativeDeviceUpdatePreparationError>),
+    Publication(Box<IdeRuntimeNativeDeviceUpdatePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<Self>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: Box<hyper_storage_engine::ProjectResourcePublicationOutcome>,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeRuntimeNativeDeviceUpdatePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeRuntimeNativeDeviceUpdateImportError {
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.publication_committed(),
+            Self::ReopenAfterPreparation { preparation, .. } => preparation.publication_committed(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.publication_committed(),
+            Self::ProjectSnapshotUnavailable
+            | Self::Artifact(_)
+            | Self::ProjectIdentityMismatch
+            | Self::ProjectRevisionMismatch { .. }
+            | Self::ProjectManifestMismatch
+            | Self::Preparation(_)
+            | Self::NativeClose(_)
+            | Self::NativeCloseAndReopen { .. } => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeRuntimeNativeDeviceUpdateImportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProjectSnapshotUnavailable => {
+                formatter.write_str("running playback exposes no verified project snapshot")
+            }
+            Self::Artifact(source) => {
+                write!(formatter, "selected Runtime native-device update was refused: {source}")
+            }
+            Self::ProjectIdentityMismatch => {
+                formatter.write_str("selected Runtime native-device update belongs to another project")
+            }
+            Self::ProjectRevisionMismatch {
+                update_revision,
+                project_revision,
+            } => write!(
+                formatter,
+                "selected Runtime native-device update targets project revision {update_revision}, but the open project is revision {project_revision}"
+            ),
+            Self::ProjectManifestMismatch => formatter.write_str(
+                "selected Runtime native-device update does not match the exact verified project contents",
+            ),
+            Self::Preparation(source) => source.fmt(formatter),
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before importing the Runtime native-device update: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before importing the Runtime native-device update ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "Runtime native-device update import failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "Runtime native-device update was imported through project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "Runtime native-device update import failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeRuntimeNativeDeviceUpdateImportError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Artifact(source) => Some(source.as_ref()),
+            Self::Preparation(source) => Some(source.as_ref()),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::ProjectSnapshotUnavailable
+            | Self::ProjectIdentityMismatch
+            | Self::ProjectRevisionMismatch { .. }
+            | Self::ProjectManifestMismatch
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
 /// Why one explicit Runtime loop update could not become a durable arrangement
 /// loop edit in the currently open project.
 ///
@@ -2992,6 +3136,7 @@ pub enum IdeWorkerCommandFailure {
     Recording(IdeRecordingError),
     RuntimeScenePerformanceImport(Box<IdeRuntimeScenePerformanceImportError>),
     RuntimeMixerUpdateImport(Box<IdeRuntimeMixerUpdateImportError>),
+    RuntimeNativeDeviceUpdateImport(Box<IdeRuntimeNativeDeviceUpdateImportError>),
     RuntimeLoopUpdateImport(Box<IdeRuntimeLoopUpdateImportError>),
     ScenePerformanceCapture(Box<IdeScenePerformanceCaptureError>),
     MixerAutomationCapture(Box<IdeMixerAutomationCaptureError>),
@@ -3169,6 +3314,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::Recording(source) => source.fmt(formatter),
             Self::RuntimeScenePerformanceImport(source) => source.fmt(formatter),
             Self::RuntimeMixerUpdateImport(source) => source.fmt(formatter),
+            Self::RuntimeNativeDeviceUpdateImport(source) => source.fmt(formatter),
             Self::RuntimeLoopUpdateImport(source) => source.fmt(formatter),
             Self::ScenePerformanceCapture(source) => source.fmt(formatter),
             Self::MixerAutomationCapture(source) => source.fmt(formatter),
@@ -3277,6 +3423,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::Recording(source) => Some(source),
             Self::RuntimeScenePerformanceImport(source) => Some(source),
             Self::RuntimeMixerUpdateImport(source) => Some(source),
+            Self::RuntimeNativeDeviceUpdateImport(source) => Some(source),
             Self::RuntimeLoopUpdateImport(source) => Some(source),
             Self::ScenePerformanceCapture(source) => Some(source),
             Self::MixerAutomationCapture(source) => Some(source),
@@ -3819,6 +3966,11 @@ pub enum IdeWorkerEvent {
     },
     RuntimeMixerUpdateImporting,
     RuntimeMixerUpdateImported {
+        revision: u64,
+        changed: bool,
+    },
+    RuntimeNativeDeviceUpdateImporting,
+    RuntimeNativeDeviceUpdateImported {
         revision: u64,
         changed: bool,
     },
@@ -5022,6 +5174,9 @@ enum ProjectMutation {
     ImportRuntimeMixerUpdate {
         plan: IdeMixerSavePlan,
     },
+    ImportRuntimeNativeDeviceUpdate {
+        update: RuntimeNativeDeviceUpdate,
+    },
     ImportRuntimeLoopUpdate {
         range: Option<IdeLoopRangeFrames>,
     },
@@ -5247,6 +5402,9 @@ impl ProjectMutation {
                 IdeWorkerCommandKind::ImportRuntimeScenePerformance
             }
             Self::ImportRuntimeMixerUpdate { .. } => IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+            Self::ImportRuntimeNativeDeviceUpdate { .. } => {
+                IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate
+            }
             Self::ImportRuntimeLoopUpdate { .. } => IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
             Self::CaptureScenePerformance { .. } => IdeWorkerCommandKind::CaptureScenePerformance,
             Self::MoveArrangementSceneLaunch { .. } => {
@@ -5376,6 +5534,9 @@ impl ProjectMutation {
                 }
             }
             Self::ImportRuntimeMixerUpdate { .. } => IdeWorkerEvent::RuntimeMixerUpdateImporting,
+            Self::ImportRuntimeNativeDeviceUpdate { .. } => {
+                IdeWorkerEvent::RuntimeNativeDeviceUpdateImporting
+            }
             Self::ImportRuntimeLoopUpdate { .. } => IdeWorkerEvent::RuntimeLoopUpdateImporting,
             Self::CaptureScenePerformance { launches, .. } => {
                 IdeWorkerEvent::ScenePerformanceCaptureSaving {
@@ -5705,6 +5866,9 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::AddArrangementSceneLaunch => "scene marker",
         IdeWorkerCommandKind::ImportRuntimeScenePerformance => "Runtime scene performance import",
         IdeWorkerCommandKind::ImportRuntimeMixerUpdate => "Runtime mixer update import",
+        IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate => {
+            "Runtime native-device update import"
+        }
         IdeWorkerCommandKind::ImportRuntimeLoopUpdate => "Runtime loop update import",
         IdeWorkerCommandKind::CaptureScenePerformance => "scene performance capture",
         IdeWorkerCommandKind::CaptureMixerAutomation => "mixer automation capture",
@@ -6110,6 +6274,7 @@ fn process_command(
         | IdeWorkerCommand::ImportAudio { .. }
         | IdeWorkerCommand::ImportRuntimeScenePerformance { .. }
         | IdeWorkerCommand::ImportRuntimeMixerUpdate { .. }
+        | IdeWorkerCommand::ImportRuntimeNativeDeviceUpdate { .. }
         | IdeWorkerCommand::ImportRuntimeLoopUpdate { .. }
         | IdeWorkerCommand::CreateAudioClipFromTake { .. }
         | IdeWorkerCommand::CreateAndPlaceAudioClipFromTake { .. }
@@ -6402,6 +6567,9 @@ fn process_project_mutation_command(
         IdeWorkerCommand::ImportRuntimeMixerUpdate { path } => {
             import_runtime_mixer_update(state, events, &path)
         }
+        IdeWorkerCommand::ImportRuntimeNativeDeviceUpdate { path } => {
+            import_runtime_native_device_update(state, events, &path)
+        }
         IdeWorkerCommand::ImportRuntimeLoopUpdate { path } => {
             import_runtime_loop_update(state, events, &path)
         }
@@ -6578,6 +6746,17 @@ fn publish_runtime_mixer_update_import_failure(
     )
 }
 
+fn publish_runtime_native_device_update_import_failure(
+    events: &SyncSender<IdeWorkerEvent>,
+    reason: IdeRuntimeNativeDeviceUpdateImportError,
+) -> bool {
+    publish_failure(
+        events,
+        IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
+        IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(Box::new(reason)),
+    )
+}
+
 fn publish_runtime_loop_update_import_failure(
     events: &SyncSender<IdeWorkerEvent>,
     reason: IdeRuntimeLoopUpdateImportError,
@@ -6653,6 +6832,30 @@ fn validate_runtime_loop_update(
     }
     if source.project_sha256() != runtime_loop_update_sha256_hex(project_manifest_sha256) {
         return Err(IdeRuntimeLoopUpdateImportError::ProjectManifestMismatch);
+    }
+    Ok(())
+}
+
+fn validate_runtime_native_device_update(
+    update: &RuntimeNativeDeviceUpdate,
+    project_id: &str,
+    project_revision: u64,
+    project_manifest_sha256: &[u8; 32],
+) -> Result<(), IdeRuntimeNativeDeviceUpdateImportError> {
+    let source = update.source();
+    if source.project_id() != project_id {
+        return Err(IdeRuntimeNativeDeviceUpdateImportError::ProjectIdentityMismatch);
+    }
+    if source.project_revision() != project_revision {
+        return Err(
+            IdeRuntimeNativeDeviceUpdateImportError::ProjectRevisionMismatch {
+                update_revision: source.project_revision(),
+                project_revision,
+            },
+        );
+    }
+    if source.project_sha256() != runtime_native_device_update_sha256_hex(project_manifest_sha256) {
+        return Err(IdeRuntimeNativeDeviceUpdateImportError::ProjectManifestMismatch);
     }
     Ok(())
 }
@@ -6816,6 +7019,61 @@ fn import_runtime_mixer_update(
         state,
         events,
         ProjectMutation::ImportRuntimeMixerUpdate { plan },
+    )
+}
+
+fn import_runtime_native_device_update(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    path: &Path,
+) -> bool {
+    let WorkerState::Running(application) = state else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    };
+    let (project_id, project_revision, project_manifest_sha256) = match application.snapshot() {
+        Some(snapshot) => (
+            snapshot.project_id.to_owned(),
+            snapshot.project_revision,
+            snapshot.project_manifest_sha256,
+        ),
+        None => {
+            return publish_runtime_native_device_update_import_failure(
+                events,
+                IdeRuntimeNativeDeviceUpdateImportError::ProjectSnapshotUnavailable,
+            );
+        }
+    };
+    let update = match read_runtime_native_device_update(path) {
+        Ok(update) => update,
+        Err(source) => {
+            return publish_runtime_native_device_update_import_failure(
+                events,
+                IdeRuntimeNativeDeviceUpdateImportError::Artifact(Box::new(source)),
+            );
+        }
+    };
+    if let Err(reason) = validate_runtime_native_device_update(
+        &update,
+        &project_id,
+        project_revision,
+        &project_manifest_sha256,
+    ) {
+        return publish_runtime_native_device_update_import_failure(events, reason);
+    }
+    if let Err(source) = application.validate_runtime_native_device_update_import(&update) {
+        return publish_runtime_native_device_update_import_failure(
+            events,
+            IdeRuntimeNativeDeviceUpdateImportError::Preparation(Box::new(source)),
+        );
+    }
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::ImportRuntimeNativeDeviceUpdate { update },
     )
 }
 
@@ -11223,6 +11481,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             ..
         }
         | ProjectMutationAttempt::ImportRuntimeMixerUpdate(Ok(outcome))
+        | ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Ok(outcome))
         | ProjectMutationAttempt::ImportRuntimeLoopUpdate {
             result: Ok(outcome),
         }
@@ -11441,6 +11700,11 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         ProjectMutationAttempt::ImportRuntimeLoopUpdate {
             result: Err(reason),
         } if reason.publication_committed() => HistoryEffect::Invalidate,
+        ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Err(reason))
+            if reason.publication_committed() =>
+        {
+            HistoryEffect::Invalidate
+        }
         ProjectMutationAttempt::RemoveAudioTrackContent(Err(reason))
             if reason.publication_committed() =>
         {
@@ -11496,6 +11760,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::ImportRuntimeScenePerformance { result: Err(_), .. }
         | ProjectMutationAttempt::ImportRuntimeMixerUpdate(Err(_))
+        | ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Err(_))
         | ProjectMutationAttempt::ImportRuntimeLoopUpdate { result: Err(_) }
         | ProjectMutationAttempt::CaptureScenePerformance { result: Err(_), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Err(_), .. }
@@ -12566,6 +12831,13 @@ fn project_mutation_save_failure(
                 IdeRuntimeMixerUpdateImportError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::ImportRuntimeNativeDeviceUpdate { .. } => {
+            IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(Box::new(
+                IdeRuntimeNativeDeviceUpdateImportError::Preparation(Box::new(
+                    IdeRuntimeNativeDeviceUpdatePreparationError::MixerSave(Box::new(reason)),
+                )),
+            ))
+        }
         ProjectMutation::ImportRuntimeLoopUpdate { .. } => {
             IdeWorkerCommandFailure::RuntimeLoopUpdateImport(Box::new(
                 IdeRuntimeLoopUpdateImportError::Arrangement(Box::new(
@@ -12933,6 +13205,11 @@ fn project_mutation_native_close_failure(
                 IdeRuntimeMixerUpdateImportError::MixerSave(Box::new(
                     IdeProjectSaveError::NativeClose(failure),
                 )),
+            ))
+        }
+        ProjectMutation::ImportRuntimeNativeDeviceUpdate { .. } => {
+            IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(Box::new(
+                IdeRuntimeNativeDeviceUpdateImportError::NativeClose(failure),
             ))
         }
         ProjectMutation::ImportRuntimeLoopUpdate { .. } => {
@@ -13308,6 +13585,12 @@ enum ProjectMutationAttempt {
     },
     ImportRuntimeMixerUpdate(
         Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeProjectSaveError>,
+    ),
+    ImportRuntimeNativeDeviceUpdate(
+        Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeRuntimeNativeDeviceUpdateImportError,
+        >,
     ),
     ImportRuntimeLoopUpdate {
         result: Result<
@@ -14532,6 +14815,16 @@ fn complete_project_mutation(
                         IdeRuntimeMixerUpdateImportError::MixerSave(Box::new(reason)),
                     )),
                 ),
+                ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::RuntimeNativeDeviceUpdateImported {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                    },
+                ),
+                ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Err(reason)) => {
+                    publish_runtime_native_device_update_import_failure(events, reason)
+                }
                 ProjectMutationAttempt::ImportRuntimeLoopUpdate {
                     result: Ok(outcome),
                 } => send_event(
@@ -16180,6 +16473,29 @@ fn attempt_project_mutation(
                 } else {
                     plan.publish()
                         .map_err(|source| IdeProjectSaveError::Publication(Box::new(source)))
+                },
+            )
+        }
+        ProjectMutation::ImportRuntimeNativeDeviceUpdate { update } => {
+            ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(
+                if let Some(failure) = native_failure {
+                    Err(IdeRuntimeNativeDeviceUpdateImportError::NativeClose(
+                        failure,
+                    ))
+                } else {
+                    RunningDesktopIdeApplication::prepare_runtime_native_device_update_import(
+                        application,
+                        recovery,
+                        &update,
+                    )
+                    .map_err(|source| {
+                        IdeRuntimeNativeDeviceUpdateImportError::Preparation(Box::new(source))
+                    })
+                    .and_then(|plan| {
+                        plan.publish().map_err(|source| {
+                            IdeRuntimeNativeDeviceUpdateImportError::Publication(Box::new(source))
+                        })
+                    })
                 },
             )
         }
@@ -18099,6 +18415,38 @@ fn project_mutation_reopen_failure(
                     preparation: Box::new(IdeRuntimeMixerUpdateImportError::MixerSave(Box::new(
                         preparation,
                     ))),
+                    reopen: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Ok(outcome)) => {
+            IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(Box::new(
+                IdeRuntimeNativeDeviceUpdateImportError::ReopenAfterPublication {
+                    outcome: Box::new(outcome),
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Err(
+            IdeRuntimeNativeDeviceUpdateImportError::Publication(publication),
+        )) => IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(Box::new(
+            IdeRuntimeNativeDeviceUpdateImportError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Err(
+            IdeRuntimeNativeDeviceUpdateImportError::NativeClose(close),
+        )) => IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(Box::new(
+            IdeRuntimeNativeDeviceUpdateImportError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Err(preparation)) => {
+            IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(Box::new(
+                IdeRuntimeNativeDeviceUpdateImportError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
                     reopen: Box::new(reopen),
                 },
             ))
@@ -20303,6 +20651,10 @@ mod tests {
         RuntimeLoopRange, RuntimeLoopUpdateDirectory, RuntimeLoopUpdateSource,
     };
     use hyper_runtime_mixer_update::{RuntimeMixerUpdateDirectory, RuntimeMixerUpdateSource};
+    use hyper_runtime_native_device_update::{
+        RuntimeNativeDeviceUpdateDevice, RuntimeNativeDeviceUpdateDirectory,
+        RuntimeNativeDeviceUpdateSource,
+    };
     use hyper_scene_performance::{
         RuntimeScenePerformanceSource, RuntimeScenePerformanceUpdateDirectory,
     };
@@ -20928,6 +21280,110 @@ mod tests {
             .unwrap()
     }
 
+    fn publish_runtime_native_device_update_for_test(
+        directory: &Path,
+        project: &Path,
+        change_state: bool,
+        source_chain_sha256_override: Option<&str>,
+    ) -> (PathBuf, String, Vec<u8>) {
+        let verified = verify_project_package(project).unwrap();
+        let mut descriptors = verified
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::DeviceChain);
+        let descriptor = descriptors
+            .next()
+            .expect("the fixture project must expose one native device-chain resource");
+        assert!(
+            descriptors.next().is_none(),
+            "the fixture project must expose only one native device-chain resource"
+        );
+        let chain_id = descriptor.id().to_owned();
+        let source_bytes = verified.read_resource(&chain_id).unwrap();
+        let source_chain = hyper_native_device::DeviceChain::parse(&source_bytes).unwrap();
+        assert_eq!(
+            source_chain.to_canonical_vec().unwrap(),
+            source_bytes,
+            "the Runtime fixture must originate from canonical device-chain authority"
+        );
+        let devices = source_chain
+            .devices()
+            .iter()
+            .map(|device| {
+                let (enabled, state) = match device.state() {
+                    hyper_native_device::NativeDeviceState::Filter(source) => (
+                        if change_state {
+                            false
+                        } else {
+                            device.enabled()
+                        },
+                        hyper_native_device::NativeDeviceState::Filter(if change_state {
+                            hyper_native_device::NativeFilterState::try_new(
+                                NativeFilterMode::HighPass,
+                                80_000,
+                                2_000_000,
+                            )
+                            .unwrap()
+                        } else {
+                            *source
+                        }),
+                    ),
+                    hyper_native_device::NativeDeviceState::Compressor(source) => (
+                        if change_state {
+                            false
+                        } else {
+                            device.enabled()
+                        },
+                        hyper_native_device::NativeDeviceState::Compressor(if change_state {
+                            hyper_native_device::NativeCompressorState::try_new(
+                                -12_000, 6_000_000, 2_000, 60_000, 1_000,
+                            )
+                            .unwrap()
+                        } else {
+                            *source
+                        }),
+                    ),
+                };
+                RuntimeNativeDeviceUpdateDevice::try_new(
+                    device.id().to_owned(),
+                    device.device_id().to_owned(),
+                    device.state_version(),
+                    device.dsp_version(),
+                    enabled,
+                    state,
+                )
+                .unwrap()
+            })
+            .collect();
+        let source = RuntimeNativeDeviceUpdateSource::try_new(
+            verified.manifest().project_id().to_owned(),
+            verified.manifest().revision(),
+            runtime_native_device_update_sha256_hex(verified.manifest_sha256()),
+            runtime_native_device_update_sha256_hex(&[0xbb; 32]),
+            1,
+        )
+        .unwrap();
+        let source_chain_sha256 = source_chain_sha256_override
+            .unwrap_or(descriptor.sha256())
+            .to_owned();
+        drop(verified);
+        let update = RuntimeNativeDeviceUpdate::try_new(
+            uuid::Uuid::new_v4().to_string(),
+            source,
+            chain_id.clone(),
+            source_chain.track_id().to_owned(),
+            source_chain_sha256,
+            devices,
+        )
+        .unwrap();
+        let path = RuntimeNativeDeviceUpdateDirectory::open(directory)
+            .unwrap()
+            .publish(&update)
+            .unwrap();
+        (path, chain_id, source_bytes)
+    }
+
     fn open_project_for_runtime_mixer_update_import(
         worker: &DesktopIdeWorker,
         project: PathBuf,
@@ -21225,6 +21681,204 @@ mod tests {
         };
         assert!(session.mixer_commands.is_empty());
         assert_eq!(unpublished_native_failure, None);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one worker flow verifies native-device state authority, no-op handling, stale refusal, and undo restoration together"
+    )]
+    fn runtime_native_device_update_import_replaces_only_the_bound_chain_and_is_reversible() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-runtime-native-device-update-import-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the project must open before creating the Runtime source chain");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the fixture project exposes an audio track")
+            .id()
+            .to_owned();
+        add_compressor_history(&worker, track_id);
+
+        let updates = fixture.join("updates");
+        std::fs::create_dir(&updates).unwrap();
+        let source_revision = verify_project_package(&project)
+            .unwrap()
+            .manifest()
+            .revision();
+        let (changed_path, chain_id, source_bytes) =
+            publish_runtime_native_device_update_for_test(&updates, &project, true, None);
+
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeNativeDeviceUpdate {
+                path: changed_path.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::RuntimeNativeDeviceUpdateImporting
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("Runtime native-device update import"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(imported) = recv_native_mutation(&worker) else {
+            panic!("the imported device chain must reopen before completion is reported");
+        };
+        let compressor = imported
+            .native_compressors()
+            .first()
+            .expect("the imported Runtime state must retain the compressor instance");
+        assert_eq!(compressor.chain_id(), chain_id);
+        assert!(!compressor.enabled());
+        assert_eq!(compressor.threshold_millidecibels(), -12_000);
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::RuntimeNativeDeviceUpdateImported {
+                revision,
+                changed: true,
+            } if revision == source_revision + 1
+        ));
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "Runtime native-device update import",
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("native device"),
+                redo_label: Some("Runtime native-device update import"),
+            }
+        ));
+        let IdeWorkerEvent::Running(restored) = recv_native_mutation(&worker) else {
+            panic!("the restored device chain must reopen before undo completion is reported");
+        };
+        let restored_compressor = restored
+            .native_compressors()
+            .first()
+            .expect("undo must restore the source compressor instance");
+        assert!(restored_compressor.enabled());
+        assert_eq!(restored_compressor.threshold_millidecibels(), -18_000);
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::EditRestored {
+                redo: false,
+                label: "Runtime native-device update import",
+                ..
+            }
+        ));
+        let restored_package = verify_project_package(&project).unwrap();
+        assert_eq!(
+            restored_package.read_resource(&chain_id).unwrap(),
+            source_bytes,
+            "undo must restore the exact prior chain bytes, including any retained authority"
+        );
+        let restored_revision = restored_package.manifest().revision();
+        drop(restored_package);
+
+        let (no_op_path, _, _) =
+            publish_runtime_native_device_update_for_test(&updates, &project, false, None);
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeNativeDeviceUpdate { path: no_op_path })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::RuntimeNativeDeviceUpdateImporting
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::Running(_)
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::RuntimeNativeDeviceUpdateImported {
+                revision,
+                changed: false,
+            } if revision == restored_revision
+        ));
+        assert_eq!(
+            verify_project_package(&project)
+                .unwrap()
+                .manifest()
+                .revision(),
+            restored_revision
+        );
+
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeNativeDeviceUpdate { path: changed_path })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeRuntimeNativeDeviceUpdateImportError::ProjectRevisionMismatch {
+                    update_revision,
+                    project_revision,
+                } if *update_revision == source_revision && *project_revision == restored_revision
+            )
+        ));
+
+        let invalid_digest = "d".repeat(64);
+        let (mismatched_path, _, _) = publish_runtime_native_device_update_for_test(
+            &updates,
+            &project,
+            false,
+            Some(&invalid_digest),
+        );
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeNativeDeviceUpdate {
+                path: mismatched_path,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeRuntimeNativeDeviceUpdateImportError::Preparation(source)
+                    if matches!(
+                        source.as_ref(),
+                        IdeRuntimeNativeDeviceUpdatePreparationError::SourceChainDigestMismatch
+                    )
+            )
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
     }
 
     fn capture_scene(id: &str, grid_quantized: bool) -> ScenePerformanceScene {

@@ -97,7 +97,8 @@ use hyper_mixer_runtime::{
     MixerBaseStateProjectionError, MixerParameterStateSnapshot, mixer_base_state_from_snapshot,
 };
 use hyper_native_device::{
-    DeviceChain, DeviceChainError, NativeCompressorState, NativeDeviceInstance, NativeFilterState,
+    DeviceChain, DeviceChainError, NativeCompressorState, NativeDeviceInstance, NativeDeviceState,
+    NativeFilterState,
 };
 pub use hyper_native_device::{
     MAX_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
@@ -203,6 +204,7 @@ pub use hyper_project_history::{
 };
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackError, ProjectPlaybackLimits};
 use hyper_project_model::{ResourceRole, is_valid_entity_id};
+use hyper_runtime_native_device_update::RuntimeNativeDeviceUpdate;
 use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPlacementPublicationRequest,
     AudioClipPublicationOutcome, AudioClipPublicationRequest, AudioClipRemovalOutcome,
@@ -249,7 +251,8 @@ pub use worker::{
     IdeMixerAutomationCaptureError, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerSend,
     IdeNativeCompressor, IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError,
     IdeRecordingCaptureKind, IdeRecordingState, IdeRecordingTake, IdeRunningObservation,
-    IdeRuntimeLoopUpdateImportError, IdeRuntimeMixerUpdateImportError, IdeRuntimePreparationError,
+    IdeRuntimeLoopUpdateImportError, IdeRuntimeMixerUpdateImportError,
+    IdeRuntimeNativeDeviceUpdateImportError, IdeRuntimePreparationError,
     IdeRuntimeScenePerformanceImportError, IdeScene, IdeScenePerformanceCaptureError,
     IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure,
     IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
@@ -6048,6 +6051,178 @@ impl Error for IdeNativeFilterEditError {
     }
 }
 
+/// Why a Runtime native-device update could not be bound to the exact verified
+/// device-chain authority in an open project.
+///
+/// The update carries state only. This preparation therefore refuses any
+/// source-chain drift instead of reconstructing a chain or accepting unknown
+/// extension semantics from the external artifact.
+#[derive(Debug)]
+pub enum IdeRuntimeNativeDeviceUpdatePreparationError {
+    ProjectSnapshotUnavailable,
+    DeviceChainResourceMissing,
+    DeviceChainResourceAmbiguous,
+    DeviceChainResourceRoleMismatch,
+    SourceChainDigestMismatch,
+    SourceChainNotCanonical,
+    SourceChainUnavailable,
+    SourceChainIdentityMismatch,
+    SourceChainProjectMismatch,
+    SourceChainTrackMismatch,
+    DeviceCountMismatch,
+    DeviceIdentityMismatch,
+    DeviceTypeMismatch,
+    DeviceVersionMismatch,
+    DeviceStateKindMismatch,
+    CapacityUnavailable,
+    Storage(StorageError),
+    Serialization(DeviceChainError),
+    Device(DeviceChainError),
+    MixerSave(Box<IdeProjectSaveError>),
+}
+
+impl fmt::Display for IdeRuntimeNativeDeviceUpdatePreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProjectSnapshotUnavailable => {
+                formatter.write_str("running playback exposes no verified project snapshot")
+            }
+            Self::DeviceChainResourceMissing => {
+                formatter.write_str("the Runtime native-device update targets no device-chain resource in the open project")
+            }
+            Self::DeviceChainResourceAmbiguous => formatter.write_str(
+                "the Runtime native-device update targets an ambiguous device-chain resource",
+            ),
+            Self::DeviceChainResourceRoleMismatch => formatter.write_str(
+                "the Runtime native-device update target is not a device-chain resource",
+            ),
+            Self::SourceChainDigestMismatch => formatter.write_str(
+                "the Runtime native-device update does not match the exact source device-chain resource",
+            ),
+            Self::SourceChainNotCanonical => formatter.write_str(
+                "the source device-chain resource is not canonical and cannot accept a Runtime update",
+            ),
+            Self::SourceChainUnavailable => formatter.write_str(
+                "the Runtime native-device update targets a device chain unavailable to active playback",
+            ),
+            Self::SourceChainIdentityMismatch => formatter.write_str(
+                "the Runtime native-device update does not match the source device-chain identity",
+            ),
+            Self::SourceChainProjectMismatch => formatter.write_str(
+                "the Runtime native-device update does not match the source device-chain project",
+            ),
+            Self::SourceChainTrackMismatch => formatter.write_str(
+                "the Runtime native-device update does not match the source device-chain track",
+            ),
+            Self::DeviceCountMismatch => formatter.write_str(
+                "the Runtime native-device update does not match the source device count",
+            ),
+            Self::DeviceIdentityMismatch => formatter.write_str(
+                "the Runtime native-device update does not match a source device identity",
+            ),
+            Self::DeviceTypeMismatch => formatter.write_str(
+                "the Runtime native-device update does not match a source device type",
+            ),
+            Self::DeviceVersionMismatch => formatter.write_str(
+                "the Runtime native-device update does not match a source device version",
+            ),
+            Self::DeviceStateKindMismatch => formatter.write_str(
+                "the Runtime native-device update does not match a source device state kind",
+            ),
+            Self::CapacityUnavailable => {
+                formatter.write_str("native-device update preparation capacity is unavailable")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) | Self::Device(source) => source.fmt(formatter),
+            Self::MixerSave(source) => {
+                write!(formatter, "live mixer state could not be preserved: {source}")
+            }
+        }
+    }
+}
+
+impl Error for IdeRuntimeNativeDeviceUpdatePreparationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) | Self::Device(source) => Some(source),
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::ProjectSnapshotUnavailable
+            | Self::DeviceChainResourceMissing
+            | Self::DeviceChainResourceAmbiguous
+            | Self::DeviceChainResourceRoleMismatch
+            | Self::SourceChainDigestMismatch
+            | Self::SourceChainNotCanonical
+            | Self::SourceChainUnavailable
+            | Self::SourceChainIdentityMismatch
+            | Self::SourceChainProjectMismatch
+            | Self::SourceChainTrackMismatch
+            | Self::DeviceCountMismatch
+            | Self::DeviceIdentityMismatch
+            | Self::DeviceTypeMismatch
+            | Self::DeviceVersionMismatch
+            | Self::DeviceStateKindMismatch
+            | Self::CapacityUnavailable => None,
+        }
+    }
+}
+
+/// Publication failure after a Runtime native-device update has been bound to
+/// a verified source chain and the current mixer save plan.
+#[derive(Debug)]
+pub enum IdeRuntimeNativeDeviceUpdatePublicationError {
+    Mixer(Box<ProjectResourcePublicationError>),
+    DeviceChain {
+        mixer: Box<ProjectResourcePublicationOutcome>,
+        source: Box<ProjectResourcePublicationError>,
+    },
+}
+
+impl IdeRuntimeNativeDeviceUpdatePublicationError {
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        match self {
+            Self::Mixer(source) => source.published(),
+            Self::DeviceChain { mixer, source } => mixer.changed() || source.published(),
+        }
+    }
+}
+
+impl fmt::Display for IdeRuntimeNativeDeviceUpdatePublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mixer(source) if source.published() => write!(
+                formatter,
+                "live mixer preservation may have committed with incomplete project verification or recovery: {source}"
+            ),
+            Self::Mixer(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::DeviceChain { source, .. } if source.published() => write!(
+                formatter,
+                "Runtime native-device update may have committed with incomplete project verification or recovery: {source}"
+            ),
+            Self::DeviceChain { mixer, source } if mixer.changed() => write!(
+                formatter,
+                "live mixer state was preserved in project revision {} but the Runtime native-device update failed: {source}",
+                mixer.project_revision()
+            ),
+            Self::DeviceChain { source, .. } => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeRuntimeNativeDeviceUpdatePublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Mixer(source) | Self::DeviceChain { source, .. } => Some(source.as_ref()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum IdeAutomationTakePublicationError {
     Mixer(Box<ProjectResourcePublicationError>),
@@ -9449,6 +9624,13 @@ struct IdeNativeFilterEditPlan {
     inverse: IdeHistoryOperation,
 }
 
+#[derive(Debug)]
+struct IdeRuntimeNativeDeviceUpdateImportPlan {
+    mixer: IdeMixerSavePlan,
+    chain_id: String,
+    chain_bytes: Vec<u8>,
+}
+
 fn find_native_filter_chain<'a>(
     prepared: &'a PreparedProjectPlayback,
     chain_id: &str,
@@ -9502,6 +9684,143 @@ fn serialize_native_filter_chain(chain: &DeviceChain) -> Result<Vec<u8>, IdeNati
     chain
         .to_canonical_vec()
         .map_err(IdeNativeFilterEditError::Serialization)
+}
+
+fn runtime_native_device_update_source_chain<'a>(
+    prepared: &'a PreparedProjectPlayback,
+    update: &RuntimeNativeDeviceUpdate,
+) -> Result<&'a DeviceChain, IdeRuntimeNativeDeviceUpdatePreparationError> {
+    let package = prepared.package();
+    let mut descriptors = package
+        .manifest()
+        .resources()
+        .iter()
+        .filter(|descriptor| descriptor.id() == update.chain_id());
+    let descriptor = descriptors
+        .next()
+        .ok_or(IdeRuntimeNativeDeviceUpdatePreparationError::DeviceChainResourceMissing)?;
+    if descriptors.next().is_some() {
+        return Err(IdeRuntimeNativeDeviceUpdatePreparationError::DeviceChainResourceAmbiguous);
+    }
+    if descriptor.role() != ResourceRole::DeviceChain {
+        return Err(IdeRuntimeNativeDeviceUpdatePreparationError::DeviceChainResourceRoleMismatch);
+    }
+    if descriptor.sha256() != update.source_chain_sha256() {
+        return Err(IdeRuntimeNativeDeviceUpdatePreparationError::SourceChainDigestMismatch);
+    }
+    let mut chains = prepared
+        .device_chains()
+        .iter()
+        .filter(|chain| chain.id() == descriptor.id());
+    let source_chain = chains
+        .next()
+        .ok_or(IdeRuntimeNativeDeviceUpdatePreparationError::SourceChainUnavailable)?;
+    if chains.next().is_some() {
+        return Err(IdeRuntimeNativeDeviceUpdatePreparationError::SourceChainUnavailable);
+    }
+    let source_bytes = package
+        .read_resource(descriptor.id())
+        .map_err(IdeRuntimeNativeDeviceUpdatePreparationError::Storage)?;
+    let canonical_source = source_chain
+        .to_canonical_vec()
+        .map_err(IdeRuntimeNativeDeviceUpdatePreparationError::Serialization)?;
+    if canonical_source != source_bytes {
+        return Err(IdeRuntimeNativeDeviceUpdatePreparationError::SourceChainNotCanonical);
+    }
+    if source_chain.id() != update.chain_id() {
+        return Err(IdeRuntimeNativeDeviceUpdatePreparationError::SourceChainIdentityMismatch);
+    }
+    if source_chain.project_id() != package.manifest().project_id()
+        || source_chain.project_id() != update.source().project_id()
+    {
+        return Err(IdeRuntimeNativeDeviceUpdatePreparationError::SourceChainProjectMismatch);
+    }
+    if source_chain.track_id() != update.track_id() {
+        return Err(IdeRuntimeNativeDeviceUpdatePreparationError::SourceChainTrackMismatch);
+    }
+    validate_runtime_native_device_update_topology(source_chain, update)?;
+    Ok(source_chain)
+}
+
+fn validate_runtime_native_device_update_topology(
+    source_chain: &DeviceChain,
+    update: &RuntimeNativeDeviceUpdate,
+) -> Result<(), IdeRuntimeNativeDeviceUpdatePreparationError> {
+    if source_chain.devices().len() != update.devices().len() {
+        return Err(IdeRuntimeNativeDeviceUpdatePreparationError::DeviceCountMismatch);
+    }
+    for (source_device, update_device) in source_chain.devices().iter().zip(update.devices()) {
+        if source_device.id() != update_device.id() {
+            return Err(IdeRuntimeNativeDeviceUpdatePreparationError::DeviceIdentityMismatch);
+        }
+        if source_device.device_id() != update_device.device_id() {
+            return Err(IdeRuntimeNativeDeviceUpdatePreparationError::DeviceTypeMismatch);
+        }
+        if source_device.state_version() != update_device.state_version()
+            || source_device.dsp_version() != update_device.dsp_version()
+        {
+            return Err(IdeRuntimeNativeDeviceUpdatePreparationError::DeviceVersionMismatch);
+        }
+        if !matches!(
+            (source_device.state(), update_device.state()),
+            (NativeDeviceState::Filter(_), NativeDeviceState::Filter(_))
+                | (
+                    NativeDeviceState::Compressor(_),
+                    NativeDeviceState::Compressor(_)
+                )
+        ) {
+            return Err(IdeRuntimeNativeDeviceUpdatePreparationError::DeviceStateKindMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn runtime_native_device_update_candidate(
+    source_chain: &DeviceChain,
+    update: &RuntimeNativeDeviceUpdate,
+) -> Result<DeviceChain, IdeRuntimeNativeDeviceUpdatePreparationError> {
+    validate_runtime_native_device_update_topology(source_chain, update)?;
+    let mut candidate = source_chain.clone();
+    for update_device in update.devices() {
+        candidate = match update_device.state() {
+            NativeDeviceState::Filter(state) => {
+                candidate.try_with_filter_state(update_device.id(), update_device.enabled(), state)
+            }
+            NativeDeviceState::Compressor(state) => candidate.try_with_compressor_state(
+                update_device.id(),
+                update_device.enabled(),
+                state,
+            ),
+        }
+        .map_err(IdeRuntimeNativeDeviceUpdatePreparationError::Device)?;
+    }
+    Ok(candidate)
+}
+
+impl IdeRuntimeNativeDeviceUpdateImportPlan {
+    fn publish(
+        &self,
+    ) -> Result<ProjectResourcePublicationOutcome, IdeRuntimeNativeDeviceUpdatePublicationError>
+    {
+        let mixer = self.mixer.publish().map_err(|source| {
+            IdeRuntimeNativeDeviceUpdatePublicationError::Mixer(Box::new(source))
+        })?;
+        publish_project_resource(
+            &self.mixer.project_path,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                resource_id: &self.chain_id,
+                expected_role: ResourceRole::DeviceChain,
+                resource_bytes: &self.chain_bytes,
+            },
+        )
+        .map_err(
+            |source| IdeRuntimeNativeDeviceUpdatePublicationError::DeviceChain {
+                mixer: Box::new(mixer),
+                source: Box::new(source),
+            },
+        )
+    }
 }
 
 impl IdeNativeFilterEditPlan {
@@ -10804,6 +11123,62 @@ impl RunningDesktopIdeApplication {
             .prepared_project()
             .ok_or(IdeProjectSaveError::ProjectSnapshotUnavailable)?;
         Self::prepare_mixer_base_state_save(&self.application, project, state)
+    }
+
+    /// Performs the non-mutating source binding required before the worker
+    /// fences playback for an external Runtime native-device update.
+    pub(crate) fn validate_runtime_native_device_update_import(
+        &self,
+        update: &RuntimeNativeDeviceUpdate,
+    ) -> Result<(), IdeRuntimeNativeDeviceUpdatePreparationError> {
+        #[cfg(test)]
+        let session = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            IdePlaybackSessionOwner::Test(_) => {
+                return Err(
+                    IdeRuntimeNativeDeviceUpdatePreparationError::ProjectSnapshotUnavailable,
+                );
+            }
+        };
+        #[cfg(not(test))]
+        let IdePlaybackSessionOwner::Native(session) = &self.session;
+        let prepared = session
+            .prepared_project()
+            .ok_or(IdeRuntimeNativeDeviceUpdatePreparationError::ProjectSnapshotUnavailable)?;
+        let _ = runtime_native_device_update_source_chain(prepared, update)?;
+        Ok(())
+    }
+
+    /// Rebinds a preflighted Runtime native-device update to the recovered
+    /// project authority after native playback has closed, preserving the
+    /// acknowledged live mixer state before replacing only the target chain.
+    fn prepare_runtime_native_device_update_import(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        update: &RuntimeNativeDeviceUpdate,
+    ) -> Result<IdeRuntimeNativeDeviceUpdateImportPlan, IdeRuntimeNativeDeviceUpdatePreparationError>
+    {
+        let prepared = recovery
+            .prepared_project()
+            .ok_or(IdeRuntimeNativeDeviceUpdatePreparationError::ProjectSnapshotUnavailable)?;
+        let source_chain = runtime_native_device_update_source_chain(prepared, update)?;
+        let candidate = runtime_native_device_update_candidate(source_chain, update)?;
+        let chain_bytes = candidate
+            .to_canonical_vec()
+            .map_err(IdeRuntimeNativeDeviceUpdatePreparationError::Serialization)?;
+        let mut chain_id = String::new();
+        chain_id
+            .try_reserve_exact(source_chain.id().len())
+            .map_err(|_| IdeRuntimeNativeDeviceUpdatePreparationError::CapacityUnavailable)?;
+        chain_id.push_str(source_chain.id());
+        let mixer = Self::prepare_mixer_save(application, recovery).map_err(|source| {
+            IdeRuntimeNativeDeviceUpdatePreparationError::MixerSave(Box::new(source))
+        })?;
+        Ok(IdeRuntimeNativeDeviceUpdateImportPlan {
+            mixer,
+            chain_id,
+            chain_bytes,
+        })
     }
 
     fn store_mixer_recovery_snapshot(&self) -> Result<(), IdeProjectSaveError> {
@@ -17796,6 +18171,9 @@ mod tests {
     use hyper_mixer_runtime::output_meter_snapshot_for_test;
     use hyper_playback_json::{LoaderLimits, PlaybackJsonInput, load};
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
+    use hyper_runtime_native_device_update::{
+        RuntimeNativeDeviceUpdateDevice, RuntimeNativeDeviceUpdateSource,
+    };
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
 
@@ -21973,6 +22351,129 @@ mod tests {
         assert!(reopened.device_chains().is_empty());
         assert!(!project_path.join("devices").exists());
         hyper_storage_engine::verify_project_package(&project_path).unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one state-only projection test verifies extension preservation, ordered identity, both device kinds, and canonical serialization together"
+    )]
+    fn runtime_native_device_update_projects_only_state_and_preserves_extensions() {
+        let filter_id = "018f47a2-6b2d-7c11-8a44-001122338512";
+        let compressor_id = "018f47a2-6b2d-7c11-8a44-001122338513";
+        let chain_id = "018f47a2-6b2d-7c11-8a44-001122338514";
+        let source = DeviceChain::try_new(
+            chain_id.to_owned(),
+            ARRANGEMENT_TEST_PROJECT_ID.to_owned(),
+            ARRANGEMENT_TEST_TRACK_ID.to_owned(),
+            vec![
+                NativeDeviceInstance::try_new_filter(
+                    filter_id.to_owned(),
+                    true,
+                    NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107)
+                        .unwrap(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+        .try_with_appended_compressor(
+            compressor_id.to_owned(),
+            true,
+            NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 0).unwrap(),
+        )
+        .unwrap();
+        let mut wire: Value = serde_json::from_slice(&source.to_canonical_vec().unwrap()).unwrap();
+        wire["extensions"] = json!({"org.example.chain": {"retained": true}});
+        wire["devices"][0]["extensions"] = json!({"org.example.filter": {"retained": true}});
+        wire["devices"][1]["extensions"] = json!({"org.example.compressor": {"retained": true}});
+        let source = DeviceChain::parse(&serde_json_canonicalizer::to_vec(&wire).unwrap()).unwrap();
+        let update = RuntimeNativeDeviceUpdate::try_new(
+            "018f47a2-6b2d-7c11-8a44-001122338515".to_owned(),
+            RuntimeNativeDeviceUpdateSource::try_new(
+                ARRANGEMENT_TEST_PROJECT_ID.to_owned(),
+                7,
+                "a".repeat(64),
+                "b".repeat(64),
+                3,
+            )
+            .unwrap(),
+            chain_id.to_owned(),
+            ARRANGEMENT_TEST_TRACK_ID.to_owned(),
+            "c".repeat(64),
+            vec![
+                RuntimeNativeDeviceUpdateDevice::try_new(
+                    filter_id.to_owned(),
+                    source.devices()[0].device_id().to_owned(),
+                    source.devices()[0].state_version(),
+                    source.devices()[0].dsp_version(),
+                    false,
+                    NativeDeviceState::Filter(
+                        NativeFilterState::try_new(NativeFilterMode::HighPass, 80_000, 2_000_000)
+                            .unwrap(),
+                    ),
+                )
+                .unwrap(),
+                RuntimeNativeDeviceUpdateDevice::try_new(
+                    compressor_id.to_owned(),
+                    source.devices()[1].device_id().to_owned(),
+                    source.devices()[1].state_version(),
+                    source.devices()[1].dsp_version(),
+                    false,
+                    NativeDeviceState::Compressor(
+                        NativeCompressorState::try_new(-12_000, 6_000_000, 2_000, 60_000, 1_000)
+                            .unwrap(),
+                    ),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let candidate = runtime_native_device_update_candidate(&source, &update).unwrap();
+        assert_eq!(candidate.extensions(), source.extensions());
+        assert_eq!(candidate.devices().len(), source.devices().len());
+        for (candidate_device, source_device) in candidate.devices().iter().zip(source.devices()) {
+            assert_eq!(candidate_device.id(), source_device.id());
+            assert_eq!(candidate_device.device_id(), source_device.device_id());
+            assert_eq!(
+                candidate_device.state_version(),
+                source_device.state_version()
+            );
+            assert_eq!(candidate_device.dsp_version(), source_device.dsp_version());
+            assert_eq!(candidate_device.extensions(), source_device.extensions());
+        }
+        assert!(!candidate.devices()[0].enabled());
+        assert_eq!(
+            candidate.devices()[0].filter_state().unwrap().mode(),
+            NativeFilterMode::HighPass
+        );
+        assert!(!candidate.devices()[1].enabled());
+        assert_eq!(
+            candidate.devices()[1]
+                .compressor_state()
+                .unwrap()
+                .threshold_millidecibels(),
+            -12_000
+        );
+        assert_eq!(
+            DeviceChain::parse(&candidate.to_canonical_vec().unwrap()).unwrap(),
+            candidate
+        );
+
+        let reversed = RuntimeNativeDeviceUpdate::try_new(
+            "018f47a2-6b2d-7c11-8a44-001122338516".to_owned(),
+            update.source().clone(),
+            chain_id.to_owned(),
+            ARRANGEMENT_TEST_TRACK_ID.to_owned(),
+            "c".repeat(64),
+            update.devices().iter().cloned().rev().collect(),
+        )
+        .unwrap();
+        assert!(matches!(
+            runtime_native_device_update_candidate(&source, &reversed),
+            Err(IdeRuntimeNativeDeviceUpdatePreparationError::DeviceIdentityMismatch)
+        ));
     }
 
     #[test]

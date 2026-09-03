@@ -54,9 +54,9 @@ use hyper_desktop_ide::{
     IdeAudioClipLoopEditError, IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
     IdeAudioClipSourceTrimEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
     IdeAudioImportError, IdeAutomationTakeEditError, IdeRuntimeLoopUpdateImportError,
-    IdeRuntimeMixerUpdateImportError, IdeRuntimeScenePerformanceImportError, IdeSceneCreationError,
-    IdeSceneDuplicationError, IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEditError,
-    IdeTempoEditError,
+    IdeRuntimeMixerUpdateImportError, IdeRuntimeNativeDeviceUpdateImportError,
+    IdeRuntimeScenePerformanceImportError, IdeSceneCreationError, IdeSceneDuplicationError,
+    IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEditError, IdeTempoEditError,
 };
 #[cfg(test)]
 use hyper_mixer_runtime::PlaybackRecoverySnapshot;
@@ -85,6 +85,7 @@ const INPUT_METER_FLOOR_DBFS: f32 = -60.0;
 const MIXER_STRIP_METER_FLOOR_DBFS: f32 = -60.0;
 const RUNTIME_SCENE_PERFORMANCE_IMPORT_FILTER_LABEL: &str = "Runtime scene-performance updates";
 const RUNTIME_MIXER_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime mixer updates";
+const RUNTIME_NATIVE_DEVICE_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime native-device updates";
 const RUNTIME_LOOP_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime loop updates";
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
@@ -111,6 +112,12 @@ enum RuntimeScenePerformanceImportChoice {
 
 #[derive(Debug)]
 enum RuntimeMixerUpdateImportChoice {
+    Selected(PathBuf),
+    Cancelled,
+}
+
+#[derive(Debug)]
+enum RuntimeNativeDeviceUpdateImportChoice {
     Selected(PathBuf),
     Cancelled,
 }
@@ -589,6 +596,7 @@ fn bind_callbacks(
     bind_scene_performance_capture_callbacks(ui, worker);
     bind_runtime_scene_performance_import_callback(ui, worker);
     bind_runtime_mixer_update_import_callback(ui, worker);
+    bind_runtime_native_device_update_import_callback(ui, worker);
     bind_runtime_loop_update_import_callback(ui, worker, project_state);
     bind_audio_preview_callbacks(ui, worker, &routes.takes);
     bind_audio_import_callback(ui, worker, &routes.audio_imports);
@@ -1585,6 +1593,86 @@ fn bind_runtime_mixer_update_import_callback_with(
         }
         ui.set_app_mode(AppMode::ImportingRuntimeMixerUpdate);
         ui.set_status_text("Waiting for a Runtime mixer update…".into());
+        ui.set_error_text(SharedString::default());
+        choose(weak.clone(), Rc::clone(&worker));
+    });
+}
+
+fn bind_runtime_native_device_update_import_callback(ui: &MainWindow, worker: &WorkerCell) {
+    bind_runtime_native_device_update_import_callback_with(ui, worker, |weak, worker| {
+        let weak_for_dialog = weak.clone();
+        let spawn_result = slint::spawn_local(async move {
+            let selection = rfd::AsyncFileDialog::new()
+                .set_title("Import Runtime native-device update")
+                .add_filter(RUNTIME_NATIVE_DEVICE_UPDATE_IMPORT_FILTER_LABEL, &["json"])
+                .pick_file()
+                .await;
+            let Some(ui) = weak_for_dialog.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::ImportingRuntimeNativeDeviceUpdate {
+                return;
+            }
+            let choice = selection.map_or(
+                RuntimeNativeDeviceUpdateImportChoice::Cancelled,
+                |selection| {
+                    RuntimeNativeDeviceUpdateImportChoice::Selected(selection.path().to_path_buf())
+                },
+            );
+            complete_runtime_native_device_update_import_choice(&ui, &worker, choice);
+        });
+        if spawn_result.is_err()
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime native-device update selection is unavailable".into());
+        }
+    });
+}
+
+fn complete_runtime_native_device_update_import_choice(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    choice: RuntimeNativeDeviceUpdateImportChoice,
+) {
+    complete_runtime_native_device_update_import_choice_with(ui, choice, |command| {
+        submit_to_ui(ui, worker, command);
+    });
+}
+
+fn complete_runtime_native_device_update_import_choice_with(
+    ui: &MainWindow,
+    choice: RuntimeNativeDeviceUpdateImportChoice,
+    submit: impl FnOnce(IdeWorkerCommand),
+) {
+    match choice {
+        RuntimeNativeDeviceUpdateImportChoice::Selected(path) => {
+            submit(IdeWorkerCommand::ImportRuntimeNativeDeviceUpdate { path });
+        }
+        RuntimeNativeDeviceUpdateImportChoice::Cancelled => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime native-device update import cancelled".into());
+        }
+    }
+}
+
+fn bind_runtime_native_device_update_import_callback_with(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell) + 'static,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    actions.on_import_runtime_native_device_update(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        ui.set_app_mode(AppMode::ImportingRuntimeNativeDeviceUpdate);
+        ui.set_status_text("Waiting for a Runtime native-device update…".into());
         ui.set_error_text(SharedString::default());
         choose(weak.clone(), Rc::clone(&worker));
     });
@@ -6601,6 +6689,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
             AppMode::ImportingRuntimeScenePerformance
         }
         IdeWorkerCommandKind::ImportRuntimeMixerUpdate => AppMode::ImportingRuntimeMixerUpdate,
+        IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate => {
+            AppMode::ImportingRuntimeNativeDeviceUpdate
+        }
         IdeWorkerCommandKind::ImportRuntimeLoopUpdate => AppMode::ImportingRuntimeLoopUpdate,
         IdeWorkerCommandKind::SetArrangementPlacementActive
         | IdeWorkerCommandKind::MoveArrangementPlacement
@@ -6840,6 +6931,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::ImportRuntimeMixerUpdate => {
             "Verifying the Runtime mixer update and waiting for a clean committed mixer checkpoint…"
+        }
+        IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate => {
+            "Verifying the Runtime native-device update and reopening project after one device-chain edit…"
         }
         IdeWorkerCommandKind::ImportRuntimeLoopUpdate => {
             "Verifying the Runtime loop update and reopening project after one arrangement-loop edit…"
@@ -7646,6 +7740,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::RuntimeMixerUpdateImporting
         | IdeWorkerEvent::RuntimeMixerUpdateImported { .. }) => {
             apply_runtime_mixer_update_import_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::RuntimeNativeDeviceUpdateImporting
+        | IdeWorkerEvent::RuntimeNativeDeviceUpdateImported { .. }) => {
+            apply_runtime_native_device_update_import_event(ui, &event);
         }
         event @ (IdeWorkerEvent::RuntimeLoopUpdateImporting
         | IdeWorkerEvent::RuntimeLoopUpdateImported { .. }) => {
@@ -10840,6 +10938,34 @@ fn apply_runtime_mixer_update_import_event(ui: &MainWindow, event: &IdeWorkerEve
     }
 }
 
+fn apply_runtime_native_device_update_import_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::RuntimeNativeDeviceUpdateImporting => {
+            ui.set_app_mode(AppMode::ImportingRuntimeNativeDeviceUpdate);
+            ui.set_status_text(
+                "Verifying the Runtime native-device update and preparing one atomic device-chain edit…"
+                    .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RuntimeNativeDeviceUpdateImported { revision, changed } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(
+                if *changed {
+                    format!("Imported Runtime native-device update in project revision {revision}")
+                } else {
+                    format!(
+                        "Runtime native-device update already matches project revision {revision}; project unchanged"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("Runtime native-device update import dispatcher received another event"),
+    }
+}
+
 fn apply_runtime_loop_update_import_event(
     ui: &MainWindow,
     project_state: &ProjectUiStateCell,
@@ -11752,6 +11878,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::ImportRuntimeMixerUpdate
             if current == AppMode::ImportingRuntimeMixerUpdate =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate
+            if current == AppMode::ImportingRuntimeNativeDeviceUpdate =>
         {
             AppMode::Running
         }
@@ -26027,6 +26158,7 @@ mod tests {
         assert_audio_import_window_contract(ui);
         assert_runtime_scene_performance_import_window_contract(ui);
         assert_runtime_mixer_update_import_window_contract(ui);
+        assert_runtime_native_device_update_import_window_contract(ui);
         assert_runtime_loop_update_import_window_contract(ui);
         assert_audio_track_content_removal_window_contract(ui);
         assert_audio_track_freeze_window_contract(ui);
@@ -26152,6 +26284,11 @@ mod tests {
     fn assert_runtime_mixer_update_import_window_contract(ui: &MainWindow) {
         assert_runtime_mixer_update_import_callback_contract(ui);
         assert_runtime_mixer_update_import_event_contract(ui);
+    }
+
+    fn assert_runtime_native_device_update_import_window_contract(ui: &MainWindow) {
+        assert_runtime_native_device_update_import_callback_contract(ui);
+        assert_runtime_native_device_update_import_event_contract(ui);
     }
 
     fn assert_runtime_loop_update_import_window_contract(ui: &MainWindow) {
@@ -26438,6 +26575,159 @@ mod tests {
             mode_after_failure(
                 AppMode::ImportingRuntimeMixerUpdate,
                 IdeWorkerCommandKind::ImportRuntimeMixerUpdate,
+            ),
+            AppMode::Running
+        );
+    }
+
+    fn assert_runtime_native_device_update_import_callback_contract(ui: &MainWindow) {
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        bind_runtime_native_device_update_import_callback_with(ui, &worker, move |weak, _| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_native_device_update_import_choice_with(
+                &ui,
+                RuntimeNativeDeviceUpdateImportChoice::Selected(PathBuf::from(
+                    "devices.hyper-native-device-update.json",
+                )),
+                |command| submitted_by_callback.borrow_mut().push(command),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.set_error_text("stale error".into());
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_native_device_update();
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::ImportRuntimeNativeDeviceUpdate { path }]
+                if path == &PathBuf::from("devices.hyper-native-device-update.json")
+        ));
+        assert_eq!(
+            ui.get_app_mode(),
+            AppMode::ImportingRuntimeNativeDeviceUpdate
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::Closed);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_native_device_update();
+        assert_eq!(
+            submitted.borrow().len(),
+            1,
+            "Closed mode owns no Runtime native-device update import action"
+        );
+
+        bind_runtime_native_device_update_import_callback_with(ui, &worker, move |weak, _| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_native_device_update_import_choice_with(
+                &ui,
+                RuntimeNativeDeviceUpdateImportChoice::Cancelled,
+                |_| panic!("a cancelled chooser must not submit a command"),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_native_device_update();
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime native-device update import cancelled"
+        );
+
+        bind_runtime_native_device_update_import_callback_with(ui, &worker, move |weak, worker| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_native_device_update_import_choice(
+                &ui,
+                &worker,
+                RuntimeNativeDeviceUpdateImportChoice::Selected(PathBuf::from(
+                    "devices.hyper-native-device-update.json",
+                )),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_native_device_update();
+        assert_eq!(ui.get_app_mode(), AppMode::Unavailable);
+        assert!(ui.get_error_text().contains("no longer available"));
+    }
+
+    fn assert_runtime_native_device_update_import_event_contract(ui: &MainWindow) {
+        let routes = UiRoutes::default();
+        let project_state = Rc::new(ProjectUiState::default());
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeNativeDeviceUpdateImporting,
+        );
+        assert_eq!(
+            ui.get_app_mode(),
+            AppMode::ImportingRuntimeNativeDeviceUpdate
+        );
+        assert_eq!(
+            ui.get_status_text(),
+            "Verifying the Runtime native-device update and preparing one atomic device-chain edit…"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeNativeDeviceUpdateImported {
+                revision: 8,
+                changed: true,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Imported Runtime native-device update in project revision 8"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeNativeDeviceUpdateImported {
+                revision: 8,
+                changed: false,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime native-device update already matches project revision 8; project unchanged"
+        );
+
+        ui.set_app_mode(AppMode::ImportingRuntimeNativeDeviceUpdate);
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(Box::new(
+                    IdeRuntimeNativeDeviceUpdateImportError::ProjectIdentityMismatch,
+                )),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(ui.get_error_text().contains("another project"));
+
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
+            ),
+            AppMode::ImportingRuntimeNativeDeviceUpdate
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ImportingRuntimeNativeDeviceUpdate,
+                IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
             ),
             AppMode::Running
         );
