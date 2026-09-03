@@ -4,6 +4,7 @@
 
 mod loop_update;
 mod mixer_update;
+mod native_device_update;
 mod output;
 mod scene_performance;
 
@@ -52,6 +53,9 @@ use hyper_runtime_deployment::resolve_runtime_deployment;
 use hyper_runtime_host::{PanelHost, RuntimeArguments, ServedPanel, serve_panels_with_idle};
 use hyper_runtime_loop_update::{RuntimeLoopUpdateDirectory, RuntimeLoopUpdateSource};
 use hyper_runtime_mixer_update::{RuntimeMixerUpdateDirectory, RuntimeMixerUpdateSource};
+use hyper_runtime_native_device_update::{
+    RuntimeNativeDeviceUpdateDirectory, RuntimeNativeDeviceUpdateSource,
+};
 use hyper_scene_performance::{
     RuntimeScenePerformanceSource, RuntimeScenePerformanceUpdateDirectory, sha256_hex,
 };
@@ -64,6 +68,10 @@ use loop_update::{
 use mixer_update::{
     RuntimeMixerUpdateConfiguration, RuntimeMixerUpdateController, RuntimeMixerUpdateObservation,
     RuntimeMixerUpdatePoll,
+};
+use native_device_update::{
+    RuntimeNativeDeviceUpdateConfiguration, RuntimeNativeDeviceUpdateController,
+    RuntimeNativeDeviceUpdateObservation, RuntimeNativeDeviceUpdatePoll,
 };
 use output::{RuntimeOutputRoute, discover_runtime_output_targets, prepare_runtime_output};
 use scene_performance::{
@@ -95,6 +103,7 @@ const HEARTBEAT_TIMEOUT_MS: u32 = 500;
 struct SessionHost {
     session: DesktopPlaybackSession,
     mixer_update: RuntimeMixerUpdateController,
+    native_device_update: RuntimeNativeDeviceUpdateController,
     loop_update: RuntimeLoopUpdateController,
     scene_performance: RuntimeScenePerformanceCaptureController,
     panel_connected: Arc<AtomicBool>,
@@ -159,11 +168,11 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     match parse_runtime_invocation(std::env::args().skip(1)).map_err(|error| {
         format!(
-            "{error}\nusage:\n  hyper-runtime --list-audio-outputs\n  hyper-runtime <deployment-target-directory> [--audio-output ROUTING_ID] [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--mixer-updates DIRECTORY] [--loop-updates DIRECTORY] [--operator-ui]"
+            "{error}\nusage:\n  hyper-runtime --list-audio-outputs\n  hyper-runtime <deployment-target-directory> [--audio-output ROUTING_ID] [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--mixer-updates DIRECTORY] [--native-device-updates DIRECTORY] [--loop-updates DIRECTORY] [--operator-ui]"
         )
     })? {
         RuntimeInvocation::ListAudioOutputs => list_runtime_audio_outputs(),
-        RuntimeInvocation::Host(arguments) if arguments.operator_ui() => run_operator_ui(arguments),
+        RuntimeInvocation::Host(arguments) if arguments.operator_ui() => run_operator_ui(*arguments),
         RuntimeInvocation::Host(arguments) => run_headless(&arguments),
     }
 }
@@ -171,7 +180,7 @@ fn run() -> Result<(), String> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimeInvocation {
     ListAudioOutputs,
-    Host(RuntimeArguments),
+    Host(Box<RuntimeArguments>),
 }
 
 fn parse_runtime_invocation<I>(arguments: I) -> Result<RuntimeInvocation, String>
@@ -189,7 +198,7 @@ where
         return Err("--list-audio-outputs must be used by itself".to_owned());
     }
     RuntimeArguments::parse(arguments)
-        .map(RuntimeInvocation::Host)
+        .map(|arguments| RuntimeInvocation::Host(Box::new(arguments)))
         .map_err(|error| error.to_string())
 }
 
@@ -285,6 +294,7 @@ struct RuntimeObservers {
     recovery: PlaybackRecoveryCheckpoint,
     panel_connected: Arc<AtomicBool>,
     mixer_update: Arc<Mutex<RuntimeMixerUpdateObservation>>,
+    native_device_update: Arc<Mutex<RuntimeNativeDeviceUpdateObservation>>,
     loop_update: Arc<Mutex<RuntimeLoopUpdateObservation>>,
     scene_performance: Arc<Mutex<RuntimeScenePerformanceCaptureObservation>>,
 }
@@ -296,6 +306,7 @@ struct OperatorReady {
     mixer_channels: Vec<OperatorMixerChannel>,
     mixer_sends: Vec<OperatorMixerSend>,
     native_devices: Vec<OperatorNativeDevice>,
+    native_device_chains: Vec<OperatorNativeDeviceChain>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -328,6 +339,17 @@ struct OperatorNativeDevice {
     track_name: String,
     kind: String,
     handle: NativeDeviceHandle,
+}
+
+/// Display-only facts for one immutable native-device-chain export target.
+///
+/// The selection position is assigned by the verified Runtime catalog. It is
+/// deliberately not a device handle, track identity, or label supplied by the
+/// UI; each of those has different lifetime or uniqueness semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperatorNativeDeviceChain {
+    track_label: String,
+    device_count: i32,
 }
 
 struct OperatorWorker {
@@ -410,6 +432,7 @@ impl OperatorMeterObserver {
 struct StartedRuntime {
     host: SessionHost,
     observers: RuntimeObservers,
+    native_device_chains: Vec<OperatorNativeDeviceChain>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -417,6 +440,9 @@ enum OperatorCommand {
     Start,
     Stop,
     ExportMixerUpdate,
+    ExportNativeDeviceUpdate {
+        chain_index: usize,
+    },
     ExportLoopUpdate,
     StartScenePerformanceCapture,
     StopScenePerformanceCapture,
@@ -571,6 +597,14 @@ trait RuntimeMixerUpdateControl {
     fn poll_mixer_update_export(&mut self) -> Option<String>;
 }
 
+/// Native-device update export remains with the Runtime session that owns the
+/// audio-cycle recovery checkpoint.
+trait RuntimeNativeDeviceUpdateControl {
+    fn export_native_device_update(&mut self, chain_index: usize) -> Result<String, String>;
+
+    fn poll_native_device_update_export(&mut self) -> Option<String>;
+}
+
 /// Loop-update export remains with the same owner as live transport commands.
 trait RuntimeLoopUpdateControl {
     fn export_loop_update(&mut self) -> Result<String, String>;
@@ -692,6 +726,39 @@ impl RuntimeMixerUpdateControl for SessionHost {
     }
 }
 
+impl RuntimeNativeDeviceUpdateControl for SessionHost {
+    fn export_native_device_update(&mut self, chain_index: usize) -> Result<String, String> {
+        let update = &mut self.native_device_update;
+        let session = &mut self.session;
+        update.request_export(session, chain_index).map_or_else(
+            |error| Err(error.to_string()),
+            |fence_sequence| {
+                Ok(format!(
+                    "native-device update export queued at committed native-device fence {fence_sequence}"
+                ))
+            },
+        )
+    }
+
+    fn poll_native_device_update_export(&mut self) -> Option<String> {
+        let update = &mut self.native_device_update;
+        let session = &mut self.session;
+        match update.poll(session) {
+            Some(RuntimeNativeDeviceUpdatePoll::Saved(saved)) => Some(format!(
+                "native-device update published to {}",
+                saved.path.display()
+            )),
+            Some(RuntimeNativeDeviceUpdatePoll::NoChanges) => Some(
+                "native-device update not published: no committed native-device changes".to_owned(),
+            ),
+            Some(RuntimeNativeDeviceUpdatePoll::Failed(error)) => {
+                Some(format!("native-device update export failed: {error}"))
+            }
+            None => None,
+        }
+    }
+}
+
 impl RuntimeLoopUpdateControl for SessionHost {
     fn export_loop_update(&mut self) -> Result<String, String> {
         let update = &mut self.loop_update;
@@ -762,6 +829,8 @@ struct PreparedRuntimeStartup {
     facts: RuntimeFacts,
     project: PreparedProjectPlayback,
     mixer_update: RuntimeMixerUpdateConfiguration,
+    native_device_update: RuntimeNativeDeviceUpdateConfiguration,
+    native_device_chains: Vec<OperatorNativeDeviceChain>,
     loop_update: RuntimeLoopUpdateConfiguration,
     scene_performance: RuntimeScenePerformanceCaptureConfiguration,
 }
@@ -790,6 +859,35 @@ fn prepare_runtime_loop_update_configuration(
     })
 }
 
+/// Prepares immutable provenance and chain-selection facts before the native
+/// audio owner starts. Live state is intentionally absent here: it is read
+/// only after the controller's explicit native-device fence commits.
+fn prepare_runtime_native_device_update_configuration(
+    project: &PreparedProjectPlayback,
+    bundle_identity: &str,
+    deployment_generation: u64,
+    output_directory: Option<RuntimeNativeDeviceUpdateDirectory>,
+) -> Result<RuntimeNativeDeviceUpdateConfiguration, String> {
+    let manifest = project.package().manifest();
+    let source = RuntimeNativeDeviceUpdateSource::try_new(
+        manifest.project_id().to_owned(),
+        manifest.revision(),
+        sha256_hex(project.package().manifest_sha256()),
+        bundle_identity.to_owned(),
+        deployment_generation,
+    )
+    .map_err(|error| {
+        format!("verified Runtime native-device-update source could not be prepared: {error}")
+    })?;
+    RuntimeNativeDeviceUpdateConfiguration::try_new(source, project, output_directory).map_err(
+        |error| {
+            format!(
+                "verified Runtime native-device-update configuration could not be prepared: {error}"
+            )
+        },
+    )
+}
+
 fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRuntimeStartup, String> {
     let deployment = resolve_runtime_deployment(
         arguments.deployment_root(),
@@ -806,6 +904,7 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
     })?;
     let scene_performance_output = open_runtime_scene_performance_output(arguments)?;
     let mixer_update_output = open_runtime_mixer_update_output(arguments)?;
+    let native_device_update_output = open_runtime_native_device_update_output(arguments)?;
     let loop_update_output = open_runtime_loop_update_output(arguments)?;
     let prepared_project = deployment.bundle().project();
     let manifest = prepared_project.package().manifest();
@@ -855,6 +954,14 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
     .map_err(|error| {
         format!("verified Runtime mixer-update configuration could not be prepared: {error}")
     })?;
+    let native_device_update = prepare_runtime_native_device_update_configuration(
+        prepared_project,
+        &bundle_identity,
+        deployment.generation(),
+        native_device_update_output,
+    )?;
+    let native_device_chains =
+        operator_native_device_chain_catalog(prepared_project, &native_device_update)?;
     let loop_update = prepare_runtime_loop_update_configuration(
         prepared_project,
         &bundle_identity,
@@ -877,6 +984,8 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
         facts,
         project: deployment.into_bundle().into_project(),
         mixer_update,
+        native_device_update,
+        native_device_chains,
         loop_update,
         scene_performance,
     })
@@ -888,10 +997,13 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         session,
         mixer_update,
         mixer_update_observation,
+        native_device_update,
+        native_device_update_observation,
         loop_update,
         loop_update_observation,
         scene_performance,
         scene_performance_observation,
+        native_device_chains,
     ) = prepare_output_and_host(
         || prepare_runtime_startup(arguments),
         || {
@@ -915,6 +1027,8 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
             let scene_performance_observation = scene_performance.observation();
             let mixer_update = startup.mixer_update.attach();
             let mixer_update_observation = mixer_update.observation();
+            let native_device_update = startup.native_device_update.attach();
+            let native_device_update_observation = native_device_update.observation();
             let loop_update = startup.loop_update.attach();
             let loop_update_observation = loop_update.observation();
             Ok((
@@ -922,10 +1036,13 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
                 session,
                 mixer_update,
                 mixer_update_observation,
+                native_device_update,
+                native_device_update_observation,
                 loop_update,
                 loop_update_observation,
                 scene_performance,
                 scene_performance_observation,
+                startup.native_device_chains,
             ))
         },
     )?;
@@ -937,6 +1054,7 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         recovery: session.recovery_checkpoint(),
         panel_connected: Arc::clone(&panel_connected),
         mixer_update: mixer_update_observation,
+        native_device_update: native_device_update_observation,
         loop_update: loop_update_observation,
         scene_performance: scene_performance_observation,
     };
@@ -944,11 +1062,13 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         host: SessionHost {
             session,
             mixer_update,
+            native_device_update,
             loop_update,
             scene_performance,
             panel_connected,
         },
         observers,
+        native_device_chains,
     })
 }
 
@@ -1019,6 +1139,43 @@ fn open_runtime_mixer_update_output(
     if output_root.starts_with(&deployment_root) {
         return Err(format!(
             "mixer-update output directory {} must be outside deployment target {}",
+            output.root_path().display(),
+            arguments.deployment_root().display()
+        ));
+    }
+    Ok(Some(output))
+}
+
+/// Opens an explicit Runtime native-device-update directory only when it is
+/// outside the verified deployment tree. Native-device handback artifacts
+/// must never modify the hosted deployment or its embedded project package.
+fn open_runtime_native_device_update_output(
+    arguments: &RuntimeArguments,
+) -> Result<Option<RuntimeNativeDeviceUpdateDirectory>, String> {
+    let Some(path) = arguments.native_device_updates() else {
+        return Ok(None);
+    };
+    let output = RuntimeNativeDeviceUpdateDirectory::open(path).map_err(|error| {
+        format!(
+            "native-device-update output directory {} is invalid: {error}",
+            path.display()
+        )
+    })?;
+    let deployment_root = std::fs::canonicalize(arguments.deployment_root()).map_err(|error| {
+        format!(
+            "verified deployment root {} cannot be canonicalized for native-device-update output isolation: {error}",
+            arguments.deployment_root().display()
+        )
+    })?;
+    let output_root = std::fs::canonicalize(output.root_path()).map_err(|error| {
+        format!(
+            "native-device-update output directory {} cannot be canonicalized: {error}",
+            output.root_path().display()
+        )
+    })?;
+    if output_root.starts_with(&deployment_root) {
+        return Err(format!(
+            "native-device-update output directory {} must be outside deployment target {}",
             output.root_path().display(),
             arguments.deployment_root().display()
         ));
@@ -1108,6 +1265,7 @@ fn host_runtime<H, O>(
 where
     H: PanelHost
         + RuntimeMixerUpdateControl
+        + RuntimeNativeDeviceUpdateControl
         + RuntimeLoopUpdateControl
         + RuntimeOperatorControl
         + RuntimeScenePerformanceControl,
@@ -1125,6 +1283,9 @@ where
             diagnostic(message);
         }
         if let Some(message) = host.poll_mixer_update_export() {
+            diagnostic(message);
+        }
+        if let Some(message) = host.poll_native_device_update_export() {
             diagnostic(message);
         }
         if let Some(message) = host.poll_loop_update_export() {
@@ -1243,6 +1404,7 @@ fn finish_runtime_output<O: RuntimeOutputObservation>(
 fn drain_operator_commands<
     H: RuntimeLoopUpdateControl
         + RuntimeMixerUpdateControl
+        + RuntimeNativeDeviceUpdateControl
         + RuntimeOperatorControl
         + RuntimeScenePerformanceControl,
 >(
@@ -1273,6 +1435,14 @@ fn drain_operator_commands<
                 Ok(message) => diagnostic(message),
                 Err(error) => diagnostic(format!("mixer-update export refused: {error}")),
             },
+            OperatorCommand::ExportNativeDeviceUpdate { chain_index } => {
+                match host.export_native_device_update(chain_index) {
+                    Ok(message) => diagnostic(message),
+                    Err(error) => {
+                        diagnostic(format!("native-device update export refused: {error}"));
+                    }
+                }
+            }
             OperatorCommand::ExportLoopUpdate => match host.export_loop_update() {
                 Ok(message) => diagnostic(message),
                 Err(error) => diagnostic(format!("loop-update export refused: {error}")),
@@ -1661,6 +1831,48 @@ fn operator_native_device(device: DesktopNativeDevice<'_>) -> OperatorNativeDevi
     }
 }
 
+/// Builds the immutable operator catalog from verified project facts rather
+/// than from flattened session device handles. The resulting row position is
+/// the only selection value accepted by the Runtime controller.
+fn operator_native_device_chain_catalog(
+    project: &PreparedProjectPlayback,
+    configuration: &RuntimeNativeDeviceUpdateConfiguration,
+) -> Result<Vec<OperatorNativeDeviceChain>, String> {
+    let (loaded, mixer, ..) = project.session().parts();
+    let catalog = configuration.chain_catalog().map_err(|error| {
+        format!("verified native-device update catalog could not be prepared: {error}")
+    })?;
+    let mut chains = Vec::new();
+    chains
+        .try_reserve_exact(catalog.len())
+        .map_err(|_| "operator native-device chain catalog capacity is unavailable".to_owned())?;
+    for chain in catalog {
+        let compiled_slot = mixer.slots().get(chain.slot).ok_or_else(|| {
+            "verified native-device update catalog has an unavailable mixer slot".to_owned()
+        })?;
+        if compiled_slot.track_id() != chain.track_id {
+            return Err(
+                "verified native-device update catalog disagrees with the mixer track order"
+                    .to_owned(),
+            );
+        }
+        let track_name = loaded.track_name(&chain.track_id).ok_or_else(|| {
+            "verified native-device update catalog has an unavailable track name".to_owned()
+        })?;
+        let channel = chain.slot.checked_add(1).ok_or_else(|| {
+            "verified native-device update catalog has an invalid mixer channel number".to_owned()
+        })?;
+        let device_count = i32::try_from(chain.device_count).map_err(|_| {
+            "verified native-device update catalog has an invalid device count".to_owned()
+        })?;
+        chains.push(OperatorNativeDeviceChain {
+            track_label: format!("Channel {channel} · {track_name}"),
+            device_count,
+        });
+    }
+    Ok(chains)
+}
+
 fn build_operator_mixer_send_catalog(
     channels: &[OperatorMixerChannel],
     mut send_count: impl FnMut(usize) -> Option<usize>,
@@ -1750,6 +1962,7 @@ fn spawn_operator_worker(
     let handle = std::thread::spawn(move || {
         let result = match start_runtime(&arguments) {
             Ok(mut runtime) => {
+                let native_device_chains = runtime.native_device_chains.clone();
                 let ready_model =
                     operator_scene_catalog(&runtime.host.session).and_then(|scenes| {
                         operator_mixer_catalog(&runtime.host.session).and_then(|mixer_channels| {
@@ -1765,6 +1978,7 @@ fn spawn_operator_worker(
                                             mixer_channels,
                                             mixer_sends,
                                             native_devices,
+                                            native_device_chains,
                                         })
                                         .ok_or_else(|| {
                                             "operator output meter authority was already transferred"
@@ -1853,6 +2067,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         mixer_channels,
         mixer_sends,
         native_devices,
+        native_device_chains,
     } = ready;
     let meter_observer = Rc::new(RefCell::new(OperatorMeterObserver::new(
         meters,
@@ -1865,6 +2080,9 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let mixer_model = Rc::new(VecModel::from(operator_mixer_rows(&mixer_channels)));
     let mixer_send_model = Rc::new(VecModel::from(operator_mixer_send_rows(&mixer_sends)));
     let native_device_model = Rc::new(VecModel::from(operator_native_device_rows(&native_devices)));
+    let native_device_chain_model = Rc::new(VecModel::from(operator_native_device_chain_rows(
+        &native_device_chains,
+    )));
     let transport_authority = Rc::new(Cell::new(None));
     let loop_authority = Rc::new(Cell::new(None));
     let metronome_authority = Rc::new(Cell::new(None));
@@ -1881,6 +2099,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     ui.set_mixer_channels(ModelRc::from(Rc::clone(&mixer_model)));
     ui.set_mixer_sends(ModelRc::from(Rc::clone(&mixer_send_model)));
     ui.set_native_devices(ModelRc::from(Rc::clone(&native_device_model)));
+    ui.set_native_device_chains(ModelRc::from(Rc::clone(&native_device_chain_model)));
 
     apply_static_facts(&ui, &observers.facts);
     wire_operator_transport_controls(&ui, &commands_tx, &diagnostic, &transport_authority);
@@ -1896,6 +2115,13 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_loudness_controls(&ui, &commands_tx, &diagnostic, &loudness_authority);
     wire_operator_mixer_controls(&ui, &commands_tx, &diagnostic, &mixer_authority);
     wire_operator_mixer_update_export(&ui, &commands_tx, &diagnostic, &observers.mixer_update);
+    wire_operator_native_device_update_export(
+        &ui,
+        &commands_tx,
+        &diagnostic,
+        &native_device_chains,
+        &observers.native_device_update,
+    );
     wire_operator_loop_update_export(&ui, &commands_tx, &diagnostic, &observers.loop_update);
     wire_operator_native_device_controls(
         &ui,
@@ -1969,6 +2195,11 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     );
     apply_operator_scene_performance_observation(&ui, observers.scene_performance.as_ref(), false);
     apply_operator_mixer_update_observation(&ui, observers.mixer_update.as_ref(), false);
+    apply_operator_native_device_update_observation(
+        &ui,
+        observers.native_device_update.as_ref(),
+        false,
+    );
     apply_operator_loop_update_observation(&ui, observers.loop_update.as_ref(), false);
 
     let weak = ui.as_weak();
@@ -1992,6 +2223,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_native_device_authority = Rc::clone(&native_device_authority);
     let timer_scene_performance = Arc::clone(&observers.scene_performance);
     let timer_mixer_update = Arc::clone(&observers.mixer_update);
+    let timer_native_device_update = Arc::clone(&observers.native_device_update);
     let timer_loop_update = Arc::clone(&observers.loop_update);
     let timer_native_devices = native_devices;
     let timer_mixer_channels = mixer_channels;
@@ -2053,6 +2285,11 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
             apply_operator_mixer_update_observation(
                 &ui,
                 timer_mixer_update.as_ref(),
+                terminal_latched,
+            );
+            apply_operator_native_device_update_observation(
+                &ui,
+                timer_native_device_update.as_ref(),
                 terminal_latched,
             );
             apply_operator_loop_update_observation(
@@ -2838,6 +3075,60 @@ fn wire_operator_mixer_update_export(
             return;
         }
         send_operator_command(&sender, OperatorCommand::ExportMixerUpdate, &diagnostic);
+    });
+}
+
+/// Forwards one explicitly selected chain only when the Runtime-owned
+/// observation authorizes it. The UI retains no runtime handle or identity:
+/// the bounded row position is verified against its immutable startup catalog
+/// before the owner validates it again.
+fn wire_operator_native_device_update_export(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    chains: &[OperatorNativeDeviceChain],
+    observation: &Arc<Mutex<RuntimeNativeDeviceUpdateObservation>>,
+) {
+    let sender = sender.clone();
+    let diagnostic = Arc::clone(diagnostic);
+    let chains = chains.to_vec();
+    let observation = Arc::clone(observation);
+    let weak = ui.as_weak();
+    ui.on_export_native_device_update_requested(move |row| {
+        let Ok(chain_index) = usize::try_from(row) else {
+            set_diagnostic(
+                &diagnostic,
+                "native-device update export refused: selected chain is unavailable".to_owned(),
+            );
+            return;
+        };
+        if chains.get(chain_index).is_none() {
+            set_diagnostic(
+                &diagnostic,
+                "native-device update export refused: selected chain is unavailable".to_owned(),
+            );
+            return;
+        }
+        let export_enabled = weak
+            .upgrade()
+            .is_some_and(|ui| ui.get_native_device_update_export_enabled())
+            && observation
+                .lock()
+                .map(|observation| observation.export_enabled)
+                .unwrap_or(false);
+        if !export_enabled {
+            set_diagnostic(
+                &diagnostic,
+                "native-device update export refused: committed Runtime native-device state is unavailable"
+                    .to_owned(),
+            );
+            return;
+        }
+        send_operator_command(
+            &sender,
+            OperatorCommand::ExportNativeDeviceUpdate { chain_index },
+            &diagnostic,
+        );
     });
 }
 
@@ -4082,6 +4373,18 @@ fn operator_native_device_rows(devices: &[OperatorNativeDevice]) -> Vec<Operator
         .collect()
 }
 
+fn operator_native_device_chain_rows(
+    chains: &[OperatorNativeDeviceChain],
+) -> Vec<OperatorNativeDeviceChainRow> {
+    chains
+        .iter()
+        .map(|chain| OperatorNativeDeviceChainRow {
+            track_label: chain.track_label.clone().into(),
+            device_count: chain.device_count,
+        })
+        .collect()
+}
+
 fn native_device_authority(
     devices: &[OperatorNativeDevice],
     state: &NativeDeviceStateSnapshot,
@@ -4671,6 +4974,24 @@ fn apply_operator_mixer_update_observation(
     ui.set_mixer_update_export_enabled(observation.export_enabled);
 }
 
+fn apply_operator_native_device_update_observation(
+    ui: &OperatorWindow,
+    observation: &Mutex<RuntimeNativeDeviceUpdateObservation>,
+    terminal_latched: bool,
+) {
+    if terminal_latched {
+        revoke_operator_native_device_update_authority(ui);
+        return;
+    }
+    let Ok(observation) = observation.lock() else {
+        ui.set_native_device_update_state("Runtime native-device-update state unavailable".into());
+        ui.set_native_device_update_export_enabled(false);
+        return;
+    };
+    ui.set_native_device_update_state(observation.state.clone().into());
+    ui.set_native_device_update_export_enabled(observation.export_enabled);
+}
+
 fn apply_operator_loop_update_observation(
     ui: &OperatorWindow,
     observation: &Mutex<RuntimeLoopUpdateObservation>,
@@ -4692,6 +5013,11 @@ fn apply_operator_loop_update_observation(
 fn revoke_operator_mixer_update_authority(ui: &OperatorWindow) {
     ui.set_mixer_update_state("Runtime stopped · mixer update unavailable".into());
     ui.set_mixer_update_export_enabled(false);
+}
+
+fn revoke_operator_native_device_update_authority(ui: &OperatorWindow) {
+    ui.set_native_device_update_state("Runtime stopped · native-device update unavailable".into());
+    ui.set_native_device_update_export_enabled(false);
 }
 
 fn revoke_operator_loop_update_authority(ui: &OperatorWindow) {
@@ -5339,6 +5665,13 @@ mod tests {
         }))
     }
 
+    fn test_native_device_update_observation() -> Arc<Mutex<RuntimeNativeDeviceUpdateObservation>> {
+        Arc::new(Mutex::new(RuntimeNativeDeviceUpdateObservation {
+            state: "fixture native-device-update state".to_owned(),
+            export_enabled: false,
+        }))
+    }
+
     fn test_loop_update_observation() -> Arc<Mutex<RuntimeLoopUpdateObservation>> {
         Arc::new(Mutex::new(RuntimeLoopUpdateObservation {
             state: "fixture loop-update state".to_owned(),
@@ -5421,6 +5754,19 @@ mod tests {
         let mut arguments = Vec::new();
         if let Some(output) = output {
             arguments.push("--mixer-updates".to_owned());
+            arguments.push(output.display().to_string());
+        }
+        arguments.push(deployment.display().to_string());
+        RuntimeArguments::parse(arguments).expect("construct Runtime arguments")
+    }
+
+    fn runtime_arguments_with_native_device_update_output(
+        deployment: &Path,
+        output: Option<&Path>,
+    ) -> RuntimeArguments {
+        let mut arguments = Vec::new();
+        if let Some(output) = output {
+            arguments.push("--native-device-updates".to_owned());
             arguments.push(output.display().to_string());
         }
         arguments.push(deployment.display().to_string());
@@ -5901,6 +6247,50 @@ mod tests {
     }
 
     #[test]
+    fn native_device_update_output_is_explicit_and_outside_the_deployment_tree() {
+        let temporary = RuntimeTemporaryDirectory::new();
+        let deployment = temporary.child("deployment");
+        let output = temporary.child("native-device-updates");
+        fs::create_dir(&deployment).unwrap();
+        fs::create_dir(&output).unwrap();
+
+        let disabled = runtime_arguments_with_native_device_update_output(&deployment, None);
+        assert!(
+            open_runtime_native_device_update_output(&disabled)
+                .unwrap()
+                .is_none()
+        );
+
+        let arguments =
+            runtime_arguments_with_native_device_update_output(&deployment, Some(&output));
+        let retained = open_runtime_native_device_update_output(&arguments)
+            .unwrap()
+            .expect("the explicit external directory is retained");
+        assert_eq!(retained.root_path(), output);
+        assert!(retained.root_path().starts_with(temporary.path()));
+    }
+
+    #[test]
+    fn native_device_update_output_never_targets_the_deployment_tree() {
+        let temporary = RuntimeTemporaryDirectory::new();
+        let deployment = temporary.child("deployment");
+        let output = deployment.join("native-device-updates");
+        fs::create_dir(&deployment).unwrap();
+        fs::create_dir(&output).unwrap();
+        let arguments =
+            runtime_arguments_with_native_device_update_output(&deployment, Some(&output));
+
+        let Err(error) = open_runtime_native_device_update_output(&arguments) else {
+            panic!("a deployment child cannot be used for native-device updates");
+        };
+        assert!(
+            error.contains("must be outside deployment target"),
+            "{error}"
+        );
+        assert!(fs::read_dir(&output).unwrap().next().is_none());
+    }
+
+    #[test]
     fn loop_update_output_is_explicit_and_outside_the_deployment_tree() {
         let temporary = RuntimeTemporaryDirectory::new();
         let deployment = temporary.child("deployment");
@@ -6028,6 +6418,8 @@ mod tests {
         native_device_commands: Vec<NativeDeviceCommand>,
         mixer_update_commands: usize,
         mixer_update_poll: Option<String>,
+        native_device_update_commands: Vec<usize>,
+        native_device_update_poll: Option<String>,
         loop_update_commands: usize,
         loop_update_poll: Option<String>,
         scene_performance_commands: Vec<OperatorScenePerformanceAction>,
@@ -6118,6 +6510,21 @@ mod tests {
 
         fn poll_mixer_update_export(&mut self) -> Option<String> {
             self.mixer_update_poll.take()
+        }
+    }
+
+    impl RuntimeNativeDeviceUpdateControl for OperatorControl {
+        fn export_native_device_update(&mut self, chain_index: usize) -> Result<String, String> {
+            if self.reject {
+                Err("owner busy".to_owned())
+            } else {
+                self.native_device_update_commands.push(chain_index);
+                Ok("native-device update export queued".to_owned())
+            }
+        }
+
+        fn poll_native_device_update_export(&mut self) -> Option<String> {
+            self.native_device_update_poll.take()
         }
     }
 
@@ -6216,6 +6623,9 @@ mod tests {
             .send(OperatorCommand::StopScenePerformanceCapture)
             .unwrap();
         sender.send(OperatorCommand::ExportMixerUpdate).unwrap();
+        sender
+            .send(OperatorCommand::ExportNativeDeviceUpdate { chain_index: 0 })
+            .unwrap();
         sender.send(OperatorCommand::ExportLoopUpdate).unwrap();
         sender.send(OperatorCommand::ResetLoudness).unwrap();
         drain_operator_commands(&mut owner, &receiver, &stop, &|message| {
@@ -6255,6 +6665,7 @@ mod tests {
             ]
         );
         assert_eq!(owner.mixer_update_commands, 1);
+        assert_eq!(owner.native_device_update_commands, [0]);
         assert_eq!(owner.loop_update_commands, 1);
         assert_eq!(
             diagnostics.into_inner(),
@@ -6270,6 +6681,7 @@ mod tests {
                 "scene-performance capture started",
                 "scene-performance capture stop requested",
                 "mixer-update export queued",
+                "native-device update export queued",
                 "loop-update export queued",
                 "programme loudness reset queued",
             ]
@@ -6386,6 +6798,84 @@ mod tests {
         assert_eq!(
             diagnostic.lock().unwrap().as_str(),
             "mixer-update export refused: committed Runtime mixer state is unavailable"
+        );
+    }
+
+    #[test]
+    fn native_device_update_export_is_chain_bounded_and_recovery_gated() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = OperatorWindow::new().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let diagnostic = Arc::new(Mutex::new(String::new()));
+        let chains = vec![
+            OperatorNativeDeviceChain {
+                track_label: "Channel 1 · Filter bus".to_owned(),
+                device_count: 1,
+            },
+            OperatorNativeDeviceChain {
+                track_label: "Channel 3 · Master bus".to_owned(),
+                device_count: 2,
+            },
+        ];
+        let model = Rc::new(VecModel::from(operator_native_device_chain_rows(&chains)));
+        ui.set_native_device_chains(ModelRc::from(Rc::clone(&model)));
+        assert_eq!(
+            model.row_data(0).unwrap().track_label.as_str(),
+            "Channel 1 · Filter bus"
+        );
+        assert_eq!(model.row_data(1).unwrap().device_count, 2);
+
+        let observation = test_native_device_update_observation();
+        wire_operator_native_device_update_export(&ui, &sender, &diagnostic, &chains, &observation);
+        apply_operator_native_device_update_observation(&ui, observation.as_ref(), false);
+
+        ui.invoke_export_native_device_update_requested(0);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "native-device update export refused: committed Runtime native-device state is unavailable"
+        );
+
+        *observation.lock().unwrap() = RuntimeNativeDeviceUpdateObservation {
+            state: "Ready to export one committed native-device chain".to_owned(),
+            export_enabled: true,
+        };
+        apply_operator_native_device_update_observation(&ui, observation.as_ref(), false);
+        assert_eq!(
+            ui.get_native_device_update_state().as_str(),
+            "Ready to export one committed native-device chain"
+        );
+        assert!(ui.get_native_device_update_export_enabled());
+
+        ui.invoke_export_native_device_update_requested(-1);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "native-device update export refused: selected chain is unavailable"
+        );
+        ui.invoke_export_native_device_update_requested(2);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "native-device update export refused: selected chain is unavailable"
+        );
+
+        ui.invoke_export_native_device_update_requested(1);
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::ExportNativeDeviceUpdate { chain_index: 1 })
+        );
+        assert!(
+            ui.get_native_device_update_export_enabled(),
+            "the UI retains the committed presentation until Runtime publishes another one"
+        );
+
+        revoke_operator_native_device_update_authority(&ui);
+        ui.invoke_export_native_device_update_requested(0);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "native-device update export refused: committed Runtime native-device state is unavailable"
         );
     }
 
@@ -6707,6 +7197,7 @@ mod tests {
             recovery: PlaybackRecoveryCheckpoint::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
             mixer_update: test_mixer_update_observation(),
+            native_device_update: test_native_device_update_observation(),
             loop_update: test_loop_update_observation(),
             scene_performance: test_scene_performance_observation(),
         };
@@ -9336,6 +9827,7 @@ mod tests {
             recovery: recovery.clone(),
             panel_connected: Arc::new(AtomicBool::new(false)),
             mixer_update: test_mixer_update_observation(),
+            native_device_update: test_native_device_update_observation(),
             loop_update: test_loop_update_observation(),
             scene_performance: test_scene_performance_observation(),
         };
@@ -9446,6 +9938,7 @@ mod tests {
             recovery: PlaybackRecoveryCheckpoint::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
             mixer_update: test_mixer_update_observation(),
+            native_device_update: test_native_device_update_observation(),
             loop_update: test_loop_update_observation(),
             scene_performance: test_scene_performance_observation(),
         };
@@ -9695,6 +10188,7 @@ mod tests {
             recovery: terminal_recovery,
             panel_connected: Arc::new(AtomicBool::new(false)),
             mixer_update: test_mixer_update_observation(),
+            native_device_update: test_native_device_update_observation(),
             loop_update: test_loop_update_observation(),
             scene_performance: test_scene_performance_observation(),
         };

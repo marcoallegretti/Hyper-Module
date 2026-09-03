@@ -33,6 +33,7 @@ hyper-runtime-mixer-update = { path = "../../../crates/runtime-mixer-update" }
 hyper-runtime-loop-update = { path = "../../../crates/runtime-loop-update" }
 hyper-scene-performance = { path = "../../../crates/scene-performance" }
 hyper-storage-engine = { path = "../../../crates/storage-engine" }
+hyper-runtime-native-device-update = { path = "../../../crates/runtime-native-device-update" }
 slint = { version = "=1.17.1", default-features = false, features = [
     "accessibility",
     "backend-winit",

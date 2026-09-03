@@ -60,6 +60,11 @@ export struct OperatorNativeDeviceRow {
     compressor-makeup-decibels: float,
 }
 
+export struct OperatorNativeDeviceChainRow {
+    track-label: string,
+    device-count: int,
+}
+
 component FactCard inherits Rectangle {
     in property <string> label;
     in property <string> value;
@@ -596,7 +601,10 @@ export component OperatorWindow inherits Window {
     in property <[OperatorMixerRow]> mixer-channels;
     in property <[OperatorMixerSendRow]> mixer-sends;
     in property <[OperatorNativeDeviceRow]> native-devices;
+    in property <[OperatorNativeDeviceChainRow]> native-device-chains;
     in property <string> native-device-state: "No prepared native devices";
+    in property <string> native-device-update-state: "Native-device update unavailable";
+    in property <bool> native-device-update-export-enabled: false;
     in property <float> main-gain-percent: 0;
     in property <bool> main-muted: false;
     in property <bool> main-mute-enabled: false;
@@ -641,6 +649,7 @@ export component OperatorWindow inherits Window {
     callback set-native-compressor-attack-requested(int, float);
     callback set-native-compressor-release-requested(int, float);
     callback set-native-compressor-makeup-requested(int, float);
+    callback export-native-device-update-requested(int);
     callback set-mixer-send-gain-requested(int, float);
     callback set-mixer-send-pan-requested(int, float);
     callback set-main-gain-requested(float);
@@ -1137,6 +1146,53 @@ export component OperatorWindow inherits Window {
                                     Text { text: "MAKEUP " + Math.round(device.compressor-makeup-decibels * 10) / 10 + " dB"; color: #8d99ad; font-size: 9px; width: 94px; vertical-alignment: center; }
                                     CommittedSlider { width: 110px; minimum: -24; maximum: 24; step: 0.1; committed-value: device.compressor-makeup-decibels; enabled: device.controls-enabled; control-label: device.track-name + " compressor makeup decibels"; released(value) => { root.set-native-compressor-makeup-requested(index, value); } }
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.native-device-chains.length > 0 : Rectangle {
+            background: #171b24;
+            border-color: #2c3445;
+            border-width: 1px;
+            border-radius: 8px;
+            min-height: 118px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 7px;
+                HorizontalLayout {
+                    Text { text: "NATIVE-DEVICE UPDATE · COMMITTED STATE"; color: #8d99ad; font-size: 11px; font-weight: 700; }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: root.native-device-update-state; color: #8d99ad; font-size: 10px; overflow: elide; }
+                }
+                ListView {
+                    height: 72px;
+                    for chain[index] in root.native-device-chains : Rectangle {
+                        min-height: 32px;
+                        background: transparent;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: chain.track-label;
+                                color: #edf2f8;
+                                font-size: 11px;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: chain.device-count + " device" + (chain.device-count == 1 ? "" : "s");
+                                color: #8d99ad;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                            }
+                            Button {
+                                text: "Export update";
+                                accessible-label: "Export committed native-device state for " + chain.track-label;
+                                enabled: root.native-device-update-export-enabled;
+                                clicked => { root.export-native-device-update-requested(index); }
                             }
                         }
                     }

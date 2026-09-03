@@ -2476,6 +2476,7 @@ dependencies = [
  "hyper-runtime-host",
  "hyper-runtime-loop-update",
  "hyper-runtime-mixer-update",
+ "hyper-runtime-native-device-update",
  "hyper-scene-performance",
  "hyper-storage-engine",
  "i-slint-backend-testing",

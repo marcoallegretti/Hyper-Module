@@ -702,6 +702,10 @@ impl SessionControlHandles {
         self.runtime_mut().sink_mut().try_send_mixer_fence()
     }
 
+    fn try_send_native_device_fence(&mut self) -> Result<Option<u64>, DesktopDirectControlError> {
+        self.runtime_mut().sink_mut().try_send_native_device_fence()
+    }
+
     fn try_send_transport_fence(&mut self) -> Result<Option<u64>, DesktopDirectControlError> {
         self.runtime_mut().sink_mut().try_send_transport_fence()
     }
@@ -2143,6 +2147,22 @@ impl DesktopPlaybackSession {
     /// or a bounded-queue/disconnection rejection.
     pub fn try_send_mixer_fence(&mut self) -> Result<Option<u64>, DesktopDirectControlError> {
         self.controls.try_send_mixer_fence()
+    }
+
+    /// Allocates and enqueues a FIFO fence after all previously accepted
+    /// native-device commands. Its sequence reaches recovery only after a
+    /// successful process cycle, paired with the coherent native-device state
+    /// that the cycle committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ok(None)` only after the nonzero sequence space is exhausted,
+    /// or a bounded-queue/disconnection rejection. It also refuses sessions
+    /// whose prepared graph has no native-device command authority.
+    pub fn try_send_native_device_fence(
+        &mut self,
+    ) -> Result<Option<u64>, DesktopDirectControlError> {
+        self.controls.try_send_native_device_fence()
     }
 
     /// Allocates and enqueues a FIFO fence after all previously accepted
@@ -3645,6 +3665,42 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn native_device_fence_is_explicit_and_requires_native_authority() {
+        let input = live_session_input();
+        let (project, mixer, _, media) = input.parts();
+        let facts = collect_media_asset_facts(media).unwrap();
+        let graph = project
+            .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+            .unwrap();
+        let prepared = media.prepare_playback(&graph).unwrap();
+        let runtime =
+            RoutedMainRuntime::try_new_prepared_playback_with_devices(&prepared, mixer, &[], 64)
+                .unwrap();
+        let (transport, mixer, native_devices, _runtime) =
+            RoutedTransportRuntime::with_command_queues_and_native_device_commands(runtime);
+        let (_publisher, recovery) = playback_recovery_channel(None, None);
+        let mut controls =
+            build_session_controls(transport, mixer, Some(native_devices), recovery, None).unwrap();
+        assert_eq!(controls.try_send_native_device_fence().unwrap(), Some(1));
+
+        let input = live_session_input();
+        let (project, mixer, _, media) = input.parts();
+        let facts = collect_media_asset_facts(media).unwrap();
+        let graph = project
+            .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+            .unwrap();
+        let prepared = media.prepare_playback(&graph).unwrap();
+        let runtime = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
+        let (transport, mixer, _runtime) = RoutedTransportRuntime::with_command_queues(runtime);
+        let (_publisher, recovery) = playback_recovery_channel(None, None);
+        let mut controls = build_session_controls(transport, mixer, None, recovery, None).unwrap();
+        assert!(matches!(
+            controls.try_send_native_device_fence(),
+            Err(DesktopDirectControlError::NativeDeviceUnavailable)
+        ));
     }
 
     #[test]

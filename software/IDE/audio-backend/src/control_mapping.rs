@@ -247,6 +247,16 @@ impl DesktopControlSink {
             .map_err(DesktopDirectControlError::Mixer)
     }
 
+    pub(crate) fn try_send_native_device_fence(
+        &mut self,
+    ) -> Result<Option<u64>, DesktopDirectControlError> {
+        self.native_devices
+            .as_mut()
+            .ok_or(DesktopDirectControlError::NativeDeviceUnavailable)?
+            .try_send_fence()
+            .map_err(DesktopDirectControlError::NativeDevice)
+    }
+
     pub(crate) fn try_send_transport_fence(
         &mut self,
     ) -> Result<Option<u64>, DesktopDirectControlError> {

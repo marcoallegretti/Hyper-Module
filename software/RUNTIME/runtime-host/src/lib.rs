@@ -83,6 +83,7 @@ pub struct RuntimeArguments {
     performance_updates: Option<PathBuf>,
     mixer_updates: Option<PathBuf>,
     loop_updates: Option<PathBuf>,
+    native_device_updates: Option<PathBuf>,
     audio_output: Option<String>,
     operator_ui: bool,
 }
@@ -133,6 +134,7 @@ impl RuntimeArguments {
         let mut performance_updates = None;
         let mut mixer_updates = None;
         let mut loop_updates = None;
+        let mut native_device_updates = None;
         let mut audio_output = None;
         let mut operator_ui = false;
         let mut arguments = arguments.into_iter();
@@ -184,6 +186,15 @@ impl RuntimeArguments {
                         .ok_or(ArgumentError::MissingValue("--loop-updates"))?;
                     loop_updates = Some(PathBuf::from(value));
                 }
+                "--native-device-updates" => {
+                    if native_device_updates.is_some() {
+                        return Err(ArgumentError::Repeated("--native-device-updates"));
+                    }
+                    let value = arguments
+                        .next()
+                        .ok_or(ArgumentError::MissingValue("--native-device-updates"))?;
+                    native_device_updates = Some(PathBuf::from(value));
+                }
                 "--audio-output" => {
                     if audio_output.is_some() {
                         return Err(ArgumentError::Repeated("--audio-output"));
@@ -211,6 +222,7 @@ impl RuntimeArguments {
             performance_updates,
             mixer_updates,
             loop_updates,
+            native_device_updates,
             audio_output,
             operator_ui,
         })
@@ -244,6 +256,12 @@ impl RuntimeArguments {
         self.loop_updates.as_deref()
     }
 
+    /// Returns the explicit Runtime native-device-update directory, when enabled.
+    #[must_use]
+    pub fn native_device_updates(&self) -> Option<&Path> {
+        self.native_device_updates.as_deref()
+    }
+
     /// Returns the opaque desktop output routing identity requested for this
     /// Runtime launch, if one was explicitly selected.
     #[must_use]
@@ -270,6 +288,8 @@ mod argument_tests {
             "mixer-updates".to_owned(),
             "--loop-updates".to_owned(),
             "loop-updates".to_owned(),
+            "--native-device-updates".to_owned(),
+            "native-device-updates".to_owned(),
             "--audio-output".to_owned(),
             "studio-right".to_owned(),
             "deployment".to_owned(),
@@ -283,6 +303,10 @@ mod argument_tests {
         );
         assert_eq!(arguments.mixer_updates(), Some(Path::new("mixer-updates")));
         assert_eq!(arguments.loop_updates(), Some(Path::new("loop-updates")));
+        assert_eq!(
+            arguments.native_device_updates(),
+            Some(Path::new("native-device-updates"))
+        );
         assert_eq!(arguments.audio_output(), Some("studio-right"));
     }
 
@@ -320,6 +344,20 @@ mod argument_tests {
         assert_eq!(
             RuntimeArguments::parse(["--loop-updates".to_owned()]),
             Err(ArgumentError::MissingValue("--loop-updates"))
+        );
+        assert_eq!(
+            RuntimeArguments::parse([
+                "--native-device-updates".to_owned(),
+                "first".to_owned(),
+                "--native-device-updates".to_owned(),
+                "second".to_owned(),
+                "deployment".to_owned(),
+            ]),
+            Err(ArgumentError::Repeated("--native-device-updates"))
+        );
+        assert_eq!(
+            RuntimeArguments::parse(["--native-device-updates".to_owned()]),
+            Err(ArgumentError::MissingValue("--native-device-updates"))
         );
         assert_eq!(
             RuntimeArguments::parse([
