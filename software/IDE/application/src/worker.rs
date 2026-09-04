@@ -2890,6 +2890,30 @@ pub enum IdeRuntimeRecordingUpdateImportError {
     },
 }
 
+impl IdeRuntimeRecordingUpdateImportError {
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        match self {
+            Self::Storage(source) => source.published(),
+            Self::ReopenAfterPreparation { preparation, .. } => preparation.publication_committed(),
+            Self::ImportedButReopenFailed { .. } => true,
+            Self::ImportAndReopen { import, .. } => import.published(),
+            Self::ProjectSnapshotUnavailable
+            | Self::Artifact(_)
+            | Self::ProjectIdentityMismatch
+            | Self::ProjectRevisionMismatch { .. }
+            | Self::ProjectManifestMismatch
+            | Self::RecordingTrackUnavailable
+            | Self::RecordingTrackNotAudio
+            | Self::RecordingSampleRateMismatch { .. }
+            | Self::RecordingInputUnavailable { .. }
+            | Self::MixerSave(_)
+            | Self::NativeClose(_)
+            | Self::NativeCloseAndReopen { .. } => false,
+        }
+    }
+}
+
 impl fmt::Display for IdeRuntimeRecordingUpdateImportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -4118,6 +4142,9 @@ pub enum IdeWorkerEvent {
     Recording(IdeRecordingState),
     RecordingFinalizing,
     RecordingImported(IdeRecordingImportOutcome),
+    RecordingImportCommittedWithWarning {
+        warning: Box<IdeRecordingError>,
+    },
     RecordingAborted(IdeRecordingAbortOutcome),
     RuntimeScenePerformanceImporting {
         launch_count: usize,
@@ -4142,6 +4169,9 @@ pub enum IdeWorkerEvent {
     RuntimeRecordingUpdateImporting,
     RuntimeRecordingUpdateImported {
         revision: u64,
+    },
+    RuntimeRecordingUpdateImportCommittedWithWarning {
+        warning: Box<IdeRuntimeRecordingUpdateImportError>,
     },
     RuntimeLoopUpdateImporting,
     RuntimeLoopUpdateImported {
@@ -6943,11 +6973,25 @@ fn publish_runtime_recording_update_import_failure(
     events: &SyncSender<IdeWorkerEvent>,
     reason: IdeRuntimeRecordingUpdateImportError,
 ) -> bool {
-    publish_failure(
+    send_event(
         events,
-        IdeWorkerCommandKind::ImportRuntimeRecordingUpdate,
-        IdeWorkerCommandFailure::RuntimeRecordingUpdateImport(Box::new(reason)),
+        runtime_recording_update_import_failure_event(reason),
     )
+}
+
+fn runtime_recording_update_import_failure_event(
+    reason: IdeRuntimeRecordingUpdateImportError,
+) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::RuntimeRecordingUpdateImportCommittedWithWarning {
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::ImportRuntimeRecordingUpdate,
+            reason: IdeWorkerCommandFailure::RuntimeRecordingUpdateImport(Box::new(reason)),
+        }
+    }
 }
 
 fn runtime_native_device_update_import_failure_event(
@@ -9337,17 +9381,19 @@ fn begin_recording_close(
             let observed_frame = target.observed_frame();
             reopen_after_recording_failure(
                 state,
-                application,
-                target.project_path(),
-                observed_frame,
-                failure.map_or(
-                    IdeRecordingError::Preparation(
-                        super::IdeRecordingPreparationError::ProjectSnapshotUnavailable,
+                RecordingFailureReopenRequest::new(
+                    application,
+                    target.project_path(),
+                    observed_frame,
+                    failure.map_or(
+                        IdeRecordingError::Preparation(
+                            super::IdeRecordingPreparationError::ProjectSnapshotUnavailable,
+                        ),
+                        IdeRecordingError::NativeClose,
                     ),
-                    IdeRecordingError::NativeClose,
+                    IdeWorkerCommandKind::StartRecording,
                 ),
                 events,
-                IdeWorkerCommandKind::StartRecording,
             )
         }
     }
@@ -9367,12 +9413,14 @@ fn complete_recording_start(
         drop(recovery);
         return reopen_after_recording_failure(
             state,
-            application,
-            &project_path,
-            start_frame,
-            IdeRecordingError::NativeClose(failure),
+            RecordingFailureReopenRequest::new(
+                application,
+                &project_path,
+                start_frame,
+                IdeRecordingError::NativeClose(failure),
+                IdeWorkerCommandKind::StartRecording,
+            ),
             events,
-            IdeWorkerCommandKind::StartRecording,
         );
     }
     let plan = match IdeRecordingPlan::prepare(target, &recovery) {
@@ -9381,12 +9429,14 @@ fn complete_recording_start(
             drop(recovery);
             return reopen_after_recording_failure(
                 state,
-                application,
-                &project_path,
-                start_frame,
-                IdeRecordingError::Preparation(source),
+                RecordingFailureReopenRequest::new(
+                    application,
+                    &project_path,
+                    start_frame,
+                    IdeRecordingError::Preparation(source),
+                    IdeWorkerCommandKind::StartRecording,
+                ),
                 events,
-                IdeWorkerCommandKind::StartRecording,
             );
         }
     };
@@ -9399,12 +9449,14 @@ fn complete_recording_start(
     if let Err(source) = publication {
         return reopen_after_recording_failure(
             state,
-            application,
-            &project_path,
-            start_frame,
-            IdeRecordingError::MixerSave(Box::new(source)),
+            RecordingFailureReopenRequest::new(
+                application,
+                &project_path,
+                start_frame,
+                IdeRecordingError::MixerSave(Box::new(source)),
+                IdeWorkerCommandKind::StartRecording,
+            ),
             events,
-            IdeWorkerCommandKind::StartRecording,
         );
     }
     match application.start_recording(plan) {
@@ -9422,12 +9474,14 @@ fn complete_recording_start(
             } = *failure;
             reopen_after_recording_failure(
                 state,
-                application,
-                &project_path,
-                start_frame,
-                IdeRecordingError::Start(Box::new(reason)),
+                RecordingFailureReopenRequest::new(
+                    application,
+                    &project_path,
+                    start_frame,
+                    IdeRecordingError::Start(Box::new(reason)),
+                    IdeWorkerCommandKind::StartRecording,
+                ),
                 events,
-                IdeWorkerCommandKind::StartRecording,
             )
         }
     }
@@ -9462,12 +9516,15 @@ fn finalize_recording(
             } = *failure;
             reopen_after_recording_failure(
                 state,
-                application,
-                &project_path,
-                start_frame,
-                IdeRecordingError::Finalize(Box::new(reason)),
+                RecordingFailureReopenRequest::new(
+                    application,
+                    &project_path,
+                    start_frame,
+                    IdeRecordingError::Finalize(Box::new(reason)),
+                    IdeWorkerCommandKind::StopRecording,
+                )
+                .with_history(history),
                 events,
-                IdeWorkerCommandKind::StopRecording,
             )
         }
     }
@@ -9498,26 +9555,69 @@ fn abort_recording(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>)
             } = *failure;
             reopen_after_recording_failure(
                 state,
-                application,
-                &project_path,
-                start_frame,
-                IdeRecordingError::Abort(Box::new(reason)),
+                RecordingFailureReopenRequest::new(
+                    application,
+                    &project_path,
+                    start_frame,
+                    IdeRecordingError::Abort(Box::new(reason)),
+                    IdeWorkerCommandKind::AbortRecording,
+                ),
                 events,
-                IdeWorkerCommandKind::AbortRecording,
             )
         }
     }
 }
 
-fn reopen_after_recording_failure(
-    state: &mut WorkerState,
+struct RecordingFailureReopenRequest<'a> {
     application: DesktopIdeApplication,
-    project_path: &std::path::Path,
+    project_path: &'a Path,
     start_frame: usize,
     operation: IdeRecordingError,
-    events: &SyncSender<IdeWorkerEvent>,
     command: IdeWorkerCommandKind,
+    history: Option<&'a mut UndoHistory>,
+}
+
+impl<'a> RecordingFailureReopenRequest<'a> {
+    fn new(
+        application: DesktopIdeApplication,
+        project_path: &'a Path,
+        start_frame: usize,
+        operation: IdeRecordingError,
+        command: IdeWorkerCommandKind,
+    ) -> Self {
+        Self {
+            application,
+            project_path,
+            start_frame,
+            operation,
+            command,
+            history: None,
+        }
+    }
+
+    fn with_history(mut self, history: &'a mut UndoHistory) -> Self {
+        self.history = Some(history);
+        self
+    }
+}
+
+fn reopen_after_recording_failure(
+    state: &mut WorkerState,
+    request: RecordingFailureReopenRequest<'_>,
+    events: &SyncSender<IdeWorkerEvent>,
 ) -> bool {
+    let RecordingFailureReopenRequest {
+        application,
+        project_path,
+        start_frame,
+        operation,
+        command,
+        mut history,
+    } = request;
+    let history_changed = match history.as_deref_mut() {
+        Some(history) if operation.publication_committed() => history.clear(),
+        Some(_) | None => false,
+    };
     match application.open_project(project_path) {
         Ok(mut running) => {
             let restore = running.try_send_transport(TransportCommand::Locate {
@@ -9527,6 +9627,17 @@ fn reopen_after_recording_failure(
             *state = WorkerState::Running(running);
             let mut no_native_failure = None;
             if !publish_state(state, events, &mut no_native_failure) {
+                return false;
+            }
+            if history_changed
+                && !send_event(
+                    events,
+                    history
+                        .as_deref()
+                        .expect("committed recording failure retains history")
+                        .state_event(),
+                )
+            {
                 return false;
             }
             let reason = match restore {
@@ -9543,6 +9654,17 @@ fn reopen_after_recording_failure(
             *state = WorkerState::Closed(application);
             let mut no_native_failure = None;
             if !publish_state(state, events, &mut no_native_failure) {
+                return false;
+            }
+            if history_changed
+                && !send_event(
+                    events,
+                    history
+                        .as_deref()
+                        .expect("committed recording failure retains history")
+                        .state_event(),
+                )
+            {
                 return false;
             }
             publish_recording_failure(
@@ -16046,14 +16168,28 @@ fn complete_project_mutation(
             if !publish_state(state, events, &mut no_native_failure) {
                 return false;
             }
-            let reason = project_mutation_reopen_failure(attempt, reopen);
-            match reason {
-                IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(reason) => {
-                    publish_runtime_native_device_update_import_failure(events, *reason)
-                }
-                reason => publish_failure(events, command, reason),
-            }
+            publish_project_mutation_reopen_failure(
+                events,
+                command,
+                project_mutation_reopen_failure(attempt, reopen),
+            )
         }
+    }
+}
+
+fn publish_project_mutation_reopen_failure(
+    events: &SyncSender<IdeWorkerEvent>,
+    command: IdeWorkerCommandKind,
+    reason: IdeWorkerCommandFailure,
+) -> bool {
+    match reason {
+        IdeWorkerCommandFailure::RuntimeNativeDeviceUpdateImport(reason) => {
+            publish_runtime_native_device_update_import_failure(events, *reason)
+        }
+        IdeWorkerCommandFailure::RuntimeRecordingUpdateImport(reason) => {
+            publish_runtime_recording_update_import_failure(events, *reason)
+        }
+        reason => publish_failure(events, command, reason),
     }
 }
 
@@ -16249,6 +16385,13 @@ fn import_runtime_recording_update_after_close(
     let prepared = recovery
         .prepared_project()
         .ok_or(IdeRuntimeRecordingUpdateImportError::ProjectSnapshotUnavailable)?;
+    import_runtime_recording_update_from_prepared(prepared, update)
+}
+
+fn import_runtime_recording_update_from_prepared(
+    prepared: &hyper_project_loader::PreparedProjectPlayback,
+    update: &RuntimeRecordingUpdate,
+) -> Result<RecordingImportOutcome, IdeRuntimeRecordingUpdateImportError> {
     let package = prepared.package();
     validate_runtime_recording_update_source(
         update,
@@ -20928,7 +21071,17 @@ fn publish_recording_failure(
     command: IdeWorkerCommandKind,
     reason: IdeRecordingError,
 ) -> bool {
-    publish_failure(events, command, IdeWorkerCommandFailure::Recording(reason))
+    let event = if reason.publication_committed() {
+        IdeWorkerEvent::RecordingImportCommittedWithWarning {
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command,
+            reason: IdeWorkerCommandFailure::Recording(reason),
+        }
+    };
+    send_event(events, event)
 }
 
 fn send_event(events: &SyncSender<IdeWorkerEvent>, event: IdeWorkerEvent) -> bool {
@@ -22539,6 +22692,47 @@ mod tests {
             &[0, 1],
             3,
         );
+        let invalid_handoff_path = publish_runtime_recording_update_for_test(
+            &updates,
+            &project,
+            &recording_path,
+            &recording_bytes,
+            &track_id,
+            &[0, 1],
+            3,
+        );
+        let mut invalid_handoff: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&invalid_handoff_path).unwrap()).unwrap();
+        invalid_handoff["handoff"]["recording"]["byte_length"] = serde_json::json!(0);
+        std::fs::write(
+            &invalid_handoff_path,
+            serde_json_canonicalizer::to_vec(&invalid_handoff).unwrap(),
+        )
+        .unwrap();
+
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeRecordingUpdate {
+                path: invalid_handoff_path,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeRecordingUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeRecordingUpdateImport(reason),
+            } if matches!(reason.as_ref(), IdeRuntimeRecordingUpdateImportError::Artifact(_))
+        ));
+        let rejected_handoff = verify_project_package(&project).unwrap();
+        assert_eq!(rejected_handoff.manifest().revision(), source_revision);
+        assert!(rejected_handoff.manifest().assets().is_empty());
+        assert!(
+            rejected_handoff
+                .manifest()
+                .resources()
+                .iter()
+                .all(|resource| resource.role() != ResourceRole::RecordingMetadata)
+        );
+        drop(rejected_handoff);
 
         worker
             .try_send(IdeWorkerCommand::ImportRuntimeRecordingUpdate {
@@ -22632,6 +22826,184 @@ mod tests {
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn runtime_recording_update_refuses_recovered_project_drift_before_storage_import() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-runtime-recording-update-recovery-drift-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let (project, update, source_revision, asset_count, recording_metadata_count) =
+            preflight_runtime_recording_update_for_recovery_drift(&fixture);
+        publish_runtime_recording_project_drift(&project, source_revision);
+
+        let recovered = hyper_project_loader::prepare_project_playback(
+            &project,
+            audio_import_application().config.project_limits,
+        )
+        .unwrap();
+        let error = import_runtime_recording_update_from_prepared(&recovered, &update).unwrap_err();
+        assert!(matches!(
+            error,
+            IdeRuntimeRecordingUpdateImportError::ProjectRevisionMismatch {
+                update_revision,
+                project_revision,
+            } if update_revision == source_revision && project_revision == source_revision + 1
+        ));
+        drop(recovered);
+
+        let unchanged = verify_project_package(&project).unwrap();
+        assert_eq!(unchanged.manifest().revision(), source_revision + 1);
+        assert_eq!(unchanged.manifest().assets().len(), asset_count);
+        assert_eq!(
+            unchanged
+                .manifest()
+                .resources()
+                .iter()
+                .filter(|resource| resource.role() == ResourceRole::RecordingMetadata)
+                .count(),
+            recording_metadata_count
+        );
+        drop(unchanged);
+
+        let recovered = hyper_project_loader::prepare_project_playback(
+            &project,
+            audio_import_application().config.project_limits,
+        )
+        .unwrap();
+        let attempt = ProjectMutationAttempt::ImportRuntimeRecordingUpdate(Err(
+            import_runtime_recording_update_from_prepared(&recovered, &update).unwrap_err(),
+        ));
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut history = UndoHistory::default();
+        history.record_edit(labelled("scene", "scene rename"));
+        history.record_restore(false, labelled("undone", "clip gain"));
+        observe_history(
+            &mut history,
+            &attempt,
+            IdeWorkerCommandKind::ImportRuntimeRecordingUpdate,
+            &events,
+        );
+        assert!(history.undo.is_empty() && history.redo.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            })
+        ));
+        drop(recovered);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    fn preflight_runtime_recording_update_for_recovery_drift(
+        fixture: &Path,
+    ) -> (PathBuf, RuntimeRecordingUpdate, u64, usize, usize) {
+        let created = create_project_package(
+            fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+
+        // P0 is independently loaded authority against which the external
+        // Runtime update is preflighted before the test publishes P1.
+        let preflight = hyper_project_loader::prepare_project_playback(
+            &project,
+            audio_import_application().config.project_limits,
+        )
+        .unwrap();
+        let track_id = {
+            let (loaded, mixer, _, _) = preflight.session().parts();
+            mixer
+                .slots()
+                .iter()
+                .find_map(|slot| {
+                    loaded
+                        .is_audio_track(slot.track_id())
+                        .then(|| slot.track_id().to_owned())
+                })
+                .expect("the fixture project exposes one audio recording track")
+        };
+        let recording_bytes = pcm16_wav(2, 48_000, &[100, -100, 200, -200]);
+        let recording_path = fixture.join("recovery-drift-recording.wav");
+        std::fs::write(&recording_path, &recording_bytes).unwrap();
+        let updates = fixture.join("updates");
+        std::fs::create_dir(&updates).unwrap();
+        let update_path = publish_runtime_recording_update_for_test(
+            &updates,
+            &project,
+            &recording_path,
+            &recording_bytes,
+            &track_id,
+            &[0, 1],
+            2,
+        );
+        let update = read_runtime_recording_update(&update_path).unwrap();
+        let (source_revision, asset_count, recording_metadata_count) = {
+            let package = preflight.package();
+            validate_runtime_recording_update_source(
+                &update,
+                package.manifest().project_id(),
+                package.manifest().revision(),
+                package.manifest_sha256(),
+            )
+            .unwrap();
+            let (loaded, _, _, _) = preflight.session().parts();
+            validate_runtime_recording_update_binding(
+                &update,
+                package.manifest().sample_rate_hz(),
+                package.manifest().required_capabilities().audio_inputs(),
+                loaded,
+            )
+            .unwrap();
+            (
+                package.manifest().revision(),
+                package.manifest().assets().len(),
+                package
+                    .manifest()
+                    .resources()
+                    .iter()
+                    .filter(|resource| resource.role() == ResourceRole::RecordingMetadata)
+                    .count(),
+            )
+        };
+        drop(preflight);
+        (
+            project,
+            update,
+            source_revision,
+            asset_count,
+            recording_metadata_count,
+        )
+    }
+
+    fn publish_runtime_recording_project_drift(project: &Path, source_revision: u64) {
+        let (mixer_id, original_mixer) = project_mixer_bytes(project);
+        let original_mixer = String::from_utf8(original_mixer).unwrap();
+        let replacement_mixer =
+            original_mixer.replace("\"gain_millionths\":1000000", "\"gain_millionths\":500000");
+        assert_ne!(replacement_mixer, original_mixer);
+        let before_drift = verify_project_package(project).unwrap();
+        let expected_identity = *before_drift.manifest_sha256();
+        drop(before_drift);
+        let drifted = publish_project_resource(
+            project,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: expected_identity,
+                resource_id: &mixer_id,
+                expected_role: ResourceRole::Mixer,
+                resource_bytes: replacement_mixer.as_bytes(),
+            },
+        )
+        .unwrap();
+        assert_eq!(drifted.project_revision(), source_revision + 1);
     }
 
     fn capture_scene(id: &str, grid_quantized: bool) -> ScenePerformanceScene {
@@ -33501,6 +33873,97 @@ mod tests {
                 command: IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn committed_runtime_recording_update_warning_invalidates_history_and_stays_truthful() {
+        let committed_warning = || {
+            IdeRuntimeRecordingUpdateImportError::Storage(Box::new(RecordingImportError::for_test(
+                "simulated recording cleanup warning",
+                true,
+            )))
+        };
+        let attempt =
+            ProjectMutationAttempt::ImportRuntimeRecordingUpdate(Err(committed_warning()));
+        assert!(matches!(
+            history_effect(&attempt),
+            HistoryEffect::Invalidate
+        ));
+
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut history = UndoHistory::default();
+        history.record_edit(labelled("scene", "scene rename"));
+        history.record_restore(false, labelled("undone", "clip gain"));
+        observe_history(
+            &mut history,
+            &attempt,
+            IdeWorkerCommandKind::ImportRuntimeRecordingUpdate,
+            &events,
+        );
+        assert!(history.undo.is_empty() && history.redo.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            })
+        ));
+
+        assert!(matches!(
+            runtime_recording_update_import_failure_event(committed_warning()),
+            IdeWorkerEvent::RuntimeRecordingUpdateImportCommittedWithWarning { warning }
+                if warning.publication_committed()
+                    && warning.to_string().contains("simulated recording cleanup warning")
+        ));
+
+        let reopen = project_mutation_reopen_failure(
+            ProjectMutationAttempt::ImportRuntimeRecordingUpdate(Err(committed_warning())),
+            IdeProjectOpenError::SelectedOutputUnavailable,
+        );
+        assert!(publish_project_mutation_reopen_failure(
+            &events,
+            IdeWorkerCommandKind::ImportRuntimeRecordingUpdate,
+            reopen,
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::RuntimeRecordingUpdateImportCommittedWithWarning { warning })
+                if warning.publication_committed()
+                    && warning.to_string().contains("did not establish a durable outcome")
+                    && warning.to_string().contains("could not be reopened")
+        ));
+
+        assert!(matches!(
+            runtime_recording_update_import_failure_event(
+                IdeRuntimeRecordingUpdateImportError::Storage(Box::new(
+                    RecordingImportError::for_test("simulated recording refusal", false),
+                )),
+            ),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeRecordingUpdate,
+                ..
+            }
+        ));
+
+        let local_warning =
+            IdeRecordingError::Finalize(Box::new(crate::IdeRecordingFinalizeError::Import {
+                journal_path: PathBuf::from("recording.journal"),
+                source: RecordingImportError::for_test(
+                    "simulated local recording cleanup warning",
+                    true,
+                ),
+            }));
+        assert!(publish_recording_failure(
+            &events,
+            IdeWorkerCommandKind::StopRecording,
+            local_warning,
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::RecordingImportCommittedWithWarning { warning })
+                if warning.publication_committed()
+                    && warning.to_string().contains("local recording cleanup warning")
         ));
     }
 

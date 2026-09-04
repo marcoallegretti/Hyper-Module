@@ -7825,6 +7825,9 @@ fn apply_event(
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::RecordingImported(outcome) => apply_recording_imported(ui, &outcome),
+        event @ IdeWorkerEvent::RecordingImportCommittedWithWarning { .. } => {
+            apply_recording_import_committed_warning(ui, &event);
+        }
         IdeWorkerEvent::RecordingAborted(outcome) => apply_recording_aborted(ui, &outcome),
         event @ (IdeWorkerEvent::RuntimeScenePerformanceImporting { .. }
         | IdeWorkerEvent::RuntimeScenePerformanceImported { .. }) => {
@@ -7840,7 +7843,8 @@ fn apply_event(
             apply_runtime_native_device_update_import_event(ui, &event);
         }
         event @ (IdeWorkerEvent::RuntimeRecordingUpdateImporting
-        | IdeWorkerEvent::RuntimeRecordingUpdateImported { .. }) => {
+        | IdeWorkerEvent::RuntimeRecordingUpdateImported { .. }
+        | IdeWorkerEvent::RuntimeRecordingUpdateImportCommittedWithWarning { .. }) => {
             apply_runtime_recording_update_import_event(ui, &event);
         }
         event @ (IdeWorkerEvent::RuntimeLoopUpdateImporting
@@ -9973,6 +9977,14 @@ fn apply_recording_imported(ui: &MainWindow, outcome: &IdeRecordingImportOutcome
     ui.set_error_text(SharedString::default());
 }
 
+fn apply_recording_import_committed_warning(ui: &MainWindow, event: &IdeWorkerEvent) {
+    let IdeWorkerEvent::RecordingImportCommittedWithWarning { warning } = event else {
+        unreachable!("recording import committed-warning dispatcher received another event");
+    };
+    ui.set_status_text(committed_warning_status(ui.get_app_mode(), "Recording import").into());
+    ui.set_error_text(warning.to_string().into());
+}
+
 fn apply_recording_aborted(ui: &MainWindow, outcome: &IdeRecordingAbortOutcome) {
     let monitor_warning = outcome
         .monitor_output_error()
@@ -11086,6 +11098,12 @@ fn apply_runtime_recording_update_import_event(ui: &MainWindow, event: &IdeWorke
                 format!("Imported Runtime recording take in project revision {revision}").into(),
             );
             ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RuntimeRecordingUpdateImportCommittedWithWarning { warning } => {
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), "Runtime recording import").into(),
+            );
+            ui.set_error_text(warning.to_string().into());
         }
         _ => unreachable!("Runtime recording-update import dispatcher received another event"),
     }
@@ -27009,6 +27027,12 @@ mod tests {
         );
         assert!(ui.get_error_text().is_empty());
 
+        assert_runtime_recording_update_import_committed_warning_contract(
+            ui,
+            &routes,
+            &project_state,
+        );
+
         ui.set_app_mode(AppMode::ImportingRuntimeRecordingUpdate);
         apply_event(
             ui,
@@ -27037,6 +27061,42 @@ mod tests {
                 IdeWorkerCommandKind::ImportRuntimeRecordingUpdate,
             ),
             AppMode::Running
+        );
+    }
+
+    fn assert_runtime_recording_update_import_committed_warning_contract(
+        ui: &MainWindow,
+        routes: &UiRoutes,
+        project_state: &ProjectUiStateCell,
+    ) {
+        apply_event(
+            ui,
+            routes,
+            project_state,
+            IdeWorkerEvent::RuntimeRecordingUpdateImportCommittedWithWarning {
+                warning: Box::new(IdeRuntimeRecordingUpdateImportError::ProjectIdentityMismatch),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime recording import committed and reopened with a project recovery warning"
+        );
+        assert!(ui.get_error_text().contains("another project"));
+
+        ui.set_app_mode(AppMode::Closed);
+        apply_event(
+            ui,
+            routes,
+            project_state,
+            IdeWorkerEvent::RuntimeRecordingUpdateImportCommittedWithWarning {
+                warning: Box::new(IdeRuntimeRecordingUpdateImportError::ProjectIdentityMismatch),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Closed);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime recording import committed, but the project could not be reopened"
         );
     }
 

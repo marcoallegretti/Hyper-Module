@@ -175,6 +175,18 @@ pub enum IdeRecordingFinalizeError {
     },
 }
 
+impl IdeRecordingFinalizeError {
+    /// Returns whether the recording import became the active project state
+    /// before finalization reported an error.
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Import { source, .. } => source.published(),
+            Self::Backend(_) | Self::Handoff { .. } => false,
+        }
+    }
+}
+
 impl fmt::Display for IdeRecordingFinalizeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -277,6 +289,27 @@ pub enum IdeRecordingError {
         outcome: Box<IdeRecordingAbortOutcome>,
         reopen: Box<IdeProjectOpenError>,
     },
+}
+
+impl IdeRecordingError {
+    /// Returns whether a finalized recording import became the active project
+    /// state before this error was observed.
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        match self {
+            Self::Finalize(source) => source.publication_committed(),
+            Self::RestoreAfterFailure { operation, .. }
+            | Self::ReopenAfterFailure { operation, .. } => operation.publication_committed(),
+            Self::ImportedButReopenFailed { .. } => true,
+            Self::Preparation(_)
+            | Self::MixerSave(_)
+            | Self::NativeClose(_)
+            | Self::Start(_)
+            | Self::Abort(_)
+            | Self::Restore(_)
+            | Self::AbortedButReopenFailed { .. } => false,
+        }
+    }
 }
 
 impl fmt::Display for IdeRecordingError {
