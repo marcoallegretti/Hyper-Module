@@ -55,8 +55,9 @@ use hyper_desktop_ide::{
     IdeAudioClipSourceTrimEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
     IdeAudioImportError, IdeAutomationTakeEditError, IdeRuntimeLoopUpdateImportError,
     IdeRuntimeMixerUpdateImportError, IdeRuntimeNativeDeviceUpdateImportError,
-    IdeRuntimeScenePerformanceImportError, IdeSceneCreationError, IdeSceneDuplicationError,
-    IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEditError, IdeTempoEditError,
+    IdeRuntimeRecordingUpdateImportError, IdeRuntimeScenePerformanceImportError,
+    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneRemovalError, IdeSceneRenameError,
+    IdeSceneSlotEditError, IdeTempoEditError,
 };
 #[cfg(test)]
 use hyper_mixer_runtime::PlaybackRecoverySnapshot;
@@ -86,6 +87,7 @@ const MIXER_STRIP_METER_FLOOR_DBFS: f32 = -60.0;
 const RUNTIME_SCENE_PERFORMANCE_IMPORT_FILTER_LABEL: &str = "Runtime scene-performance updates";
 const RUNTIME_MIXER_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime mixer updates";
 const RUNTIME_NATIVE_DEVICE_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime native-device updates";
+const RUNTIME_RECORDING_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime recording updates";
 const RUNTIME_LOOP_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime loop updates";
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
@@ -118,6 +120,12 @@ enum RuntimeMixerUpdateImportChoice {
 
 #[derive(Debug)]
 enum RuntimeNativeDeviceUpdateImportChoice {
+    Selected(PathBuf),
+    Cancelled,
+}
+
+#[derive(Debug)]
+enum RuntimeRecordingUpdateImportChoice {
     Selected(PathBuf),
     Cancelled,
 }
@@ -597,6 +605,7 @@ fn bind_callbacks(
     bind_runtime_scene_performance_import_callback(ui, worker);
     bind_runtime_mixer_update_import_callback(ui, worker);
     bind_runtime_native_device_update_import_callback(ui, worker);
+    bind_runtime_recording_update_import_callback(ui, worker);
     bind_runtime_loop_update_import_callback(ui, worker, project_state);
     bind_audio_preview_callbacks(ui, worker, &routes.takes);
     bind_audio_import_callback(ui, worker, &routes.audio_imports);
@@ -1673,6 +1682,84 @@ fn bind_runtime_native_device_update_import_callback_with(
         }
         ui.set_app_mode(AppMode::ImportingRuntimeNativeDeviceUpdate);
         ui.set_status_text("Waiting for a Runtime native-device update…".into());
+        ui.set_error_text(SharedString::default());
+        choose(weak.clone(), Rc::clone(&worker));
+    });
+}
+
+fn bind_runtime_recording_update_import_callback(ui: &MainWindow, worker: &WorkerCell) {
+    bind_runtime_recording_update_import_callback_with(ui, worker, |weak, worker| {
+        let weak_for_dialog = weak.clone();
+        let spawn_result = slint::spawn_local(async move {
+            let selection = rfd::AsyncFileDialog::new()
+                .set_title("Import Runtime recording update")
+                .add_filter(RUNTIME_RECORDING_UPDATE_IMPORT_FILTER_LABEL, &["json"])
+                .pick_file()
+                .await;
+            let Some(ui) = weak_for_dialog.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::ImportingRuntimeRecordingUpdate {
+                return;
+            }
+            let choice =
+                selection.map_or(RuntimeRecordingUpdateImportChoice::Cancelled, |selection| {
+                    RuntimeRecordingUpdateImportChoice::Selected(selection.path().to_path_buf())
+                });
+            complete_runtime_recording_update_import_choice(&ui, &worker, choice);
+        });
+        if spawn_result.is_err()
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime recording update selection is unavailable".into());
+        }
+    });
+}
+
+fn complete_runtime_recording_update_import_choice(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    choice: RuntimeRecordingUpdateImportChoice,
+) {
+    complete_runtime_recording_update_import_choice_with(ui, choice, |command| {
+        submit_to_ui(ui, worker, command);
+    });
+}
+
+fn complete_runtime_recording_update_import_choice_with(
+    ui: &MainWindow,
+    choice: RuntimeRecordingUpdateImportChoice,
+    submit: impl FnOnce(IdeWorkerCommand),
+) {
+    match choice {
+        RuntimeRecordingUpdateImportChoice::Selected(path) => {
+            submit(IdeWorkerCommand::ImportRuntimeRecordingUpdate { path });
+        }
+        RuntimeRecordingUpdateImportChoice::Cancelled => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime recording update import cancelled".into());
+        }
+    }
+}
+
+fn bind_runtime_recording_update_import_callback_with(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell) + 'static,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    actions.on_import_runtime_recording_update(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        ui.set_app_mode(AppMode::ImportingRuntimeRecordingUpdate);
+        ui.set_status_text("Waiting for a Runtime recording update…".into());
         ui.set_error_text(SharedString::default());
         choose(weak.clone(), Rc::clone(&worker));
     });
@@ -6692,6 +6779,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate => {
             AppMode::ImportingRuntimeNativeDeviceUpdate
         }
+        IdeWorkerCommandKind::ImportRuntimeRecordingUpdate => {
+            AppMode::ImportingRuntimeRecordingUpdate
+        }
         IdeWorkerCommandKind::ImportRuntimeLoopUpdate => AppMode::ImportingRuntimeLoopUpdate,
         IdeWorkerCommandKind::SetArrangementPlacementActive
         | IdeWorkerCommandKind::MoveArrangementPlacement
@@ -6934,6 +7024,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate => {
             "Verifying the Runtime native-device update and reopening project after one device-chain edit…"
+        }
+        IdeWorkerCommandKind::ImportRuntimeRecordingUpdate => {
+            "Verifying the Runtime recording update and reopening project after one durable take import…"
         }
         IdeWorkerCommandKind::ImportRuntimeLoopUpdate => {
             "Verifying the Runtime loop update and reopening project after one arrangement-loop edit…"
@@ -7745,6 +7838,10 @@ fn apply_event(
         | IdeWorkerEvent::RuntimeNativeDeviceUpdateImported { .. }
         | IdeWorkerEvent::RuntimeNativeDeviceUpdateImportCommittedWithWarning { .. }) => {
             apply_runtime_native_device_update_import_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::RuntimeRecordingUpdateImporting
+        | IdeWorkerEvent::RuntimeRecordingUpdateImported { .. }) => {
+            apply_runtime_recording_update_import_event(ui, &event);
         }
         event @ (IdeWorkerEvent::RuntimeLoopUpdateImporting
         | IdeWorkerEvent::RuntimeLoopUpdateImported { .. }) => {
@@ -10973,6 +11070,27 @@ fn apply_runtime_native_device_update_import_event(ui: &MainWindow, event: &IdeW
     }
 }
 
+fn apply_runtime_recording_update_import_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::RuntimeRecordingUpdateImporting => {
+            ui.set_app_mode(AppMode::ImportingRuntimeRecordingUpdate);
+            ui.set_status_text(
+                "Verifying the Runtime recording update and preparing one durable take import…"
+                    .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RuntimeRecordingUpdateImported { revision } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(
+                format!("Imported Runtime recording take in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("Runtime recording-update import dispatcher received another event"),
+    }
+}
+
 fn apply_runtime_loop_update_import_event(
     ui: &MainWindow,
     project_state: &ProjectUiStateCell,
@@ -11890,6 +12008,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::ImportRuntimeNativeDeviceUpdate
             if current == AppMode::ImportingRuntimeNativeDeviceUpdate =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::ImportRuntimeRecordingUpdate
+            if current == AppMode::ImportingRuntimeRecordingUpdate =>
         {
             AppMode::Running
         }
@@ -26166,6 +26289,7 @@ mod tests {
         assert_runtime_scene_performance_import_window_contract(ui);
         assert_runtime_mixer_update_import_window_contract(ui);
         assert_runtime_native_device_update_import_window_contract(ui);
+        assert_runtime_recording_update_import_window_contract(ui);
         assert_runtime_loop_update_import_window_contract(ui);
         assert_audio_track_content_removal_window_contract(ui);
         assert_audio_track_freeze_window_contract(ui);
@@ -26296,6 +26420,11 @@ mod tests {
     fn assert_runtime_native_device_update_import_window_contract(ui: &MainWindow) {
         assert_runtime_native_device_update_import_callback_contract(ui);
         assert_runtime_native_device_update_import_event_contract(ui);
+    }
+
+    fn assert_runtime_recording_update_import_window_contract(ui: &MainWindow) {
+        assert_runtime_recording_update_import_callback_contract(ui);
+        assert_runtime_recording_update_import_event_contract(ui);
     }
 
     fn assert_runtime_loop_update_import_window_contract(ui: &MainWindow) {
@@ -26779,6 +26908,135 @@ mod tests {
         assert_eq!(
             ui.get_status_text(),
             "Runtime native-device import committed, but the project could not be reopened"
+        );
+    }
+
+    fn assert_runtime_recording_update_import_callback_contract(ui: &MainWindow) {
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        bind_runtime_recording_update_import_callback_with(ui, &worker, move |weak, _| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_recording_update_import_choice_with(
+                &ui,
+                RuntimeRecordingUpdateImportChoice::Selected(PathBuf::from(
+                    "take.hyper-recording-update.json",
+                )),
+                |command| submitted_by_callback.borrow_mut().push(command),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.set_error_text("stale error".into());
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_recording_update();
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::ImportRuntimeRecordingUpdate { path }]
+                if path == &PathBuf::from("take.hyper-recording-update.json")
+        ));
+        assert_eq!(ui.get_app_mode(), AppMode::ImportingRuntimeRecordingUpdate);
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::Closed);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_recording_update();
+        assert_eq!(
+            submitted.borrow().len(),
+            1,
+            "Closed mode owns no Runtime recording-update import action"
+        );
+
+        bind_runtime_recording_update_import_callback_with(ui, &worker, move |weak, _| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_recording_update_import_choice_with(
+                &ui,
+                RuntimeRecordingUpdateImportChoice::Cancelled,
+                |_| panic!("a cancelled chooser must not submit a command"),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_recording_update();
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime recording update import cancelled"
+        );
+
+        bind_runtime_recording_update_import_callback_with(ui, &worker, move |weak, worker| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_recording_update_import_choice(
+                &ui,
+                &worker,
+                RuntimeRecordingUpdateImportChoice::Selected(PathBuf::from(
+                    "take.hyper-recording-update.json",
+                )),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_recording_update();
+        assert_eq!(ui.get_app_mode(), AppMode::Unavailable);
+        assert!(ui.get_error_text().contains("no longer available"));
+    }
+
+    fn assert_runtime_recording_update_import_event_contract(ui: &MainWindow) {
+        let routes = UiRoutes::default();
+        let project_state = Rc::new(ProjectUiState::default());
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeRecordingUpdateImporting,
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::ImportingRuntimeRecordingUpdate);
+        assert_eq!(
+            ui.get_status_text(),
+            "Verifying the Runtime recording update and preparing one durable take import…"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeRecordingUpdateImported { revision: 8 },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Imported Runtime recording take in project revision 8"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::ImportingRuntimeRecordingUpdate);
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeRecordingUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeRecordingUpdateImport(Box::new(
+                    IdeRuntimeRecordingUpdateImportError::ProjectIdentityMismatch,
+                )),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(ui.get_error_text().contains("another project"));
+
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::ImportRuntimeRecordingUpdate,
+            ),
+            AppMode::ImportingRuntimeRecordingUpdate
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ImportingRuntimeRecordingUpdate,
+                IdeWorkerCommandKind::ImportRuntimeRecordingUpdate,
+            ),
+            AppMode::Running
         );
     }
 

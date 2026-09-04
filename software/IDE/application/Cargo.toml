@@ -32,6 +32,7 @@ hyper-recording-worker = { path = "../../../crates/recording-worker" }
 hyper-runtime-loop-update = { path = "../../../crates/runtime-loop-update" }
 hyper-runtime-mixer-update = { path = "../../../crates/runtime-mixer-update" }
 hyper-runtime-native-device-update = { path = "../../../crates/runtime-native-device-update" }
+hyper-runtime-recording-update = { path = "../../../crates/runtime-recording-update" }
 hyper-runtime-bundle-builder = { path = "../runtime-bundle-builder" }
 hyper-scene-performance = { path = "../../../crates/scene-performance" }
 hyper-storage-engine = { path = "../../../crates/storage-engine" }

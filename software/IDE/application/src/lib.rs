@@ -253,10 +253,10 @@ pub use worker::{
     IdeRecordingCaptureKind, IdeRecordingState, IdeRecordingTake, IdeRunningObservation,
     IdeRuntimeLoopUpdateImportError, IdeRuntimeMixerUpdateImportError,
     IdeRuntimeNativeDeviceUpdateImportError, IdeRuntimePreparationError,
-    IdeRuntimeScenePerformanceImportError, IdeScene, IdeScenePerformanceCaptureError,
-    IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure,
-    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
-    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeRuntimeRecordingUpdateImportError, IdeRuntimeScenePerformanceImportError, IdeScene,
+    IdeScenePerformanceCaptureError, IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand,
+    IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError,
+    IdeWorkerJoinError, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
     IdeWorkerShutdownReport, IdeWorkerStartError, MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS,
     desktop_ide_worker_supervisor_snapshot,
 };
@@ -10680,6 +10680,12 @@ pub struct RunningIdeSnapshot<'a> {
     pub project_manifest_sha256: [u8; 32],
     pub project_name: &'a str,
     pub sample_rate_hz: u32,
+    /// Number of physical audio inputs required by the verified project.
+    ///
+    /// External finalized-recording handoffs must not claim an input that the
+    /// project cannot represent, because that would make the next project open
+    /// fail its recording-binding validation.
+    pub required_audio_inputs: u8,
     pub playback_extent: IdePlaybackExtent,
     pub arrangement: Arc<IdePlaybackArrangement>,
     pub automation: Arc<IdePlaybackAutomation>,
@@ -16895,6 +16901,11 @@ impl RunningDesktopIdeApplication {
             project_manifest_sha256: *project.package().manifest_sha256(),
             project_name: project.package().manifest().name(),
             sample_rate_hz: project.session().sample_rate_hz(),
+            required_audio_inputs: project
+                .package()
+                .manifest()
+                .required_capabilities()
+                .audio_inputs(),
             playback_extent: project.session().extent(),
             arrangement: project.session().shared_arrangement(),
             automation: project.session().shared_automation_takes(),

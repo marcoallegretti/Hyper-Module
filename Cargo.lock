@@ -2213,6 +2213,7 @@ dependencies = [
  "hyper-runtime-loop-update",
  "hyper-runtime-mixer-update",
  "hyper-runtime-native-device-update",
+ "hyper-runtime-recording-update",
  "hyper-scene-performance",
  "hyper-storage-engine",
  "hyper-thread-supervisor",
