@@ -29,6 +29,14 @@ use hyper_playback_json::{
 use hyper_project_history::{ProjectHistory, ProjectHistoryError, RecentProject};
 use hyper_project_model::{ResourceRole, is_valid_entity_id, is_valid_interactive_project_name};
 use hyper_recording_metadata::RecordingCaptureKind;
+use hyper_runtime_automation_update::{
+    RuntimeAutomationTarget, RuntimeAutomationUpdate, RuntimeAutomationUpdateError,
+    read_runtime_automation_update, sha256_hex as runtime_automation_update_sha256_hex,
+};
+#[cfg(test)]
+use hyper_runtime_automation_update::{
+    RuntimeAutomationUpdateDirectory, RuntimeAutomationUpdateSource,
+};
 use hyper_runtime_bundle_builder::{
     DEFAULT_MAXIMUM_RUNTIME_BUNDLE_BYTES, PublishedRuntimeBundle, RuntimeBundleBuildError,
     build_project_runtime_bundle,
@@ -299,6 +307,7 @@ pub enum IdeWorkerCommandKind {
     ImportRuntimeNativeDeviceUpdate,
     ImportRuntimeRecordingUpdate,
     ImportRuntimeLoopUpdate,
+    ImportRuntimeAutomationUpdate,
     CaptureScenePerformance,
     CaptureMixerAutomation,
     StartAudioPreview,
@@ -667,6 +676,9 @@ pub enum IdeWorkerCommand {
     ImportRuntimeLoopUpdate {
         path: PathBuf,
     },
+    ImportRuntimeAutomationUpdate {
+        path: PathBuf,
+    },
     StartScenePerformanceCapture,
     StopScenePerformanceCapture,
     StartMixerAutomationCapture {
@@ -847,6 +859,9 @@ impl IdeWorkerCommand {
                 IdeWorkerCommandKind::ImportRuntimeRecordingUpdate
             }
             Self::ImportRuntimeLoopUpdate { .. } => IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+            Self::ImportRuntimeAutomationUpdate { .. } => {
+                IdeWorkerCommandKind::ImportRuntimeAutomationUpdate
+            }
             Self::StartScenePerformanceCapture | Self::StopScenePerformanceCapture => {
                 IdeWorkerCommandKind::CaptureScenePerformance
             }
@@ -3078,6 +3093,138 @@ impl Error for IdeRuntimeLoopUpdateImportError {
     }
 }
 
+/// Why one explicit Runtime automation update could not become one durable
+/// automation take in the currently open project.
+///
+/// The selected artifact is external input, not project authority. The IDE
+/// validates its immutable project provenance and rebinding target before the
+/// playback fence, then validates the final automation document again against
+/// the recovered project before publication.
+#[derive(Debug)]
+pub enum IdeRuntimeAutomationUpdateImportError {
+    ProjectSnapshotUnavailable,
+    Artifact(Box<RuntimeAutomationUpdateError>),
+    ProjectIdentityMismatch,
+    ProjectRevisionMismatch {
+        update_revision: u64,
+        project_revision: u64,
+    },
+    ProjectManifestMismatch,
+    TargetUnavailable,
+    TargetAlreadyAutomated,
+    NoRemainingAutomationCapacity,
+    PointCapacityExceeded {
+        update_point_count: usize,
+        remaining_point_count: usize,
+    },
+    CapacityUnavailable,
+    AutomationTake(Box<IdeAutomationTakeCreationError>),
+    ReopenAfterFailure {
+        failure: Box<Self>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: Box<hyper_storage_engine::ProjectResourcePublicationOutcome>,
+        source: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeRuntimeAutomationUpdateImportError {
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        match self {
+            Self::AutomationTake(source) => source.publication_committed(),
+            Self::ReopenAfterFailure { failure, .. } => failure.publication_committed(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::ProjectSnapshotUnavailable
+            | Self::Artifact(_)
+            | Self::ProjectIdentityMismatch
+            | Self::ProjectRevisionMismatch { .. }
+            | Self::ProjectManifestMismatch
+            | Self::TargetUnavailable
+            | Self::TargetAlreadyAutomated
+            | Self::NoRemainingAutomationCapacity
+            | Self::PointCapacityExceeded { .. }
+            | Self::CapacityUnavailable => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeRuntimeAutomationUpdateImportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProjectSnapshotUnavailable => {
+                formatter.write_str("running playback exposes no verified project snapshot")
+            }
+            Self::Artifact(source) => {
+                write!(formatter, "selected Runtime automation update was refused: {source}")
+            }
+            Self::ProjectIdentityMismatch => {
+                formatter.write_str("selected Runtime automation update belongs to another project")
+            }
+            Self::ProjectRevisionMismatch {
+                update_revision,
+                project_revision,
+            } => write!(
+                formatter,
+                "selected Runtime automation update targets project revision {update_revision}, but the open project is revision {project_revision}"
+            ),
+            Self::ProjectManifestMismatch => formatter.write_str(
+                "selected Runtime automation update does not match the exact verified project contents",
+            ),
+            Self::TargetUnavailable => formatter.write_str(
+                "selected Runtime automation update targets a mixer parameter unavailable in the open project",
+            ),
+            Self::TargetAlreadyAutomated => formatter.write_str(
+                "selected Runtime automation update conflicts with an enabled automation lane",
+            ),
+            Self::NoRemainingAutomationCapacity => formatter.write_str(
+                "the open project cannot accept another automation take",
+            ),
+            Self::PointCapacityExceeded {
+                update_point_count,
+                remaining_point_count,
+            } => write!(
+                formatter,
+                "selected Runtime automation update has {update_point_count} points, but the open project can retain only {remaining_point_count} more"
+            ),
+            Self::CapacityUnavailable => formatter.write_str(
+                "Runtime automation update import preparation capacity is unavailable",
+            ),
+            Self::AutomationTake(source) => source.fmt(formatter),
+            Self::ReopenAfterFailure { failure, reopen } => write!(
+                formatter,
+                "Runtime automation update import failed ({failure}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "Runtime automation update was imported through project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+        }
+    }
+}
+
+impl Error for IdeRuntimeAutomationUpdateImportError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Artifact(source) => Some(source.as_ref()),
+            Self::AutomationTake(source) => Some(source.as_ref()),
+            Self::ReopenAfterFailure { failure, .. } => Some(failure.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::ProjectSnapshotUnavailable
+            | Self::ProjectIdentityMismatch
+            | Self::ProjectRevisionMismatch { .. }
+            | Self::ProjectManifestMismatch
+            | Self::TargetUnavailable
+            | Self::TargetAlreadyAutomated
+            | Self::NoRemainingAutomationCapacity
+            | Self::PointCapacityExceeded { .. }
+            | Self::CapacityUnavailable => None,
+        }
+    }
+}
+
 /// Why a bounded live mixer-automation capture could not be completed.
 ///
 /// Version 1 captures exactly one resolved mixer parameter from committed,
@@ -3322,6 +3469,7 @@ pub enum IdeWorkerCommandFailure {
     RuntimeNativeDeviceUpdateImport(Box<IdeRuntimeNativeDeviceUpdateImportError>),
     RuntimeRecordingUpdateImport(Box<IdeRuntimeRecordingUpdateImportError>),
     RuntimeLoopUpdateImport(Box<IdeRuntimeLoopUpdateImportError>),
+    RuntimeAutomationUpdateImport(Box<IdeRuntimeAutomationUpdateImportError>),
     ScenePerformanceCapture(Box<IdeScenePerformanceCaptureError>),
     MixerAutomationCapture(Box<IdeMixerAutomationCaptureError>),
     AudioPreview(IdeAudioPreviewError),
@@ -3501,6 +3649,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::RuntimeNativeDeviceUpdateImport(source) => source.fmt(formatter),
             Self::RuntimeRecordingUpdateImport(source) => source.fmt(formatter),
             Self::RuntimeLoopUpdateImport(source) => source.fmt(formatter),
+            Self::RuntimeAutomationUpdateImport(source) => source.fmt(formatter),
             Self::ScenePerformanceCapture(source) => source.fmt(formatter),
             Self::MixerAutomationCapture(source) => source.fmt(formatter),
             Self::AudioPreview(source) => source.fmt(formatter),
@@ -3611,6 +3760,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::RuntimeNativeDeviceUpdateImport(source) => Some(source),
             Self::RuntimeRecordingUpdateImport(source) => Some(source),
             Self::RuntimeLoopUpdateImport(source) => Some(source),
+            Self::RuntimeAutomationUpdateImport(source) => Some(source),
             Self::ScenePerformanceCapture(source) => Some(source),
             Self::MixerAutomationCapture(source) => Some(source),
             Self::AudioPreview(source) => Some(source),
@@ -4177,6 +4327,19 @@ pub enum IdeWorkerEvent {
     RuntimeLoopUpdateImported {
         revision: u64,
         changed: bool,
+    },
+    RuntimeAutomationUpdateImporting {
+        name: String,
+        point_count: usize,
+    },
+    RuntimeAutomationUpdateImported {
+        revision: u64,
+        take_id: String,
+        name: String,
+    },
+    RuntimeAutomationUpdateImportCommittedWithWarning {
+        name: String,
+        warning: Box<IdeRuntimeAutomationUpdateImportError>,
     },
     ScenePerformanceCaptureStarted {
         maximum_launch_count: usize,
@@ -5382,6 +5545,10 @@ enum ProjectMutation {
     ImportRuntimeLoopUpdate {
         range: Option<IdeLoopRangeFrames>,
     },
+    ImportRuntimeAutomationUpdate {
+        update: RuntimeAutomationUpdate,
+        request: IdeAutomationTakeRequest,
+    },
     CaptureScenePerformance {
         launches: Vec<ScenePerformanceLaunch>,
     },
@@ -5611,6 +5778,9 @@ impl ProjectMutation {
                 IdeWorkerCommandKind::ImportRuntimeRecordingUpdate
             }
             Self::ImportRuntimeLoopUpdate { .. } => IdeWorkerCommandKind::ImportRuntimeLoopUpdate,
+            Self::ImportRuntimeAutomationUpdate { .. } => {
+                IdeWorkerCommandKind::ImportRuntimeAutomationUpdate
+            }
             Self::CaptureScenePerformance { .. } => IdeWorkerCommandKind::CaptureScenePerformance,
             Self::MoveArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::MoveArrangementSceneLaunch
@@ -5746,6 +5916,12 @@ impl ProjectMutation {
                 IdeWorkerEvent::RuntimeRecordingUpdateImporting
             }
             Self::ImportRuntimeLoopUpdate { .. } => IdeWorkerEvent::RuntimeLoopUpdateImporting,
+            Self::ImportRuntimeAutomationUpdate { request, .. } => {
+                IdeWorkerEvent::RuntimeAutomationUpdateImporting {
+                    name: request.name.clone(),
+                    point_count: request.points.len(),
+                }
+            }
             Self::CaptureScenePerformance { launches, .. } => {
                 IdeWorkerEvent::ScenePerformanceCaptureSaving {
                     launch_count: launches.len(),
@@ -6079,6 +6255,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::ImportRuntimeRecordingUpdate => "Runtime recording update import",
         IdeWorkerCommandKind::ImportRuntimeLoopUpdate => "Runtime loop update import",
+        IdeWorkerCommandKind::ImportRuntimeAutomationUpdate => "Runtime automation update import",
         IdeWorkerCommandKind::CaptureScenePerformance => "scene performance capture",
         IdeWorkerCommandKind::CaptureMixerAutomation => "mixer automation capture",
         IdeWorkerCommandKind::DuplicateArrangementPlacement => "placement duplication",
@@ -6486,6 +6663,7 @@ fn process_command(
         | IdeWorkerCommand::ImportRuntimeNativeDeviceUpdate { .. }
         | IdeWorkerCommand::ImportRuntimeRecordingUpdate { .. }
         | IdeWorkerCommand::ImportRuntimeLoopUpdate { .. }
+        | IdeWorkerCommand::ImportRuntimeAutomationUpdate { .. }
         | IdeWorkerCommand::CreateAudioClipFromTake { .. }
         | IdeWorkerCommand::CreateAndPlaceAudioClipFromTake { .. }
         | IdeWorkerCommand::DuplicateAudioClip { .. }
@@ -6786,6 +6964,9 @@ fn process_project_mutation_command(
         IdeWorkerCommand::ImportRuntimeLoopUpdate { path } => {
             import_runtime_loop_update(state, events, &path)
         }
+        IdeWorkerCommand::ImportRuntimeAutomationUpdate { path } => {
+            import_runtime_automation_update(state, events, &path)
+        }
         IdeWorkerCommand::CreateAudioClipFromTake { recording_id, name } => {
             create_audio_clip_from_take(state, events, &recording_id, &name)
         }
@@ -7020,6 +7201,17 @@ fn publish_runtime_loop_update_import_failure(
     )
 }
 
+fn publish_runtime_automation_update_import_failure(
+    events: &SyncSender<IdeWorkerEvent>,
+    reason: IdeRuntimeAutomationUpdateImportError,
+) -> bool {
+    publish_failure(
+        events,
+        IdeWorkerCommandKind::ImportRuntimeAutomationUpdate,
+        IdeWorkerCommandFailure::RuntimeAutomationUpdateImport(Box::new(reason)),
+    )
+}
+
 fn validate_runtime_scene_performance_update(
     update: &RuntimeScenePerformanceUpdate,
     project_id: &str,
@@ -7086,6 +7278,126 @@ fn validate_runtime_loop_update(
         return Err(IdeRuntimeLoopUpdateImportError::ProjectManifestMismatch);
     }
     Ok(())
+}
+
+fn validate_runtime_automation_update(
+    update: &RuntimeAutomationUpdate,
+    project_id: &str,
+    project_revision: u64,
+    project_manifest_sha256: &[u8; 32],
+) -> Result<(), IdeRuntimeAutomationUpdateImportError> {
+    let source = update.source();
+    if source.project_id() != project_id {
+        return Err(IdeRuntimeAutomationUpdateImportError::ProjectIdentityMismatch);
+    }
+    if source.project_revision() != project_revision {
+        return Err(
+            IdeRuntimeAutomationUpdateImportError::ProjectRevisionMismatch {
+                update_revision: source.project_revision(),
+                project_revision,
+            },
+        );
+    }
+    if source.project_sha256() != runtime_automation_update_sha256_hex(project_manifest_sha256) {
+        return Err(IdeRuntimeAutomationUpdateImportError::ProjectManifestMismatch);
+    }
+    Ok(())
+}
+
+fn runtime_automation_update_target(
+    target: &RuntimeAutomationTarget,
+) -> Result<IdeAutomationTarget, IdeRuntimeAutomationUpdateImportError> {
+    let copy_identity = |identity: &str| {
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(identity.len())
+            .map_err(|_| IdeRuntimeAutomationUpdateImportError::CapacityUnavailable)?;
+        owned.push_str(identity);
+        Ok(owned)
+    };
+    match target {
+        RuntimeAutomationTarget::Channel {
+            track_id,
+            parameter,
+        } => Ok(IdeAutomationTarget::Channel {
+            track_id: copy_identity(track_id)?,
+            parameter: *parameter,
+        }),
+        RuntimeAutomationTarget::Send { send_id, parameter } => Ok(IdeAutomationTarget::Send {
+            send_id: copy_identity(send_id)?,
+            parameter: *parameter,
+        }),
+        RuntimeAutomationTarget::Main { parameter } => Ok(IdeAutomationTarget::Main {
+            parameter: *parameter,
+        }),
+    }
+}
+
+fn runtime_automation_update_take_request(
+    update: &RuntimeAutomationUpdate,
+    target: IdeAutomationTarget,
+) -> Result<IdeAutomationTakeRequest, IdeRuntimeAutomationUpdateImportError> {
+    let mut name = String::new();
+    name.try_reserve_exact(update.name().len())
+        .map_err(|_| IdeRuntimeAutomationUpdateImportError::CapacityUnavailable)?;
+    name.push_str(update.name());
+    let mut points = Vec::new();
+    points
+        .try_reserve_exact(update.points().len())
+        .map_err(|_| IdeRuntimeAutomationUpdateImportError::CapacityUnavailable)?;
+    points.extend_from_slice(update.points());
+    Ok(IdeAutomationTakeRequest {
+        name,
+        start_tick: update.start_tick(),
+        end_tick: update.end_tick(),
+        target,
+        interpolation: update.interpolation(),
+        points,
+    })
+}
+
+fn prepare_runtime_automation_update_import(
+    application: &RunningDesktopIdeApplication,
+    update: &RuntimeAutomationUpdate,
+) -> Result<IdeAutomationTakeRequest, IdeRuntimeAutomationUpdateImportError> {
+    let target = runtime_automation_update_target(update.target())?;
+    {
+        let snapshot = application
+            .snapshot()
+            .ok_or(IdeRuntimeAutomationUpdateImportError::ProjectSnapshotUnavailable)?;
+        validate_runtime_automation_update(
+            update,
+            snapshot.project_id,
+            snapshot.project_revision,
+            &snapshot.project_manifest_sha256,
+        )?;
+        let resolved_target = resolve_mixer_automation_capture_target(&snapshot, &target)
+            .ok_or(IdeRuntimeAutomationUpdateImportError::TargetUnavailable)?;
+        if enabled_automation_targets(&snapshot, resolved_target) {
+            return Err(IdeRuntimeAutomationUpdateImportError::TargetAlreadyAutomated);
+        }
+    }
+    let can_add = application
+        .can_add_automation_take()
+        .ok_or(IdeRuntimeAutomationUpdateImportError::ProjectSnapshotUnavailable)?;
+    if !can_add {
+        return Err(IdeRuntimeAutomationUpdateImportError::NoRemainingAutomationCapacity);
+    }
+    let remaining_point_count = application
+        .remaining_automation_capture_point_capacity()
+        .ok_or(IdeRuntimeAutomationUpdateImportError::ProjectSnapshotUnavailable)?;
+    if update.points().len() > remaining_point_count {
+        return Err(
+            IdeRuntimeAutomationUpdateImportError::PointCapacityExceeded {
+                update_point_count: update.points().len(),
+                remaining_point_count,
+            },
+        );
+    }
+    // Resolving the target above makes the artifact's stable identity concrete
+    // before we cross the playback fence. The recovered-project serializer
+    // repeats that authoritative binding immediately before publication.
+    runtime_automation_update_take_request(update, target)
 }
 
 fn validate_runtime_native_device_update(
@@ -7507,6 +7819,38 @@ fn import_runtime_loop_update(
         state,
         events,
         ProjectMutation::ImportRuntimeLoopUpdate { range },
+    )
+}
+
+fn import_runtime_automation_update(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    path: &Path,
+) -> bool {
+    let WorkerState::Running(application) = state else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::ImportRuntimeAutomationUpdate,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    };
+    let update = match read_runtime_automation_update(path) {
+        Ok(update) => update,
+        Err(source) => {
+            return publish_runtime_automation_update_import_failure(
+                events,
+                IdeRuntimeAutomationUpdateImportError::Artifact(Box::new(source)),
+            );
+        }
+    };
+    let request = match prepare_runtime_automation_update_import(application, &update) {
+        Ok(request) => request,
+        Err(reason) => return publish_runtime_automation_update_import_failure(events, reason),
+    };
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::ImportRuntimeAutomationUpdate { update, request },
     )
 }
 
@@ -11803,7 +12147,29 @@ fn observe_history(
                 ));
                 true
             }
+            ProjectMutationAttempt::ImportRuntimeAutomationUpdate {
+                inverse: Some(inverse),
+                result: Ok(outcome),
+                ..
+            } if outcome.changed() => {
+                history.record_edit(UndoEntry::from_operation(
+                    inverse.clone(),
+                    undo_label(command),
+                ));
+                true
+            }
             ProjectMutationAttempt::AddAutomationTake {
+                inverse: Some(inverse),
+                result: Err(reason),
+                ..
+            } if reason.publication_committed() => {
+                history.record_edit(UndoEntry::from_operation(
+                    inverse.clone(),
+                    undo_label(command),
+                ));
+                true
+            }
+            ProjectMutationAttempt::ImportRuntimeAutomationUpdate {
                 inverse: Some(inverse),
                 result: Err(reason),
                 ..
@@ -12071,6 +12437,10 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             result: Ok(outcome),
             ..
         }
+        | ProjectMutationAttempt::ImportRuntimeAutomationUpdate {
+            result: Ok(outcome),
+            ..
+        }
         | ProjectMutationAttempt::SetAutomationTakeActive {
             result: Ok(outcome),
             ..
@@ -12238,6 +12608,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::ImportRuntimeMixerUpdate(Err(_))
         | ProjectMutationAttempt::ImportRuntimeNativeDeviceUpdate(Err(_))
         | ProjectMutationAttempt::ImportRuntimeLoopUpdate { result: Err(_) }
+        | ProjectMutationAttempt::ImportRuntimeAutomationUpdate { result: Err(_), .. }
         | ProjectMutationAttempt::CaptureScenePerformance { result: Err(_), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::SetArrangementLoopRange { result: Err(_) }
@@ -13326,6 +13697,13 @@ fn project_mutation_save_failure(
                 )),
             ))
         }
+        ProjectMutation::ImportRuntimeAutomationUpdate { .. } => {
+            IdeWorkerCommandFailure::RuntimeAutomationUpdateImport(Box::new(
+                IdeRuntimeAutomationUpdateImportError::AutomationTake(Box::new(
+                    IdeAutomationTakeCreationError::MixerSave(Box::new(reason)),
+                )),
+            ))
+        }
         ProjectMutation::CaptureScenePerformance { .. } => {
             IdeWorkerCommandFailure::ScenePerformanceCapture(Box::new(
                 IdeScenePerformanceCaptureError::Arrangement(Box::new(
@@ -13702,6 +14080,13 @@ fn project_mutation_native_close_failure(
             IdeWorkerCommandFailure::RuntimeLoopUpdateImport(Box::new(
                 IdeRuntimeLoopUpdateImportError::Arrangement(Box::new(
                     IdeArrangementPlacementEditError::NativeClose(failure),
+                )),
+            ))
+        }
+        ProjectMutation::ImportRuntimeAutomationUpdate { .. } => {
+            IdeWorkerCommandFailure::RuntimeAutomationUpdateImport(Box::new(
+                IdeRuntimeAutomationUpdateImportError::AutomationTake(Box::new(
+                    IdeAutomationTakeCreationError::NativeClose(failure),
                 )),
             ))
         }
@@ -14085,6 +14470,14 @@ enum ProjectMutationAttempt {
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeArrangementPlacementEditError,
+        >,
+    },
+    ImportRuntimeAutomationUpdate {
+        name: String,
+        inverse: Option<IdeHistoryOperation>,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeRuntimeAutomationUpdateImportError,
         >,
     },
     CaptureScenePerformance {
@@ -14730,6 +15123,23 @@ fn automation_take_creation_failure_event(
     }
 }
 
+fn runtime_automation_update_import_failure_event(
+    name: String,
+    reason: IdeRuntimeAutomationUpdateImportError,
+) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::RuntimeAutomationUpdateImportCommittedWithWarning {
+            name,
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::ImportRuntimeAutomationUpdate,
+            reason: IdeWorkerCommandFailure::RuntimeAutomationUpdateImport(Box::new(reason)),
+        }
+    }
+}
+
 pub(super) fn scene_duplication_failure_event(
     name: String,
     reason: IdeSceneDuplicationError,
@@ -15343,6 +15753,26 @@ fn complete_project_mutation(
                             IdeRuntimeLoopUpdateImportError::Arrangement(reason),
                         ))
                     },
+                ),
+                ProjectMutationAttempt::ImportRuntimeAutomationUpdate {
+                    name,
+                    result: Ok(outcome),
+                    ..
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::RuntimeAutomationUpdateImported {
+                        revision: outcome.project_revision(),
+                        take_id: outcome.resource_id().to_owned(),
+                        name,
+                    },
+                ),
+                ProjectMutationAttempt::ImportRuntimeAutomationUpdate {
+                    name,
+                    result: Err(reason),
+                    ..
+                } => send_event(
+                    events,
+                    runtime_automation_update_import_failure_event(name, reason),
                 ),
                 ProjectMutationAttempt::CaptureScenePerformance {
                     launch_count,
@@ -17067,6 +17497,20 @@ fn attempt_project_mutation(
                 ),
             }
         }
+        ProjectMutation::ImportRuntimeAutomationUpdate { update, request } => {
+            let (inverse, result) = attempt_runtime_automation_update_import(
+                application,
+                recovery,
+                &update,
+                &request,
+                native_failure,
+            );
+            ProjectMutationAttempt::ImportRuntimeAutomationUpdate {
+                name: request.name,
+                inverse,
+                result,
+            }
+        }
         ProjectMutation::CaptureScenePerformance { launches } => {
             ProjectMutationAttempt::CaptureScenePerformance {
                 launch_count: launches.len(),
@@ -17887,6 +18331,45 @@ fn attempt_automation_take_creation(
         }
         Err(reason) => (None, Err(reason)),
     }
+}
+
+fn attempt_runtime_automation_update_import(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    update: &RuntimeAutomationUpdate,
+    request: &IdeAutomationTakeRequest,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> (
+    Option<IdeHistoryOperation>,
+    Result<
+        hyper_storage_engine::ProjectResourcePublicationOutcome,
+        IdeRuntimeAutomationUpdateImportError,
+    >,
+) {
+    if native_failure.is_none() {
+        let source_validation = recovery
+            .prepared_project()
+            .ok_or(IdeRuntimeAutomationUpdateImportError::ProjectSnapshotUnavailable)
+            .and_then(|prepared| {
+                validate_runtime_automation_update(
+                    update,
+                    prepared.package().manifest().project_id(),
+                    prepared.package().manifest().revision(),
+                    prepared.package().manifest_sha256(),
+                )
+            });
+        if let Err(reason) = source_validation {
+            return (None, Err(reason));
+        }
+    }
+    let (inverse, result) =
+        attempt_automation_take_creation(application, recovery, request, native_failure);
+    (
+        inverse,
+        result.map_err(|source| {
+            IdeRuntimeAutomationUpdateImportError::AutomationTake(Box::new(source))
+        }),
+    )
 }
 
 fn attempt_arrangement_scene_launch_addition(
@@ -19048,6 +19531,24 @@ fn project_mutation_reopen_failure(
                 ))
             })
         }
+        ProjectMutationAttempt::ImportRuntimeAutomationUpdate {
+            result: Ok(outcome),
+            ..
+        } => IdeWorkerCommandFailure::RuntimeAutomationUpdateImport(Box::new(
+            IdeRuntimeAutomationUpdateImportError::ReopenAfterPublication {
+                outcome: Box::new(outcome),
+                source: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::ImportRuntimeAutomationUpdate {
+            result: Err(failure),
+            ..
+        } => IdeWorkerCommandFailure::RuntimeAutomationUpdateImport(Box::new(
+            IdeRuntimeAutomationUpdateImportError::ReopenAfterFailure {
+                failure: Box::new(failure),
+                reopen: Box::new(reopen),
+            },
+        )),
         ProjectMutationAttempt::CaptureScenePerformance { result, .. } => {
             arrangement_placement_edit_reopen_failure(result, reopen, |reason| {
                 IdeWorkerCommandFailure::ScenePerformanceCapture(Box::new(
@@ -21377,6 +21878,27 @@ mod tests {
         RuntimeLoopUpdate::try_new(RUNTIME_UPDATE_ID.to_owned(), source, range).unwrap()
     }
 
+    fn runtime_automation_update() -> RuntimeAutomationUpdate {
+        let source = RuntimeAutomationUpdateSource::try_new(
+            RUNTIME_PROJECT_ID.to_owned(),
+            7,
+            runtime_automation_update_sha256_hex(&[0xaa; 32]),
+            runtime_automation_update_sha256_hex(&[0xbb; 32]),
+            3,
+        )
+        .unwrap();
+        RuntimeAutomationUpdate::try_new(
+            RUNTIME_UPDATE_ID.to_owned(),
+            source,
+            "Runtime automation".to_owned(),
+            RuntimeAutomationTarget::main(AutomationMainParameter::Gain),
+            0,
+            1_920,
+            vec![AutomationPoint::new(0, AutomationValue::Integer(500_000))],
+        )
+        .unwrap()
+    }
+
     fn runtime_native_device_update() -> RuntimeNativeDeviceUpdate {
         let source = RuntimeNativeDeviceUpdateSource::try_new(
             RUNTIME_PROJECT_ID.to_owned(),
@@ -21511,6 +22033,33 @@ mod tests {
         assert!(matches!(
             validate_runtime_loop_update(&update, RUNTIME_PROJECT_ID, 7, &[0xcc; 32],),
             Err(IdeRuntimeLoopUpdateImportError::ProjectManifestMismatch)
+        ));
+    }
+
+    #[test]
+    fn runtime_automation_update_import_requires_exact_project_provenance() {
+        let update = runtime_automation_update();
+
+        assert!(
+            validate_runtime_automation_update(&update, RUNTIME_PROJECT_ID, 7, &[0xaa; 32],)
+                .is_ok()
+        );
+        assert!(matches!(
+            validate_runtime_automation_update(&update, CAPTURE_SCENE_A, 7, &[0xaa; 32]),
+            Err(IdeRuntimeAutomationUpdateImportError::ProjectIdentityMismatch)
+        ));
+        assert!(matches!(
+            validate_runtime_automation_update(&update, RUNTIME_PROJECT_ID, 8, &[0xaa; 32],),
+            Err(
+                IdeRuntimeAutomationUpdateImportError::ProjectRevisionMismatch {
+                    update_revision: 7,
+                    project_revision: 8,
+                }
+            )
+        ));
+        assert!(matches!(
+            validate_runtime_automation_update(&update, RUNTIME_PROJECT_ID, 7, &[0xcc; 32],),
+            Err(IdeRuntimeAutomationUpdateImportError::ProjectManifestMismatch)
         ));
     }
 
@@ -21660,6 +22209,266 @@ mod tests {
                 .manifest()
                 .revision(),
             scene_revision + 1
+        );
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    fn publish_runtime_automation_update_for_test(
+        directory: &Path,
+        project: &Path,
+        track_id: &str,
+    ) -> PathBuf {
+        let verified = verify_project_package(project).unwrap();
+        let source = RuntimeAutomationUpdateSource::try_new(
+            verified.manifest().project_id().to_owned(),
+            verified.manifest().revision(),
+            runtime_automation_update_sha256_hex(verified.manifest_sha256()),
+            runtime_automation_update_sha256_hex(&[0xbb; 32]),
+            1,
+        )
+        .unwrap();
+        drop(verified);
+        let update = RuntimeAutomationUpdate::try_new(
+            uuid::Uuid::new_v4().to_string(),
+            source,
+            "Runtime gain pass".to_owned(),
+            RuntimeAutomationTarget::try_channel(
+                track_id.to_owned(),
+                AutomationChannelParameter::Gain,
+            )
+            .unwrap(),
+            0,
+            1_920,
+            vec![
+                AutomationPoint::new(0, AutomationValue::Integer(500_000)),
+                AutomationPoint::new(960, AutomationValue::Integer(750_000)),
+            ],
+        )
+        .unwrap();
+        RuntimeAutomationUpdateDirectory::open(directory)
+            .unwrap()
+            .publish(&update)
+            .unwrap()
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker scenario keeps external artifact import, durable take publication, history, and stale-source refusal visible"
+    )]
+    fn runtime_automation_update_import_publishes_one_take_and_refuses_a_stale_artifact() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-runtime-automation-update-import-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 5)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the project must open before importing Runtime automation");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the created project must expose one audio track")
+            .id()
+            .to_owned();
+        let source_revision = verify_project_package(&project)
+            .unwrap()
+            .manifest()
+            .revision();
+        let updates = fixture.join("updates");
+        std::fs::create_dir(&updates).unwrap();
+        let update_path = publish_runtime_automation_update_for_test(&updates, &project, &track_id);
+
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeAutomationUpdate {
+                path: update_path.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RuntimeAutomationUpdateImporting {
+                name,
+                point_count: 2,
+            } if name == "Runtime gain pass"
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("Runtime automation update import"),
+                redo_label: None,
+            }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        let imported = recv(&worker);
+        let IdeWorkerEvent::RuntimeAutomationUpdateImported {
+            revision,
+            take_id,
+            name,
+        } = imported
+        else {
+            panic!("the Runtime automation import must report its durable take: {imported:?}");
+        };
+        assert_eq!(revision, source_revision + 1);
+        assert_eq!(name, "Runtime gain pass");
+
+        let prepared = hyper_project_loader::prepare_project_playback(
+            &project,
+            audio_import_application().config.project_limits,
+        )
+        .unwrap();
+        let takes = prepared.session().automation_takes().takes();
+        assert_eq!(takes.len(), 1);
+        assert_eq!(takes[0].id(), take_id);
+        assert_eq!(takes[0].name(), "Runtime gain pass");
+        assert_eq!(takes[0].lanes().len(), 1);
+        assert_eq!(takes[0].lanes()[0].point_count(), 2);
+        assert!(matches!(
+            takes[0].lanes()[0].target(),
+            AutomationTarget::Channel {
+                parameter: AutomationChannelParameter::Gain,
+                ..
+            }
+        ));
+        drop(prepared);
+        assert!(update_path.is_file());
+
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeAutomationUpdate { path: update_path })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeAutomationUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeAutomationUpdateImport(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeRuntimeAutomationUpdateImportError::ProjectRevisionMismatch {
+                    update_revision,
+                    project_revision,
+                } if *update_revision == source_revision && *project_revision == source_revision + 1
+            )
+        ));
+        assert_eq!(
+            verify_project_package(&project)
+                .unwrap()
+                .manifest()
+                .revision(),
+            source_revision + 1
+        );
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn runtime_automation_update_import_refuses_an_enabled_target_before_the_fence() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-runtime-automation-target-conflict-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 5)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the project must open before establishing the local automation target");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the created project must expose one audio track")
+            .id()
+            .to_owned();
+        worker
+            .try_send(IdeWorkerCommand::AddAutomationTake {
+                request: IdeAutomationTakeRequest {
+                    name: "Existing gain".to_owned(),
+                    start_tick: 0,
+                    end_tick: 1_920,
+                    target: IdeAutomationTarget::Channel {
+                        track_id: track_id.clone(),
+                        parameter: AutomationChannelParameter::Gain,
+                    },
+                    interpolation: AutomationInterpolation::Linear,
+                    points: vec![AutomationPoint::new(0, AutomationValue::Integer(500_000))],
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AutomationTakeAdding
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged { .. }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AutomationTakeAdded { .. }
+        ));
+        let source_revision = verify_project_package(&project)
+            .unwrap()
+            .manifest()
+            .revision();
+        let updates = fixture.join("updates");
+        std::fs::create_dir(&updates).unwrap();
+        let update_path = publish_runtime_automation_update_for_test(&updates, &project, &track_id);
+
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeAutomationUpdate { path: update_path })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeAutomationUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeAutomationUpdateImport(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeRuntimeAutomationUpdateImportError::TargetAlreadyAutomated
+            )
+        ));
+        assert_eq!(
+            verify_project_package(&project)
+                .unwrap()
+                .manifest()
+                .revision(),
+            source_revision
         );
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();

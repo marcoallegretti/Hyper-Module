@@ -2209,6 +2209,7 @@ dependencies = [
  "hyper-recording-journal",
  "hyper-recording-metadata",
  "hyper-recording-worker",
+ "hyper-runtime-automation-update",
  "hyper-runtime-bundle-builder",
  "hyper-runtime-loop-update",
  "hyper-runtime-mixer-update",
