@@ -1,4 +1,4 @@
-import { Button, HorizontalBox, ListView, ScrollView, VerticalBox } from "std-widgets.slint";
+import { Button, ComboBox, HorizontalBox, LineEdit, ListView, ScrollView, VerticalBox } from "std-widgets.slint";
 
 export struct OperatorSceneRow {
     name: string,
@@ -642,6 +642,12 @@ export component OperatorWindow inherits Window {
     in property <string> scene-performance-state: "Waiting for committed Runtime transport recovery";
     in property <bool> scene-performance-start-enabled: false;
     in property <bool> scene-performance-stop-enabled: false;
+    in property <[string]> automation-target-names;
+    in-out property <int> selected-automation-target-index: -1;
+    in-out property <string> automation-capture-name: "Runtime automation";
+    in property <string> automation-capture-state: "Waiting for committed Runtime transport recovery";
+    in property <bool> automation-capture-start-enabled: false;
+    in property <bool> automation-capture-stop-enabled: false;
     in property <[OperatorMixerRow]> mixer-channels;
     in property <[OperatorMixerSendRow]> mixer-sends;
     in property <[OperatorNativeDeviceRow]> native-devices;
@@ -709,6 +715,8 @@ export component OperatorWindow inherits Window {
     callback stop-interactive-scenes-requested();
     callback start-scene-performance-capture-requested();
     callback stop-scene-performance-capture-requested();
+    callback start-automation-capture-requested(int, string);
+    callback stop-automation-capture-requested();
     callback quit-requested();
 
     begin-loudness-reset => {
@@ -1342,6 +1350,65 @@ export component OperatorWindow inherits Window {
                                 clicked => { root.export-native-device-update-requested(index); }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            background: #171b24;
+            border-color: #2c3445;
+            border-width: 1px;
+            border-radius: 8px;
+            min-height: 136px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 7px;
+                HorizontalLayout {
+                    Text { text: "RUNTIME AUTOMATION TAKE · EXTERNAL HANDOFF"; color: #8d99ad; font-size: 11px; font-weight: 700; }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: root.automation-capture-state; color: #8d99ad; font-size: 10px; overflow: elide; width: 240px; vertical-alignment: center; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "TARGET"; color: #69778c; font-size: 9px; font-weight: 700; width: 48px; vertical-alignment: center; }
+                    ComboBox {
+                        horizontal-stretch: 1;
+                        model: root.automation-target-names;
+                        current-index <=> root.selected-automation-target-index;
+                        enabled: root.automation-capture-start-enabled && root.automation-target-names.length > 0;
+                        accessible-label: "Runtime automation capture target";
+                    }
+                    Text { text: "TAKE"; color: #69778c; font-size: 9px; font-weight: 700; width: 36px; vertical-alignment: center; }
+                    LineEdit {
+                        width: 180px;
+                        text <=> root.automation-capture-name;
+                        placeholder-text: "Runtime automation";
+                        enabled: root.automation-capture-start-enabled;
+                        accessible-label: "Runtime automation take name";
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Captures committed mixer changes only. The loaded project is not changed until the IDE verifies and imports the update.";
+                        color: #69778c;
+                        font-size: 9px;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                    }
+                    Button {
+                        text: "Start capture";
+                        enabled: root.automation-capture-start-enabled;
+                        accessible-label: "Start Runtime automation capture";
+                        clicked => { root.start-automation-capture-requested(root.selected-automation-target-index, root.automation-capture-name); }
+                    }
+                    Button {
+                        text: "Stop capture";
+                        enabled: root.automation-capture-stop-enabled;
+                        accessible-label: "Stop Runtime automation capture at the next committed transport boundary";
+                        clicked => { root.stop-automation-capture-requested(); }
                     }
                 }
             }

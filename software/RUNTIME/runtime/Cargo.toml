@@ -30,6 +30,7 @@ hyper-runtime-host = { path = "../runtime-host" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
 hyper-native-device = { path = "../../../crates/native-device" }
 hyper-runtime-mixer-update = { path = "../../../crates/runtime-mixer-update" }
+hyper-runtime-automation-update = { path = "../../../crates/runtime-automation-update" }
 hyper-runtime-loop-update = { path = "../../../crates/runtime-loop-update" }
 hyper-scene-performance = { path = "../../../crates/scene-performance" }
 hyper-storage-engine = { path = "../../../crates/storage-engine" }

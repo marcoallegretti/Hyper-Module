@@ -81,6 +81,7 @@ pub struct RuntimeArguments {
     deployment_root: PathBuf,
     panel_listen: Option<SocketAddr>,
     performance_updates: Option<PathBuf>,
+    automation_updates: Option<PathBuf>,
     mixer_updates: Option<PathBuf>,
     loop_updates: Option<PathBuf>,
     native_device_updates: Option<PathBuf>,
@@ -149,6 +150,7 @@ impl RuntimeArguments {
         let mut deployment_root = None;
         let mut panel_listen = None;
         let mut performance_updates = None;
+        let mut automation_updates = None;
         let mut mixer_updates = None;
         let mut loop_updates = None;
         let mut native_device_updates = None;
@@ -181,6 +183,14 @@ impl RuntimeArguments {
                         &mut arguments,
                         &mut performance_updates,
                         "--performance-updates",
+                        |value| Ok(PathBuf::from(value)),
+                    )?;
+                }
+                "--automation-updates" => {
+                    assign_unique_option(
+                        &mut arguments,
+                        &mut automation_updates,
+                        "--automation-updates",
                         |value| Ok(PathBuf::from(value)),
                     )?;
                 }
@@ -229,6 +239,7 @@ impl RuntimeArguments {
             deployment_root: deployment_root.ok_or(ArgumentError::MissingDeploymentRoot)?,
             panel_listen,
             performance_updates,
+            automation_updates,
             mixer_updates,
             loop_updates,
             native_device_updates,
@@ -252,6 +263,12 @@ impl RuntimeArguments {
     #[must_use]
     pub fn performance_updates(&self) -> Option<&Path> {
         self.performance_updates.as_deref()
+    }
+
+    /// Returns the explicit Runtime automation-update directory, when enabled.
+    #[must_use]
+    pub fn automation_updates(&self) -> Option<&Path> {
+        self.automation_updates.as_deref()
     }
 
     /// Returns the explicit Runtime mixer-update directory, when enabled.
@@ -301,6 +318,8 @@ mod argument_tests {
         let arguments = RuntimeArguments::parse([
             "--performance-updates".to_owned(),
             "scene-updates".to_owned(),
+            "--automation-updates".to_owned(),
+            "automation-updates".to_owned(),
             "--mixer-updates".to_owned(),
             "mixer-updates".to_owned(),
             "--loop-updates".to_owned(),
@@ -319,6 +338,10 @@ mod argument_tests {
         assert_eq!(
             arguments.performance_updates(),
             Some(Path::new("scene-updates"))
+        );
+        assert_eq!(
+            arguments.automation_updates(),
+            Some(Path::new("automation-updates"))
         );
         assert_eq!(arguments.mixer_updates(), Some(Path::new("mixer-updates")));
         assert_eq!(arguments.loop_updates(), Some(Path::new("loop-updates")));
@@ -350,6 +373,20 @@ mod argument_tests {
         assert_eq!(
             RuntimeArguments::parse(["--mixer-updates".to_owned()]),
             Err(ArgumentError::MissingValue("--mixer-updates"))
+        );
+        assert_eq!(
+            RuntimeArguments::parse([
+                "--automation-updates".to_owned(),
+                "first".to_owned(),
+                "--automation-updates".to_owned(),
+                "second".to_owned(),
+                "deployment".to_owned(),
+            ]),
+            Err(ArgumentError::Repeated("--automation-updates"))
+        );
+        assert_eq!(
+            RuntimeArguments::parse(["--automation-updates".to_owned()]),
+            Err(ArgumentError::MissingValue("--automation-updates"))
         );
         assert_eq!(
             RuntimeArguments::parse([

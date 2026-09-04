@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+mod automation_update;
 mod input;
 mod loop_update;
 mod mixer_update;
@@ -52,6 +53,9 @@ use hyper_playback_compiler::{FrameTimeline, MeterEvent, TempoEvent, musical_pos
 use hyper_playback_json::{LoadedTimelineMarker, LoaderLimits};
 use hyper_playback_session::{PlaybackExtent, PlaybackSessionAssemblyLimits};
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackLimits};
+use hyper_runtime_automation_update::{
+    RuntimeAutomationUpdateDirectory, RuntimeAutomationUpdateSource,
+};
 use hyper_runtime_deployment::resolve_runtime_deployment;
 use hyper_runtime_host::{PanelHost, RuntimeArguments, ServedPanel, serve_panels_with_idle};
 use hyper_runtime_loop_update::{RuntimeLoopUpdateDirectory, RuntimeLoopUpdateSource};
@@ -62,8 +66,14 @@ use hyper_runtime_native_device_update::{
 use hyper_scene_performance::{
     RuntimeScenePerformanceSource, RuntimeScenePerformanceUpdateDirectory, sha256_hex,
 };
-use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
+use slint::{
+    CloseRequestResponse, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel,
+};
 
+use automation_update::{
+    RuntimeAutomationCaptureConfiguration, RuntimeAutomationCaptureController,
+    RuntimeAutomationCaptureObservation, RuntimeAutomationCapturePoll,
+};
 use input::{RuntimeInputRoute, discover_runtime_input_targets, prepare_runtime_input};
 use loop_update::{
     RuntimeLoopUpdateConfiguration, RuntimeLoopUpdateController, RuntimeLoopUpdateObservation,
@@ -109,6 +119,7 @@ const HEARTBEAT_TIMEOUT_MS: u32 = 500;
 /// sole control runtime, so it is the only thing that can answer these.
 struct SessionHost {
     session: DesktopPlaybackSession,
+    automation_capture: RuntimeAutomationCaptureController,
     mixer_update: RuntimeMixerUpdateController,
     native_device_update: RuntimeNativeDeviceUpdateController,
     loop_update: RuntimeLoopUpdateController,
@@ -179,7 +190,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     match parse_runtime_invocation(std::env::args().skip(1)).map_err(|error| {
         format!(
-            "{error}\nusage:\n  hyper-runtime --list-audio-outputs\n  hyper-runtime --list-audio-inputs\n  hyper-runtime <deployment-target-directory> [--audio-output ROUTING_ID] [--audio-input ROUTING_ID] [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--mixer-updates DIRECTORY] [--native-device-updates DIRECTORY] [--loop-updates DIRECTORY] [--operator-ui]"
+            "{error}\nusage:\n  hyper-runtime --list-audio-outputs\n  hyper-runtime --list-audio-inputs\n  hyper-runtime <deployment-target-directory> [--audio-output ROUTING_ID] [--audio-input ROUTING_ID] [--panel-listen ADDRESS] [--performance-updates DIRECTORY] [--automation-updates DIRECTORY] [--mixer-updates DIRECTORY] [--native-device-updates DIRECTORY] [--loop-updates DIRECTORY] [--operator-ui]"
         )
     })? {
         RuntimeInvocation::ListAudioOutputs => list_runtime_audio_outputs(),
@@ -327,6 +338,7 @@ struct RuntimeObservers {
     input_control: Option<DesktopMonitoringControl>,
     recovery: PlaybackRecoveryCheckpoint,
     panel_connected: Arc<AtomicBool>,
+    automation_capture: Arc<Mutex<RuntimeAutomationCaptureObservation>>,
     mixer_update: Arc<Mutex<RuntimeMixerUpdateObservation>>,
     native_device_update: Arc<Mutex<RuntimeNativeDeviceUpdateObservation>>,
     loop_update: Arc<Mutex<RuntimeLoopUpdateObservation>>,
@@ -342,6 +354,7 @@ struct OperatorReady {
     mixer_sends: Vec<OperatorMixerSend>,
     native_devices: Vec<OperatorNativeDevice>,
     native_device_chains: Vec<OperatorNativeDeviceChain>,
+    automation_targets: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -516,9 +529,10 @@ struct StartedRuntime {
     host: SessionHost,
     observers: RuntimeObservers,
     native_device_chains: Vec<OperatorNativeDeviceChain>,
+    automation_targets: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum OperatorCommand {
     Start,
     Stop,
@@ -527,6 +541,11 @@ enum OperatorCommand {
         chain_index: usize,
     },
     ExportLoopUpdate,
+    StartAutomationCapture {
+        target_index: usize,
+        name: String,
+    },
+    StopAutomationCapture,
     StartScenePerformanceCapture,
     StopScenePerformanceCapture,
     ReturnToStart,
@@ -683,6 +702,20 @@ trait RuntimeScenePerformanceControl {
     fn poll_scene_performance_capture(&mut self) -> Option<String>;
 }
 
+/// Runtime automation capture remains with the session that owns transport and
+/// the sole committed mixer-parameter receiver.
+trait RuntimeAutomationCaptureControl {
+    fn start_automation_capture(
+        &mut self,
+        target_index: usize,
+        name: String,
+    ) -> Result<String, String>;
+
+    fn stop_automation_capture(&mut self) -> Result<String, String>;
+
+    fn poll_automation_capture(&mut self) -> Option<String>;
+}
+
 /// Mixer-update export remains with the same owner as live mixer commands.
 trait RuntimeMixerUpdateControl {
     fn export_mixer_update(&mut self) -> Result<String, String>;
@@ -797,6 +830,54 @@ impl RuntimeScenePerformanceControl for SessionHost {
             )),
             Some(RuntimeScenePerformanceCapturePoll::Failed(error)) => {
                 Some(format!("scene-performance capture failed: {error}"))
+            }
+            None => None,
+        }
+    }
+}
+
+impl RuntimeAutomationCaptureControl for SessionHost {
+    fn start_automation_capture(
+        &mut self,
+        target_index: usize,
+        name: String,
+    ) -> Result<String, String> {
+        let capture = &mut self.automation_capture;
+        let session = &mut self.session;
+        capture.start(session, target_index, name).map_or_else(
+            |error| Err(error.to_string()),
+            |maximum_point_count| {
+                Ok(format!(
+                    "Runtime automation capture started with capacity for {maximum_point_count} committed parameter change(s)"
+                ))
+            },
+        )
+    }
+
+    fn stop_automation_capture(&mut self) -> Result<String, String> {
+        let capture = &mut self.automation_capture;
+        let session = &mut self.session;
+        capture.stop(session).map_or_else(
+            |error| Err(error.to_string()),
+            |captured_point_count| {
+                Ok(format!(
+                    "Runtime automation capture stop requested after {captured_point_count} committed parameter change(s)"
+                ))
+            },
+        )
+    }
+
+    fn poll_automation_capture(&mut self) -> Option<String> {
+        let capture = &mut self.automation_capture;
+        let session = &mut self.session;
+        match capture.poll(session) {
+            Some(RuntimeAutomationCapturePoll::Saved(saved)) => Some(format!(
+                "Runtime automation capture published {} parameter change(s) to {}",
+                saved.point_count,
+                saved.path.display()
+            )),
+            Some(RuntimeAutomationCapturePoll::Failed(error)) => {
+                Some(format!("Runtime automation capture failed: {error}"))
             }
             None => None,
         }
@@ -938,11 +1019,25 @@ fn operator_timeline_marker(
 struct PreparedRuntimeStartup {
     facts: RuntimeFacts,
     project: PreparedProjectPlayback,
+    automation_capture: RuntimeAutomationCaptureConfiguration,
+    automation_targets: Vec<String>,
     mixer_update: RuntimeMixerUpdateConfiguration,
     native_device_update: RuntimeNativeDeviceUpdateConfiguration,
     native_device_chains: Vec<OperatorNativeDeviceChain>,
     loop_update: RuntimeLoopUpdateConfiguration,
     scene_performance: RuntimeScenePerformanceCaptureConfiguration,
+}
+
+/// Explicit external authorities available for Runtime handback artifacts.
+///
+/// Each directory is opened before native audio starts, and each controller
+/// receives only its own retained authority from this aggregate.
+struct RuntimeExternalUpdateDirectories {
+    scene_performance: Option<RuntimeScenePerformanceUpdateDirectory>,
+    automation: Option<RuntimeAutomationUpdateDirectory>,
+    mixer: Option<RuntimeMixerUpdateDirectory>,
+    native_device: Option<RuntimeNativeDeviceUpdateDirectory>,
+    loop_update: Option<RuntimeLoopUpdateDirectory>,
 }
 
 /// Complete audio authority preflighted before either native stream is opened.
@@ -951,6 +1046,25 @@ struct RuntimeAudioConfiguration {
     output_route: RuntimeOutputRoute,
     input_route: RuntimeInputRoute,
     monitoring: Option<DesktopMonitoringConfig>,
+}
+
+/// Controllers attached to the sole native-audio session after all artifact
+/// and audio preflight work has completed.
+struct RuntimeHostAssembly {
+    facts: RuntimeFacts,
+    session: DesktopPlaybackSession,
+    automation_capture: RuntimeAutomationCaptureController,
+    automation_capture_observation: Arc<Mutex<RuntimeAutomationCaptureObservation>>,
+    mixer_update: RuntimeMixerUpdateController,
+    mixer_update_observation: Arc<Mutex<RuntimeMixerUpdateObservation>>,
+    native_device_update: RuntimeNativeDeviceUpdateController,
+    native_device_update_observation: Arc<Mutex<RuntimeNativeDeviceUpdateObservation>>,
+    loop_update: RuntimeLoopUpdateController,
+    loop_update_observation: Arc<Mutex<RuntimeLoopUpdateObservation>>,
+    scene_performance: RuntimeScenePerformanceCaptureController,
+    scene_performance_observation: Arc<Mutex<RuntimeScenePerformanceCaptureObservation>>,
+    native_device_chains: Vec<OperatorNativeDeviceChain>,
+    automation_targets: Vec<String>,
 }
 
 fn prepare_runtime_audio(
@@ -1023,6 +1137,34 @@ fn prepare_runtime_loop_update_configuration(
     })
 }
 
+/// Prepares immutable provenance, stable target identities, and bounded
+/// capture capacity before the native audio owner starts.
+fn prepare_runtime_automation_capture_configuration(
+    project: &PreparedProjectPlayback,
+    bundle_identity: &str,
+    deployment_generation: u64,
+    output_directory: Option<RuntimeAutomationUpdateDirectory>,
+) -> Result<RuntimeAutomationCaptureConfiguration, String> {
+    let manifest = project.package().manifest();
+    let source = RuntimeAutomationUpdateSource::try_new(
+        manifest.project_id().to_owned(),
+        manifest.revision(),
+        sha256_hex(project.package().manifest_sha256()),
+        bundle_identity.to_owned(),
+        deployment_generation,
+    )
+    .map_err(|error| {
+        format!("verified Runtime automation-update source could not be prepared: {error}")
+    })?;
+    RuntimeAutomationCaptureConfiguration::try_new(source, project, output_directory).map_err(
+        |error| {
+            format!(
+                "verified Runtime automation-capture configuration could not be prepared: {error}"
+            )
+        },
+    )
+}
+
 fn prepare_runtime_scene_performance_configuration(
     project: &PreparedProjectPlayback,
     bundle_identity: &str,
@@ -1092,10 +1234,7 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
             format_error_chain(&error)
         )
     })?;
-    let scene_performance_output = open_runtime_scene_performance_output(arguments)?;
-    let mixer_update_output = open_runtime_mixer_update_output(arguments)?;
-    let native_device_update_output = open_runtime_native_device_update_output(arguments)?;
-    let loop_update_output = open_runtime_loop_update_output(arguments)?;
+    let outputs = open_runtime_external_update_directories(arguments)?;
     let prepared_project = deployment.bundle().project();
     let manifest = prepared_project.package().manifest();
     let (project, ..) = prepared_project.session().parts();
@@ -1112,8 +1251,17 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
         prepared_project,
         &bundle_identity,
         deployment.generation(),
-        scene_performance_output,
+        outputs.scene_performance,
     )?;
+    let automation_capture = prepare_runtime_automation_capture_configuration(
+        prepared_project,
+        &bundle_identity,
+        deployment.generation(),
+        outputs.automation,
+    )?;
+    let automation_targets = automation_capture.target_labels().map_err(|error| {
+        format!("verified Runtime automation target catalog could not be prepared: {error}")
+    })?;
     let mixer_update_source = RuntimeMixerUpdateSource::try_new(
         manifest.project_id().to_owned(),
         manifest.revision(),
@@ -1127,7 +1275,7 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
     let mixer_update = RuntimeMixerUpdateConfiguration::try_new(
         mixer_update_source,
         prepared_project,
-        mixer_update_output,
+        outputs.mixer,
     )
     .map_err(|error| {
         format!("verified Runtime mixer-update configuration could not be prepared: {error}")
@@ -1136,7 +1284,7 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
         prepared_project,
         &bundle_identity,
         deployment.generation(),
-        native_device_update_output,
+        outputs.native_device,
     )?;
     let native_device_chains =
         operator_native_device_chain_catalog(prepared_project, &native_device_update)?;
@@ -1144,7 +1292,7 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
         prepared_project,
         &bundle_identity,
         deployment.generation(),
-        loop_update_output,
+        outputs.loop_update,
     )?;
     let facts = RuntimeFacts {
         bundle_identity,
@@ -1162,6 +1310,8 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
     Ok(PreparedRuntimeStartup {
         facts,
         project: deployment.into_bundle().into_project(),
+        automation_capture,
+        automation_targets,
         mixer_update,
         native_device_update,
         native_device_chains,
@@ -1171,9 +1321,11 @@ fn prepare_runtime_startup(arguments: &RuntimeArguments) -> Result<PreparedRunti
 }
 
 fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String> {
-    let (
+    let RuntimeHostAssembly {
         facts,
         session,
+        automation_capture,
+        automation_capture_observation,
         mixer_update,
         mixer_update_observation,
         native_device_update,
@@ -1183,56 +1335,11 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         scene_performance,
         scene_performance_observation,
         native_device_chains,
-    ) = prepare_output_and_host(
+        automation_targets,
+    } = prepare_output_and_host(
         || prepare_runtime_startup(arguments),
         || prepare_runtime_audio(arguments),
-        |audio, startup| {
-            let RuntimeAudioConfiguration {
-                output,
-                output_route,
-                input_route,
-                monitoring,
-            } = audio;
-            let mut facts = startup.facts;
-            facts.output_route = output_route;
-            facts.input_route = input_route;
-            let mut session = match monitoring {
-                Some(monitoring) => {
-                    DesktopPlaybackSession::start_project_monitored_with_monitor_state(
-                        monitoring,
-                        startup.project,
-                        1.0,
-                        true,
-                    )
-                }
-                None => DesktopPlaybackSession::start_project(output, startup.project),
-            }
-            .map_err(|error| format!("verified bundle could not be hosted: {error}"))?;
-            let receiver = session.take_scene_launch_receiver().ok_or_else(|| {
-                "verified bundle could not transfer committed scene-launch authority".to_owned()
-            })?;
-            let scene_performance = startup.scene_performance.attach(receiver);
-            let scene_performance_observation = scene_performance.observation();
-            let mixer_update = startup.mixer_update.attach();
-            let mixer_update_observation = mixer_update.observation();
-            let native_device_update = startup.native_device_update.attach();
-            let native_device_update_observation = native_device_update.observation();
-            let loop_update = startup.loop_update.attach();
-            let loop_update_observation = loop_update.observation();
-            Ok((
-                facts,
-                session,
-                mixer_update,
-                mixer_update_observation,
-                native_device_update,
-                native_device_update_observation,
-                loop_update,
-                loop_update_observation,
-                scene_performance,
-                scene_performance_observation,
-                startup.native_device_chains,
-            ))
-        },
+        attach_runtime_host,
     )?;
     let panel_connected = Arc::new(AtomicBool::new(false));
     let observers = RuntimeObservers {
@@ -1244,6 +1351,7 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         input_control: session.monitoring_control(),
         recovery: session.recovery_checkpoint(),
         panel_connected: Arc::clone(&panel_connected),
+        automation_capture: automation_capture_observation,
         mixer_update: mixer_update_observation,
         native_device_update: native_device_update_observation,
         loop_update: loop_update_observation,
@@ -1252,6 +1360,7 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
     Ok(StartedRuntime {
         host: SessionHost {
             session,
+            automation_capture,
             mixer_update,
             native_device_update,
             loop_update,
@@ -1260,6 +1369,64 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         },
         observers,
         native_device_chains,
+        automation_targets,
+    })
+}
+
+fn attach_runtime_host(
+    audio: RuntimeAudioConfiguration,
+    startup: PreparedRuntimeStartup,
+) -> Result<RuntimeHostAssembly, String> {
+    let RuntimeAudioConfiguration {
+        output,
+        output_route,
+        input_route,
+        monitoring,
+    } = audio;
+    let mut facts = startup.facts;
+    facts.output_route = output_route;
+    facts.input_route = input_route;
+    let mut session = match monitoring {
+        Some(monitoring) => DesktopPlaybackSession::start_project_monitored_with_monitor_state(
+            monitoring,
+            startup.project,
+            1.0,
+            true,
+        ),
+        None => DesktopPlaybackSession::start_project(output, startup.project),
+    }
+    .map_err(|error| format!("verified bundle could not be hosted: {error}"))?;
+    let scene_receiver = session.take_scene_launch_receiver().ok_or_else(|| {
+        "verified bundle could not transfer committed scene-launch authority".to_owned()
+    })?;
+    let scene_performance = startup.scene_performance.attach(scene_receiver);
+    let scene_performance_observation = scene_performance.observation();
+    let parameter_receiver = session.take_mixer_parameter_receiver().ok_or_else(|| {
+        "verified bundle could not transfer committed mixer-parameter authority".to_owned()
+    })?;
+    let automation_capture = startup.automation_capture.attach(parameter_receiver);
+    let automation_capture_observation = automation_capture.observation();
+    let mixer_update = startup.mixer_update.attach();
+    let mixer_update_observation = mixer_update.observation();
+    let native_device_update = startup.native_device_update.attach();
+    let native_device_update_observation = native_device_update.observation();
+    let loop_update = startup.loop_update.attach();
+    let loop_update_observation = loop_update.observation();
+    Ok(RuntimeHostAssembly {
+        facts,
+        session,
+        automation_capture,
+        automation_capture_observation,
+        mixer_update,
+        mixer_update_observation,
+        native_device_update,
+        native_device_update_observation,
+        loop_update,
+        loop_update_observation,
+        scene_performance,
+        scene_performance_observation,
+        native_device_chains: startup.native_device_chains,
+        automation_targets: startup.automation_targets,
     })
 }
 
@@ -1293,6 +1460,43 @@ fn open_runtime_scene_performance_output(
     if output_root.starts_with(&deployment_root) {
         return Err(format!(
             "scene-performance output directory {} must be outside deployment target {}",
+            output.root_path().display(),
+            arguments.deployment_root().display()
+        ));
+    }
+    Ok(Some(output))
+}
+
+/// Opens an explicit Runtime automation-update directory only when it is
+/// outside the verified deployment tree. Runtime captures are handbacks for
+/// the IDE, never mutations of the deployment, bundle, or embedded project.
+fn open_runtime_automation_output(
+    arguments: &RuntimeArguments,
+) -> Result<Option<RuntimeAutomationUpdateDirectory>, String> {
+    let Some(path) = arguments.automation_updates() else {
+        return Ok(None);
+    };
+    let output = RuntimeAutomationUpdateDirectory::open(path).map_err(|error| {
+        format!(
+            "automation-update output directory {} is invalid: {error}",
+            path.display()
+        )
+    })?;
+    let deployment_root = std::fs::canonicalize(arguments.deployment_root()).map_err(|error| {
+        format!(
+            "verified deployment root {} cannot be canonicalized for automation-update output isolation: {error}",
+            arguments.deployment_root().display()
+        )
+    })?;
+    let output_root = std::fs::canonicalize(output.root_path()).map_err(|error| {
+        format!(
+            "automation-update output directory {} cannot be canonicalized: {error}",
+            output.root_path().display()
+        )
+    })?;
+    if output_root.starts_with(&deployment_root) {
+        return Err(format!(
+            "automation-update output directory {} must be outside deployment target {}",
             output.root_path().display(),
             arguments.deployment_root().display()
         ));
@@ -1411,6 +1615,18 @@ fn open_runtime_loop_update_output(
     Ok(Some(output))
 }
 
+fn open_runtime_external_update_directories(
+    arguments: &RuntimeArguments,
+) -> Result<RuntimeExternalUpdateDirectories, String> {
+    Ok(RuntimeExternalUpdateDirectories {
+        scene_performance: open_runtime_scene_performance_output(arguments)?,
+        automation: open_runtime_automation_output(arguments)?,
+        mixer: open_runtime_mixer_update_output(arguments)?,
+        native_device: open_runtime_native_device_update_output(arguments)?,
+        loop_update: open_runtime_loop_update_output(arguments)?,
+    })
+}
+
 fn announce_runtime(arguments: &RuntimeArguments, runtime: &StartedRuntime) {
     println!(
         "hosting deployment generation {} bundle {} from {} with {} mixer channels via {} output and {} input",
@@ -1456,6 +1672,7 @@ fn host_runtime<H, O>(
 ) -> Result<(), String>
 where
     H: PanelHost
+        + RuntimeAutomationCaptureControl
         + RuntimeMixerUpdateControl
         + RuntimeNativeDeviceUpdateControl
         + RuntimeLoopUpdateControl
@@ -1472,6 +1689,9 @@ where
             drain_operator_commands(host, commands, stop, diagnostic);
         }
         if let Some(message) = host.poll_scene_performance_capture() {
+            diagnostic(message);
+        }
+        if let Some(message) = host.poll_automation_capture() {
             diagnostic(message);
         }
         if let Some(message) = host.poll_mixer_update_export() {
@@ -1595,6 +1815,7 @@ fn finish_runtime_output<O: RuntimeOutputObservation>(
 )]
 fn drain_operator_commands<
     H: RuntimeLoopUpdateControl
+        + RuntimeAutomationCaptureControl
         + RuntimeMixerUpdateControl
         + RuntimeNativeDeviceUpdateControl
         + RuntimeOperatorControl
@@ -1638,6 +1859,20 @@ fn drain_operator_commands<
             OperatorCommand::ExportLoopUpdate => match host.export_loop_update() {
                 Ok(message) => diagnostic(message),
                 Err(error) => diagnostic(format!("loop-update export refused: {error}")),
+            },
+            OperatorCommand::StartAutomationCapture { target_index, name } => {
+                match host.start_automation_capture(target_index, name) {
+                    Ok(message) => diagnostic(message),
+                    Err(error) => {
+                        diagnostic(format!("Runtime automation capture start refused: {error}"));
+                    }
+                }
+            }
+            OperatorCommand::StopAutomationCapture => match host.stop_automation_capture() {
+                Ok(message) => diagnostic(message),
+                Err(error) => {
+                    diagnostic(format!("Runtime automation capture stop refused: {error}"));
+                }
             },
             OperatorCommand::StartScenePerformanceCapture => {
                 match host.start_scene_performance_capture() {
@@ -1760,13 +1995,13 @@ fn drain_operator_commands<
             | OperatorCommand::SetMixerSendGain { .. }
             | OperatorCommand::SetMixerSendPan { .. }
             | OperatorCommand::SetMainGain { .. }) => {
-                drain_operator_mixer_value_command(host, command, diagnostic);
+                drain_operator_mixer_value_command(host, &command, diagnostic);
             }
             command @ (OperatorCommand::SetMixerChannelMute { .. }
             | OperatorCommand::SetMixerChannelSolo { .. }
             | OperatorCommand::SetMixerSendEnabled { .. }
             | OperatorCommand::SetMainMute { .. }) => {
-                drain_operator_mixer_boolean_command(host, command, diagnostic);
+                drain_operator_mixer_boolean_command(host, &command, diagnostic);
             }
             OperatorCommand::SetNativeDeviceEnabled { device, enabled } => {
                 match host.queue_native_device(NativeDeviceCommand::SetEnabled { device, enabled })
@@ -1821,13 +2056,16 @@ fn queue_operator_scene_stop<H: RuntimeOperatorControl>(host: &mut H, diagnostic
 
 fn drain_operator_mixer_boolean_command<H: RuntimeOperatorControl>(
     host: &mut H,
-    command: OperatorCommand,
+    command: &OperatorCommand,
     diagnostic: &dyn Fn(String),
 ) {
     let (command, accepted, refused) = match command {
         OperatorCommand::SetMixerChannelMute { channel, muted } => (
-            MixerParameterCommand::ChannelMute { channel, muted },
-            if muted {
+            MixerParameterCommand::ChannelMute {
+                channel: *channel,
+                muted: *muted,
+            },
+            if *muted {
                 "mixer channel mute queued"
             } else {
                 "mixer channel unmute queued"
@@ -1835,8 +2073,11 @@ fn drain_operator_mixer_boolean_command<H: RuntimeOperatorControl>(
             "mixer channel mute refused",
         ),
         OperatorCommand::SetMixerChannelSolo { channel, solo } => (
-            MixerParameterCommand::ChannelSolo { channel, solo },
-            if solo {
+            MixerParameterCommand::ChannelSolo {
+                channel: *channel,
+                solo: *solo,
+            },
+            if *solo {
                 "mixer channel solo queued"
             } else {
                 "mixer channel unsolo queued"
@@ -1844,8 +2085,11 @@ fn drain_operator_mixer_boolean_command<H: RuntimeOperatorControl>(
             "mixer channel solo refused",
         ),
         OperatorCommand::SetMixerSendEnabled { send, enabled } => (
-            MixerParameterCommand::SendEnabled { send, enabled },
-            if enabled {
+            MixerParameterCommand::SendEnabled {
+                send: *send,
+                enabled: *enabled,
+            },
+            if *enabled {
                 "mixer send enable queued"
             } else {
                 "mixer send disable queued"
@@ -1853,8 +2097,8 @@ fn drain_operator_mixer_boolean_command<H: RuntimeOperatorControl>(
             "mixer send toggle refused",
         ),
         OperatorCommand::SetMainMute { muted } => (
-            MixerParameterCommand::MainMute { muted },
-            if muted {
+            MixerParameterCommand::MainMute { muted: *muted },
+            if *muted {
                 "main output mute queued"
             } else {
                 "main output unmute queued"
@@ -1871,16 +2115,19 @@ fn drain_operator_mixer_boolean_command<H: RuntimeOperatorControl>(
 
 fn drain_operator_mixer_value_command<H: RuntimeOperatorControl>(
     host: &mut H,
-    command: OperatorCommand,
+    command: &OperatorCommand,
     diagnostic: &dyn Fn(String),
 ) {
     let (command, name) = match command {
         OperatorCommand::SetMixerChannelGain {
             channel,
             gain_millionths,
-        } => match LinearGain::from_millionths(gain_millionths) {
+        } => match LinearGain::from_millionths(*gain_millionths) {
             Ok(gain) => (
-                MixerParameterCommand::ChannelGain { channel, gain },
+                MixerParameterCommand::ChannelGain {
+                    channel: *channel,
+                    gain,
+                },
                 "mixer channel gain",
             ),
             Err(error) => {
@@ -1891,9 +2138,12 @@ fn drain_operator_mixer_value_command<H: RuntimeOperatorControl>(
         OperatorCommand::SetMixerChannelPan {
             channel,
             pan_millionths,
-        } => match Pan::from_millionths(pan_millionths) {
+        } => match Pan::from_millionths(*pan_millionths) {
             Ok(pan) => (
-                MixerParameterCommand::ChannelPan { channel, pan },
+                MixerParameterCommand::ChannelPan {
+                    channel: *channel,
+                    pan,
+                },
                 "mixer channel pan",
             ),
             Err(error) => {
@@ -1904,9 +2154,9 @@ fn drain_operator_mixer_value_command<H: RuntimeOperatorControl>(
         OperatorCommand::SetMixerSendGain {
             send,
             gain_millionths,
-        } => match LinearGain::from_millionths(gain_millionths) {
+        } => match LinearGain::from_millionths(*gain_millionths) {
             Ok(gain) => (
-                MixerParameterCommand::SendGain { send, gain },
+                MixerParameterCommand::SendGain { send: *send, gain },
                 "mixer send gain",
             ),
             Err(error) => {
@@ -1917,9 +2167,9 @@ fn drain_operator_mixer_value_command<H: RuntimeOperatorControl>(
         OperatorCommand::SetMixerSendPan {
             send,
             pan_millionths,
-        } => match Pan::from_millionths(pan_millionths) {
+        } => match Pan::from_millionths(*pan_millionths) {
             Ok(pan) => (
-                MixerParameterCommand::SendPan { send, pan },
+                MixerParameterCommand::SendPan { send: *send, pan },
                 "mixer send pan",
             ),
             Err(error) => {
@@ -1928,7 +2178,7 @@ fn drain_operator_mixer_value_command<H: RuntimeOperatorControl>(
             }
         },
         OperatorCommand::SetMainGain { gain_millionths } => {
-            match LinearGain::from_millionths(gain_millionths) {
+            match LinearGain::from_millionths(*gain_millionths) {
                 Ok(gain) => (MixerParameterCommand::MainGain { gain }, "main output gain"),
                 Err(error) => {
                     diagnostic(format!("main output gain refused: {error}"));
@@ -2176,6 +2426,7 @@ fn spawn_operator_worker(
         let result = match start_runtime(&arguments) {
             Ok(mut runtime) => {
                 let native_device_chains = runtime.native_device_chains.clone();
+                let automation_targets = runtime.automation_targets.clone();
                 let ready_model =
                     operator_scene_catalog(&runtime.host.session).and_then(|scenes| {
                         operator_mixer_catalog(&runtime.host.session).and_then(|mixer_channels| {
@@ -2196,6 +2447,7 @@ fn spawn_operator_worker(
                                                 mixer_sends,
                                                 native_devices,
                                                 native_device_chains,
+                                                automation_targets,
                                             }
                                         })
                                         .ok_or_else(|| {
@@ -2287,6 +2539,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         mixer_sends,
         native_devices,
         native_device_chains,
+        automation_targets,
     } = ready;
     let meter_observer = Rc::new(RefCell::new(OperatorMeterObserver::new(
         meters,
@@ -2308,6 +2561,11 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let native_device_chain_model = Rc::new(VecModel::from(operator_native_device_chain_rows(
         &native_device_chains,
     )));
+    let automation_target_count = automation_targets.len();
+    let automation_target_names = automation_targets
+        .into_iter()
+        .map(SharedString::from)
+        .collect::<Vec<_>>();
     let transport_authority = Rc::new(Cell::new(None));
     let loop_authority = Rc::new(Cell::new(None));
     let metronome_authority = Rc::new(Cell::new(None));
@@ -2325,6 +2583,10 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     ui.set_mixer_sends(ModelRc::from(Rc::clone(&mixer_send_model)));
     ui.set_native_devices(ModelRc::from(Rc::clone(&native_device_model)));
     ui.set_native_device_chains(ModelRc::from(Rc::clone(&native_device_chain_model)));
+    ui.set_automation_target_names(ModelRc::from(Rc::new(VecModel::from(
+        automation_target_names,
+    ))));
+    ui.set_selected_automation_target_index(if automation_target_count == 0 { -1 } else { 0 });
 
     apply_static_facts(&ui, &observers.facts);
     wire_operator_transport_controls(&ui, &commands_tx, &diagnostic, &transport_authority);
@@ -2370,6 +2632,13 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &commands_tx,
         &diagnostic,
         &observers.scene_performance,
+    );
+    wire_operator_automation_capture(
+        &ui,
+        &commands_tx,
+        &diagnostic,
+        &observers.automation_capture,
+        automation_target_count,
     );
     wire_operator_loop_toggle(&ui, &commands_tx, &diagnostic, &loop_authority);
     wire_operator_loop_range(&ui, &commands_tx, &diagnostic, &loop_authority);
@@ -2421,6 +2690,11 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         false,
     );
     apply_operator_scene_performance_observation(&ui, observers.scene_performance.as_ref(), false);
+    apply_operator_automation_capture_observation(
+        &ui,
+        observers.automation_capture.as_ref(),
+        false,
+    );
     apply_operator_mixer_update_observation(&ui, observers.mixer_update.as_ref(), false);
     apply_operator_native_device_update_observation(
         &ui,
@@ -2450,6 +2724,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_native_device_model = Rc::clone(&native_device_model);
     let timer_native_device_authority = Rc::clone(&native_device_authority);
     let timer_scene_performance = Arc::clone(&observers.scene_performance);
+    let timer_automation_capture = Arc::clone(&observers.automation_capture);
     let timer_mixer_update = Arc::clone(&observers.mixer_update);
     let timer_native_device_update = Arc::clone(&observers.native_device_update);
     let timer_loop_update = Arc::clone(&observers.loop_update);
@@ -2514,6 +2789,11 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
             apply_operator_scene_performance_observation(
                 &ui,
                 timer_scene_performance.as_ref(),
+                terminal_latched,
+            );
+            apply_operator_automation_capture_observation(
+                &ui,
+                timer_automation_capture.as_ref(),
                 terminal_latched,
             );
             apply_operator_mixer_update_observation(
@@ -2695,6 +2975,7 @@ fn apply_operator_worker_completion(
     revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
     revoke_operator_scene_stop_authority(ui, scene_stop_authority);
     revoke_operator_scene_performance_authority(ui);
+    revoke_operator_automation_capture_authority(ui);
     let close_result = close_operator_surface();
     let message = close_result
         .as_ref()
@@ -3237,6 +3518,89 @@ fn wire_operator_scene_performance_capture(
         send_operator_command(
             &stop_sender,
             OperatorCommand::StopScenePerformanceCapture,
+            &stop_diagnostic,
+        );
+    });
+}
+
+/// Forwards one fixed-catalog automation target only while the Runtime-owned
+/// observation authorizes capture. The UI holds a display index, never a
+/// mixer handle or authored project identity; the Runtime validates the index
+/// again before it starts capture.
+fn wire_operator_automation_capture(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    observation: &Arc<Mutex<RuntimeAutomationCaptureObservation>>,
+    target_count: usize,
+) {
+    let start_sender = sender.clone();
+    let start_diagnostic = Arc::clone(diagnostic);
+    let start_observation = Arc::clone(observation);
+    let start_ui = ui.as_weak();
+    ui.on_start_automation_capture_requested(move |selected_target, name| {
+        let Ok(target_index) = usize::try_from(selected_target) else {
+            set_diagnostic(
+                &start_diagnostic,
+                "Runtime automation capture start refused: selected target is unavailable".to_owned(),
+            );
+            return;
+        };
+        if target_index >= target_count {
+            set_diagnostic(
+                &start_diagnostic,
+                "Runtime automation capture start refused: selected target is unavailable".to_owned(),
+            );
+            return;
+        }
+        let start_enabled = start_ui
+            .upgrade()
+            .is_some_and(|ui| ui.get_automation_capture_start_enabled())
+            && start_observation
+                .lock()
+                .map(|observation| observation.start_enabled)
+                .unwrap_or(false);
+        if !start_enabled {
+            set_diagnostic(
+                &start_diagnostic,
+                "Runtime automation capture start refused: committed Runtime capture state is unavailable"
+                    .to_owned(),
+            );
+            return;
+        }
+        send_operator_command(
+            &start_sender,
+            OperatorCommand::StartAutomationCapture {
+                target_index,
+                name: name.to_string(),
+            },
+            &start_diagnostic,
+        );
+    });
+
+    let stop_sender = sender.clone();
+    let stop_diagnostic = Arc::clone(diagnostic);
+    let stop_observation = Arc::clone(observation);
+    let stop_ui = ui.as_weak();
+    ui.on_stop_automation_capture_requested(move || {
+        let stop_enabled = stop_ui
+            .upgrade()
+            .is_some_and(|ui| ui.get_automation_capture_stop_enabled())
+            && stop_observation
+                .lock()
+                .map(|observation| observation.stop_enabled)
+                .unwrap_or(false);
+        if !stop_enabled {
+            set_diagnostic(
+                &stop_diagnostic,
+                "Runtime automation capture stop refused: committed Runtime capture state is unavailable"
+                    .to_owned(),
+            );
+            return;
+        }
+        send_operator_command(
+            &stop_sender,
+            OperatorCommand::StopAutomationCapture,
             &stop_diagnostic,
         );
     });
@@ -5163,6 +5527,7 @@ fn apply_operator_cycle_observation(
         revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
         revoke_operator_scene_performance_authority(ui);
+        revoke_operator_automation_capture_authority(ui);
         return;
     }
     let observation = apply_observations(ui, observers, output_state, diagnostic);
@@ -5179,6 +5544,7 @@ fn apply_operator_cycle_observation(
         revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
         revoke_operator_scene_performance_authority(ui);
+        revoke_operator_automation_capture_authority(ui);
         return;
     }
     apply_operator_transport_observation(ui, transport_authority, observation.state());
@@ -5271,6 +5637,26 @@ fn apply_operator_scene_performance_observation(
     ui.set_scene_performance_stop_enabled(observation.stop_enabled);
 }
 
+fn apply_operator_automation_capture_observation(
+    ui: &OperatorWindow,
+    observation: &Mutex<RuntimeAutomationCaptureObservation>,
+    terminal_latched: bool,
+) {
+    if terminal_latched {
+        revoke_operator_automation_capture_authority(ui);
+        return;
+    }
+    let Ok(observation) = observation.lock() else {
+        ui.set_automation_capture_state("Runtime automation capture state unavailable".into());
+        ui.set_automation_capture_start_enabled(false);
+        ui.set_automation_capture_stop_enabled(false);
+        return;
+    };
+    ui.set_automation_capture_state(observation.state.clone().into());
+    ui.set_automation_capture_start_enabled(observation.start_enabled);
+    ui.set_automation_capture_stop_enabled(observation.stop_enabled);
+}
+
 fn apply_operator_mixer_update_observation(
     ui: &OperatorWindow,
     observation: &Mutex<RuntimeMixerUpdateObservation>,
@@ -5344,6 +5730,12 @@ fn revoke_operator_scene_performance_authority(ui: &OperatorWindow) {
     ui.set_scene_performance_state("Runtime stopped · capture unavailable".into());
     ui.set_scene_performance_start_enabled(false);
     ui.set_scene_performance_stop_enabled(false);
+}
+
+fn revoke_operator_automation_capture_authority(ui: &OperatorWindow) {
+    ui.set_automation_capture_state("Runtime stopped · automation capture unavailable".into());
+    ui.set_automation_capture_start_enabled(false);
+    ui.set_automation_capture_stop_enabled(false);
 }
 
 fn apply_operator_transport_observation(
@@ -6195,6 +6587,14 @@ mod tests {
         }))
     }
 
+    fn test_automation_capture_observation() -> Arc<Mutex<RuntimeAutomationCaptureObservation>> {
+        Arc::new(Mutex::new(RuntimeAutomationCaptureObservation {
+            state: "fixture automation capture state".to_owned(),
+            start_enabled: false,
+            stop_enabled: false,
+        }))
+    }
+
     fn test_mixer_update_observation() -> Arc<Mutex<RuntimeMixerUpdateObservation>> {
         Arc::new(Mutex::new(RuntimeMixerUpdateObservation {
             state: "fixture mixer-update state".to_owned(),
@@ -6241,6 +6641,7 @@ mod tests {
             input_control: None,
             recovery: PlaybackRecoveryCheckpoint::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
+            automation_capture: test_automation_capture_observation(),
             mixer_update: test_mixer_update_observation(),
             native_device_update: test_native_device_update_observation(),
             loop_update: test_loop_update_observation(),
@@ -7172,6 +7573,8 @@ mod tests {
         native_device_update_poll: Option<String>,
         loop_update_commands: usize,
         loop_update_poll: Option<String>,
+        automation_capture_commands: Vec<OperatorAutomationCaptureAction>,
+        automation_capture_poll: Option<String>,
         scene_performance_commands: Vec<OperatorScenePerformanceAction>,
         scene_performance_poll: Option<String>,
         reject: bool,
@@ -7181,6 +7584,12 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum OperatorScenePerformanceAction {
         Start,
+        Stop,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum OperatorAutomationCaptureAction {
+        Start { target_index: usize, name: String },
         Stop,
     }
 
@@ -7263,6 +7672,36 @@ mod tests {
 
         fn poll_scene_performance_capture(&mut self) -> Option<String> {
             self.scene_performance_poll.take()
+        }
+    }
+
+    impl RuntimeAutomationCaptureControl for OperatorControl {
+        fn start_automation_capture(
+            &mut self,
+            target_index: usize,
+            name: String,
+        ) -> Result<String, String> {
+            if self.reject {
+                Err("owner busy".to_owned())
+            } else {
+                self.automation_capture_commands
+                    .push(OperatorAutomationCaptureAction::Start { target_index, name });
+                Ok("Runtime automation capture started".to_owned())
+            }
+        }
+
+        fn stop_automation_capture(&mut self) -> Result<String, String> {
+            if self.reject {
+                Err("owner busy".to_owned())
+            } else {
+                self.automation_capture_commands
+                    .push(OperatorAutomationCaptureAction::Stop);
+                Ok("Runtime automation capture stop requested".to_owned())
+            }
+        }
+
+        fn poll_automation_capture(&mut self) -> Option<String> {
+            self.automation_capture_poll.take()
         }
     }
 
@@ -7492,6 +7931,44 @@ mod tests {
     }
 
     #[test]
+    fn operator_automation_capture_commands_reach_the_sole_owner() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        sender
+            .send(OperatorCommand::StartAutomationCapture {
+                target_index: 2,
+                name: "Runtime pass".to_owned(),
+            })
+            .unwrap();
+        sender.send(OperatorCommand::StopAutomationCapture).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut owner = OperatorControl::default();
+        let diagnostics = RefCell::new(Vec::new());
+
+        drain_operator_commands(&mut owner, &receiver, &stop, &|message| {
+            diagnostics.borrow_mut().push(message);
+        });
+
+        assert_eq!(
+            owner.automation_capture_commands,
+            [
+                OperatorAutomationCaptureAction::Start {
+                    target_index: 2,
+                    name: "Runtime pass".to_owned(),
+                },
+                OperatorAutomationCaptureAction::Stop,
+            ]
+        );
+        assert_eq!(
+            diagnostics.into_inner(),
+            [
+                "Runtime automation capture started",
+                "Runtime automation capture stop requested",
+            ]
+        );
+        assert!(!stop.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn operator_scene_performance_controls_follow_committed_runtime_observation() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = OperatorWindow::new().unwrap();
@@ -7556,6 +8033,80 @@ mod tests {
         assert_eq!(
             diagnostic.lock().unwrap().as_str(),
             "scene-performance capture stop refused: committed Runtime capture state is unavailable"
+        );
+    }
+
+    #[test]
+    fn operator_automation_capture_controls_follow_committed_runtime_observation() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = OperatorWindow::new().unwrap();
+        ui.set_automation_target_names(ModelRc::from(Rc::new(VecModel::from(vec![
+            SharedString::from("Track / Gain"),
+        ]))));
+        ui.set_selected_automation_target_index(0);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let diagnostic = Arc::new(Mutex::new(String::new()));
+        let observation = test_automation_capture_observation();
+        wire_operator_automation_capture(&ui, &sender, &diagnostic, &observation, 1);
+        apply_operator_automation_capture_observation(&ui, observation.as_ref(), false);
+
+        ui.invoke_start_automation_capture_requested(0, "Runtime pass".into());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "Runtime automation capture start refused: committed Runtime capture state is unavailable"
+        );
+
+        *observation.lock().unwrap() = RuntimeAutomationCaptureObservation {
+            state: "Ready to capture a Runtime automation take".to_owned(),
+            start_enabled: true,
+            stop_enabled: false,
+        };
+        apply_operator_automation_capture_observation(&ui, observation.as_ref(), false);
+        assert!(ui.get_automation_capture_start_enabled());
+        assert!(!ui.get_automation_capture_stop_enabled());
+
+        ui.invoke_start_automation_capture_requested(0, "Runtime pass".into());
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::StartAutomationCapture {
+                target_index: 0,
+                name: "Runtime pass".to_owned(),
+            })
+        );
+        assert!(
+            ui.get_automation_capture_start_enabled(),
+            "the UI retains committed Runtime state until the owner publishes another observation"
+        );
+
+        ui.invoke_start_automation_capture_requested(-1, "Runtime pass".into());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "Runtime automation capture start refused: selected target is unavailable"
+        );
+
+        *observation.lock().unwrap() = RuntimeAutomationCaptureObservation {
+            state: "Capturing 0 committed parameter change(s)".to_owned(),
+            start_enabled: false,
+            stop_enabled: true,
+        };
+        apply_operator_automation_capture_observation(&ui, observation.as_ref(), false);
+        assert!(!ui.get_automation_capture_start_enabled());
+        assert!(ui.get_automation_capture_stop_enabled());
+
+        ui.invoke_stop_automation_capture_requested();
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::StopAutomationCapture)
+        );
+
+        revoke_operator_automation_capture_authority(&ui);
+        ui.invoke_stop_automation_capture_requested();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "Runtime automation capture stop refused: committed Runtime capture state is unavailable"
         );
     }
 
@@ -10610,6 +11161,7 @@ mod tests {
             input_control: None,
             recovery: recovery.clone(),
             panel_connected: Arc::new(AtomicBool::new(false)),
+            automation_capture: test_automation_capture_observation(),
             mixer_update: test_mixer_update_observation(),
             native_device_update: test_native_device_update_observation(),
             loop_update: test_loop_update_observation(),
@@ -10725,6 +11277,7 @@ mod tests {
             input_control: None,
             recovery: PlaybackRecoveryCheckpoint::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
+            automation_capture: test_automation_capture_observation(),
             mixer_update: test_mixer_update_observation(),
             native_device_update: test_native_device_update_observation(),
             loop_update: test_loop_update_observation(),
@@ -10978,6 +11531,7 @@ mod tests {
             input_control: None,
             recovery: terminal_recovery,
             panel_connected: Arc::new(AtomicBool::new(false)),
+            automation_capture: test_automation_capture_observation(),
             mixer_update: test_mixer_update_observation(),
             native_device_update: test_native_device_update_observation(),
             loop_update: test_loop_update_observation(),

@@ -2474,6 +2474,7 @@ dependencies = [
  "hyper-playback-session",
  "hyper-project-loader",
  "hyper-project-model",
+ "hyper-runtime-automation-update",
  "hyper-runtime-deployment",
  "hyper-runtime-host",
  "hyper-runtime-loop-update",
