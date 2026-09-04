@@ -6,7 +6,7 @@ use std::path::Path;
 
 use cap_fs_ext::OpenOptionsMaybeDirExt;
 use cap_std::fs::{Dir, OpenOptions};
-use hyper_recording_metadata::RecordingMetadataDocument;
+use hyper_recording_metadata::{FinalizedRecordingHandoff, RecordingMetadataDocument};
 use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -25,8 +25,6 @@ use crate::stable_file::copy_open_stable;
 
 const MAX_RECORDING_BYTES: u64 = u32::MAX as u64;
 const MAX_MANIFEST_BYTES: usize = 1_048_576;
-const MAX_HANDOFF_BYTES: usize = 2 * 1_048_576;
-const MAX_HANDOFF_PATH_BYTES: usize = 4_096;
 const TRANSACTION_INTENT_NAME: &str = "intent.json";
 const TRANSACTION_INTENT_STAGING_NAME: &str = ".intent.json.tmp";
 
@@ -101,25 +99,6 @@ struct TransactionFile {
     sha256: String,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FinalizedRecordingHandoff {
-    format: String,
-    format_version: u8,
-    recording: HandoffRecording,
-    metadata: Value,
-    extensions: serde_json::Map<String, Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HandoffRecording {
-    path: String,
-    media_type: String,
-    byte_length: u64,
-    sha256: String,
-}
-
 impl RecordingImportOutcome {
     #[must_use]
     pub const fn project_identity(&self) -> &[u8; 32] {
@@ -187,33 +166,15 @@ pub fn import_finalized_recording_handoff(
     project_path: impl AsRef<Path>,
     handoff_bytes: &[u8],
 ) -> Result<RecordingImportOutcome, RecordingImportError> {
-    let handoff: FinalizedRecordingHandoff =
-        hyper_strict_json::parse(handoff_bytes, MAX_HANDOFF_BYTES)
-            .map_err(|error| caused("recording handoff is invalid", error))?;
-    require_canonical_json(handoff_bytes, "recording handoff")?;
-    if handoff.format != "hyper-finalized-recording-handoff"
-        || handoff.format_version != 1
-        || !handoff.extensions.is_empty()
-        || handoff.recording.media_type != "audio/wav"
-        || handoff.recording.path.is_empty()
-        || handoff.recording.path.len() > MAX_HANDOFF_PATH_BYTES
-        || handoff.recording.path.contains('\0')
-    {
-        return Err(failure("recording handoff domain is invalid"));
-    }
-    let recording_path = Path::new(&handoff.recording.path);
-    if !recording_path.is_absolute() {
-        return Err(failure("recording handoff path must be absolute"));
-    }
-    let metadata_bytes = serde_json_canonicalizer::to_vec(&handoff.metadata)
-        .map_err(|error| caused("serialize recording handoff metadata", error))?;
+    let handoff = FinalizedRecordingHandoff::parse(handoff_bytes)
+        .map_err(|error| caused("recording handoff is invalid", error))?;
     import_recording(
         project_path,
         RecordingImportRequest {
-            recording_path,
-            recording_byte_length: handoff.recording.byte_length,
-            recording_sha256: decode_digest(&handoff.recording.sha256)?,
-            metadata_bytes: &metadata_bytes,
+            recording_path: handoff.recording_path(),
+            recording_byte_length: handoff.recording_byte_length(),
+            recording_sha256: *handoff.recording_sha256(),
+            metadata_bytes: handoff.metadata_bytes(),
         },
     )
 }

@@ -6,19 +6,28 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const FORMAT: &str = "hyper-recording-metadata";
 const FORMAT_VERSION: u8 = 1;
 const HANDOFF_FORMAT: &str = "hyper-finalized-recording-handoff";
 const HANDOFF_FORMAT_VERSION: u8 = 1;
-const MAX_HANDOFF_PATH_UTF8_BYTES: usize = 4096;
 const VERSION_ONE_SAMPLE_RATE: u32 = 48_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_METADATA_BYTES: usize = 1_048_576;
 const TAKE_LABEL_EXTENSION: &str = "io.hypermodule.recording-take";
 const TAKE_LABEL_FIELD: &str = "label";
 const MAX_TAKE_LABEL_CHARACTERS: usize = 120;
+
+/// Maximum byte size accepted for one finalized-recording handoff.
+///
+/// The complete metadata object is independently bounded to one MiB. The
+/// two-MiB handoff boundary retains the established application transport
+/// limit while rejecting unrelated file contents before deserialization.
+pub const MAX_FINALIZED_RECORDING_HANDOFF_BYTES: usize = 2 * MAX_METADATA_BYTES;
+
+/// Maximum UTF-8 length of the absolute published WAV path in one handoff.
+pub const MAX_FINALIZED_RECORDING_HANDOFF_PATH_UTF8_BYTES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -169,6 +178,227 @@ impl RecordingMetadataDocument {
     }
 }
 
+/// A fully validated, canonical finalized-recording handoff.
+///
+/// This type deliberately validates only the transport descriptor and
+/// recording metadata. It does not open or trust the referenced WAV file;
+/// filesystem identity, media integrity, destination selection, and durable
+/// import remain responsibilities of the receiving storage transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalizedRecordingHandoff {
+    canonical_bytes: Vec<u8>,
+    recording_path: PathBuf,
+    recording_byte_length: u64,
+    recording_sha256: [u8; 32],
+    metadata: RecordingMetadataDocument,
+    metadata_bytes: Vec<u8>,
+}
+
+impl FinalizedRecordingHandoff {
+    /// Parses one complete canonical version-1 finalized-recording handoff.
+    ///
+    /// # Errors
+    ///
+    /// Refuses oversized, malformed, noncanonical, or incompatible handoffs
+    /// before callers can use the media descriptor or metadata facts.
+    pub fn parse(bytes: &[u8]) -> Result<Self, FinalizedRecordingHandoffParseError> {
+        if bytes.len() > MAX_FINALIZED_RECORDING_HANDOFF_BYTES {
+            return Err(FinalizedRecordingHandoffParseError::limit(
+                "recording handoff exceeds the version-one byte capacity",
+            ));
+        }
+        let value: serde_json::Value =
+            hyper_strict_json::parse(bytes, MAX_FINALIZED_RECORDING_HANDOFF_BYTES).map_err(
+                |source| {
+                    FinalizedRecordingHandoffParseError::with_source(
+                        FinalizedRecordingHandoffParseErrorKind::Json(source.kind),
+                        "recording handoff is not strict JSON",
+                        source,
+                    )
+                },
+            )?;
+        let canonical = serde_json_canonicalizer::to_vec(&value).map_err(|source| {
+            FinalizedRecordingHandoffParseError::with_source(
+                FinalizedRecordingHandoffParseErrorKind::InvalidDomain,
+                "recording handoff cannot be canonicalized",
+                source,
+            )
+        })?;
+        if canonical != bytes {
+            return Err(FinalizedRecordingHandoffParseError::noncanonical());
+        }
+        let raw: RawFinalizedRecordingHandoff =
+            serde_json::from_value(value).map_err(|source| {
+                FinalizedRecordingHandoffParseError::with_source(
+                    FinalizedRecordingHandoffParseErrorKind::InvalidDomain,
+                    "recording handoff shape is invalid",
+                    source,
+                )
+            })?;
+        if raw.format != HANDOFF_FORMAT
+            || raw.format_version != HANDOFF_FORMAT_VERSION
+            || !raw.extensions.is_empty()
+            || raw.recording.media_type != "audio/wav"
+            || raw.recording.path.is_empty()
+        {
+            return Err(FinalizedRecordingHandoffParseError::invalid(
+                "recording handoff domain is invalid",
+            ));
+        }
+        let recording_path = PathBuf::from(raw.recording.path);
+        handoff_publication_path(&recording_path).map_err(|source| {
+            FinalizedRecordingHandoffParseError::with_source(
+                FinalizedRecordingHandoffParseErrorKind::InvalidDomain,
+                "recording handoff publication path is invalid",
+                source,
+            )
+        })?;
+        let recording_sha256 = decode_sha256(&raw.recording.sha256)?;
+        let metadata_bytes = serde_json_canonicalizer::to_vec(&raw.metadata).map_err(|source| {
+            FinalizedRecordingHandoffParseError::with_source(
+                FinalizedRecordingHandoffParseErrorKind::InvalidDomain,
+                "recording handoff metadata cannot be canonicalized",
+                source,
+            )
+        })?;
+        let metadata = RecordingMetadataDocument::parse(&metadata_bytes).map_err(|source| {
+            FinalizedRecordingHandoffParseError::with_source(
+                FinalizedRecordingHandoffParseErrorKind::Metadata(source.kind()),
+                "recording handoff metadata is invalid",
+                source,
+            )
+        })?;
+        Ok(Self {
+            canonical_bytes: bytes.to_vec(),
+            recording_path,
+            recording_byte_length: raw.recording.byte_length,
+            recording_sha256,
+            metadata,
+            metadata_bytes,
+        })
+    }
+
+    /// Returns the original canonical handoff bytes.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    /// Returns the absolute source WAV path carried by the handoff.
+    #[must_use]
+    pub fn recording_path(&self) -> &Path {
+        &self.recording_path
+    }
+
+    /// Returns the verified source WAV byte length carried by the handoff.
+    #[must_use]
+    pub const fn recording_byte_length(&self) -> u64 {
+        self.recording_byte_length
+    }
+
+    /// Returns the SHA-256 descriptor carried by the handoff.
+    #[must_use]
+    pub const fn recording_sha256(&self) -> &[u8; 32] {
+        &self.recording_sha256
+    }
+
+    /// Returns the validated recording metadata document.
+    #[must_use]
+    pub const fn metadata(&self) -> &RecordingMetadataDocument {
+        &self.metadata
+    }
+
+    /// Returns canonical bytes for the embedded recording metadata document.
+    #[must_use]
+    pub fn metadata_bytes(&self) -> &[u8] {
+        &self.metadata_bytes
+    }
+}
+
+/// Classifies a finalized-recording handoff rejection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalizedRecordingHandoffParseErrorKind {
+    /// The input was not valid strict JSON.
+    Json(StrictJsonErrorKind),
+    /// The input was valid JSON but not RFC 8785 canonical bytes.
+    NonCanonicalJson,
+    /// The handoff shape or version-one domain was invalid.
+    InvalidDomain,
+    /// Embedded recording metadata was rejected by its typed parser.
+    Metadata(RecordingMetadataParseErrorKind),
+    /// The handoff exceeded its fixed byte capacity.
+    LimitExceeded,
+}
+
+/// A classified finalized-recording handoff parse failure.
+#[derive(Debug)]
+pub struct FinalizedRecordingHandoffParseError {
+    kind: FinalizedRecordingHandoffParseErrorKind,
+    message: String,
+    source: Option<Box<dyn Error + Send + Sync>>,
+}
+
+impl FinalizedRecordingHandoffParseError {
+    /// Returns the stable error category.
+    #[must_use]
+    pub const fn kind(&self) -> FinalizedRecordingHandoffParseErrorKind {
+        self.kind
+    }
+
+    fn invalid(message: &'static str) -> Self {
+        Self::new(
+            FinalizedRecordingHandoffParseErrorKind::InvalidDomain,
+            message,
+        )
+    }
+
+    fn limit(message: &'static str) -> Self {
+        Self::new(
+            FinalizedRecordingHandoffParseErrorKind::LimitExceeded,
+            message,
+        )
+    }
+
+    fn noncanonical() -> Self {
+        Self::new(
+            FinalizedRecordingHandoffParseErrorKind::NonCanonicalJson,
+            "recording handoff is not canonical RFC 8785 JSON",
+        )
+    }
+
+    fn new(kind: FinalizedRecordingHandoffParseErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    fn with_source(
+        kind: FinalizedRecordingHandoffParseErrorKind,
+        message: impl Into<String>,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
+impl fmt::Display for FinalizedRecordingHandoffParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for FinalizedRecordingHandoffParseError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.as_deref().map(|source| source as _)
+    }
+}
+
 #[derive(Debug)]
 pub enum RecordingMetadataEditError {
     InvalidTakeLabel,
@@ -259,6 +489,25 @@ struct RawRecordingMetadata {
     channels: u8,
     frame_count: u64,
     extensions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFinalizedRecordingHandoff {
+    format: String,
+    format_version: u8,
+    recording: RawFinalizedRecording,
+    metadata: serde_json::Value,
+    extensions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFinalizedRecording {
+    path: String,
+    media_type: String,
+    byte_length: u64,
+    sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -535,13 +784,49 @@ fn handoff_publication_path(path: &Path) -> Result<&str, RecordingHandoffError> 
         return Err(RecordingHandoffError::PublicationPathContainsNul);
     }
     let actual_bytes = path.len();
-    if actual_bytes > MAX_HANDOFF_PATH_UTF8_BYTES {
+    if actual_bytes > MAX_FINALIZED_RECORDING_HANDOFF_PATH_UTF8_BYTES {
         return Err(RecordingHandoffError::PublicationPathTooLong {
             actual_bytes,
-            maximum: MAX_HANDOFF_PATH_UTF8_BYTES,
+            maximum: MAX_FINALIZED_RECORDING_HANDOFF_PATH_UTF8_BYTES,
         });
     }
     Ok(path)
+}
+
+fn decode_sha256(value: &str) -> Result<[u8; 32], FinalizedRecordingHandoffParseError> {
+    if !valid_sha256(value) {
+        return Err(FinalizedRecordingHandoffParseError::invalid(
+            "recording handoff SHA-256 digest is invalid",
+        ));
+    }
+    let mut output = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0]).ok_or_else(|| {
+            FinalizedRecordingHandoffParseError::invalid(
+                "recording handoff SHA-256 digest is invalid",
+            )
+        })?;
+        let low = hex_nibble(pair[1]).ok_or_else(|| {
+            FinalizedRecordingHandoffParseError::invalid(
+                "recording handoff SHA-256 digest is invalid",
+            )
+        })?;
+        output[index] = (high << 4) | low;
+    }
+    Ok(output)
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn validate_document(
@@ -891,6 +1176,113 @@ mod tests {
         .unwrap()
     }
 
+    fn finalized_handoff() -> Vec<u8> {
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&recording_metadata_with_extensions(&serde_json::json!({})))
+                .unwrap();
+        serde_json_canonicalizer::to_vec(&serde_json::json!({
+            "extensions": {},
+            "format": HANDOFF_FORMAT,
+            "format_version": HANDOFF_FORMAT_VERSION,
+            "metadata": metadata,
+            "recording": {
+                "byte_length": 96,
+                "media_type": "audio/wav",
+                "path": format!("{ABSOLUTE_PREFIX}recorded-take.wav"),
+                "sha256": "a".repeat(64),
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn finalized_handoff_parser_retains_one_complete_validated_contract() {
+        let bytes = finalized_handoff();
+        let handoff = FinalizedRecordingHandoff::parse(&bytes).unwrap();
+
+        assert_eq!(handoff.canonical_bytes(), bytes);
+        assert_eq!(
+            handoff.recording_path(),
+            Path::new(&format!("{ABSOLUTE_PREFIX}recorded-take.wav"))
+        );
+        assert_eq!(handoff.recording_byte_length(), 96);
+        assert_eq!(handoff.recording_sha256(), &[0xaa; 32]);
+        assert_eq!(
+            handoff.metadata().project_id(),
+            "018f47a2-6b2d-7c11-8a44-001122334457"
+        );
+        assert_eq!(
+            handoff.metadata_bytes(),
+            recording_metadata_with_extensions(&serde_json::json!({}))
+        );
+    }
+
+    #[test]
+    fn finalized_handoff_parser_preserves_existing_hex_digest_compatibility() {
+        let mut value: serde_json::Value = serde_json::from_slice(&finalized_handoff()).unwrap();
+        value["recording"]["sha256"] = serde_json::json!("A".repeat(64));
+        let bytes = serde_json_canonicalizer::to_vec(&value).unwrap();
+
+        let handoff = FinalizedRecordingHandoff::parse(&bytes).unwrap();
+        assert_eq!(handoff.recording_sha256(), &[0xaa; 32]);
+        assert_eq!(handoff.canonical_bytes(), bytes);
+    }
+
+    #[test]
+    fn finalized_handoff_parser_refuses_noncanonical_and_untrusted_domains() {
+        let bytes = finalized_handoff();
+        let mut noncanonical = Vec::with_capacity(bytes.len() + 1);
+        noncanonical.push(b' ');
+        noncanonical.extend_from_slice(&bytes);
+        assert_eq!(
+            FinalizedRecordingHandoff::parse(&noncanonical)
+                .unwrap_err()
+                .kind(),
+            FinalizedRecordingHandoffParseErrorKind::NonCanonicalJson
+        );
+
+        let mut relative_path: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        relative_path["recording"]["path"] = serde_json::json!("recorded-take.wav");
+        let relative_path = serde_json_canonicalizer::to_vec(&relative_path).unwrap();
+        assert_eq!(
+            FinalizedRecordingHandoff::parse(&relative_path)
+                .unwrap_err()
+                .kind(),
+            FinalizedRecordingHandoffParseErrorKind::InvalidDomain
+        );
+
+        let mut invalid_digest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        invalid_digest["recording"]["sha256"] = serde_json::json!("z".repeat(64));
+        let invalid_digest = serde_json_canonicalizer::to_vec(&invalid_digest).unwrap();
+        assert_eq!(
+            FinalizedRecordingHandoff::parse(&invalid_digest)
+                .unwrap_err()
+                .kind(),
+            FinalizedRecordingHandoffParseErrorKind::InvalidDomain
+        );
+
+        let mut unknown_metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        unknown_metadata["metadata"]["unexpected"] = serde_json::json!(true);
+        let unknown_metadata = serde_json_canonicalizer::to_vec(&unknown_metadata).unwrap();
+        assert!(matches!(
+            FinalizedRecordingHandoff::parse(&unknown_metadata)
+                .unwrap_err()
+                .kind(),
+            FinalizedRecordingHandoffParseErrorKind::Metadata(_)
+        ));
+    }
+
+    #[test]
+    fn finalized_handoff_parser_enforces_the_transport_byte_boundary() {
+        let oversized = vec![b' '; MAX_FINALIZED_RECORDING_HANDOFF_BYTES + 1];
+        assert_eq!(
+            FinalizedRecordingHandoff::parse(&oversized)
+                .unwrap_err()
+                .kind(),
+            FinalizedRecordingHandoffParseErrorKind::LimitExceeded
+        );
+    }
+
     #[test]
     fn take_label_rewrite_is_canonical_and_preserves_extensions() {
         let source_extensions = serde_json::json!({
@@ -972,9 +1364,9 @@ mod tests {
 
         let exact = format!(
             "{ABSOLUTE_PREFIX}{}",
-            "a".repeat(MAX_HANDOFF_PATH_UTF8_BYTES - ABSOLUTE_PREFIX.len())
+            "a".repeat(MAX_FINALIZED_RECORDING_HANDOFF_PATH_UTF8_BYTES - ABSOLUTE_PREFIX.len())
         );
-        assert_eq!(exact.len(), MAX_HANDOFF_PATH_UTF8_BYTES);
+        assert_eq!(exact.len(), MAX_FINALIZED_RECORDING_HANDOFF_PATH_UTF8_BYTES);
         assert!(handoff_publication_path(Path::new(&exact)).is_ok());
 
         let oversized = format!("{exact}a");
