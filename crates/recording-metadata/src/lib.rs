@@ -29,6 +29,14 @@ pub const MAX_FINALIZED_RECORDING_HANDOFF_BYTES: usize = 2 * MAX_METADATA_BYTES;
 /// Maximum UTF-8 length of the absolute published WAV path in one handoff.
 pub const MAX_FINALIZED_RECORDING_HANDOFF_PATH_UTF8_BYTES: usize = 4_096;
 
+/// Maximum WAV byte length represented by one version-one finalized handoff.
+///
+/// The handoff describes ordinary RIFF/WAV media, whose version-one storage
+/// contract carries a 32-bit byte length. Keeping this transport boundary
+/// public lets every handoff consumer refuse an impossible descriptor before
+/// it can cross an ownership or playback fence.
+pub const MAX_FINALIZED_RECORDING_BYTE_LENGTH: u64 = u32::MAX as u64;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RecordingCaptureKind {
@@ -240,6 +248,8 @@ impl FinalizedRecordingHandoff {
             || !raw.extensions.is_empty()
             || raw.recording.media_type != "audio/wav"
             || raw.recording.path.is_empty()
+            || raw.recording.byte_length == 0
+            || raw.recording.byte_length > MAX_FINALIZED_RECORDING_BYTE_LENGTH
         {
             return Err(FinalizedRecordingHandoffParseError::invalid(
                 "recording handoff domain is invalid",
@@ -1270,6 +1280,27 @@ mod tests {
                 .kind(),
             FinalizedRecordingHandoffParseErrorKind::Metadata(_)
         ));
+
+        let mut empty_recording: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        empty_recording["recording"]["byte_length"] = serde_json::json!(0);
+        let empty_recording = serde_json_canonicalizer::to_vec(&empty_recording).unwrap();
+        assert_eq!(
+            FinalizedRecordingHandoff::parse(&empty_recording)
+                .unwrap_err()
+                .kind(),
+            FinalizedRecordingHandoffParseErrorKind::InvalidDomain
+        );
+
+        let mut oversized_recording: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        oversized_recording["recording"]["byte_length"] =
+            serde_json::json!(MAX_FINALIZED_RECORDING_BYTE_LENGTH + 1);
+        let oversized_recording = serde_json_canonicalizer::to_vec(&oversized_recording).unwrap();
+        assert_eq!(
+            FinalizedRecordingHandoff::parse(&oversized_recording)
+                .unwrap_err()
+                .kind(),
+            FinalizedRecordingHandoffParseErrorKind::InvalidDomain
+        );
     }
 
     #[test]

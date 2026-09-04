@@ -6,7 +6,9 @@ use std::path::Path;
 
 use cap_fs_ext::OpenOptionsMaybeDirExt;
 use cap_std::fs::{Dir, OpenOptions};
-use hyper_recording_metadata::{FinalizedRecordingHandoff, RecordingMetadataDocument};
+use hyper_recording_metadata::{
+    FinalizedRecordingHandoff, MAX_FINALIZED_RECORDING_BYTE_LENGTH, RecordingMetadataDocument,
+};
 use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -23,7 +25,6 @@ use crate::project_lock::{
 };
 use crate::stable_file::copy_open_stable;
 
-const MAX_RECORDING_BYTES: u64 = u32::MAX as u64;
 const MAX_MANIFEST_BYTES: usize = 1_048_576;
 const TRANSACTION_INTENT_NAME: &str = "intent.json";
 const TRANSACTION_INTENT_STAGING_NAME: &str = ".intent.json.tmp";
@@ -124,7 +125,31 @@ impl RecordingImportOutcome {
 #[derive(Debug)]
 pub struct RecordingImportError {
     message: String,
+    published: bool,
     source: Option<Box<dyn Error + Send + Sync>>,
+}
+
+impl RecordingImportError {
+    /// Returns whether a verified recording import became the active project
+    /// state before this error was observed.
+    #[must_use]
+    pub const fn published(&self) -> bool {
+        self.published
+    }
+
+    /// Constructs a controlled recording-import error for higher-layer tests.
+    ///
+    /// This is unavailable from the default production build so callers cannot
+    /// fabricate a durable-import outcome.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn for_test(message: impl Into<String>, published: bool) -> Self {
+        Self {
+            message: message.into(),
+            published,
+            source: None,
+        }
+    }
 }
 
 impl fmt::Display for RecordingImportError {
@@ -142,6 +167,7 @@ impl Error for RecordingImportError {
 fn failure(message: impl Into<String>) -> RecordingImportError {
     RecordingImportError {
         message: message.into(),
+        published: false,
         source: None,
     }
 }
@@ -152,6 +178,15 @@ fn caused(
 ) -> RecordingImportError {
     RecordingImportError {
         message: message.into(),
+        published: false,
+        source: Some(Box::new(source)),
+    }
+}
+
+fn committed_cleanup_failure(source: RecordingImportError) -> RecordingImportError {
+    RecordingImportError {
+        message: "recording import committed but transaction cleanup is incomplete".to_owned(),
+        published: true,
         source: Some(Box::new(source)),
     }
 }
@@ -245,7 +280,13 @@ pub fn recover_recording_imports(
         };
         let disposition =
             recover_transaction(&root_path, &root_dir, &backups, &transaction, &tx, None)?;
-        clear_and_remove_transaction(&backups, transaction, &name)?;
+        clear_and_remove_transaction(&backups, transaction, &name).map_err(|error| {
+            if disposition == RecordingImportRecoveryDisposition::Committed {
+                committed_cleanup_failure(error)
+            } else {
+                error
+            }
+        })?;
         outcomes.push(RecordingImportRecovery {
             transaction_id: tx.id,
             disposition,
@@ -328,33 +369,79 @@ fn import_recording_observed(
         &created_directories,
         after_transaction_sync,
     );
-    if let Err(operation_error) = result {
-        let Ok(tx) = read_transaction(&transaction, &transaction_name) else {
-            clear_and_remove_transaction(&backups, transaction, &transaction_name)?;
-            return Err(operation_error);
-        };
-        match recover_transaction(
-            verified.root(),
-            &verified.root_dir,
-            &backups,
-            &transaction,
-            &tx,
-            existing_recordings.as_ref(),
-        ) {
-            Ok(_) => {
-                clear_and_remove_transaction(&backups, transaction, &transaction_name)?;
-                return Err(operation_error);
-            }
-            Err(recovery_error) => {
-                return Err(RecordingImportError {
-                    message: "recording import and recovery both failed".to_owned(),
-                    source: Some(Box::new(recovery_error)),
-                });
-            }
+    match result {
+        Ok(outcome) => {
+            clear_and_remove_transaction(&backups, transaction, &transaction_name)
+                .map_err(committed_cleanup_failure)?;
+            Ok(outcome)
         }
+        Err(operation_error) => recover_failed_recording_import(
+            &verified,
+            &backups,
+            transaction,
+            &transaction_name,
+            existing_recordings.as_ref(),
+            operation_error,
+        ),
     }
-    clear_and_remove_transaction(&backups, transaction, &transaction_name)?;
-    result
+}
+
+fn recover_failed_recording_import(
+    verified: &StructurallyVerifiedProject,
+    backups: &Dir,
+    transaction: Dir,
+    transaction_name: &str,
+    existing_recordings: Option<&Dir>,
+    operation_error: RecordingImportError,
+) -> Result<RecordingImportOutcome, RecordingImportError> {
+    let Ok(tx) = read_transaction(&transaction, transaction_name) else {
+        clear_and_remove_transaction(backups, transaction, transaction_name)?;
+        return Err(operation_error);
+    };
+    match recover_transaction(
+        verified.root(),
+        &verified.root_dir,
+        backups,
+        &transaction,
+        &tx,
+        existing_recordings,
+    ) {
+        Ok(RecordingImportRecoveryDisposition::RolledBack) => {
+            clear_and_remove_transaction(backups, transaction, transaction_name)?;
+            Err(operation_error)
+        }
+        Ok(RecordingImportRecoveryDisposition::Committed) => {
+            let outcome = recovered_import_outcome(verified.root(), &tx)?;
+            clear_and_remove_transaction(backups, transaction, transaction_name)
+                .map_err(committed_cleanup_failure)?;
+            Ok(outcome)
+        }
+        Err(recovery_error) => Err(RecordingImportError {
+            message: "recording import and recovery both failed".to_owned(),
+            published: recovery_error.published(),
+            source: Some(Box::new(recovery_error)),
+        }),
+    }
+}
+
+fn recovered_import_outcome(
+    project_path: &Path,
+    transaction: &TransactionRecord,
+) -> Result<RecordingImportOutcome, RecordingImportError> {
+    let committed = verify_project_package(project_path)
+        .map_err(|error| caused("recovered recording import does not verify", error))?;
+    let identity = decode_digest(&transaction.after_project_sha256)?;
+    if committed.manifest_sha256 != identity {
+        return Err(failure(
+            "recovered recording import project identity changed",
+        ));
+    }
+    Ok(RecordingImportOutcome {
+        project_identity: identity,
+        project_revision: committed.manifest.revision(),
+        recording_path: transaction.recording.path.clone(),
+        metadata_path: transaction.metadata.path.clone(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -488,7 +575,9 @@ fn reject_unhandled_recording_transactions(backups: &Dir) -> Result<(), Recordin
 }
 
 fn validate_request(request: RecordingImportRequest<'_>) -> Result<(), RecordingImportError> {
-    if request.recording_byte_length == 0 || request.recording_byte_length > MAX_RECORDING_BYTES {
+    if request.recording_byte_length == 0
+        || request.recording_byte_length > MAX_FINALIZED_RECORDING_BYTE_LENGTH
+    {
         return Err(failure("recording byte length is invalid"));
     }
     if request.metadata_bytes.is_empty() || request.metadata_bytes.len() > MAX_MANIFEST_BYTES {
@@ -967,7 +1056,7 @@ fn read_transaction(
 
 fn valid_transaction_file(file: &TransactionFile, extension: &str) -> bool {
     file.byte_length > 0
-        && file.byte_length <= MAX_RECORDING_BYTES
+        && file.byte_length <= MAX_FINALIZED_RECORDING_BYTE_LENGTH
         && file.path.starts_with("assets/recordings/")
         && file.path.ends_with(&format!(".{extension}"))
         && decode_digest(&file.sha256).is_ok()
@@ -1349,6 +1438,54 @@ mod tests {
             2
         );
         assert!(recover_recording_imports(&fixture.root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn committed_import_retains_its_publication_truth_when_cleanup_fails() {
+        let fixture = Fixture::new(false);
+        let error = import_recording_observed(&fixture.root, fixture.request(), |root| {
+            let transaction = fs::read_dir(root.join("backups"))
+                .map_err(|error| caused("find recording cleanup fixture transaction", error))?
+                .filter_map(Result::ok)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(TRANSACTION_PREFIX)
+                })
+                .ok_or_else(|| failure("recording cleanup fixture lost its transaction"))?;
+            fs::write(
+                transaction.path().join("cleanup-residue"),
+                b"fixture residue",
+            )
+            .map_err(|error| caused("write recording cleanup fixture residue", error))
+        })
+        .unwrap_err();
+
+        assert!(error.published(), "the manifest-last import was verified");
+        assert!(
+            error
+                .to_string()
+                .contains("transaction cleanup is incomplete")
+        );
+        let package = verify_project_package(&fixture.root).unwrap();
+        assert_eq!(package.manifest().revision(), 2);
+        assert_eq!(
+            package
+                .read_asset(
+                    ASSET_ID,
+                    u64::try_from(fixture.recording_bytes.len()).unwrap() + 1,
+                )
+                .unwrap(),
+            fixture.recording_bytes
+        );
+        assert!(
+            package
+                .manifest()
+                .resources()
+                .iter()
+                .any(|resource| resource.id() == METADATA_ID)
+        );
     }
 
     #[test]

@@ -27,6 +27,8 @@ use hyper_fs_authority::{
 #[cfg(windows)]
 use hyper_fs_authority::{identity, remove_file_if_identity, rename_no_replace};
 use hyper_project_model::is_valid_entity_id;
+#[cfg(test)]
+use hyper_recording_metadata::MAX_FINALIZED_RECORDING_BYTE_LENGTH;
 use hyper_recording_metadata::{FinalizedRecordingHandoff, MAX_FINALIZED_RECORDING_HANDOFF_BYTES};
 use same_file::Handle;
 use serde::{Deserialize, Serialize};
@@ -1014,6 +1016,30 @@ mod tests {
         let injected = serde_json_canonicalizer::to_vec(&injected).unwrap();
         assert_eq!(
             RuntimeRecordingUpdate::parse(&injected).unwrap_err().kind(),
+            RuntimeRecordingUpdateErrorKind::InvalidUpdate
+        );
+    }
+
+    #[test]
+    fn update_refuses_handoff_recording_lengths_outside_the_shared_contract() {
+        let bytes = update().canonical_bytes().unwrap();
+
+        let mut empty: Value = serde_json::from_slice(&bytes).unwrap();
+        empty["handoff"]["recording"]["byte_length"] = serde_json::json!(0);
+        let empty = serde_json_canonicalizer::to_vec(&empty).unwrap();
+        assert_eq!(
+            RuntimeRecordingUpdate::parse(&empty).unwrap_err().kind(),
+            RuntimeRecordingUpdateErrorKind::InvalidUpdate
+        );
+
+        let mut oversized: Value = serde_json::from_slice(&bytes).unwrap();
+        oversized["handoff"]["recording"]["byte_length"] =
+            serde_json::json!(MAX_FINALIZED_RECORDING_BYTE_LENGTH + 1);
+        let oversized = serde_json_canonicalizer::to_vec(&oversized).unwrap();
+        assert_eq!(
+            RuntimeRecordingUpdate::parse(&oversized)
+                .unwrap_err()
+                .kind(),
             RuntimeRecordingUpdateErrorKind::InvalidUpdate
         );
     }
