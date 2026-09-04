@@ -22,6 +22,7 @@ members = [
     "crates/recording-transport",
     "crates/recording-worker",
     "crates/runtime-mixer-update",
+    "crates/runtime-automation-update",
     "crates/runtime-loop-update",
     "crates/runtime-native-device-update",
     "crates/runtime-recording-update",
