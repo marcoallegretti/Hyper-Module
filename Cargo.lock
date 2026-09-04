@@ -2629,6 +2629,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-runtime-recording-update"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "hyper-fs-authority",
+ "hyper-project-model",
+ "hyper-recording-metadata",
+ "hyper-strict-json",
+ "same-file",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "uuid",
+]
+
+[[package]]
 name = "hyper-scene-performance"
 version = "0.1.0"
 dependencies = [
