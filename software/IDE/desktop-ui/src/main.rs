@@ -53,11 +53,11 @@ use hyper_desktop_ide::{
     IdeArrangementPlacementEditError, IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError,
     IdeAudioClipLoopEditError, IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
     IdeAudioClipSourceTrimEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
-    IdeAudioImportError, IdeAutomationTakeEditError, IdeRuntimeLoopUpdateImportError,
-    IdeRuntimeMixerUpdateImportError, IdeRuntimeNativeDeviceUpdateImportError,
-    IdeRuntimeRecordingUpdateImportError, IdeRuntimeScenePerformanceImportError,
-    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneRemovalError, IdeSceneRenameError,
-    IdeSceneSlotEditError, IdeTempoEditError,
+    IdeAudioImportError, IdeAutomationTakeEditError, IdeRuntimeAutomationUpdateImportError,
+    IdeRuntimeLoopUpdateImportError, IdeRuntimeMixerUpdateImportError,
+    IdeRuntimeNativeDeviceUpdateImportError, IdeRuntimeRecordingUpdateImportError,
+    IdeRuntimeScenePerformanceImportError, IdeSceneCreationError, IdeSceneDuplicationError,
+    IdeSceneRemovalError, IdeSceneRenameError, IdeSceneSlotEditError, IdeTempoEditError,
 };
 #[cfg(test)]
 use hyper_mixer_runtime::PlaybackRecoverySnapshot;
@@ -89,6 +89,7 @@ const RUNTIME_MIXER_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime mixer updates";
 const RUNTIME_NATIVE_DEVICE_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime native-device updates";
 const RUNTIME_RECORDING_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime recording updates";
 const RUNTIME_LOOP_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime loop updates";
+const RUNTIME_AUTOMATION_UPDATE_IMPORT_FILTER_LABEL: &str = "Runtime automation updates";
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
@@ -132,6 +133,12 @@ enum RuntimeRecordingUpdateImportChoice {
 
 #[derive(Debug)]
 enum RuntimeLoopUpdateImportChoice {
+    Selected(PathBuf),
+    Cancelled,
+}
+
+#[derive(Debug)]
+enum RuntimeAutomationUpdateImportChoice {
     Selected(PathBuf),
     Cancelled,
 }
@@ -607,6 +614,7 @@ fn bind_callbacks(
     bind_runtime_native_device_update_import_callback(ui, worker);
     bind_runtime_recording_update_import_callback(ui, worker);
     bind_runtime_loop_update_import_callback(ui, worker, project_state);
+    bind_runtime_automation_update_import_callback(ui, worker);
     bind_audio_preview_callbacks(ui, worker, &routes.takes);
     bind_audio_import_callback(ui, worker, &routes.audio_imports);
 }
@@ -1760,6 +1768,86 @@ fn bind_runtime_recording_update_import_callback_with(
         }
         ui.set_app_mode(AppMode::ImportingRuntimeRecordingUpdate);
         ui.set_status_text("Waiting for a Runtime recording update…".into());
+        ui.set_error_text(SharedString::default());
+        choose(weak.clone(), Rc::clone(&worker));
+    });
+}
+
+fn bind_runtime_automation_update_import_callback(ui: &MainWindow, worker: &WorkerCell) {
+    bind_runtime_automation_update_import_callback_with(ui, worker, |weak, worker| {
+        let weak_for_dialog = weak.clone();
+        let spawn_result = slint::spawn_local(async move {
+            let selection = rfd::AsyncFileDialog::new()
+                .set_title("Import Runtime automation update")
+                .add_filter(RUNTIME_AUTOMATION_UPDATE_IMPORT_FILTER_LABEL, &["json"])
+                .pick_file()
+                .await;
+            let Some(ui) = weak_for_dialog.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::ImportingRuntimeAutomationUpdate {
+                return;
+            }
+            let choice = selection.map_or(
+                RuntimeAutomationUpdateImportChoice::Cancelled,
+                |selection| {
+                    RuntimeAutomationUpdateImportChoice::Selected(selection.path().to_path_buf())
+                },
+            );
+            complete_runtime_automation_update_import_choice(&ui, &worker, choice);
+        });
+        if spawn_result.is_err()
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime automation update selection is unavailable".into());
+        }
+    });
+}
+
+fn complete_runtime_automation_update_import_choice(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    choice: RuntimeAutomationUpdateImportChoice,
+) {
+    complete_runtime_automation_update_import_choice_with(ui, choice, |command| {
+        submit_to_ui(ui, worker, command);
+    });
+}
+
+fn complete_runtime_automation_update_import_choice_with(
+    ui: &MainWindow,
+    choice: RuntimeAutomationUpdateImportChoice,
+    submit: impl FnOnce(IdeWorkerCommand),
+) {
+    match choice {
+        RuntimeAutomationUpdateImportChoice::Selected(path) => {
+            submit(IdeWorkerCommand::ImportRuntimeAutomationUpdate { path });
+        }
+        RuntimeAutomationUpdateImportChoice::Cancelled => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime automation update import cancelled".into());
+        }
+    }
+}
+
+fn bind_runtime_automation_update_import_callback_with(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell) + 'static,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    actions.on_import_runtime_automation_update(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        ui.set_app_mode(AppMode::ImportingRuntimeAutomationUpdate);
+        ui.set_status_text("Waiting for a Runtime automation update…".into());
         ui.set_error_text(SharedString::default());
         choose(weak.clone(), Rc::clone(&worker));
     });
@@ -6783,6 +6871,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
             AppMode::ImportingRuntimeRecordingUpdate
         }
         IdeWorkerCommandKind::ImportRuntimeLoopUpdate => AppMode::ImportingRuntimeLoopUpdate,
+        IdeWorkerCommandKind::ImportRuntimeAutomationUpdate => {
+            AppMode::ImportingRuntimeAutomationUpdate
+        }
         IdeWorkerCommandKind::SetArrangementPlacementActive
         | IdeWorkerCommandKind::MoveArrangementPlacement
         | IdeWorkerCommandKind::SetArrangementPlacementDuration
@@ -7030,6 +7121,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::ImportRuntimeLoopUpdate => {
             "Verifying the Runtime loop update and reopening project after one arrangement-loop edit…"
+        }
+        IdeWorkerCommandKind::ImportRuntimeAutomationUpdate => {
+            "Verifying the Runtime automation update and reopening project after one durable automation-take import…"
         }
         IdeWorkerCommandKind::SetArrangementPlacementActive => {
             "Preserving mixer state, updating the arrangement placement, and reopening project…"
@@ -7850,6 +7944,11 @@ fn apply_event(
         event @ (IdeWorkerEvent::RuntimeLoopUpdateImporting
         | IdeWorkerEvent::RuntimeLoopUpdateImported { .. }) => {
             apply_runtime_loop_update_import_event(ui, project_state, &event);
+        }
+        event @ (IdeWorkerEvent::RuntimeAutomationUpdateImporting { .. }
+        | IdeWorkerEvent::RuntimeAutomationUpdateImported { .. }
+        | IdeWorkerEvent::RuntimeAutomationUpdateImportCommittedWithWarning { .. }) => {
+            apply_runtime_automation_update_import_event(ui, &event);
         }
         event @ (IdeWorkerEvent::ScenePerformanceCaptureStarted { .. }
         | IdeWorkerEvent::ScenePerformanceCaptureProgress { .. }
@@ -11146,6 +11245,37 @@ fn apply_runtime_loop_update_import_event(
     }
 }
 
+fn apply_runtime_automation_update_import_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::RuntimeAutomationUpdateImporting { name, point_count } => {
+            ui.set_app_mode(AppMode::ImportingRuntimeAutomationUpdate);
+            ui.set_status_text(
+                format!(
+                    "Verifying Runtime automation take {name} with {point_count} {} and preparing one durable take import…",
+                    if *point_count == 1 { "point" } else { "points" }
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RuntimeAutomationUpdateImported { revision, name, .. } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(
+                format!("Imported Runtime automation take {name} in project revision {revision}")
+                    .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RuntimeAutomationUpdateImportCommittedWithWarning { warning, .. } => {
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), "Runtime automation import").into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        _ => unreachable!("Runtime automation-update import dispatcher received another event"),
+    }
+}
+
 fn apply_mixer_automation_capture_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::MixerAutomationCaptureStarted {
@@ -12036,6 +12166,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::ImportRuntimeLoopUpdate
             if current == AppMode::ImportingRuntimeLoopUpdate =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::ImportRuntimeAutomationUpdate
+            if current == AppMode::ImportingRuntimeAutomationUpdate =>
         {
             AppMode::Running
         }
@@ -26308,6 +26443,7 @@ mod tests {
         assert_runtime_mixer_update_import_window_contract(ui);
         assert_runtime_native_device_update_import_window_contract(ui);
         assert_runtime_recording_update_import_window_contract(ui);
+        assert_runtime_automation_update_import_window_contract(ui);
         assert_runtime_loop_update_import_window_contract(ui);
         assert_audio_track_content_removal_window_contract(ui);
         assert_audio_track_freeze_window_contract(ui);
@@ -26443,6 +26579,11 @@ mod tests {
     fn assert_runtime_recording_update_import_window_contract(ui: &MainWindow) {
         assert_runtime_recording_update_import_callback_contract(ui);
         assert_runtime_recording_update_import_event_contract(ui);
+    }
+
+    fn assert_runtime_automation_update_import_window_contract(ui: &MainWindow) {
+        assert_runtime_automation_update_import_callback_contract(ui);
+        assert_runtime_automation_update_import_event_contract(ui);
     }
 
     fn assert_runtime_loop_update_import_window_contract(ui: &MainWindow) {
@@ -27097,6 +27238,186 @@ mod tests {
         assert_eq!(
             ui.get_status_text(),
             "Runtime recording import committed, but the project could not be reopened"
+        );
+    }
+
+    fn assert_runtime_automation_update_import_callback_contract(ui: &MainWindow) {
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        bind_runtime_automation_update_import_callback_with(ui, &worker, move |weak, _| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_automation_update_import_choice_with(
+                &ui,
+                RuntimeAutomationUpdateImportChoice::Selected(PathBuf::from(
+                    "take.hyper-automation-update.json",
+                )),
+                |command| submitted_by_callback.borrow_mut().push(command),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.set_error_text("stale error".into());
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_automation_update();
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::ImportRuntimeAutomationUpdate { path }]
+                if path == &PathBuf::from("take.hyper-automation-update.json")
+        ));
+        assert_eq!(ui.get_app_mode(), AppMode::ImportingRuntimeAutomationUpdate);
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::Closed);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_automation_update();
+        assert_eq!(
+            submitted.borrow().len(),
+            1,
+            "Closed mode owns no Runtime automation-update import action"
+        );
+
+        bind_runtime_automation_update_import_callback_with(ui, &worker, move |weak, _| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_automation_update_import_choice_with(
+                &ui,
+                RuntimeAutomationUpdateImportChoice::Cancelled,
+                |_| panic!("a cancelled chooser must not submit a command"),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_automation_update();
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime automation update import cancelled"
+        );
+
+        bind_runtime_automation_update_import_callback_with(ui, &worker, move |weak, worker| {
+            let ui = weak.upgrade().unwrap();
+            complete_runtime_automation_update_import_choice(
+                &ui,
+                &worker,
+                RuntimeAutomationUpdateImportChoice::Selected(PathBuf::from(
+                    "take.hyper-automation-update.json",
+                )),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>()
+            .invoke_import_runtime_automation_update();
+        assert_eq!(ui.get_app_mode(), AppMode::Unavailable);
+        assert!(ui.get_error_text().contains("no longer available"));
+    }
+
+    fn assert_runtime_automation_update_import_event_contract(ui: &MainWindow) {
+        let routes = UiRoutes::default();
+        let project_state = Rc::new(ProjectUiState::default());
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeAutomationUpdateImporting {
+                name: "Runtime gain pass".to_owned(),
+                point_count: 2,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::ImportingRuntimeAutomationUpdate);
+        assert_eq!(
+            ui.get_status_text(),
+            "Verifying Runtime automation take Runtime gain pass with 2 points and preparing one durable take import…"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::RuntimeAutomationUpdateImported {
+                revision: 8,
+                take_id: "take-a".to_owned(),
+                name: "Runtime gain pass".to_owned(),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Imported Runtime automation take Runtime gain pass in project revision 8"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        assert_runtime_automation_update_import_committed_warning_contract(
+            ui,
+            &routes,
+            &project_state,
+        );
+
+        ui.set_app_mode(AppMode::ImportingRuntimeAutomationUpdate);
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeAutomationUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeAutomationUpdateImport(Box::new(
+                    IdeRuntimeAutomationUpdateImportError::ProjectIdentityMismatch,
+                )),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(ui.get_error_text().contains("another project"));
+
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::ImportRuntimeAutomationUpdate,
+            ),
+            AppMode::ImportingRuntimeAutomationUpdate
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ImportingRuntimeAutomationUpdate,
+                IdeWorkerCommandKind::ImportRuntimeAutomationUpdate,
+            ),
+            AppMode::Running
+        );
+    }
+
+    fn assert_runtime_automation_update_import_committed_warning_contract(
+        ui: &MainWindow,
+        routes: &UiRoutes,
+        project_state: &ProjectUiStateCell,
+    ) {
+        apply_event(
+            ui,
+            routes,
+            project_state,
+            IdeWorkerEvent::RuntimeAutomationUpdateImportCommittedWithWarning {
+                name: "Runtime gain pass".to_owned(),
+                warning: Box::new(IdeRuntimeAutomationUpdateImportError::ProjectIdentityMismatch),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime automation import committed and reopened with a project recovery warning"
+        );
+        assert!(ui.get_error_text().contains("another project"));
+
+        ui.set_app_mode(AppMode::Closed);
+        apply_event(
+            ui,
+            routes,
+            project_state,
+            IdeWorkerEvent::RuntimeAutomationUpdateImportCommittedWithWarning {
+                name: "Runtime gain pass".to_owned(),
+                warning: Box::new(IdeRuntimeAutomationUpdateImportError::ProjectIdentityMismatch),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Closed);
+        assert_eq!(
+            ui.get_status_text(),
+            "Runtime automation import committed, but the project could not be reopened"
         );
     }
 

@@ -74,6 +74,7 @@ export enum AppMode {
     importing-runtime-native-device-update,
     importing-runtime-recording-update,
     importing-runtime-loop-update,
+    importing-runtime-automation-update,
     preparing-preview,
     previewing,
     saving,
@@ -335,6 +336,7 @@ export global IdeActions {
     callback import-runtime-native-device-update();
     callback import-runtime-recording-update();
     callback import-runtime-loop-update();
+    callback import-runtime-automation-update();
     callback start-mixer-automation-capture(string, int);
     callback stop-mixer-automation-capture();
     callback transport-seek(float);
@@ -1333,6 +1335,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.importing-runtime-native-device-update ? "◌  IMPORTING DEVICES"
                         : root.app-mode == AppMode.importing-runtime-recording-update ? "◌  IMPORTING TAKE"
                         : root.app-mode == AppMode.importing-runtime-loop-update ? "◌  IMPORTING LOOP"
+                        : root.app-mode == AppMode.importing-runtime-automation-update ? "◌  IMPORTING AUTOMATION"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
                         : root.app-mode == AppMode.closing ? "◌  CLOSING"
                         : root.app-mode == AppMode.closed ? "●  READY"
@@ -3732,6 +3735,27 @@ export component MainWindow inherits Window {
                                 root.automation-capture-target-index = 0;
                                 root.automation-capture-visible = true;
                             }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: #27313d; }
+
+                    HorizontalLayout {
+                        height: 34px;
+                        spacing: 8px;
+                        Text {
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                            text: "Import a verified Runtime automation update as one durable take";
+                            color: #8fa0b4;
+                            font-size: 9px;
+                            overflow: elide;
+                        }
+                        Button {
+                            text: "Import Runtime automation…";
+                            accessible-label: "Select one Runtime automation update and import its provenance-checked automation take";
+                            enabled: root.app-mode == AppMode.running && !root.local-edit-form-visible;
+                            clicked => { IdeActions.import-runtime-automation-update(); }
                         }
                     }
 
