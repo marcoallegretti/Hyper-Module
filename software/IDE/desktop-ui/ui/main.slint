@@ -1188,6 +1188,19 @@ export component MainWindow inherits Window {
                 }
                 return accept;
             }
+            if event.text == Key.End {
+                if !event.repeat
+                    && !event.modifiers.control
+                    && !event.modifiers.shift
+                    && !event.modifiers.alt
+                    && !event.modifiers.meta
+                    && root.app-mode == AppMode.running
+                    && root.performance-visible
+                    && root.transport-seek-available {
+                    IdeActions.transport-seek(100);
+                }
+                return accept;
+            }
             if event.modifiers.control && !event.repeat && (event.text == "z" || event.text == "Z") {
                 if event.modifiers.shift {
                     if root.redo-available {

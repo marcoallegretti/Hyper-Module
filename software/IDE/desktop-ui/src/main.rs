@@ -18532,6 +18532,21 @@ mod tests {
         clippy::fn_params_excessive_bools,
         reason = "the test mirrors independently dispatched keyboard modifier state"
     )]
+    fn dispatch_ide_end(
+        ui: &MainWindow,
+        control: bool,
+        shift: bool,
+        alt: bool,
+        meta: bool,
+        repeated: bool,
+    ) {
+        dispatch_ide_special_key(ui, Key::End.into(), control, shift, alt, meta, repeated);
+    }
+
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "the test mirrors independently dispatched keyboard modifier state"
+    )]
     fn dispatch_ide_special_key(
         ui: &MainWindow,
         key: SharedString,
@@ -19629,8 +19644,62 @@ mod tests {
         ui.set_transport_return_start_available(false);
     }
 
+    fn assert_transport_end_shortcut_contract(ui: &MainWindow) {
+        let seeks = Rc::new(RefCell::new(Vec::new()));
+        let seeks_by_callback = Rc::clone(&seeks);
+        ui.global::<IdeActions>().on_transport_seek(move |percent| {
+            seeks_by_callback.borrow_mut().push(percent.to_bits());
+        });
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_visible(false);
+        ui.set_takes_visible(false);
+        ui.set_arrangement_visible(false);
+        ui.set_clips_visible(false);
+        ui.set_loudness_visible(false);
+        ui.set_scene_create_visible(false);
+        ui.set_scene_rename_visible(false);
+        ui.set_scene_duplicate_visible(false);
+        ui.set_scene_slots_visible(false);
+        ui.set_transport_seek_available(true);
+        apply_transport_recovery_availability(ui, PlaybackRecoveryTransportState::Stopped);
+        dispatch_ide_end(ui, false, false, false, false, false);
+        dispatch_ide_end(ui, false, false, false, false, true);
+        assert_eq!(seeks.borrow().as_slice(), [100.0_f32.to_bits()]);
+
+        apply_transport_recovery_availability(ui, PlaybackRecoveryTransportState::Rolling);
+        dispatch_ide_end(ui, false, false, false, false, false);
+        assert_eq!(
+            seeks.borrow().as_slice(),
+            [100.0_f32.to_bits(), 100.0_f32.to_bits()]
+        );
+
+        dispatch_ide_end(ui, true, false, false, false, false);
+        dispatch_ide_end(ui, false, true, false, false, false);
+        dispatch_ide_end(ui, false, false, true, false, false);
+        dispatch_ide_end(ui, false, false, false, true, false);
+        ui.set_transport_seek_available(false);
+        dispatch_ide_end(ui, false, false, false, false, false);
+        ui.set_transport_seek_available(true);
+        ui.set_new_track_visible(true);
+        dispatch_ide_end(ui, false, false, false, false, false);
+        ui.set_new_track_visible(false);
+        ui.set_arrangement_visible(true);
+        dispatch_ide_end(ui, false, false, false, false, false);
+        ui.set_arrangement_visible(false);
+        ui.set_app_mode(AppMode::OutputFailed);
+        dispatch_ide_end(ui, false, false, false, false, false);
+        assert_eq!(
+            seeks.borrow().len(),
+            2,
+            "modifiers, repeats, revoked seek, hidden performance controls, and non-running modes remain inert"
+        );
+
+        ui.set_transport_seek_available(false);
+    }
+
     #[test]
-    fn generated_transport_home_shortcut_preserves_focused_slider_behavior() {
+    fn generated_transport_endpoint_shortcuts_preserve_focused_slider_behavior() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();
         let returns = Rc::new(Cell::new(0_usize));
@@ -19639,6 +19708,11 @@ mod tests {
             .on_transport_return_start(move || {
                 returns_by_callback.set(returns_by_callback.get() + 1);
             });
+        let seeks = Rc::new(RefCell::new(Vec::new()));
+        let seeks_by_callback = Rc::clone(&seeks);
+        ui.global::<IdeActions>().on_transport_seek(move |percent| {
+            seeks_by_callback.borrow_mut().push(percent.to_bits());
+        });
         ui.set_app_mode(AppMode::Running);
         ui.set_transport_return_start_available(true);
         ui.set_transport_seek_available(true);
@@ -19647,6 +19721,8 @@ mod tests {
 
         dispatch_ide_home(&ui, false, false, false, false, false);
         assert_eq!(returns.get(), 1);
+        dispatch_ide_end(&ui, false, false, false, false, false);
+        assert_eq!(seeks.borrow().as_slice(), [100.0_f32.to_bits()]);
         let seek = ElementHandle::find_by_accessible_label(
             &ui,
             "Locate within finite compiled playback range",
@@ -19657,6 +19733,14 @@ mod tests {
         seek.mock_single_click(PointerEventButton::Left);
         dispatch_ide_home(&ui, false, false, false, false, false);
         assert_eq!(returns.get(), 1, "the focused transport slider owns Home");
+        let local_seek_count = seeks.borrow().len();
+        dispatch_ide_end(&ui, false, false, false, false, false);
+        assert_eq!(
+            seeks.borrow().len(),
+            local_seek_count + 1,
+            "the focused transport slider owns End without leaking a global request"
+        );
+        assert_eq!(seeks.borrow().last().copied(), Some(100.0_f32.to_bits()));
         ui.hide().unwrap();
     }
 
@@ -26458,6 +26542,7 @@ mod tests {
         assert_terminal_output_failure_close_contract(&ui);
         assert_transport_space_shortcut_contract(&ui);
         assert_transport_home_shortcut_contract(&ui);
+        assert_transport_end_shortcut_contract(&ui);
         assert_transport_running_observation_contract(&ui);
         assert_terminal_output_failure_event_contract(&ui);
         assert_audio_import_shortcut_contract(&ui);

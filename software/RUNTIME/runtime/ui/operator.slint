@@ -757,8 +757,24 @@ export component OperatorWindow inherits Window {
                 return accept;
             }
             if event.text == Key.Home {
-                if !event.repeat && root.transport-return-to-start-enabled {
+                if !event.repeat
+                    && !event.modifiers.control
+                    && !event.modifiers.shift
+                    && !event.modifiers.alt
+                    && !event.modifiers.meta
+                    && root.transport-return-to-start-enabled {
                     root.return-to-start-requested();
+                }
+                return accept;
+            }
+            if event.text == Key.End {
+                if !event.repeat
+                    && !event.modifiers.control
+                    && !event.modifiers.shift
+                    && !event.modifiers.alt
+                    && !event.modifiers.meta
+                    && root.transport-seek-enabled {
+                    root.locate-percent-requested(100);
                 }
                 return accept;
             }

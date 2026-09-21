@@ -149,6 +149,31 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
     );
     assert_eq!(*returns.borrow(), 1);
 
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::End.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressRepeated {
+            text: Key::End.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyReleased {
+            text: Key::End.into(),
+        },
+    );
+    assert_eq!(seek_intents.borrow().as_slice(), [100.0_f32.to_bits()]);
+
+    dispatch_shift_key(&ui, Key::Home.into());
+    dispatch_shift_key(&ui, Key::End.into());
+    assert_eq!(*returns.borrow(), 1);
+    assert_eq!(seek_intents.borrow().as_slice(), [100.0_f32.to_bits()]);
+
     let seek = find_control(&ui, "Committed transport position percent");
     click_committed_marker(&ui, &seek, 0.2);
     dispatch_key(
@@ -170,9 +195,34 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
         },
     );
     assert_eq!(*returns.borrow(), 1, "the focused slider owns Home");
-    assert_eq!(seek_intents.borrow().len(), 2);
-    assert!((f32::from_bits(seek_intents.borrow()[0]) - 20.0).abs() <= 0.001);
-    assert_eq!(seek_intents.borrow()[1], 0.0_f32.to_bits());
+    assert_eq!(seek_intents.borrow().len(), 3);
+    assert_eq!(seek_intents.borrow()[0], 100.0_f32.to_bits());
+    assert!((f32::from_bits(seek_intents.borrow()[1]) - 20.0).abs() <= 0.001);
+    assert_eq!(seek_intents.borrow()[2], 0.0_f32.to_bits());
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::End.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressRepeated {
+            text: Key::End.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyReleased {
+            text: Key::End.into(),
+        },
+    );
+    assert_eq!(
+        seek_intents.borrow().len(),
+        4,
+        "the focused slider owns End"
+    );
+    assert_eq!(seek_intents.borrow()[3], 100.0_f32.to_bits());
 
     ui.set_transport_start_enabled(false);
     ui.set_transport_stop_enabled(false);
@@ -205,8 +255,21 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
             text: Key::Home.into(),
         },
     );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::End.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyReleased {
+            text: Key::End.into(),
+        },
+    );
     assert_eq!(*toggles.borrow(), 2);
     assert_eq!(*returns.borrow(), 1);
+    assert_eq!(seek_intents.borrow().len(), 4);
 }
 
 #[test]
@@ -789,6 +852,23 @@ fn dispatch_shift_space(ui: &OperatorWindow, repeated: bool) {
             text: Key::Space.into(),
         },
     );
+    dispatch_key(
+        ui,
+        WindowEvent::KeyReleased {
+            text: Key::Shift.into(),
+        },
+    );
+}
+
+fn dispatch_shift_key(ui: &OperatorWindow, key: slint::SharedString) {
+    dispatch_key(
+        ui,
+        WindowEvent::KeyPressed {
+            text: Key::Shift.into(),
+        },
+    );
+    dispatch_key(ui, WindowEvent::KeyPressed { text: key.clone() });
+    dispatch_key(ui, WindowEvent::KeyReleased { text: key });
     dispatch_key(
         ui,
         WindowEvent::KeyReleased {
