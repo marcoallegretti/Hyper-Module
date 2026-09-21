@@ -40,6 +40,7 @@ hyper-storage-engine = { path = "../../../crates/storage-engine" }
 hyper-runtime-native-device-update = { path = "../../../crates/runtime-native-device-update" }
 hyper-runtime-recording-update = { path = "../../../crates/runtime-recording-update" }
 chrono = "=0.4.45"
+ctrlc = { version = "=3.5.2", features = ["termination"] }
 slint = { version = "=1.17.1", default-features = false, features = [
     "accessibility",
     "backend-winit",

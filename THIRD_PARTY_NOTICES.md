@@ -1,5 +1,20 @@
 # Third-Party Notices
 
+## ctrlc 3.5.2
+
+The `hyper-runtime` crate uses `ctrlc` 3.5.2 to route supported operating-system
+termination signals through the Runtime's existing orderly shutdown path.
+
+Copyright the rust-ctrlc contributors. Licensed under either the MIT License or
+Apache License 2.0.
+
+Source: <https://github.com/Detegr/rust-ctrlc/tree/3.5.2>
+
+Licenses:
+
+- <https://github.com/Detegr/rust-ctrlc/blob/3.5.2/LICENSE-MIT>
+- <https://github.com/Detegr/rust-ctrlc/blob/3.5.2/LICENSE-APACHE>
+
 ## Symphonia 0.5.5
 
 The `hyper-audio-source` crate uses selected components of Symphonia 0.5.5:

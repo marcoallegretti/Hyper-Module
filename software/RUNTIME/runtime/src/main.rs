@@ -1271,11 +1271,35 @@ fn run() -> Result<(), String> {
         }
         RuntimeInvocation::ListAudioOutputs => list_runtime_audio_outputs(),
         RuntimeInvocation::ListAudioInputs => list_runtime_audio_inputs(),
-        RuntimeInvocation::Host(arguments) if arguments.operator_ui() => {
-            run_operator_ui(*arguments)
+        RuntimeInvocation::Host(arguments) => {
+            let stop = install_runtime_shutdown_signal()?;
+            if arguments.operator_ui() {
+                run_operator_ui(*arguments, &stop)
+            } else {
+                run_headless(&arguments, &stop)
+            }
         }
-        RuntimeInvocation::Host(arguments) => run_headless(&arguments),
     }
+}
+
+type RuntimeShutdownHandler = Box<dyn FnMut() + Send>;
+
+fn install_runtime_shutdown_signal_with<E>(
+    install: impl FnOnce(RuntimeShutdownHandler) -> Result<(), E>,
+) -> Result<Arc<AtomicBool>, E> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal_stop = Arc::clone(&stop);
+    install(Box::new(move || {
+        signal_stop.store(true, Ordering::Release);
+    }))?;
+    Ok(stop)
+}
+
+fn install_runtime_shutdown_signal() -> Result<Arc<AtomicBool>, String> {
+    install_runtime_shutdown_signal_with(|handler| {
+        ctrlc::try_set_handler(handler)
+            .map_err(|error| format!("cannot install Runtime shutdown signal handler: {error}"))
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2999,17 +3023,16 @@ fn announce_runtime(arguments: &RuntimeArguments, runtime: &StartedRuntime) {
     }
 }
 
-fn run_headless(arguments: &RuntimeArguments) -> Result<(), String> {
+fn run_headless(arguments: &RuntimeArguments, stop: &Arc<AtomicBool>) -> Result<(), String> {
     let mut runtime = start_runtime(arguments)?;
     announce_runtime(arguments, &runtime);
-    let stop = Arc::new(AtomicBool::new(false));
-    watch_for_quit(Arc::clone(&stop));
+    watch_for_quit(Arc::clone(stop));
     let output_status = runtime.observers.audio.clone();
     host_runtime(
         arguments,
         &mut runtime.host,
         &output_status,
-        &stop,
+        stop,
         None,
         &|message| {
             println!("{message}");
@@ -3887,7 +3910,7 @@ fn spawn_operator_worker(
     clippy::too_many_lines,
     reason = "the linear scope makes Slint timer and worker ownership explicit"
 )]
-fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
+fn run_operator_ui(arguments: RuntimeArguments, stop: &Arc<AtomicBool>) -> Result<(), String> {
     let ui =
         OperatorWindow::new().map_err(|error| format!("operator UI could not open: {error}"))?;
     let meter_config = SamplePeakBallisticsConfig::try_new(
@@ -3897,7 +3920,6 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         u64::MAX,
     )
     .map_err(|error| format!("operator output meter policy is invalid: {error}"))?;
-    let stop = Arc::new(AtomicBool::new(false));
     let (commands_tx, commands_rx) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
     let diagnostic = Arc::new(Mutex::new(
         "starting verified Runtime deployment".to_owned(),
@@ -3905,7 +3927,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let completion_close_error = Arc::new(Mutex::new(None));
     let worker = spawn_operator_worker(
         arguments,
-        Arc::clone(&stop),
+        Arc::clone(stop),
         commands_rx,
         Arc::clone(&diagnostic),
     );
@@ -3999,7 +4021,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &diagnostic,
         &timeline_marker_authority,
     );
-    wire_operator_quit(&ui, &commands_tx, &stop, &diagnostic);
+    wire_operator_quit(&ui, &commands_tx, stop, &diagnostic);
     wire_operator_peak_reset(&ui, &meter_observer, &loudness_authority);
     wire_operator_loudness_controls(&ui, &commands_tx, &diagnostic, &loudness_authority);
     wire_operator_mixer_controls(&ui, &commands_tx, &diagnostic, &mixer_authority);
@@ -4288,7 +4310,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         .map_err(|error| format!("operator UI failed: {error}"));
     drop(timer);
     let ui_result = reconcile_operator_ui_close(ui_result, &completion_close_error);
-    finish_operator_worker(ui_result, &stop, &commands_tx, worker.handle)
+    finish_operator_worker(ui_result, stop, &commands_tx, worker.handle)
 }
 
 fn finish_failed_operator_startup(
@@ -8058,12 +8080,12 @@ fn limits() -> Result<ProjectPlaybackLimits, String> {
     })
 }
 
-/// Ends the process when standard input closes or asks it to.
+/// Requests headless shutdown when standard input closes or asks it to.
 ///
-/// `std` has no signal handling, so the process is stopped the way a headless
-/// process is driven: through the stream it was started with. The serving loop
-/// observes this flag between reads, so it takes effect while a panel is
-/// connected rather than only between connections.
+/// Standard input shares the same stop authority as operating-system
+/// termination and native-output failure. The serving loop observes this flag
+/// between reads, so it takes effect while a panel is connected rather than
+/// only between connections.
 fn watch_for_quit(stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let mut line = String::new();
@@ -8399,6 +8421,30 @@ mod tests {
             RUNTIME_VERSION.strip_prefix("hyper-runtime "),
             Some(env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn installed_shutdown_signal_requests_the_shared_runtime_stop() {
+        let installed = Arc::new(Mutex::new(None::<RuntimeShutdownHandler>));
+        let installed_by_registration = Arc::clone(&installed);
+        let stop = install_runtime_shutdown_signal_with(move |handler| {
+            *installed_by_registration.lock().unwrap() = Some(handler);
+            Ok::<(), &'static str>(())
+        })
+        .unwrap();
+        assert!(!stop.load(Ordering::Acquire));
+
+        let mut handler = installed.lock().unwrap().take().unwrap();
+        handler();
+        assert!(stop.load(Ordering::Acquire));
+        handler();
+        assert!(stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn rejected_shutdown_signal_installation_publishes_no_stop_authority() {
+        let result = install_runtime_shutdown_signal_with(|_| Err("registration refused"));
+        assert!(matches!(result, Err("registration refused")));
     }
 
     #[test]
@@ -9344,6 +9390,37 @@ mod tests {
         assert!(
             owner.commands.is_empty(),
             "terminal output is observed before queued controls are forwarded"
+        );
+    }
+
+    #[test]
+    fn a_pre_requested_stop_skips_owner_work_and_settles_recording() {
+        let arguments = RuntimeArguments::parse(["deployment".to_owned()]).unwrap();
+        let stop = AtomicBool::new(true);
+        let mut owner = OperatorControl {
+            recording_poll: Some("unexpected owner turn".to_owned()),
+            recording_abort: Some(Ok(Some("recording journal retained".to_owned()))),
+            ..OperatorControl::default()
+        };
+        let diagnostics = RefCell::new(Vec::new());
+
+        host_runtime(
+            &arguments,
+            &mut owner,
+            &OutputObservation(OutputStreamState::Running),
+            &stop,
+            None,
+            &|message| diagnostics.borrow_mut().push(message),
+        )
+        .unwrap();
+
+        assert_eq!(
+            owner.recording_poll.as_deref(),
+            Some("unexpected owner turn")
+        );
+        assert_eq!(
+            diagnostics.into_inner(),
+            ["no panel link requested", "recording journal retained"]
         );
     }
 
