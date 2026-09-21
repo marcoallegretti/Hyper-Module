@@ -120,6 +120,7 @@ const HEARTBEAT_TIMEOUT_MS: u32 = 500;
 struct SessionHost {
     session: DesktopPlaybackSession,
     audio_observers: RuntimeAudioObservers,
+    meter_receivers: RuntimeMeterReceivers,
     automation_capture: RuntimeAutomationCaptureController,
     mixer_update: RuntimeMixerUpdateController,
     native_device_update: RuntimeNativeDeviceUpdateController,
@@ -169,16 +170,18 @@ impl PanelHost for SessionHost {
 }
 
 impl SessionHost {
-    fn take_meter_receiver(&mut self) -> Option<OutputMeterReceiver> {
-        self.session.take_meter_receiver()
-    }
-
-    fn take_input_meter_receiver(&mut self) -> Option<InputMeterReceiver> {
-        self.session.take_monitoring_input_meter_receiver()
-    }
-
     fn refresh_audio_observers(&self) {
         self.audio_observers.rebind(&self.session);
+    }
+
+    fn refresh_meter_receivers(&mut self) -> Result<(), &'static str> {
+        let output = self
+            .session
+            .take_meter_receiver()
+            .ok_or("Runtime output meter authority was already transferred")?;
+        let input = self.session.take_monitoring_input_meter_receiver();
+        self.meter_receivers.replace(output, input);
+        Ok(())
     }
 
     /// Returns the first owner whose in-flight work prevents a playback-owner
@@ -359,6 +362,7 @@ struct OperatorTimelineMarker {
 struct RuntimeObservers {
     facts: RuntimeFacts,
     audio: RuntimeAudioObservers,
+    meter_receivers: RuntimeMeterReceivers,
     panel_connected: Arc<AtomicBool>,
     automation_capture: Arc<Mutex<RuntimeAutomationCaptureObservation>>,
     mixer_update: Arc<Mutex<RuntimeMixerUpdateObservation>>,
@@ -380,6 +384,34 @@ struct RuntimeAudioObservationHandles {
 #[derive(Clone, Debug)]
 struct RuntimeAudioObservers {
     handles: Arc<Mutex<RuntimeAudioObservationHandles>>,
+}
+
+#[derive(Debug)]
+struct RuntimeMeterReceiverGeneration {
+    output: OutputMeterReceiver,
+    input: Option<InputMeterReceiver>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeMeterReceivers {
+    pending: Arc<Mutex<Option<RuntimeMeterReceiverGeneration>>>,
+}
+
+impl RuntimeMeterReceivers {
+    fn replace(&self, output: OutputMeterReceiver, input: Option<InputMeterReceiver>) {
+        *self
+            .pending
+            .lock()
+            .expect("Runtime meter-receiver lock is not poisoned") =
+            Some(RuntimeMeterReceiverGeneration { output, input });
+    }
+
+    fn take(&self) -> Option<RuntimeMeterReceiverGeneration> {
+        self.pending
+            .lock()
+            .expect("Runtime meter-receiver lock is not poisoned")
+            .take()
+    }
 }
 
 impl RuntimeAudioObservers {
@@ -425,8 +457,6 @@ impl RuntimeAudioObservationHandles {
 
 struct OperatorReady {
     observers: RuntimeObservers,
-    meters: OutputMeterReceiver,
-    input_meters: Option<InputMeterReceiver>,
     scenes: Vec<OperatorScene>,
     mixer_channels: Vec<OperatorMixerChannel>,
     mixer_sends: Vec<OperatorMixerSend>,
@@ -1427,9 +1457,11 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
     )?;
     let panel_connected = Arc::new(AtomicBool::new(false));
     let audio_observers = RuntimeAudioObservers::new(&session);
+    let meter_receivers = RuntimeMeterReceivers::default();
     let observers = RuntimeObservers {
         facts,
         audio: audio_observers.clone(),
+        meter_receivers: meter_receivers.clone(),
         panel_connected: Arc::clone(&panel_connected),
         automation_capture: automation_capture_observation,
         mixer_update: mixer_update_observation,
@@ -1437,9 +1469,10 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         loop_update: loop_update_observation,
         scene_performance: scene_performance_observation,
     };
-    let host = SessionHost {
+    let mut host = SessionHost {
         session,
         audio_observers,
+        meter_receivers,
         automation_capture,
         mixer_update,
         native_device_update,
@@ -1453,6 +1486,9 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         ));
     }
     host.refresh_audio_observers();
+    host.refresh_meter_receivers().map_err(|error| {
+        format!("verified Runtime host cannot publish meter authority: {error}")
+    })?;
     Ok(StartedRuntime {
         host,
         observers,
@@ -2519,30 +2555,19 @@ fn spawn_operator_worker(
                     operator_scene_catalog(&runtime.host.session).and_then(|scenes| {
                         operator_mixer_catalog(&runtime.host.session).and_then(|mixer_channels| {
                             operator_mixer_send_catalog(&runtime.host.session, &mixer_channels)
-                                .and_then(|mixer_sends| operator_native_device_catalog(&runtime.host.session).and_then(|native_devices| {
-                                    runtime
-                                        .host
-                                        .take_meter_receiver()
-                                        .map(|meters| {
-                                            let input_meters =
-                                                runtime.host.take_input_meter_receiver();
-                                            OperatorReady {
-                                                observers: runtime.observers.clone(),
-                                                meters,
-                                                input_meters,
-                                                scenes,
-                                                mixer_channels,
-                                                mixer_sends,
-                                                native_devices,
-                                                native_device_chains,
-                                                automation_targets,
-                                            }
-                                        })
-                                        .ok_or_else(|| {
-                                            "operator output meter authority was already transferred"
-                                                .to_owned()
-                                        })
-                                }))
+                                .and_then(|mixer_sends| {
+                                    operator_native_device_catalog(&runtime.host.session).map(
+                                        |native_devices| OperatorReady {
+                                            observers: runtime.observers.clone(),
+                                            scenes,
+                                            mixer_channels,
+                                            mixer_sends,
+                                            native_devices,
+                                            native_device_chains,
+                                            automation_targets,
+                                        },
+                                    )
+                                })
                         })
                     });
                 match ready_model {
@@ -2620,8 +2645,6 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     };
     let OperatorReady {
         observers,
-        meters,
-        input_meters,
         scenes,
         mixer_channels,
         mixer_sends,
@@ -2629,16 +2652,21 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         native_device_chains,
         automation_targets,
     } = ready;
+    let RuntimeMeterReceiverGeneration {
+        output: meters,
+        input: input_meters,
+    } = observers
+        .meter_receivers
+        .take()
+        .ok_or_else(|| "operator meter authority was not published at startup".to_owned())?;
     let meter_observer = Rc::new(RefCell::new(OperatorMeterObserver::new(
         meters,
         meter_config,
     )));
-    let input_meter_observer = input_meters.map(|meters| {
-        Rc::new(RefCell::new(OperatorInputMeterObserver::new(
-            meters,
-            meter_config,
-        )))
-    });
+    let input_meter_observer =
+        Rc::new(RefCell::new(input_meters.map(|meters| {
+            OperatorInputMeterObserver::new(meters, meter_config)
+        })));
     let timeline_marker_model = Rc::new(VecModel::from(operator_timeline_marker_rows(
         &observers.facts.timeline_markers,
     )));
@@ -2759,7 +2787,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &loudness_authority,
         false,
     );
-    apply_operator_input_monitor_observation(&ui, &observers, input_meter_observer.as_ref(), false);
+    apply_operator_input_monitor_observation(&ui, &observers, &input_meter_observer, false);
     apply_operator_mixer_observation(
         &ui,
         &mixer_model,
@@ -2795,7 +2823,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
     let timer_meter_observer = Rc::clone(&meter_observer);
-    let timer_input_meter_observer = input_meter_observer.clone();
+    let timer_input_meter_observer = Rc::clone(&input_meter_observer);
     let timer_scene_model = Rc::clone(&scene_model);
     let timer_scene_launch_authority = Rc::clone(&scene_launch_authority);
     let timer_scene_selection = Rc::clone(&scene_selection);
@@ -2826,6 +2854,14 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer = Timer::default();
     timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
         if let Some(ui) = weak.upgrade() {
+            if let Some(replacement) = timer_observers.meter_receivers.take() {
+                *timer_meter_observer.borrow_mut() =
+                    OperatorMeterObserver::new(replacement.output, meter_config);
+                *timer_input_meter_observer.borrow_mut() = replacement
+                    .input
+                    .map(|meters| OperatorInputMeterObserver::new(meters, meter_config));
+                timer_loudness_authority.set(None);
+            }
             let audio = timer_observers.audio.snapshot();
             let output_state = audio.output_status.state();
             apply_operator_cycle_observation(
@@ -2855,7 +2891,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
             apply_operator_input_monitor_observation(
                 &ui,
                 &timer_observers,
-                timer_input_meter_observer.as_ref(),
+                &timer_input_meter_observer,
                 terminal_latched,
             );
             apply_operator_mixer_observation(
@@ -6444,7 +6480,7 @@ fn apply_operator_meter_observation(
 fn apply_operator_input_monitor_observation(
     ui: &OperatorWindow,
     observers: &RuntimeObservers,
-    meter_observer: Option<&Rc<RefCell<OperatorInputMeterObserver>>>,
+    meter_observer: &RefCell<Option<OperatorInputMeterObserver>>,
     terminal_latched: bool,
 ) {
     let audio = observers.audio.snapshot();
@@ -6479,11 +6515,12 @@ fn apply_operator_input_monitor_observation(
         );
         return;
     }
-    let Some(meter_observer) = meter_observer else {
+    let mut meter_observer = meter_observer.borrow_mut();
+    let Some(meter_observer) = meter_observer.as_mut() else {
         clear_operator_input_meter(ui, "Raw input-meter authority is unavailable");
         return;
     };
-    let meter = meter_observer.borrow_mut().observe();
+    let meter = meter_observer.observe();
     ui.set_left_input_level(meter.left_level);
     ui.set_left_input_reading(meter.left_reading.into());
     ui.set_right_input_level(meter.right_level);
@@ -6740,6 +6777,7 @@ mod tests {
                 timeline_markers: markers,
             },
             audio: test_audio_observers(PlaybackRecoveryCheckpoint::default()),
+            meter_receivers: RuntimeMeterReceivers::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
             automation_capture: test_automation_capture_observation(),
             mixer_update: test_mixer_update_observation(),
@@ -6782,6 +6820,25 @@ mod tests {
         let rebound = observers.snapshot().recovery.snapshot();
         assert_eq!(rebound.loop_range(), Some(replacement_range));
         assert!(!rebound.loop_enabled());
+    }
+
+    #[test]
+    fn meter_receiver_handoff_replaces_one_complete_pending_generation() {
+        let receivers = RuntimeMeterReceivers::default();
+        let (_original_output_sender, original_output) =
+            hyper_mixer_runtime::output_meter_channel();
+        let (_original_input_sender, original_input) =
+            hyper_desktop_audio::input_meter_channel_for_test().unwrap();
+        receivers.replace(original_output, Some(original_input));
+
+        let (_replacement_output_sender, replacement_output) =
+            hyper_mixer_runtime::output_meter_channel();
+        receivers.replace(replacement_output, None);
+
+        let replacement = receivers.take().unwrap();
+        assert!(replacement.input.is_none());
+        drop(replacement.output);
+        assert!(receivers.take().is_none());
     }
 
     #[test]
@@ -11290,6 +11347,7 @@ mod tests {
                 timeline_markers: Arc::from([]),
             },
             audio: test_audio_observers(recovery.clone()),
+            meter_receivers: RuntimeMeterReceivers::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
             automation_capture: test_automation_capture_observation(),
             mixer_update: test_mixer_update_observation(),
@@ -11401,6 +11459,7 @@ mod tests {
         let observers = RuntimeObservers {
             facts: facts.clone(),
             audio: test_audio_observers(PlaybackRecoveryCheckpoint::default()),
+            meter_receivers: RuntimeMeterReceivers::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
             automation_capture: test_automation_capture_observation(),
             mixer_update: test_mixer_update_observation(),
@@ -11650,6 +11709,7 @@ mod tests {
         let terminal_observers = RuntimeObservers {
             facts: facts.clone(),
             audio: test_audio_observers(terminal_recovery),
+            meter_receivers: RuntimeMeterReceivers::default(),
             panel_connected: Arc::new(AtomicBool::new(false)),
             automation_capture: test_automation_capture_observation(),
             mixer_update: test_mixer_update_observation(),
