@@ -1090,6 +1090,7 @@ export component MainWindow inherits Window {
     in property <string> transport-state: "Stopped";
     in property <bool> transport-start-available: false;
     in property <bool> transport-stop-available: false;
+    in property <bool> transport-return-start-available: false;
     in property <int> scene-performance-capture-launch-count: 0;
     in property <string> stream-state: "No stream";
     in property <string> frame-position: "0";
@@ -1171,6 +1172,19 @@ export component MainWindow inherits Window {
                     } else if root.transport-stop-available {
                         IdeActions.transport-stop();
                     }
+                }
+                return accept;
+            }
+            if event.text == Key.Home {
+                if !event.repeat
+                    && !event.modifiers.control
+                    && !event.modifiers.shift
+                    && !event.modifiers.alt
+                    && !event.modifiers.meta
+                    && root.app-mode == AppMode.running
+                    && root.performance-visible
+                    && root.transport-return-start-available {
+                    IdeActions.transport-return-start();
                 }
                 return accept;
             }
@@ -2094,7 +2108,7 @@ export component MainWindow inherits Window {
                                 Button {
                                     text: "|◀  Return";
                                     accessible-label: "Return transport to start";
-                                    enabled: root.app-mode == AppMode.running;
+                                    enabled: root.app-mode == AppMode.running && root.transport-return-start-available;
                                     clicked => { IdeActions.transport-return-start(); }
                                 }
                                 if root.app-mode != AppMode.capturing-scene-performance : Button {

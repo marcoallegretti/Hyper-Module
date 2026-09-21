@@ -11956,6 +11956,7 @@ fn reset_project(
     ui.set_transport_state("Stopped".into());
     ui.set_transport_start_available(false);
     ui.set_transport_stop_available(false);
+    ui.set_transport_return_start_available(false);
     ui.set_stream_state("No stream".into());
     ui.set_frame_position("0".into());
     ui.set_transport_clock("00:00:00.000".into());
@@ -11973,6 +11974,7 @@ fn reset_project(
 fn apply_transport_recovery_availability(ui: &MainWindow, state: PlaybackRecoveryTransportState) {
     ui.set_transport_start_available(state == PlaybackRecoveryTransportState::Stopped);
     ui.set_transport_stop_available(state == PlaybackRecoveryTransportState::Rolling);
+    ui.set_transport_return_start_available(true);
 }
 
 fn apply_output_failure_observation(ui: &MainWindow) {
@@ -11980,6 +11982,7 @@ fn apply_output_failure_observation(ui: &MainWindow) {
     ui.set_stream_state("Failed".into());
     ui.set_transport_start_available(false);
     ui.set_transport_stop_available(false);
+    ui.set_transport_return_start_available(false);
     ui.set_transport_seek_available(false);
     ui.set_metronome_available(false);
     ui.set_app_mode(AppMode::OutputFailed);
@@ -18507,6 +18510,37 @@ mod tests {
         meta: bool,
         repeated: bool,
     ) {
+        dispatch_ide_special_key(ui, Key::Space.into(), control, shift, alt, meta, repeated);
+    }
+
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "the test mirrors independently dispatched keyboard modifier state"
+    )]
+    fn dispatch_ide_home(
+        ui: &MainWindow,
+        control: bool,
+        shift: bool,
+        alt: bool,
+        meta: bool,
+        repeated: bool,
+    ) {
+        dispatch_ide_special_key(ui, Key::Home.into(), control, shift, alt, meta, repeated);
+    }
+
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "the test mirrors independently dispatched keyboard modifier state"
+    )]
+    fn dispatch_ide_special_key(
+        ui: &MainWindow,
+        key: SharedString,
+        control: bool,
+        shift: bool,
+        alt: bool,
+        meta: bool,
+        repeated: bool,
+    ) {
         if control {
             ui.window().dispatch_event(WindowEvent::KeyPressed {
                 text: Key::Control.into(),
@@ -18528,17 +18562,12 @@ mod tests {
             });
         }
         ui.window().dispatch_event(if repeated {
-            WindowEvent::KeyPressRepeated {
-                text: Key::Space.into(),
-            }
+            WindowEvent::KeyPressRepeated { text: key.clone() }
         } else {
-            WindowEvent::KeyPressed {
-                text: Key::Space.into(),
-            }
+            WindowEvent::KeyPressed { text: key.clone() }
         });
-        ui.window().dispatch_event(WindowEvent::KeyReleased {
-            text: Key::Space.into(),
-        });
+        ui.window()
+            .dispatch_event(WindowEvent::KeyReleased { text: key });
         if meta {
             ui.window().dispatch_event(WindowEvent::KeyReleased {
                 text: Key::Meta.into(),
@@ -19411,6 +19440,7 @@ mod tests {
         ui.set_stream_state("Running".into());
         ui.set_transport_start_available(true);
         ui.set_transport_stop_available(true);
+        ui.set_transport_return_start_available(true);
         ui.set_transport_seek_available(true);
         ui.set_metronome_available(true);
         ui.global::<IdeActions>().invoke_close_project();
@@ -19436,6 +19466,7 @@ mod tests {
         assert!(ui.get_close_unsaved_mixer_confirming());
         assert!(!ui.get_transport_start_available());
         assert!(!ui.get_transport_stop_available());
+        assert!(!ui.get_transport_return_start_available());
         assert!(!ui.get_transport_seek_available());
         assert!(!ui.get_metronome_available());
         assert!(ui.get_status_text().contains("output ended unexpectedly"));
@@ -19462,6 +19493,7 @@ mod tests {
         assert!(ui.get_error_text().contains("locked"));
         assert!(!ui.get_transport_start_available());
         assert!(!ui.get_transport_stop_available());
+        assert!(!ui.get_transport_return_start_available());
         assert!(!ui.get_transport_seek_available());
         assert!(!ui.get_metronome_available());
     }
@@ -19491,6 +19523,7 @@ mod tests {
         apply_transport_recovery_availability(ui, PlaybackRecoveryTransportState::Stopped);
         assert!(ui.get_transport_start_available());
         assert!(!ui.get_transport_stop_available());
+        assert!(ui.get_transport_return_start_available());
         dispatch_ide_space(ui, false, false, false, false, false);
         dispatch_ide_space(ui, false, false, false, false, true);
         assert_eq!(
@@ -19502,6 +19535,7 @@ mod tests {
         apply_transport_recovery_availability(ui, PlaybackRecoveryTransportState::Rolling);
         assert!(!ui.get_transport_start_available());
         assert!(ui.get_transport_stop_available());
+        assert!(ui.get_transport_return_start_available());
         dispatch_ide_space(ui, false, false, false, false, false);
         assert_eq!(
             stops.get(),
@@ -19533,6 +19567,97 @@ mod tests {
 
         ui.set_app_mode(AppMode::Running);
         ui.set_transport_start_available(false);
+    }
+
+    fn assert_transport_home_shortcut_contract(ui: &MainWindow) {
+        let returns = Rc::new(Cell::new(0_usize));
+        let returns_by_callback = Rc::clone(&returns);
+        ui.global::<IdeActions>()
+            .on_transport_return_start(move || {
+                returns_by_callback.set(returns_by_callback.get() + 1);
+            });
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_visible(false);
+        ui.set_takes_visible(false);
+        ui.set_arrangement_visible(false);
+        ui.set_clips_visible(false);
+        ui.set_loudness_visible(false);
+        ui.set_scene_create_visible(false);
+        ui.set_scene_rename_visible(false);
+        ui.set_scene_duplicate_visible(false);
+        ui.set_scene_slots_visible(false);
+        apply_transport_recovery_availability(ui, PlaybackRecoveryTransportState::Stopped);
+        assert!(ui.get_transport_return_start_available());
+        dispatch_ide_home(ui, false, false, false, false, false);
+        dispatch_ide_home(ui, false, false, false, false, true);
+        assert_eq!(
+            returns.get(),
+            1,
+            "Home reuses Return only once from stopped recovery authority"
+        );
+
+        apply_transport_recovery_availability(ui, PlaybackRecoveryTransportState::Rolling);
+        dispatch_ide_home(ui, false, false, false, false, false);
+        assert_eq!(
+            returns.get(),
+            2,
+            "Home remains available from rolling recovery authority"
+        );
+
+        dispatch_ide_home(ui, true, false, false, false, false);
+        dispatch_ide_home(ui, false, true, false, false, false);
+        dispatch_ide_home(ui, false, false, true, false, false);
+        dispatch_ide_home(ui, false, false, false, true, false);
+        ui.set_transport_return_start_available(false);
+        dispatch_ide_home(ui, false, false, false, false, false);
+        apply_transport_recovery_availability(ui, PlaybackRecoveryTransportState::Stopped);
+        ui.set_new_track_visible(true);
+        dispatch_ide_home(ui, false, false, false, false, false);
+        ui.set_new_track_visible(false);
+        ui.set_clips_visible(true);
+        dispatch_ide_home(ui, false, false, false, false, false);
+        ui.set_clips_visible(false);
+        ui.set_app_mode(AppMode::Previewing);
+        dispatch_ide_home(ui, false, false, false, false, false);
+        assert_eq!(
+            returns.get(),
+            2,
+            "modifiers, revoked authority, local forms, hidden performance controls, and non-running modes remain inert"
+        );
+
+        ui.set_transport_return_start_available(false);
+    }
+
+    #[test]
+    fn generated_transport_home_shortcut_preserves_focused_slider_behavior() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let returns = Rc::new(Cell::new(0_usize));
+        let returns_by_callback = Rc::clone(&returns);
+        ui.global::<IdeActions>()
+            .on_transport_return_start(move || {
+                returns_by_callback.set(returns_by_callback.get() + 1);
+            });
+        ui.set_app_mode(AppMode::Running);
+        ui.set_transport_return_start_available(true);
+        ui.set_transport_seek_available(true);
+        ui.set_transport_progress_percent(20.0);
+        ui.show().unwrap();
+
+        dispatch_ide_home(&ui, false, false, false, false, false);
+        assert_eq!(returns.get(), 1);
+        let seek = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Locate within finite compiled playback range",
+        )
+        .next()
+        .expect("the enabled transport slider is present");
+        assert_eq!(seek.accessible_enabled(), Some(true));
+        seek.mock_single_click(PointerEventButton::Left);
+        dispatch_ide_home(&ui, false, false, false, false, false);
+        assert_eq!(returns.get(), 1, "the focused transport slider owns Home");
+        ui.hide().unwrap();
     }
 
     fn assert_transport_running_observation_contract(ui: &MainWindow) {
@@ -19619,6 +19744,7 @@ mod tests {
         assert_eq!(ui.get_stream_state(), "Failed");
         assert!(!ui.get_transport_start_available());
         assert!(!ui.get_transport_stop_available());
+        assert!(!ui.get_transport_return_start_available());
         assert!(!ui.get_transport_seek_available());
         assert!(!ui.get_metronome_available());
         dispatch_ide_space(ui, false, false, false, false, false);
@@ -19634,6 +19760,7 @@ mod tests {
         ui.set_stream_state("Running".into());
         ui.set_transport_start_available(true);
         ui.set_transport_stop_available(true);
+        ui.set_transport_return_start_available(true);
         ui.set_transport_seek_available(true);
         ui.set_metronome_available(true);
         apply_event(
@@ -19649,6 +19776,7 @@ mod tests {
         assert_eq!(ui.get_stream_state(), "Failed");
         assert!(!ui.get_transport_start_available());
         assert!(!ui.get_transport_stop_available());
+        assert!(!ui.get_transport_return_start_available());
         assert!(!ui.get_transport_seek_available());
         assert!(!ui.get_metronome_available());
     }
@@ -26329,6 +26457,7 @@ mod tests {
         assert_unsaved_mixer_close_contract(&ui);
         assert_terminal_output_failure_close_contract(&ui);
         assert_transport_space_shortcut_contract(&ui);
+        assert_transport_home_shortcut_contract(&ui);
         assert_transport_running_observation_contract(&ui);
         assert_terminal_output_failure_event_contract(&ui);
         assert_audio_import_shortcut_contract(&ui);
