@@ -19829,6 +19829,72 @@ mod tests {
     }
 
     #[test]
+    fn generated_loop_shortcut_uses_only_visible_committed_authority() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let toggles = Rc::new(Cell::new(0_usize));
+        let toggles_by_callback = Rc::clone(&toggles);
+        ui.global::<IdeActions>().on_loop_toggle(move || {
+            toggles_by_callback.set(toggles_by_callback.get() + 1);
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.set_loop_toggle_available(true);
+        ui.show().unwrap();
+
+        dispatch_ide_special_key(&ui, "l".into(), false, false, false, false, true);
+        dispatch_ide_special_key(&ui, "l".into(), true, false, false, false, false);
+        dispatch_ide_special_key(&ui, "l".into(), false, true, false, false, false);
+        dispatch_ide_special_key(&ui, "l".into(), false, false, true, false, false);
+        dispatch_ide_special_key(&ui, "l".into(), false, false, false, true, false);
+        assert_eq!(toggles.get(), 0);
+
+        dispatch_ide_special_key(&ui, "l".into(), false, false, false, false, false);
+        dispatch_ide_special_key(&ui, "L".into(), false, false, false, false, false);
+        assert_eq!(toggles.get(), 2);
+
+        let show = ElementHandle::find_by_accessible_label(&ui, "Show IDE keyboard shortcuts")
+            .next()
+            .expect("the IDE header exposes shortcut help");
+        show.mock_single_click(PointerEventButton::Left);
+        dispatch_ide_special_key(&ui, "l".into(), false, false, false, false, false);
+        assert_eq!(toggles.get(), 2, "the shortcut sheet is modal");
+        dispatch_ide_escape(&ui, false);
+
+        ui.set_loop_toggle_available(false);
+        dispatch_ide_special_key(&ui, "l".into(), false, false, false, false, false);
+        ui.set_loop_toggle_available(true);
+        ui.set_mixer_visible(true);
+        dispatch_ide_special_key(&ui, "l".into(), false, false, false, false, false);
+        ui.set_mixer_visible(false);
+        ui.set_new_track_visible(true);
+        dispatch_ide_special_key(&ui, "l".into(), false, false, false, false, false);
+        ui.set_new_track_visible(false);
+        ui.set_app_mode(AppMode::OutputFailed);
+        dispatch_ide_special_key(&ui, "l".into(), false, false, false, false, false);
+        assert_eq!(
+            toggles.get(),
+            2,
+            "revoked authority, hidden Performance controls, local forms, and non-running modes remain inert"
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_tempo_available(true);
+        let tempo =
+            ElementHandle::find_by_accessible_label(&ui, "Project tempo in beats per minute")
+                .next()
+                .expect("the enabled Performance tempo field is present");
+        assert_eq!(tempo.accessible_enabled(), Some(true));
+        tempo.mock_single_click(PointerEventButton::Left);
+        dispatch_ide_special_key(&ui, "l".into(), false, false, false, false, false);
+        assert_eq!(
+            toggles.get(),
+            2,
+            "a focused text field owns an unmodified letter without leaking a loop request"
+        );
+        ui.hide().unwrap();
+    }
+
+    #[test]
     fn generated_shortcut_help_is_modal_and_dismissible() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();
@@ -19860,6 +19926,7 @@ mod tests {
             "Space: Start or stop transport",
             "Home: Return transport to start",
             "End: Seek exact playback end",
+            "L: Enable or disable the armed loop",
             "Escape: Cancel New Project or Add Track",
         ] {
             assert!(

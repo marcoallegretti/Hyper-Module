@@ -1257,6 +1257,19 @@ export component MainWindow inherits Window {
                 }
                 return accept;
             }
+            if !event.modifiers.control
+                && !event.modifiers.shift
+                && !event.modifiers.alt
+                && !event.modifiers.meta
+                && !event.repeat
+                && (event.text == "l" || event.text == "L") {
+                if root.app-mode == AppMode.running
+                    && root.performance-visible
+                    && root.loop-toggle-available {
+                    IdeActions.loop-toggle();
+                }
+                return accept;
+            }
             if event.modifiers.control
                 && !event.modifiers.alt
                 && !event.modifiers.meta
@@ -6898,7 +6911,7 @@ export component MainWindow inherits Window {
 
         Rectangle {
             width: 740px;
-            height: 486px;
+            height: 524px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: #121821;
@@ -6962,6 +6975,7 @@ export component MainWindow inherits Window {
                             ShortcutReferenceRow { chord: "Space"; action: "Start or stop transport"; }
                             ShortcutReferenceRow { chord: "Home"; action: "Return transport to start"; }
                             ShortcutReferenceRow { chord: "End"; action: "Seek exact playback end"; }
+                            ShortcutReferenceRow { chord: "L"; action: "Enable or disable the armed loop"; }
                             ShortcutReferenceRow { chord: "Escape"; action: "Cancel New Project or Add Track"; }
                         }
                     }

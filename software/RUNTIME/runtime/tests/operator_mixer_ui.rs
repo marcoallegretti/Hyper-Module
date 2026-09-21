@@ -349,6 +349,59 @@ fn generated_recording_shortcut_uses_only_committed_authority() {
 }
 
 #[test]
+fn generated_loop_shortcut_uses_only_committed_authority() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = OperatorWindow::new().unwrap();
+    let toggles = Rc::new(RefCell::new(0_usize));
+    let toggles_by_callback = Rc::clone(&toggles);
+    ui.on_toggle_loop_requested(move || {
+        *toggles_by_callback.borrow_mut() += 1;
+    });
+    ui.show().unwrap();
+
+    dispatch_operator_key(&ui, "l".into(), false, false, false, false, false);
+    ui.set_loop_toggle_enabled(true);
+    dispatch_operator_key(&ui, "l".into(), false, false, false, false, true);
+    dispatch_operator_key(&ui, "l".into(), true, false, false, false, false);
+    dispatch_operator_key(&ui, "l".into(), false, true, false, false, false);
+    dispatch_operator_key(&ui, "l".into(), false, false, true, false, false);
+    dispatch_operator_key(&ui, "l".into(), false, false, false, true, false);
+    assert_eq!(*toggles.borrow(), 0);
+
+    dispatch_operator_key(&ui, "l".into(), false, false, false, false, false);
+    dispatch_operator_key(&ui, "L".into(), false, false, false, false, false);
+    assert_eq!(*toggles.borrow(), 2);
+
+    let show = find_control(&ui, "Show Runtime keyboard shortcuts");
+    show.mock_single_click(PointerEventButton::Left);
+    dispatch_operator_key(&ui, "l".into(), false, false, false, false, false);
+    assert_eq!(*toggles.borrow(), 2, "the shortcut sheet is modal");
+    dispatch_operator_key(&ui, Key::Escape.into(), false, false, false, false, false);
+
+    ui.set_loop_toggle_enabled(false);
+    dispatch_operator_key(&ui, "l".into(), false, false, false, false, false);
+    assert_eq!(
+        *toggles.borrow(),
+        2,
+        "revoked committed authority remains inert"
+    );
+
+    ui.set_loop_toggle_enabled(true);
+    ui.set_automation_capture_start_enabled(true);
+    scroll_down(&ui);
+    let take_name = find_control(&ui, "Runtime automation take name");
+    assert_eq!(take_name.accessible_enabled(), Some(true));
+    take_name.mock_single_click(PointerEventButton::Left);
+    dispatch_operator_key(&ui, "l".into(), false, false, false, false, false);
+    assert_eq!(
+        *toggles.borrow(),
+        2,
+        "a focused text field owns an unmodified letter without leaking a loop request"
+    );
+    ui.hide().unwrap();
+}
+
+#[test]
 fn generated_shortcut_help_is_modal_and_dismissible() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = OperatorWindow::new().unwrap();
@@ -367,6 +420,7 @@ fn generated_shortcut_help_is_modal_and_dismissible() {
         "Home: Return transport to start",
         "End: Seek exact playback end",
         "Ctrl+R: Start or stop recording",
+        "L: Enable or disable the armed loop",
         "Up / Down: Select previous or next ready scene",
         "Return: Launch selected ready scene",
         "Shift+Space: Stop interactive scenes",
