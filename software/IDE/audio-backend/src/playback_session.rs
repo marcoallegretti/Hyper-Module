@@ -3808,6 +3808,7 @@ mod tests {
         DecodedPlaybackAsset, PlaybackDocumentBytes, PlaybackSessionAssemblyInput,
         assemble_playback_session,
     };
+    use hyper_recording_journal::JournalConfig;
     use std::collections::BTreeMap;
     use std::fs;
     use std::sync::mpsc::SyncSender;
@@ -4067,6 +4068,147 @@ mod tests {
         let rebound = recovery.with_output(replacement).unwrap();
         assert!((rebound.gain_linear - 0.625).abs() <= f32::EPSILON);
         assert!(!rebound.muted);
+    }
+
+    fn recording_input(routing_id: &str) -> super::super::DesktopInputConfig {
+        super::super::DesktopInputConfig::try_new(48_000, 128)
+            .unwrap()
+            .with_routing_id(routing_id)
+            .unwrap()
+    }
+
+    fn recording_config(
+        input: super::super::DesktopInputConfig,
+        directory: &Path,
+    ) -> DesktopRecordingSessionConfig {
+        DesktopRecordingSessionConfig {
+            input,
+            transport_capacity_frames: 1_024,
+            writer: hyper_recording_worker::RecordingWorkerConfig {
+                journal_path: directory.join("take.journal"),
+                final_wav_path: directory.join("take.wav"),
+                journal: JournalConfig {
+                    sample_rate: 48_000,
+                    max_chunk_frames: 256,
+                    max_total_frames: 48_000,
+                },
+                drain_frames: 256,
+            },
+            completion_timeout: Duration::from_secs(1),
+        }
+    }
+
+    fn recording_recovery(
+        config: DesktopOutputConfig,
+        monitoring: Option<PlaybackMonitoringStartup>,
+    ) -> DesktopPlaybackRecovery {
+        DesktopPlaybackRecovery {
+            config,
+            monitoring,
+            source: Some(Arc::new(UnusedPlaybackSource)),
+            checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
+        }
+    }
+
+    #[test]
+    fn recording_start_refuses_policy_output_without_spending_recovery() {
+        let recording = recording_config(recording_input("recording-input"), Path::new("unused"));
+        let unpinned = recording_recovery(DesktopOutputConfig::try_new(48_000, 256).unwrap(), None);
+        let error = unpinned.start_recording(&recording).unwrap_err();
+
+        assert!(matches!(
+            &error,
+            DesktopPlaybackRecordingStartError::OutputNotPinned { .. }
+        ));
+        assert!(error.recovery().source.is_some());
+        assert!(error.writer_settlement().is_none());
+        let recovered = error.into_recovery();
+        assert!(recovered.source.is_some());
+    }
+
+    #[test]
+    fn recording_start_refuses_missing_monitor_without_spending_recovery() {
+        let output = DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_routing_id("recording-output")
+            .unwrap();
+        let recording = recording_config(recording_input("recording-input"), Path::new("unused"));
+        let unmonitored = recording_recovery(output, None);
+        let error = unmonitored.start_recording(&recording).unwrap_err();
+
+        assert!(matches!(
+            &error,
+            DesktopPlaybackRecordingStartError::MonitoringUnavailable { .. }
+        ));
+        assert!(error.into_recovery().source.is_some());
+    }
+
+    #[test]
+    fn recording_start_refuses_an_input_other_than_the_monitored_source() {
+        let output = DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_routing_id("recording-output")
+            .unwrap();
+        let recording = recording_config(recording_input("recording-input"), Path::new("unused"));
+        let mismatched_monitoring = DesktopMonitoringConfig::try_new(
+            recording_input("other-input"),
+            output.clone(),
+            1_024,
+            256,
+            64,
+        )
+        .unwrap();
+        let mismatched = recording_recovery(
+            output,
+            Some(PlaybackMonitoringStartup::new(
+                mismatched_monitoring,
+                1.0,
+                false,
+            )),
+        );
+        let error = mismatched.start_recording(&recording).unwrap_err();
+
+        assert!(matches!(
+            &error,
+            DesktopPlaybackRecordingStartError::InputMismatch { .. }
+        ));
+        assert!(error.into_recovery().source.is_some());
+    }
+
+    #[test]
+    fn recording_start_rejects_invalid_config_before_creating_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "hyper-playback-recording-start-refusal-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let output = DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_routing_id("recording-output")
+            .unwrap();
+        let input = recording_input("recording-input");
+        let monitoring =
+            DesktopMonitoringConfig::try_new(input.clone(), output.clone(), 1_024, 256, 64)
+                .unwrap();
+        let invalid = recording_recovery(
+            output,
+            Some(PlaybackMonitoringStartup::new(monitoring, 1.0, false)),
+        );
+        let mut invalid_recording = recording_config(input, &directory);
+        invalid_recording.transport_capacity_frames = 0;
+        let error = invalid.start_recording(&invalid_recording).unwrap_err();
+
+        assert!(matches!(
+            &error,
+            DesktopPlaybackRecordingStartError::RecordingConfig {
+                source: DesktopRecordingSessionConfigError::ZeroTransportCapacity,
+                ..
+            }
+        ));
+        assert!(error.into_recovery().source.is_some());
+        assert!(fs::read_dir(&directory).unwrap().next().is_none());
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]
