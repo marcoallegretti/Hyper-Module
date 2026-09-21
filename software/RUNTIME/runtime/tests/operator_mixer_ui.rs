@@ -514,6 +514,7 @@ fn generated_mixer_controls_forward_exact_rows_values_and_capability() {
 
     verify_committed_transport_seek(&ui, &seek_intents);
     verify_loop_mark_buttons(&ui, &loop_intents);
+    scroll_down(&ui);
     verify_enabled_controls(&ui, &intents);
     verify_recovery_and_disabled_controls(&ui, &rows, &sends, &intents);
 }
