@@ -117,8 +117,26 @@ const HEARTBEAT_TIMEOUT_MS: u32 = 500;
 
 /// The runtime's control owner. Every method forwards; the session owns the
 /// sole control runtime, so it is the only thing that can answer these.
+struct RuntimePlaybackOwner {
+    playback: DesktopPlaybackSession,
+}
+
+impl RuntimePlaybackOwner {
+    const fn new(playback: DesktopPlaybackSession) -> Self {
+        Self { playback }
+    }
+
+    const fn playback(&self) -> &DesktopPlaybackSession {
+        &self.playback
+    }
+
+    fn playback_mut(&mut self) -> &mut DesktopPlaybackSession {
+        &mut self.playback
+    }
+}
+
 struct SessionHost {
-    session: DesktopPlaybackSession,
+    owner: RuntimePlaybackOwner,
     audio_observers: RuntimeAudioObservers,
     meter_receivers: RuntimeMeterReceivers,
     automation_capture: RuntimeAutomationCaptureController,
@@ -133,7 +151,7 @@ impl PanelHost for SessionHost {
     type Error = DesktopControlSinkError;
 
     fn mixer_channel_count(&self) -> usize {
-        self.session.mixer_channel_count()
+        self.owner.playback().mixer_channel_count()
     }
 
     fn connect_panel(
@@ -141,45 +159,52 @@ impl PanelHost for SessionHost {
         descriptor: PanelDescriptor,
         bindings: &[PanelBinding],
     ) -> Result<PanelConnection<Self::Error>, PanelConnectError> {
-        let connection = self.session.attach_panel(descriptor, bindings)?;
+        let connection = self
+            .owner
+            .playback_mut()
+            .attach_panel(descriptor, bindings)?;
         self.panel_connected.store(true, Ordering::Release);
         Ok(connection)
     }
 
     fn disconnect_panel(&mut self) -> Vec<PanelReleaseFailure<Self::Error>> {
-        let failures = self.session.detach_panel();
+        let failures = self.owner.playback_mut().detach_panel();
         self.panel_connected
-            .store(self.session.has_panel(), Ordering::Release);
+            .store(self.owner.playback().has_panel(), Ordering::Release);
         failures
     }
 
     fn panel_connected(&self) -> bool {
-        self.session.has_panel()
+        self.owner.playback().has_panel()
     }
 
     fn dispatch_panel(
         &mut self,
         message: Message,
     ) -> Result<PanelDispatchOutcome, PanelDispatchError<Self::Error>> {
-        self.session.deliver_panel_message(message)
+        self.owner.playback_mut().deliver_panel_message(message)
     }
 
     fn panel_display(&mut self, out: &mut Vec<PanelDisplay>) {
-        self.session.panel_display(out);
+        self.owner.playback_mut().panel_display(out);
     }
 }
 
 impl SessionHost {
     fn refresh_audio_observers(&self) {
-        self.audio_observers.rebind(&self.session);
+        self.audio_observers.rebind(self.owner.playback());
     }
 
     fn refresh_meter_receivers(&mut self) -> Result<(), &'static str> {
         let output = self
-            .session
+            .owner
+            .playback_mut()
             .take_meter_receiver()
             .ok_or("Runtime output meter authority was already transferred")?;
-        let input = self.session.take_monitoring_input_meter_receiver();
+        let input = self
+            .owner
+            .playback_mut()
+            .take_monitoring_input_meter_receiver();
         self.meter_receivers.replace(output, input);
         Ok(())
     }
@@ -189,7 +214,7 @@ impl SessionHost {
     /// replacement session cannot complete any fence or capture owned by the
     /// current playback generation.
     fn recording_transition_blocker(&self) -> Option<&'static str> {
-        if self.session.has_panel() {
+        if self.owner.playback().has_panel() {
             Some("an external panel is connected")
         } else if !self.scene_performance.is_idle() {
             Some("scene-performance capture is active or stopping")
@@ -864,32 +889,37 @@ impl RuntimeOutputObservation for RuntimeAudioObservers {
 
 impl RuntimeOperatorControl for SessionHost {
     fn queue_transport(&mut self, command: TransportCommand) -> Result<(), String> {
-        self.session
+        self.owner
+            .playback_mut()
             .try_send_transport_command(command)
             .map_err(|error| error.to_string())
     }
 
     fn queue_loudness(&mut self, command: LoudnessMeasurementCommand) -> Result<(), String> {
-        self.session
+        self.owner
+            .playback_mut()
             .loudness_command_sender()
             .try_send(command)
             .map_err(|error| error.to_string())
     }
 
     fn queue_mixer(&mut self, command: MixerParameterCommand) -> Result<(), String> {
-        self.session
+        self.owner
+            .playback_mut()
             .try_send_mixer_parameter_command(command)
             .map_err(|error| error.to_string())
     }
 
     fn queue_native_device(&mut self, command: NativeDeviceCommand) -> Result<(), String> {
-        self.session
+        self.owner
+            .playback_mut()
             .try_send_native_device_command(command)
             .map_err(|error| error.to_string())
     }
 
     fn set_input_monitor_gain(&mut self, gain: f32) -> Result<(), String> {
-        self.session
+        self.owner
+            .playback()
             .monitoring_control()
             .ok_or_else(|| "Runtime input monitor is unavailable".to_owned())?
             .set_gain_linear(gain)
@@ -898,7 +928,8 @@ impl RuntimeOperatorControl for SessionHost {
 
     fn set_input_monitor_muted(&mut self, muted: bool) -> Result<(), String> {
         let control = self
-            .session
+            .owner
+            .playback()
             .monitoring_control()
             .ok_or_else(|| "Runtime input monitor is unavailable".to_owned())?;
         control.set_muted(muted);
@@ -909,7 +940,7 @@ impl RuntimeOperatorControl for SessionHost {
 impl RuntimeScenePerformanceControl for SessionHost {
     fn start_scene_performance_capture(&mut self) -> Result<String, String> {
         let capture = &mut self.scene_performance;
-        let session = &mut self.session;
+        let session = self.owner.playback_mut();
         capture.start(session).map_or_else(
             |error| Err(error.to_string()),
             |maximum_launch_count| {
@@ -922,7 +953,7 @@ impl RuntimeScenePerformanceControl for SessionHost {
 
     fn stop_scene_performance_capture(&mut self) -> Result<String, String> {
         let capture = &mut self.scene_performance;
-        let session = &mut self.session;
+        let session = self.owner.playback_mut();
         capture.stop(session).map_or_else(
             |error| Err(error.to_string()),
             |captured_launch_count| {
@@ -935,7 +966,7 @@ impl RuntimeScenePerformanceControl for SessionHost {
 
     fn poll_scene_performance_capture(&mut self) -> Option<String> {
         let capture = &mut self.scene_performance;
-        let session = &mut self.session;
+        let session = self.owner.playback_mut();
         match capture.poll(session) {
             Some(RuntimeScenePerformanceCapturePoll::Saved(saved)) => Some(format!(
                 "scene-performance capture published {} launch(es) to {}",
@@ -957,7 +988,7 @@ impl RuntimeAutomationCaptureControl for SessionHost {
         name: String,
     ) -> Result<String, String> {
         let capture = &mut self.automation_capture;
-        let session = &mut self.session;
+        let session = self.owner.playback_mut();
         capture.start(session, target_index, name).map_or_else(
             |error| Err(error.to_string()),
             |maximum_point_count| {
@@ -970,7 +1001,7 @@ impl RuntimeAutomationCaptureControl for SessionHost {
 
     fn stop_automation_capture(&mut self) -> Result<String, String> {
         let capture = &mut self.automation_capture;
-        let session = &mut self.session;
+        let session = self.owner.playback_mut();
         capture.stop(session).map_or_else(
             |error| Err(error.to_string()),
             |captured_point_count| {
@@ -983,7 +1014,7 @@ impl RuntimeAutomationCaptureControl for SessionHost {
 
     fn poll_automation_capture(&mut self) -> Option<String> {
         let capture = &mut self.automation_capture;
-        let session = &mut self.session;
+        let session = self.owner.playback_mut();
         match capture.poll(session) {
             Some(RuntimeAutomationCapturePoll::Saved(saved)) => Some(format!(
                 "Runtime automation capture published {} parameter change(s) to {}",
@@ -1001,7 +1032,7 @@ impl RuntimeAutomationCaptureControl for SessionHost {
 impl RuntimeMixerUpdateControl for SessionHost {
     fn export_mixer_update(&mut self) -> Result<String, String> {
         let update = &mut self.mixer_update;
-        let session = &mut self.session;
+        let session = self.owner.playback_mut();
         update.request_export(session).map_or_else(
             |error| Err(error.to_string()),
             |fence_sequence| {
@@ -1014,7 +1045,7 @@ impl RuntimeMixerUpdateControl for SessionHost {
 
     fn poll_mixer_update_export(&mut self) -> Option<String> {
         let update = &mut self.mixer_update;
-        let session = &mut self.session;
+        let session = self.owner.playback_mut();
         match update.poll(session) {
             Some(RuntimeMixerUpdatePoll::Saved(saved)) => Some(format!(
                 "mixer update published to {}",
@@ -1034,7 +1065,7 @@ impl RuntimeMixerUpdateControl for SessionHost {
 impl RuntimeNativeDeviceUpdateControl for SessionHost {
     fn export_native_device_update(&mut self, chain_index: usize) -> Result<String, String> {
         let update = &mut self.native_device_update;
-        let session = &mut self.session;
+        let session = self.owner.playback_mut();
         update.request_export(session, chain_index).map_or_else(
             |error| Err(error.to_string()),
             |fence_sequence| {
@@ -1047,7 +1078,7 @@ impl RuntimeNativeDeviceUpdateControl for SessionHost {
 
     fn poll_native_device_update_export(&mut self) -> Option<String> {
         let update = &mut self.native_device_update;
-        let session = &mut self.session;
+        let session = self.owner.playback_mut();
         match update.poll(session) {
             Some(RuntimeNativeDeviceUpdatePoll::Saved(saved)) => Some(format!(
                 "native-device update published to {}",
@@ -1067,7 +1098,7 @@ impl RuntimeNativeDeviceUpdateControl for SessionHost {
 impl RuntimeLoopUpdateControl for SessionHost {
     fn export_loop_update(&mut self) -> Result<String, String> {
         let update = &mut self.loop_update;
-        let session = &mut self.session;
+        let session = self.owner.playback_mut();
         update.request_export(session).map_or_else(
             |error| Err(error.to_string()),
             |fence_sequence| {
@@ -1080,7 +1111,7 @@ impl RuntimeLoopUpdateControl for SessionHost {
 
     fn poll_loop_update_export(&mut self) -> Option<String> {
         let update = &mut self.loop_update;
-        let session = &mut self.session;
+        let session = self.owner.playback_mut();
         match update.poll(session) {
             Some(RuntimeLoopUpdatePoll::Saved(saved)) => {
                 Some(format!("loop update published to {}", saved.path.display()))
@@ -1470,7 +1501,7 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         scene_performance: scene_performance_observation,
     };
     let mut host = SessionHost {
-        session,
+        owner: RuntimePlaybackOwner::new(session),
         audio_observers,
         meter_receivers,
         automation_capture,
@@ -2552,12 +2583,16 @@ fn spawn_operator_worker(
                 let native_device_chains = runtime.native_device_chains.clone();
                 let automation_targets = runtime.automation_targets.clone();
                 let ready_model =
-                    operator_scene_catalog(&runtime.host.session).and_then(|scenes| {
-                        operator_mixer_catalog(&runtime.host.session).and_then(|mixer_channels| {
-                            operator_mixer_send_catalog(&runtime.host.session, &mixer_channels)
+                    operator_scene_catalog(runtime.host.owner.playback()).and_then(|scenes| {
+                        operator_mixer_catalog(runtime.host.owner.playback()).and_then(
+                            |mixer_channels| {
+                                operator_mixer_send_catalog(
+                                    runtime.host.owner.playback(),
+                                    &mixer_channels,
+                                )
                                 .and_then(|mixer_sends| {
-                                    operator_native_device_catalog(&runtime.host.session).map(
-                                        |native_devices| OperatorReady {
+                                    operator_native_device_catalog(runtime.host.owner.playback())
+                                        .map(|native_devices| OperatorReady {
                                             observers: runtime.observers.clone(),
                                             scenes,
                                             mixer_channels,
@@ -2565,10 +2600,10 @@ fn spawn_operator_worker(
                                             native_devices,
                                             native_device_chains,
                                             automation_targets,
-                                        },
-                                    )
+                                        })
                                 })
-                        })
+                            },
+                        )
                     });
                 match ready_model {
                     Ok(ready_model) => {
