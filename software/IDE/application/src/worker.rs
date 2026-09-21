@@ -21781,7 +21781,10 @@ mod tests {
     };
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
     use hyper_project_loader::ProjectPlaybackLimits;
-    use hyper_recording_metadata::FinalizedRecordingHandoff;
+    use hyper_recording_journal::{JournalConfig, JournalWriter, PublishedRecording, publish_wav};
+    use hyper_recording_metadata::{
+        FinalizedRecordingHandoff, FinalizedRecordingMetadata, RecordingMetadataContext,
+    };
     use hyper_runtime_loop_update::{
         RuntimeLoopRange, RuntimeLoopUpdateDirectory, RuntimeLoopUpdateSource,
     };
@@ -22897,11 +22900,9 @@ mod tests {
     fn publish_runtime_recording_update_for_test(
         directory: &Path,
         project: &Path,
-        recording_path: &Path,
-        recording_bytes: &[u8],
+        publication: &PublishedRecording,
         track_id: &str,
         source_input_indices: &[u8],
-        frame_count: u64,
     ) -> PathBuf {
         let verified = verify_project_package(project).unwrap();
         let source = RuntimeRecordingUpdateSource::try_new(
@@ -22912,40 +22913,23 @@ mod tests {
             1,
         )
         .unwrap();
-        let recording_sha256: [u8; 32] = Sha256::digest(recording_bytes).into();
-        let metadata = serde_json::json!({
-            "asset_id": uuid::Uuid::new_v4().to_string(),
-            "capture_kind": "new",
-            "captured_at_utc": "2026-09-04T12:00:00.000Z",
-            "channels": source_input_indices.len(),
-            "extensions": {},
-            "format": "hyper-recording-metadata",
-            "format_version": 1,
-            "frame_count": frame_count,
-            "id": uuid::Uuid::new_v4().to_string(),
-            "project_id": verified.manifest().project_id(),
-            "sample_rate_hz": verified.manifest().sample_rate_hz(),
-            "source_input_indices": source_input_indices,
-            "timeline_start_tick": 0,
-            "track_id": track_id,
-        });
-        drop(verified);
-        let handoff = FinalizedRecordingHandoff::parse(
-            &serde_json_canonicalizer::to_vec(&serde_json::json!({
-                "extensions": {},
-                "format": "hyper-finalized-recording-handoff",
-                "format_version": 1,
-                "metadata": metadata,
-                "recording": {
-                    "byte_length": recording_bytes.len(),
-                    "media_type": "audio/wav",
-                    "path": recording_path.to_string_lossy(),
-                    "sha256": runtime_recording_update_sha256_hex(&recording_sha256),
-                },
-            }))
-            .unwrap(),
+        let finalized = FinalizedRecordingMetadata::try_new(
+            publication.clone(),
+            RecordingMetadataContext {
+                id: uuid::Uuid::new_v4().to_string(),
+                project_id: verified.manifest().project_id().to_owned(),
+                asset_id: uuid::Uuid::new_v4().to_string(),
+                track_id: track_id.to_owned(),
+                capture_kind: RecordingCaptureKind::New,
+                captured_at_utc: "2026-09-04T12:00:00.000Z".to_owned(),
+                timeline_start_tick: 0,
+                source_input_indices: source_input_indices.to_vec(),
+            },
         )
         .unwrap();
+        drop(verified);
+        let handoff =
+            FinalizedRecordingHandoff::parse(&finalized.to_handoff_json().unwrap()).unwrap();
         let update =
             RuntimeRecordingUpdate::try_new(uuid::Uuid::new_v4().to_string(), source, handoff)
                 .unwrap();
@@ -22953,6 +22937,27 @@ mod tests {
             .unwrap()
             .publish(&update)
             .unwrap()
+    }
+
+    fn publish_recording_for_runtime_update_test(
+        directory: &Path,
+        name: &str,
+        samples: &[f32],
+    ) -> PublishedRecording {
+        let journal_path = directory.join(format!("{name}.journal"));
+        let wav_path = directory.join(format!("{name}.wav"));
+        let mut writer = JournalWriter::create(
+            &journal_path,
+            JournalConfig {
+                sample_rate: 48_000,
+                max_chunk_frames: 256,
+                max_total_frames: 48_000,
+            },
+        )
+        .unwrap();
+        writer.append(samples).unwrap();
+        drop(writer);
+        publish_wav(&journal_path, &wav_path).unwrap()
     }
 
     fn open_project_for_runtime_mixer_update_import(
@@ -23506,9 +23511,12 @@ mod tests {
             .to_owned();
         add_compressor_history(&worker, track_id.clone());
 
-        let recording_bytes = pcm16_wav(2, 48_000, &[100, -100, 200, -200, 300, -300]);
-        let recording_path = fixture.join("runtime-recording.wav");
-        std::fs::write(&recording_path, &recording_bytes).unwrap();
+        let publication = publish_recording_for_runtime_update_test(
+            &fixture,
+            "runtime-recording",
+            &[0.25, -0.25, 0.5, -0.5, 0.75, -0.75],
+        );
+        let recording_bytes = std::fs::read(publication.final_wav_path()).unwrap();
         let updates = fixture.join("updates");
         std::fs::create_dir(&updates).unwrap();
         let source_revision = verify_project_package(&project)
@@ -23519,29 +23527,23 @@ mod tests {
         let unbound_track_path = publish_runtime_recording_update_for_test(
             &updates,
             &project,
-            &recording_path,
-            &recording_bytes,
+            &publication,
             &unbound_track_id,
             &[0, 1],
-            3,
         );
         let update_path = publish_runtime_recording_update_for_test(
             &updates,
             &project,
-            &recording_path,
-            &recording_bytes,
+            &publication,
             &track_id,
             &[0, 1],
-            3,
         );
         let invalid_handoff_path = publish_runtime_recording_update_for_test(
             &updates,
             &project,
-            &recording_path,
-            &recording_bytes,
+            &publication,
             &track_id,
             &[0, 1],
-            3,
         );
         let mut invalid_handoff: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&invalid_handoff_path).unwrap()).unwrap();
@@ -23773,19 +23775,19 @@ mod tests {
                 })
                 .expect("the fixture project exposes one audio recording track")
         };
-        let recording_bytes = pcm16_wav(2, 48_000, &[100, -100, 200, -200]);
-        let recording_path = fixture.join("recovery-drift-recording.wav");
-        std::fs::write(&recording_path, &recording_bytes).unwrap();
+        let publication = publish_recording_for_runtime_update_test(
+            fixture,
+            "recovery-drift-recording",
+            &[0.25, -0.25, 0.5, -0.5],
+        );
         let updates = fixture.join("updates");
         std::fs::create_dir(&updates).unwrap();
         let update_path = publish_runtime_recording_update_for_test(
             &updates,
             &project,
-            &recording_path,
-            &recording_bytes,
+            &publication,
             &track_id,
             &[0, 1],
-            2,
         );
         let update = read_runtime_recording_update(&update_path).unwrap();
         let (source_revision, asset_count, recording_metadata_count) = {
