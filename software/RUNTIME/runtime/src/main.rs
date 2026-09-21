@@ -119,6 +119,7 @@ const HEARTBEAT_TIMEOUT_MS: u32 = 500;
 /// sole control runtime, so it is the only thing that can answer these.
 struct SessionHost {
     session: DesktopPlaybackSession,
+    audio_observers: RuntimeAudioObservers,
     automation_capture: RuntimeAutomationCaptureController,
     mixer_update: RuntimeMixerUpdateController,
     native_device_update: RuntimeNativeDeviceUpdateController,
@@ -174,6 +175,10 @@ impl SessionHost {
 
     fn take_input_meter_receiver(&mut self) -> Option<InputMeterReceiver> {
         self.session.take_monitoring_input_meter_receiver()
+    }
+
+    fn refresh_audio_observers(&self) {
+        self.audio_observers.rebind(&self.session);
     }
 
     /// Returns the first owner whose in-flight work prevents a playback-owner
@@ -353,18 +358,69 @@ struct OperatorTimelineMarker {
 #[derive(Clone, Debug)]
 struct RuntimeObservers {
     facts: RuntimeFacts,
-    output_status: OutputStreamStatus,
-    output_counters: OutputStreamCounters,
-    input_status: Option<StreamStatus>,
-    input_counters: Option<CaptureStreamCounters>,
-    input_control: Option<DesktopMonitoringControl>,
-    recovery: PlaybackRecoveryCheckpoint,
+    audio: RuntimeAudioObservers,
     panel_connected: Arc<AtomicBool>,
     automation_capture: Arc<Mutex<RuntimeAutomationCaptureObservation>>,
     mixer_update: Arc<Mutex<RuntimeMixerUpdateObservation>>,
     native_device_update: Arc<Mutex<RuntimeNativeDeviceUpdateObservation>>,
     loop_update: Arc<Mutex<RuntimeLoopUpdateObservation>>,
     scene_performance: Arc<Mutex<RuntimeScenePerformanceCaptureObservation>>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeAudioObservationHandles {
+    output_status: OutputStreamStatus,
+    output_counters: OutputStreamCounters,
+    input_status: Option<StreamStatus>,
+    input_counters: Option<CaptureStreamCounters>,
+    input_control: Option<DesktopMonitoringControl>,
+    recovery: PlaybackRecoveryCheckpoint,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeAudioObservers {
+    handles: Arc<Mutex<RuntimeAudioObservationHandles>>,
+}
+
+impl RuntimeAudioObservers {
+    fn new(session: &DesktopPlaybackSession) -> Self {
+        Self {
+            handles: Arc::new(Mutex::new(RuntimeAudioObservationHandles::from_session(
+                session,
+            ))),
+        }
+    }
+
+    fn snapshot(&self) -> RuntimeAudioObservationHandles {
+        self.handles
+            .lock()
+            .expect("Runtime audio-observer lock is not poisoned")
+            .clone()
+    }
+
+    fn rebind(&self, session: &DesktopPlaybackSession) {
+        self.replace(RuntimeAudioObservationHandles::from_session(session));
+    }
+
+    fn replace(&self, handles: RuntimeAudioObservationHandles) {
+        *self
+            .handles
+            .lock()
+            .expect("Runtime audio-observer lock is not poisoned") = handles;
+    }
+}
+
+impl RuntimeAudioObservationHandles {
+    fn from_session(session: &DesktopPlaybackSession) -> Self {
+        Self {
+            output_status: session.output_status(),
+            output_counters: session.counters(),
+            input_status: session.monitoring_input_status(),
+            input_counters: session.monitoring_input_counters(),
+            input_control: session.monitoring_control(),
+            recovery: session.recovery_checkpoint(),
+        }
+    }
 }
 
 struct OperatorReady {
@@ -767,6 +823,12 @@ trait RuntimeOutputObservation {
 impl RuntimeOutputObservation for OutputStreamStatus {
     fn output_state(&self) -> OutputStreamState {
         self.state()
+    }
+}
+
+impl RuntimeOutputObservation for RuntimeAudioObservers {
+    fn output_state(&self) -> OutputStreamState {
+        self.snapshot().output_status.state()
     }
 }
 
@@ -1364,14 +1426,10 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         attach_runtime_host,
     )?;
     let panel_connected = Arc::new(AtomicBool::new(false));
+    let audio_observers = RuntimeAudioObservers::new(&session);
     let observers = RuntimeObservers {
         facts,
-        output_status: session.output_status(),
-        output_counters: session.counters(),
-        input_status: session.monitoring_input_status(),
-        input_counters: session.monitoring_input_counters(),
-        input_control: session.monitoring_control(),
-        recovery: session.recovery_checkpoint(),
+        audio: audio_observers.clone(),
         panel_connected: Arc::clone(&panel_connected),
         automation_capture: automation_capture_observation,
         mixer_update: mixer_update_observation,
@@ -1381,6 +1439,7 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
     };
     let host = SessionHost {
         session,
+        audio_observers,
         automation_capture,
         mixer_update,
         native_device_update,
@@ -1393,6 +1452,7 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
             "verified Runtime host unexpectedly started with a recording-transition blocker: {blocker}"
         ));
     }
+    host.refresh_audio_observers();
     Ok(StartedRuntime {
         host,
         observers,
@@ -1675,7 +1735,7 @@ fn run_headless(arguments: &RuntimeArguments) -> Result<(), String> {
     announce_runtime(arguments, &runtime);
     let stop = Arc::new(AtomicBool::new(false));
     watch_for_quit(Arc::clone(&stop));
-    let output_status = runtime.observers.output_status.clone();
+    let output_status = runtime.observers.audio.clone();
     host_runtime(
         arguments,
         &mut runtime.host,
@@ -2494,7 +2554,7 @@ fn spawn_operator_worker(
                             host_runtime(
                                 &arguments,
                                 &mut runtime.host,
-                                &runtime.observers.output_status,
+                                &runtime.observers.audio,
                                 &stop,
                                 Some(&commands),
                                 &|message| set_diagnostic(&diagnostic, message),
@@ -2674,7 +2734,8 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_metronome_level(&ui, &commands_tx, &diagnostic, &metronome_authority);
     wire_operator_input_monitor_controls(&ui, &commands_tx, &diagnostic);
 
-    let output_state = observers.output_status.state();
+    let audio = observers.audio.snapshot();
+    let output_state = audio.output_status.state();
     apply_operator_cycle_observation(
         &ui,
         &observers,
@@ -2706,7 +2767,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &mixer_channels,
         &mixer_sends,
         &mixer_authority,
-        &observers.recovery.snapshot(),
+        &audio.recovery.snapshot(),
         false,
     );
     apply_operator_native_device_observation(
@@ -2714,7 +2775,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &native_device_model,
         &native_devices,
         &native_device_authority,
-        &observers.recovery.snapshot(),
+        &audio.recovery.snapshot(),
         false,
     );
     apply_operator_scene_performance_observation(&ui, observers.scene_performance.as_ref(), false);
@@ -2765,7 +2826,8 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer = Timer::default();
     timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
         if let Some(ui) = weak.upgrade() {
-            let output_state = timer_observers.output_status.state();
+            let audio = timer_observers.audio.snapshot();
+            let output_state = audio.output_status.state();
             apply_operator_cycle_observation(
                 &ui,
                 &timer_observers,
@@ -2803,7 +2865,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &timer_mixer_channels,
                 &timer_mixer_sends,
                 &timer_mixer_authority,
-                &timer_observers.recovery.snapshot(),
+                &audio.recovery.snapshot(),
                 terminal_latched,
             );
             apply_operator_native_device_observation(
@@ -2811,7 +2873,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &timer_native_device_model,
                 &timer_native_devices,
                 &timer_native_device_authority,
-                &timer_observers.recovery.snapshot(),
+                &audio.recovery.snapshot(),
                 terminal_latched,
             );
             apply_operator_scene_performance_observation(
@@ -6299,9 +6361,10 @@ fn apply_observations(
     output_state: OutputStreamState,
     diagnostic: &Mutex<String>,
 ) -> PlaybackCycleObservation {
-    let cycle = observers.recovery.observe_cycle();
+    let audio = observers.audio.snapshot();
+    let cycle = audio.recovery.observe_cycle();
     let stream_state = output_state;
-    let counters = observers.output_counters.snapshot();
+    let counters = audio.output_counters.snapshot();
     if stream_state == OutputStreamState::Failed {
         set_diagnostic(
             diagnostic,
@@ -6384,15 +6447,16 @@ fn apply_operator_input_monitor_observation(
     meter_observer: Option<&Rc<RefCell<OperatorInputMeterObserver>>>,
     terminal_latched: bool,
 ) {
+    let audio = observers.audio.snapshot();
     let configured = matches!(
         &observers.facts.input_route,
         RuntimeInputRoute::Pinned { .. }
     );
     let presentation = operator_input_monitor_presentation(
         configured,
-        observers.input_status.as_ref(),
-        observers.input_counters.as_ref(),
-        observers.input_control.as_ref(),
+        audio.input_status.as_ref(),
+        audio.input_counters.as_ref(),
+        audio.input_control.as_ref(),
         terminal_latched,
     );
     ui.set_input_monitor_configured(presentation.authority.configured());
@@ -6644,6 +6708,19 @@ mod tests {
         }))
     }
 
+    fn test_audio_observers(recovery: PlaybackRecoveryCheckpoint) -> RuntimeAudioObservers {
+        RuntimeAudioObservers {
+            handles: Arc::new(Mutex::new(RuntimeAudioObservationHandles {
+                output_status: OutputStreamStatus::default(),
+                output_counters: OutputStreamCounters::default(),
+                input_status: None,
+                input_counters: None,
+                input_control: None,
+                recovery,
+            })),
+        }
+    }
+
     fn test_timeline_marker_observers(
         timeline: RuntimeMusicalTimeline,
         markers: Arc<[OperatorTimelineMarker]>,
@@ -6662,12 +6739,7 @@ mod tests {
                 musical_timeline: timeline,
                 timeline_markers: markers,
             },
-            output_status: OutputStreamStatus::default(),
-            output_counters: OutputStreamCounters::default(),
-            input_status: None,
-            input_counters: None,
-            input_control: None,
-            recovery: PlaybackRecoveryCheckpoint::default(),
+            audio: test_audio_observers(PlaybackRecoveryCheckpoint::default()),
             panel_connected: Arc::new(AtomicBool::new(false)),
             automation_capture: test_automation_capture_observation(),
             mixer_update: test_mixer_update_observation(),
@@ -6675,6 +6747,41 @@ mod tests {
             loop_update: test_loop_update_observation(),
             scene_performance: test_scene_performance_observation(),
         }
+    }
+
+    #[test]
+    fn audio_observer_rebind_replaces_the_complete_playback_generation() {
+        let original_range = TransportLoopRange::new(64, 256).unwrap();
+        let (_original_publisher, original) =
+            hyper_mixer_runtime::playback_recovery_channel_with_initial_loop_and_metronome(
+                None,
+                None,
+                Some(original_range),
+                true,
+                hyper_mixer_runtime::InitialMetronomeState::unavailable(),
+            );
+        let observers = test_audio_observers(original);
+        assert_eq!(
+            observers.snapshot().recovery.snapshot().loop_range(),
+            Some(original_range)
+        );
+
+        let replacement_range = TransportLoopRange::new(512, 1_024).unwrap();
+        let (_replacement_publisher, replacement) =
+            hyper_mixer_runtime::playback_recovery_channel_with_initial_loop_and_metronome(
+                None,
+                None,
+                Some(replacement_range),
+                false,
+                hyper_mixer_runtime::InitialMetronomeState::unavailable(),
+            );
+        let mut replacement_handles = observers.snapshot();
+        replacement_handles.recovery = replacement;
+        observers.replace(replacement_handles);
+
+        let rebound = observers.snapshot().recovery.snapshot();
+        assert_eq!(rebound.loop_range(), Some(replacement_range));
+        assert!(!rebound.loop_enabled());
     }
 
     #[test]
@@ -8594,7 +8701,7 @@ mod tests {
                 terminal_latched,
             );
         };
-        apply(observers.output_status.state(), false);
+        apply(observers.audio.snapshot().output_status.state(), false);
         assert!(marker_authority.borrow().is_some());
         assert!(marker_model.row_data(0).unwrap().controls_enabled);
         assert!(!ui.get_transport_seek_enabled());
@@ -8603,7 +8710,7 @@ mod tests {
             "Locate preserves recovered state · Play starts"
         );
 
-        apply(observers.output_status.state(), true);
+        apply(observers.audio.snapshot().output_status.state(), true);
 
         assert!(marker_authority.borrow().is_none());
         assert!(!marker_model.row_data(0).unwrap().controls_enabled);
@@ -11182,12 +11289,7 @@ mod tests {
                 musical_timeline: runtime_musical_timeline.clone(),
                 timeline_markers: Arc::from([]),
             },
-            output_status: OutputStreamStatus::default(),
-            output_counters: OutputStreamCounters::default(),
-            input_status: None,
-            input_counters: None,
-            input_control: None,
-            recovery: recovery.clone(),
+            audio: test_audio_observers(recovery.clone()),
             panel_connected: Arc::new(AtomicBool::new(false)),
             automation_capture: test_automation_capture_observation(),
             mixer_update: test_mixer_update_observation(),
@@ -11198,7 +11300,7 @@ mod tests {
         let _ = apply_observations(
             ui,
             &seek_observers,
-            seek_observers.output_status.state(),
+            seek_observers.audio.snapshot().output_status.state(),
             &seek_diagnostic,
         );
         assert_eq!(ui.get_transport_frame().as_str(), "855");
@@ -11298,12 +11400,7 @@ mod tests {
         };
         let observers = RuntimeObservers {
             facts: facts.clone(),
-            output_status: OutputStreamStatus::default(),
-            output_counters: OutputStreamCounters::default(),
-            input_status: None,
-            input_counters: None,
-            input_control: None,
-            recovery: PlaybackRecoveryCheckpoint::default(),
+            audio: test_audio_observers(PlaybackRecoveryCheckpoint::default()),
             panel_connected: Arc::new(AtomicBool::new(false)),
             automation_capture: test_automation_capture_observation(),
             mixer_update: test_mixer_update_observation(),
@@ -11316,7 +11413,7 @@ mod tests {
         let observation = apply_observations(
             &ui,
             &observers,
-            observers.output_status.state(),
+            observers.audio.snapshot().output_status.state(),
             &diagnostic,
         );
         apply_operator_transport_observation(&ui, &transport_authority, observation.state());
@@ -11552,12 +11649,7 @@ mod tests {
             );
         let terminal_observers = RuntimeObservers {
             facts: facts.clone(),
-            output_status: OutputStreamStatus::default(),
-            output_counters: OutputStreamCounters::default(),
-            input_status: None,
-            input_counters: None,
-            input_control: None,
-            recovery: terminal_recovery,
+            audio: test_audio_observers(terminal_recovery),
             panel_connected: Arc::new(AtomicBool::new(false)),
             automation_capture: test_automation_capture_observation(),
             mixer_update: test_mixer_update_observation(),
@@ -11594,7 +11686,7 @@ mod tests {
         apply_operator_cycle_observation(
             &ui,
             &terminal_observers,
-            terminal_observers.output_status.state(),
+            terminal_observers.audio.snapshot().output_status.state(),
             &diagnostic,
             &transport_authority,
             &loop_authority,
@@ -11666,7 +11758,7 @@ mod tests {
         apply_operator_cycle_observation(
             &ui,
             &terminal_observers,
-            terminal_observers.output_status.state(),
+            terminal_observers.audio.snapshot().output_status.state(),
             &diagnostic,
             &transport_authority,
             &loop_authority,
