@@ -1227,21 +1227,61 @@ fn main() -> ExitCode {
     }
 }
 
+const RUNTIME_HELP: &str = r"Hyper Module Runtime
+
+Usage:
+  hyper-runtime -h | --help
+  hyper-runtime -V | --version
+  hyper-runtime --list-audio-outputs
+  hyper-runtime --list-audio-inputs
+  hyper-runtime <DEPLOYMENT_DIRECTORY> [OPTIONS]
+
+Arguments:
+  DEPLOYMENT_DIRECTORY                 Verified Runtime deployment target
+
+Options:
+  -h, --help                         Show this help and exit
+  -V, --version                      Show the package version and exit
+  --list-audio-outputs               List current desktop output routes and exit
+  --list-audio-inputs                List current desktop input routes and exit
+  --audio-output ROUTING_ID          Pin one exact discovered output route
+  --audio-input ROUTING_ID           Select one exact input for monitor/record
+  --panel-listen ADDRESS             Listen for one external control panel
+  --recording-updates DIRECTORY      Publish recording handoffs outside deployment
+  --performance-updates DIRECTORY    Publish scene-performance handoffs
+  --automation-updates DIRECTORY     Publish automation handoffs
+  --mixer-updates DIRECTORY          Publish live mixer-state handoffs
+  --native-device-updates DIRECTORY  Publish live native-device handoffs
+  --loop-updates DIRECTORY           Publish live loop-range handoffs
+  --operator-ui                      Open the desktop operator window";
+
+const RUNTIME_VERSION: &str = concat!("hyper-runtime ", env!("CARGO_PKG_VERSION"));
+
 fn run() -> Result<(), String> {
-    match parse_runtime_invocation(std::env::args().skip(1)).map_err(|error| {
-        format!(
-            "{error}\nusage:\n  hyper-runtime --list-audio-outputs\n  hyper-runtime --list-audio-inputs\n  hyper-runtime <deployment-target-directory> [--audio-output ROUTING_ID] [--audio-input ROUTING_ID] [--panel-listen ADDRESS] [--recording-updates DIRECTORY] [--performance-updates DIRECTORY] [--automation-updates DIRECTORY] [--mixer-updates DIRECTORY] [--native-device-updates DIRECTORY] [--loop-updates DIRECTORY] [--operator-ui]"
-        )
-    })? {
+    match parse_runtime_invocation(std::env::args().skip(1))
+        .map_err(|error| format!("{error}\n\n{RUNTIME_HELP}"))?
+    {
+        RuntimeInvocation::Help => {
+            println!("{RUNTIME_HELP}");
+            Ok(())
+        }
+        RuntimeInvocation::Version => {
+            println!("{RUNTIME_VERSION}");
+            Ok(())
+        }
         RuntimeInvocation::ListAudioOutputs => list_runtime_audio_outputs(),
         RuntimeInvocation::ListAudioInputs => list_runtime_audio_inputs(),
-        RuntimeInvocation::Host(arguments) if arguments.operator_ui() => run_operator_ui(*arguments),
+        RuntimeInvocation::Host(arguments) if arguments.operator_ui() => {
+            run_operator_ui(*arguments)
+        }
         RuntimeInvocation::Host(arguments) => run_headless(&arguments),
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimeInvocation {
+    Help,
+    Version,
     ListAudioOutputs,
     ListAudioInputs,
     Host(Box<RuntimeArguments>),
@@ -1252,6 +1292,18 @@ where
     I: IntoIterator<Item = String>,
 {
     let arguments: Vec<_> = arguments.into_iter().collect();
+    if matches!(arguments.as_slice(), [option] if option == "--help" || option == "-h") {
+        return Ok(RuntimeInvocation::Help);
+    }
+    if matches!(arguments.as_slice(), [option] if option == "--version" || option == "-V") {
+        return Ok(RuntimeInvocation::Version);
+    }
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "--help" | "-h" | "--version" | "-V"))
+    {
+        return Err("help and version options must be used by themselves".to_owned());
+    }
     if matches!(arguments.as_slice(), [option] if option == "--list-audio-outputs") {
         return Ok(RuntimeInvocation::ListAudioOutputs);
     }
@@ -8321,6 +8373,54 @@ mod tests {
             ]),
             Err("audio target listing options must be used by themselves".to_owned())
         );
+    }
+
+    #[test]
+    fn help_and_version_are_standalone_informational_invocations() {
+        for option in ["-h", "--help"] {
+            assert_eq!(
+                parse_runtime_invocation([option.to_owned()]),
+                Ok(RuntimeInvocation::Help)
+            );
+        }
+        for option in ["-V", "--version"] {
+            assert_eq!(
+                parse_runtime_invocation([option.to_owned()]),
+                Ok(RuntimeInvocation::Version)
+            );
+        }
+        for option in ["-h", "--help", "-V", "--version"] {
+            assert_eq!(
+                parse_runtime_invocation([option.to_owned(), "deployment".to_owned()]),
+                Err("help and version options must be used by themselves".to_owned())
+            );
+        }
+        assert_eq!(
+            RUNTIME_VERSION.strip_prefix("hyper-runtime "),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn runtime_help_accounts_for_every_supported_option() {
+        for option in [
+            "-h, --help",
+            "-V, --version",
+            "--list-audio-outputs",
+            "--list-audio-inputs",
+            "--audio-output",
+            "--audio-input",
+            "--panel-listen",
+            "--recording-updates",
+            "--performance-updates",
+            "--automation-updates",
+            "--mixer-updates",
+            "--native-device-updates",
+            "--loop-updates",
+            "--operator-ui",
+        ] {
+            assert!(RUNTIME_HELP.contains(option), "help must describe {option}");
+        }
     }
 
     #[test]
