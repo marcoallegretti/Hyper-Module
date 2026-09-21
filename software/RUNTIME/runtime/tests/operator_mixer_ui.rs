@@ -295,6 +295,107 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
 }
 
 #[test]
+fn generated_shortcut_help_is_modal_and_dismissible() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = OperatorWindow::new().unwrap();
+    ui.set_transport_start_enabled(true);
+    let toggles = Rc::new(RefCell::new(0_usize));
+    let toggles_by_callback = Rc::clone(&toggles);
+    ui.on_toggle_transport_requested(move || {
+        *toggles_by_callback.borrow_mut() += 1;
+    });
+    ui.show().unwrap();
+
+    let show = find_control(&ui, "Show Runtime keyboard shortcuts");
+    show.mock_single_click(PointerEventButton::Left);
+    for label in [
+        "Space: Start or stop transport",
+        "Home: Return transport to start",
+        "End: Seek exact playback end",
+        "Up / Down: Select previous or next ready scene",
+        "Return: Launch selected ready scene",
+        "Shift+Space: Stop interactive scenes",
+    ] {
+        find_control(&ui, label);
+    }
+    dispatch_inexact_escape_chords(&ui);
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::Space.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyReleased {
+            text: Key::Space.into(),
+        },
+    );
+    assert_eq!(
+        *toggles.borrow(),
+        0,
+        "modified and repeated Escape leave shortcut help modal"
+    );
+
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::Escape.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyReleased {
+            text: Key::Escape.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::Space.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyReleased {
+            text: Key::Space.into(),
+        },
+    );
+    assert_eq!(
+        *toggles.borrow(),
+        1,
+        "Escape restores Runtime keyboard operation"
+    );
+
+    show.mock_single_click(PointerEventButton::Left);
+    ui.window().dispatch_event(WindowEvent::PointerPressed {
+        position: LogicalPosition::new(10.0, 10.0),
+        button: PointerEventButton::Left,
+    });
+    ui.window().dispatch_event(WindowEvent::PointerReleased {
+        position: LogicalPosition::new(10.0, 10.0),
+        button: PointerEventButton::Left,
+    });
+    dispatch_operator_key(&ui, Key::Space.into(), false, false, false, false, false);
+    assert_eq!(
+        *toggles.borrow(),
+        2,
+        "backdrop dismissal restores Runtime keyboard operation"
+    );
+
+    show.mock_single_click(PointerEventButton::Left);
+    let close = find_control(&ui, "Close Runtime keyboard shortcuts");
+    close.mock_single_click(PointerEventButton::Left);
+    dispatch_operator_key(&ui, Key::Space.into(), false, false, false, false, false);
+    assert_eq!(
+        *toggles.borrow(),
+        3,
+        "explicit Close restores Runtime keyboard operation"
+    );
+    ui.hide().unwrap();
+}
+
+#[test]
 fn generated_scene_stop_button_respects_recovery_authority() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = OperatorWindow::new().unwrap();
@@ -853,6 +954,18 @@ fn dispatch_key(ui: &OperatorWindow, event: WindowEvent) {
 
 fn dispatch_shift_space(ui: &OperatorWindow, repeated: bool) {
     dispatch_operator_key(ui, Key::Space.into(), false, true, false, false, repeated);
+}
+
+fn dispatch_inexact_escape_chords(ui: &OperatorWindow) {
+    for (control, shift, alt, meta) in [
+        (true, false, false, false),
+        (false, true, false, false),
+        (false, false, true, false),
+        (false, false, false, true),
+    ] {
+        dispatch_operator_key(ui, Key::Escape.into(), control, shift, alt, meta, false);
+    }
+    dispatch_operator_key(ui, Key::Escape.into(), false, false, false, false, true);
 }
 
 fn assert_modified_scene_shortcuts_are_inert(

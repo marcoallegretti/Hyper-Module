@@ -19757,6 +19757,96 @@ mod tests {
         ui.hide().unwrap();
     }
 
+    #[test]
+    fn generated_shortcut_help_is_modal_and_dismissible() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let starts = Rc::new(Cell::new(0_usize));
+        let starts_by_callback = Rc::clone(&starts);
+        ui.global::<IdeActions>().on_transport_start(move || {
+            starts_by_callback.set(starts_by_callback.get() + 1);
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.set_transport_start_available(true);
+        ui.show().unwrap();
+
+        let show = ElementHandle::find_by_accessible_label(&ui, "Show IDE keyboard shortcuts")
+            .next()
+            .expect("the IDE header exposes shortcut help");
+        show.mock_single_click(PointerEventButton::Left);
+        for label in [
+            "Ctrl+N: New project",
+            "Ctrl+O: Open project",
+            "Ctrl+S: Save project",
+            "Ctrl+Shift+S: Save As",
+            "Ctrl+T: Add audio track",
+            "Ctrl+I: Import audio in Clips",
+            "Ctrl+E: Export project mix",
+            "Ctrl+W: Close project",
+            "Ctrl+Z: Undo last project edit",
+            "Ctrl+Shift+Z / Ctrl+Y: Redo project edit",
+            "Space: Start or stop transport",
+            "Home: Return transport to start",
+            "End: Seek exact playback end",
+            "Escape: Cancel New Project or Add Track",
+        ] {
+            assert!(
+                ElementHandle::find_by_accessible_label(&ui, label)
+                    .next()
+                    .is_some(),
+                "the visible sheet must expose {label:?}"
+            );
+        }
+        for (control, shift, alt, meta) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            dispatch_ide_special_key(&ui, Key::Escape.into(), control, shift, alt, meta, false);
+        }
+        dispatch_ide_escape(&ui, true);
+        dispatch_ide_space(&ui, false, false, false, false, false);
+        assert_eq!(
+            starts.get(),
+            0,
+            "modified and repeated Escape leave shortcut help modal"
+        );
+
+        dispatch_ide_escape(&ui, false);
+        dispatch_ide_space(&ui, false, false, false, false, false);
+        assert_eq!(starts.get(), 1, "Escape restores root keyboard operation");
+
+        show.mock_single_click(PointerEventButton::Left);
+        ui.window().dispatch_event(WindowEvent::PointerPressed {
+            position: LogicalPosition::new(10.0, 10.0),
+            button: PointerEventButton::Left,
+        });
+        ui.window().dispatch_event(WindowEvent::PointerReleased {
+            position: LogicalPosition::new(10.0, 10.0),
+            button: PointerEventButton::Left,
+        });
+        dispatch_ide_space(&ui, false, false, false, false, false);
+        assert_eq!(
+            starts.get(),
+            2,
+            "backdrop dismissal restores root keyboard operation"
+        );
+
+        show.mock_single_click(PointerEventButton::Left);
+        let close = ElementHandle::find_by_accessible_label(&ui, "Close IDE keyboard shortcuts")
+            .next()
+            .expect("the shortcut sheet exposes an explicit Close action");
+        close.mock_single_click(PointerEventButton::Left);
+        dispatch_ide_space(&ui, false, false, false, false, false);
+        assert_eq!(
+            starts.get(),
+            3,
+            "explicit Close restores root keyboard operation"
+        );
+        ui.hide().unwrap();
+    }
+
     fn assert_transport_running_observation_contract(ui: &MainWindow) {
         let starts = Rc::new(Cell::new(0_usize));
         let starts_by_callback = Rc::clone(&starts);

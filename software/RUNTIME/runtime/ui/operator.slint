@@ -65,6 +65,22 @@ export struct OperatorNativeDeviceChainRow {
     device-count: int,
 }
 
+component ShortcutReferenceRow inherits Rectangle {
+    in property <string> chord;
+    in property <string> action;
+    height: 32px;
+    background: #111620;
+    border-radius: 5px;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 10px;
+        Text { width: 112px; text: root.chord; color: #6fd6bd; font-size: 10px; font-weight: 700; vertical-alignment: center; }
+        Text { text: root.action; accessible-label: root.chord + ": " + root.action; color: #dce4ef; font-size: 10px; overflow: elide; vertical-alignment: center; }
+    }
+}
+
 component FactCard inherits Rectangle {
     in property <string> label;
     in property <string> value;
@@ -562,6 +578,8 @@ export component OperatorWindow inherits Window {
     background: #0d1016;
     forward-focus: keyboard;
 
+    property <bool> shortcut-help-visible: false;
+
     in property <string> project-name;
     in property <string> project-identity;
     in property <string> project-revision;
@@ -745,7 +763,25 @@ export component OperatorWindow inherits Window {
         width: parent.width;
         height: parent.height;
 
+        capture-key-pressed(event) => {
+            if root.shortcut-help-visible
+                && !event.repeat
+                && !event.modifiers.control
+                && !event.modifiers.shift
+                && !event.modifiers.alt
+                && !event.modifiers.meta
+                && event.text == Key.Escape {
+                root.shortcut-help-visible = false;
+                keyboard.focus();
+                return accept;
+            }
+            reject
+        }
+
         key-pressed(event) => {
+            if root.shortcut-help-visible {
+                return accept;
+            }
             if event.text == Key.Space {
                 if !event.repeat
                     && !event.modifiers.control
@@ -825,7 +861,20 @@ export component OperatorWindow inherits Window {
 
         VerticalLayout {
             spacing: 4px;
-            Text { text: "HYPER RUNTIME"; color: #6fd6bd; font-size: 13px; font-weight: 700; }
+            HorizontalLayout {
+                height: 28px;
+                Text { text: "HYPER RUNTIME"; color: #6fd6bd; font-size: 13px; font-weight: 700; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Button {
+                    width: 68px;
+                    text: "Keys";
+                    accessible-label: "Show Runtime keyboard shortcuts";
+                    clicked => {
+                        root.shortcut-help-visible = true;
+                        shortcut-help-keyboard.focus();
+                    }
+                }
+            }
             Text { text: root.project-name; color: #f7f9fc; font-size: 28px; font-weight: 700; overflow: elide; }
             Text { text: root.project-identity + "  ·  revision " + root.project-revision; color: #8d99ad; font-size: 12px; overflow: elide; }
         }
@@ -1591,6 +1640,88 @@ export component OperatorWindow inherits Window {
         }
 
         }
+        }
+
+        shortcut-help-layer := Rectangle {
+            visible: root.shortcut-help-visible;
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            background: #05080ddd;
+
+            TouchArea {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                clicked => {
+                    root.shortcut-help-visible = false;
+                    keyboard.focus();
+                }
+            }
+
+            Rectangle {
+                width: 620px;
+                height: 390px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: #151a24;
+                border-color: #405066;
+                border-width: 1px;
+                border-radius: 10px;
+
+                TouchArea { width: parent.width; height: parent.height; }
+
+                shortcut-help-keyboard := FocusScope {
+                    width: parent.width;
+                    height: parent.height;
+
+                    key-pressed(event) => { accept }
+
+                    VerticalLayout {
+                        padding: 24px;
+                        spacing: 14px;
+
+                        HorizontalLayout {
+                            height: 34px;
+                            VerticalLayout {
+                                Text { text: "KEYBOARD SHORTCUTS"; color: #f7f9fc; font-size: 18px; font-weight: 700; }
+                                Text { text: "Fixed exact chords · actions remain available only when their controls are enabled"; color: #8d99ad; font-size: 10px; }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "Close";
+                                accessible-label: "Close Runtime keyboard shortcuts";
+                                clicked => {
+                                    root.shortcut-help-visible = false;
+                                    keyboard.focus();
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: #2c3445; }
+
+                        VerticalLayout {
+                            spacing: 7px;
+                            Text { text: "TRANSPORT · SCENES"; color: #8d99ad; font-size: 9px; font-weight: 700; letter-spacing: 1px; }
+                            ShortcutReferenceRow { chord: "Space"; action: "Start or stop transport"; }
+                            ShortcutReferenceRow { chord: "Home"; action: "Return transport to start"; }
+                            ShortcutReferenceRow { chord: "End"; action: "Seek exact playback end"; }
+                            ShortcutReferenceRow { chord: "Up / Down"; action: "Select previous or next ready scene"; }
+                            ShortcutReferenceRow { chord: "Return"; action: "Launch selected ready scene"; }
+                            ShortcutReferenceRow { chord: "Shift+Space"; action: "Stop interactive scenes"; }
+                        }
+
+                        Text {
+                            text: "Focused sliders keep arrows, Home, and End. Shortcuts never bypass unavailable or pending actions.";
+                            color: #8d99ad;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
         }
     }
 }

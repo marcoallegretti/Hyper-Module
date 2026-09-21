@@ -9,6 +9,22 @@ component IdeLineEdit inherits LineEdit {
     }
 }
 
+component ShortcutReferenceRow inherits Rectangle {
+    in property <string> chord;
+    in property <string> action;
+    height: 30px;
+    background: #111820;
+    border-radius: 5px;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 10px;
+        Text { width: 128px; text: root.chord; color: #7fd6a2; font-size: 10px; font-weight: 700; vertical-alignment: center; }
+        Text { text: root.action; accessible-label: root.chord + ": " + root.action; color: #dce5ef; font-size: 10px; overflow: elide; vertical-alignment: center; }
+    }
+}
+
 export enum AppMode {
     discovering,
     closed,
@@ -649,6 +665,7 @@ export component MainWindow inherits Window {
     in property <[string]> recent-project-paths: [];
     in property <string> project-history-warning: "";
     in-out property <bool> new-project-visible: false;
+    property <bool> shortcut-help-visible: false;
     in-out property <string> new-project-name: "Untitled Project";
     in-out property <bool> save-project-as-visible: false;
     in-out property <string> save-project-as-name: "";
@@ -1145,6 +1162,17 @@ export component MainWindow inherits Window {
         height: parent.height;
 
         capture-key-pressed(event) => {
+            if root.shortcut-help-visible
+                && !event.repeat
+                && !event.modifiers.control
+                && !event.modifiers.shift
+                && !event.modifiers.alt
+                && !event.modifiers.meta
+                && event.text == Key.Escape {
+                root.shortcut-help-visible = false;
+                keyboard.focus();
+                return accept;
+            }
             if !event.repeat
                 && !event.modifiers.control
                 && !event.modifiers.shift
@@ -1164,6 +1192,9 @@ export component MainWindow inherits Window {
         }
 
         key-pressed(event) => {
+            if root.shortcut-help-visible {
+                return accept;
+            }
             if event.text == Key.Space {
                 if !event.repeat
                     && !event.modifiers.control
@@ -1326,6 +1357,16 @@ export component MainWindow inherits Window {
             }
 
             Rectangle { horizontal-stretch: 1; background: transparent; }
+
+            Button {
+                width: 68px;
+                text: "Keys";
+                accessible-label: "Show IDE keyboard shortcuts";
+                clicked => {
+                    root.shortcut-help-visible = true;
+                    shortcut-help-keyboard.focus();
+                }
+            }
 
             Rectangle {
                 width: 144px;
@@ -6811,6 +6852,105 @@ export component MainWindow inherits Window {
                     font-size: 11px;
                     vertical-alignment: center;
                     overflow: elide;
+                }
+            }
+        }
+    }
+
+    shortcut-help-layer := Rectangle {
+        visible: root.shortcut-help-visible;
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: #05080ddd;
+
+        TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            clicked => {
+                root.shortcut-help-visible = false;
+                keyboard.focus();
+            }
+        }
+
+        Rectangle {
+            width: 740px;
+            height: 486px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #121821;
+            border-color: #405066;
+            border-width: 1px;
+            border-radius: 10px;
+
+            TouchArea { width: parent.width; height: parent.height; }
+
+            shortcut-help-keyboard := FocusScope {
+                width: parent.width;
+                height: parent.height;
+
+                key-pressed(event) => { accept }
+
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 14px;
+
+                    HorizontalLayout {
+                        height: 34px;
+                        VerticalLayout {
+                            Text { text: "KEYBOARD SHORTCUTS"; color: #f2f6fb; font-size: 18px; font-weight: 700; }
+                            Text { text: "Fixed exact chords · actions remain available only in their normal context"; color: #8290a2; font-size: 10px; }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Button {
+                            text: "Close";
+                            accessible-label: "Close IDE keyboard shortcuts";
+                            clicked => {
+                                root.shortcut-help-visible = false;
+                                keyboard.focus();
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: #2b3747; }
+
+                    HorizontalLayout {
+                        spacing: 14px;
+
+                        VerticalLayout {
+                            spacing: 7px;
+                            Text { text: "PROJECT"; color: #65758a; font-size: 9px; font-weight: 700; letter-spacing: 1px; }
+                            ShortcutReferenceRow { chord: "Ctrl+N"; action: "New project"; }
+                            ShortcutReferenceRow { chord: "Ctrl+O"; action: "Open project"; }
+                            ShortcutReferenceRow { chord: "Ctrl+S"; action: "Save project"; }
+                            ShortcutReferenceRow { chord: "Ctrl+Shift+S"; action: "Save As"; }
+                            ShortcutReferenceRow { chord: "Ctrl+T"; action: "Add audio track"; }
+                            ShortcutReferenceRow { chord: "Ctrl+I"; action: "Import audio in Clips"; }
+                            ShortcutReferenceRow { chord: "Ctrl+E"; action: "Export project mix"; }
+                        }
+
+                        VerticalLayout {
+                            spacing: 7px;
+                            Text { text: "HISTORY · TRANSPORT · LOCAL"; color: #65758a; font-size: 9px; font-weight: 700; letter-spacing: 1px; }
+                            ShortcutReferenceRow { chord: "Ctrl+W"; action: "Close project"; }
+                            ShortcutReferenceRow { chord: "Ctrl+Z"; action: "Undo last project edit"; }
+                            ShortcutReferenceRow { chord: "Ctrl+Shift+Z / Ctrl+Y"; action: "Redo project edit"; }
+                            ShortcutReferenceRow { chord: "Space"; action: "Start or stop transport"; }
+                            ShortcutReferenceRow { chord: "Home"; action: "Return transport to start"; }
+                            ShortcutReferenceRow { chord: "End"; action: "Seek exact playback end"; }
+                            ShortcutReferenceRow { chord: "Escape"; action: "Cancel New Project or Add Track"; }
+                        }
+                    }
+
+                    Text {
+                        text: "Focused text fields and sliders keep the keys they accept locally. Shortcuts never bypass unavailable or pending actions.";
+                        color: #8290a2;
+                        font-size: 10px;
+                        wrap: word-wrap;
+                    }
                 }
             }
         }
