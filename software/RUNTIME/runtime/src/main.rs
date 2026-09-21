@@ -169,8 +169,10 @@ impl RuntimePlaybackOwner {
             | RuntimePlaybackOwnerState::Recovery { .. }
             | RuntimePlaybackOwnerState::PendingStart(_)
             | RuntimePlaybackOwnerState::StopError { .. }
+            | RuntimePlaybackOwnerState::ShutdownPlayback(_)
             | RuntimePlaybackOwnerState::ShutdownRecovery(_)
             | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
+            | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
             | RuntimePlaybackOwnerState::ShutdownStopError(_) => None,
         }
     }
@@ -183,8 +185,10 @@ impl RuntimePlaybackOwner {
             | RuntimePlaybackOwnerState::Recovery { .. }
             | RuntimePlaybackOwnerState::PendingStart(_)
             | RuntimePlaybackOwnerState::StopError { .. }
+            | RuntimePlaybackOwnerState::ShutdownPlayback(_)
             | RuntimePlaybackOwnerState::ShutdownRecovery(_)
             | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
+            | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
             | RuntimePlaybackOwnerState::ShutdownStopError(_) => None,
         }
     }
@@ -212,8 +216,10 @@ impl RuntimePlaybackOwner {
                     | RuntimePlaybackOwnerState::Recovery { .. }
                     | RuntimePlaybackOwnerState::PendingStart(_)
                     | RuntimePlaybackOwnerState::StopError { .. }
+                    | RuntimePlaybackOwnerState::ShutdownPlayback(_)
                     | RuntimePlaybackOwnerState::ShutdownRecovery(_)
                     | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
+                    | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
                     | RuntimePlaybackOwnerState::ShutdownStopError(_)
             )
         )
@@ -346,11 +352,81 @@ impl RuntimePlaybackOwner {
         let Some(state) = self.state.take() else {
             return Err("Runtime playback ownership is unavailable during shutdown".to_owned());
         };
-        let RuntimePlaybackOwnerState::Recording { session, capture } = state else {
-            self.state = Some(state);
-            return Ok(None);
-        };
         self.playback_available.store(false, Ordering::Release);
+        let action = runtime_playback_shutdown_action(state.phase());
+        let result = match (action, state) {
+            (
+                RuntimePlaybackShutdownAction::RetainPlayback,
+                RuntimePlaybackOwnerState::Playback(playback),
+            ) => {
+                self.state = Some(RuntimePlaybackOwnerState::ShutdownPlayback(playback));
+                Ok(None)
+            }
+            (
+                RuntimePlaybackShutdownAction::AbortRecording,
+                RuntimePlaybackOwnerState::Recording { session, capture },
+            ) => self.abort_active_recording_for_shutdown(session, &capture),
+            (
+                RuntimePlaybackShutdownAction::RetainPendingStop,
+                RuntimePlaybackOwnerState::PendingStop { pending, .. },
+            ) => {
+                self.state = Some(RuntimePlaybackOwnerState::ShutdownPendingStop(pending));
+                Ok(Some(
+                    "Runtime shutdown retained pending native teardown; no replacement owner started"
+                        .to_owned(),
+                ))
+            }
+            (
+                RuntimePlaybackShutdownAction::RetainRecovery,
+                RuntimePlaybackOwnerState::Recovery { recovery, .. },
+            ) => {
+                self.state = Some(RuntimePlaybackOwnerState::ShutdownRecovery(recovery));
+                Ok(Some(
+                    "Runtime shutdown retained stopped playback recovery; no replacement owner started"
+                        .to_owned(),
+                ))
+            }
+            (
+                RuntimePlaybackShutdownAction::RetainPendingStart,
+                RuntimePlaybackOwnerState::PendingStart(pending),
+            ) => {
+                self.state = Some(RuntimePlaybackOwnerState::ShutdownPendingStart(pending));
+                Ok(Some(
+                    "Runtime shutdown retained cancelled playback startup; no replacement owner started"
+                        .to_owned(),
+                ))
+            }
+            (
+                RuntimePlaybackShutdownAction::RetainStopError,
+                RuntimePlaybackOwnerState::StopError { error, .. },
+            ) => {
+                let message =
+                    format!("Runtime shutdown retained unresolved playback stop evidence: {error}");
+                self.state = Some(RuntimePlaybackOwnerState::ShutdownStopError(error));
+                Err(message)
+            }
+            (
+                RuntimePlaybackShutdownAction::AlreadyRetained,
+                state @ (RuntimePlaybackOwnerState::ShutdownPlayback(_)
+                | RuntimePlaybackOwnerState::ShutdownRecovery(_)
+                | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
+                | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
+                | RuntimePlaybackOwnerState::ShutdownStopError(_)),
+            ) => {
+                self.state = Some(state);
+                Ok(None)
+            }
+            _ => unreachable!("Runtime playback shutdown phase and owner state diverged"),
+        };
+        self.refresh_recording_observation();
+        result
+    }
+
+    fn abort_active_recording_for_shutdown(
+        &mut self,
+        session: Box<DesktopPlaybackRecordingSession>,
+        capture: &ActiveRuntimeRecording,
+    ) -> Result<Option<String>, String> {
         let target_label = capture.target_label().to_owned();
         match (*session).abort() {
             Ok(aborted) => {
@@ -391,7 +467,6 @@ impl RuntimePlaybackOwner {
                     ),
                 };
                 self.retain_shutdown_recovery(recovery);
-                self.refresh_recording_observation();
                 if failed {
                     Err(message)
                 } else {
@@ -404,7 +479,6 @@ impl RuntimePlaybackOwner {
                 );
                 let recovery = error.into_recovery();
                 self.retain_shutdown_recovery(recovery);
-                self.refresh_recording_observation();
                 Err(message)
             }
         }
@@ -445,8 +519,10 @@ impl RuntimePlaybackOwner {
         let result = match state {
             state @ (RuntimePlaybackOwnerState::Playback(_)
             | RuntimePlaybackOwnerState::Recording { .. }
+            | RuntimePlaybackOwnerState::ShutdownPlayback(_)
             | RuntimePlaybackOwnerState::ShutdownRecovery(_)
             | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
+            | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
             | RuntimePlaybackOwnerState::ShutdownStopError(_)) => {
                 self.retain_without_progress(state)
             }
@@ -751,28 +827,13 @@ impl RuntimePlaybackOwner {
                 false,
                 false,
             ),
-            Some(RuntimePlaybackOwnerState::ShutdownRecovery(recovery)) => (
-                format!(
-                    "Runtime recording stopped for shutdown at frame {}",
-                    recovery.checkpoint().position_frame()
-                ),
-                false,
-                false,
-            ),
-            Some(RuntimePlaybackOwnerState::ShutdownPendingStop(pending)) => (
-                format!(
-                    "Runtime shutdown retains pending native ownership (input={:?}, output={:?})",
-                    pending.input_status().map(|status| status.state()),
-                    pending.output_status().map(|status| status.state())
-                ),
-                false,
-                false,
-            ),
-            Some(RuntimePlaybackOwnerState::ShutdownStopError(error)) => (
-                format!("Runtime shutdown retains playback stop evidence: {error}"),
-                false,
-                false,
-            ),
+            Some(
+                state @ (RuntimePlaybackOwnerState::ShutdownPlayback(_)
+                | RuntimePlaybackOwnerState::ShutdownRecovery(_)
+                | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
+                | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
+                | RuntimePlaybackOwnerState::ShutdownStopError(_)),
+            ) => (runtime_shutdown_recording_observation(state), false, false),
             None => (
                 "Runtime playback ownership is unavailable".to_owned(),
                 false,
@@ -785,6 +846,40 @@ impl RuntimePlaybackOwner {
                 start_enabled,
                 stop_enabled,
             };
+        }
+    }
+}
+
+fn runtime_shutdown_recording_observation(state: &RuntimePlaybackOwnerState) -> String {
+    match state {
+        RuntimePlaybackOwnerState::ShutdownPlayback(playback) => format!(
+            "Runtime shutdown retains the final playback owner at frame {} until release",
+            playback.recovery_checkpoint().snapshot().position_frame()
+        ),
+        RuntimePlaybackOwnerState::ShutdownRecovery(recovery) => format!(
+            "Runtime recording stopped for shutdown at frame {}",
+            recovery.checkpoint().position_frame()
+        ),
+        RuntimePlaybackOwnerState::ShutdownPendingStop(pending) => format!(
+            "Runtime shutdown retains pending native ownership (input={:?}, output={:?})",
+            pending.input_status().map(|status| status.state()),
+            pending.output_status().map(|status| status.state())
+        ),
+        RuntimePlaybackOwnerState::ShutdownPendingStart(pending) => format!(
+            "Runtime shutdown retains cancelled native startup (input={:?}, output={:?})",
+            pending.input_status().map(|status| status.state()),
+            pending.output_status().map(|status| status.state())
+        ),
+        RuntimePlaybackOwnerState::ShutdownStopError(error) => {
+            format!("Runtime shutdown retains playback stop evidence: {error}")
+        }
+        RuntimePlaybackOwnerState::Playback(_)
+        | RuntimePlaybackOwnerState::Recording { .. }
+        | RuntimePlaybackOwnerState::PendingStop { .. }
+        | RuntimePlaybackOwnerState::Recovery { .. }
+        | RuntimePlaybackOwnerState::PendingStart(_)
+        | RuntimePlaybackOwnerState::StopError { .. } => {
+            unreachable!("only shutdown-retained owners have shutdown observations")
         }
     }
 }
@@ -830,9 +925,69 @@ enum RuntimePlaybackOwnerState {
         error: Box<DesktopPlaybackRecoveryStopError>,
         action: RuntimePlaybackRecoveryAction,
     },
+    ShutdownPlayback(Box<DesktopPlaybackSession>),
     ShutdownRecovery(Box<DesktopPlaybackRecovery>),
     ShutdownPendingStop(Box<DesktopPlaybackRecoveryPendingStop>),
+    ShutdownPendingStart(Box<DesktopPlaybackRecoveryPendingStart>),
     ShutdownStopError(Box<DesktopPlaybackRecoveryStopError>),
+}
+
+impl RuntimePlaybackOwnerState {
+    const fn phase(&self) -> RuntimePlaybackOwnerPhase {
+        match self {
+            Self::Playback(_) => RuntimePlaybackOwnerPhase::Playback,
+            Self::Recording { .. } => RuntimePlaybackOwnerPhase::Recording,
+            Self::PendingStop { .. } => RuntimePlaybackOwnerPhase::PendingStop,
+            Self::Recovery { .. } => RuntimePlaybackOwnerPhase::Recovery,
+            Self::PendingStart(_) => RuntimePlaybackOwnerPhase::PendingStart,
+            Self::StopError { .. } => RuntimePlaybackOwnerPhase::StopError,
+            Self::ShutdownPlayback(_)
+            | Self::ShutdownRecovery(_)
+            | Self::ShutdownPendingStop(_)
+            | Self::ShutdownPendingStart(_)
+            | Self::ShutdownStopError(_) => RuntimePlaybackOwnerPhase::ShutdownRetained,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimePlaybackOwnerPhase {
+    Playback,
+    Recording,
+    PendingStop,
+    Recovery,
+    PendingStart,
+    StopError,
+    ShutdownRetained,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimePlaybackShutdownAction {
+    RetainPlayback,
+    AbortRecording,
+    RetainPendingStop,
+    RetainRecovery,
+    RetainPendingStart,
+    RetainStopError,
+    AlreadyRetained,
+}
+
+const fn runtime_playback_shutdown_action(
+    phase: RuntimePlaybackOwnerPhase,
+) -> RuntimePlaybackShutdownAction {
+    match phase {
+        RuntimePlaybackOwnerPhase::Playback => RuntimePlaybackShutdownAction::RetainPlayback,
+        RuntimePlaybackOwnerPhase::Recording => RuntimePlaybackShutdownAction::AbortRecording,
+        RuntimePlaybackOwnerPhase::PendingStop => RuntimePlaybackShutdownAction::RetainPendingStop,
+        RuntimePlaybackOwnerPhase::Recovery => RuntimePlaybackShutdownAction::RetainRecovery,
+        RuntimePlaybackOwnerPhase::PendingStart => {
+            RuntimePlaybackShutdownAction::RetainPendingStart
+        }
+        RuntimePlaybackOwnerPhase::StopError => RuntimePlaybackShutdownAction::RetainStopError,
+        RuntimePlaybackOwnerPhase::ShutdownRetained => {
+            RuntimePlaybackShutdownAction::AlreadyRetained
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -8093,6 +8248,42 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, "receiver rebind failed");
         assert_eq!(refreshes.get(), 2);
+    }
+
+    #[test]
+    fn runtime_shutdown_terminalizes_every_playback_owner_phase() {
+        for (phase, expected) in [
+            (
+                RuntimePlaybackOwnerPhase::Playback,
+                RuntimePlaybackShutdownAction::RetainPlayback,
+            ),
+            (
+                RuntimePlaybackOwnerPhase::Recording,
+                RuntimePlaybackShutdownAction::AbortRecording,
+            ),
+            (
+                RuntimePlaybackOwnerPhase::PendingStop,
+                RuntimePlaybackShutdownAction::RetainPendingStop,
+            ),
+            (
+                RuntimePlaybackOwnerPhase::Recovery,
+                RuntimePlaybackShutdownAction::RetainRecovery,
+            ),
+            (
+                RuntimePlaybackOwnerPhase::PendingStart,
+                RuntimePlaybackShutdownAction::RetainPendingStart,
+            ),
+            (
+                RuntimePlaybackOwnerPhase::StopError,
+                RuntimePlaybackShutdownAction::RetainStopError,
+            ),
+            (
+                RuntimePlaybackOwnerPhase::ShutdownRetained,
+                RuntimePlaybackShutdownAction::AlreadyRetained,
+            ),
+        ] {
+            assert_eq!(runtime_playback_shutdown_action(phase), expected);
+        }
     }
 
     #[test]
