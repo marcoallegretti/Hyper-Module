@@ -1130,6 +1130,15 @@ pub struct NativeFilterProcessor {
     transition: Option<FilterTransition>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NativeFilterProcessorCheckpoint {
+    enabled: bool,
+    state: NativeFilterState,
+    coefficients: BiquadCoefficients,
+    channels: [BiquadState; 2],
+    transition: Option<FilterTransition>,
+}
+
 impl NativeFilterProcessor {
     /// Compiles one filter into fixed callback state.
     ///
@@ -1164,6 +1173,24 @@ impl NativeFilterProcessor {
     #[must_use]
     pub const fn state(&self) -> NativeFilterState {
         self.state
+    }
+
+    const fn checkpoint(&self) -> NativeFilterProcessorCheckpoint {
+        NativeFilterProcessorCheckpoint {
+            enabled: self.enabled,
+            state: self.state,
+            coefficients: self.coefficients,
+            channels: self.channels,
+            transition: self.transition,
+        }
+    }
+
+    fn restore_checkpoint(&mut self, checkpoint: NativeFilterProcessorCheckpoint) {
+        self.enabled = checkpoint.enabled;
+        self.state = checkpoint.state;
+        self.coefficients = checkpoint.coefficients;
+        self.channels = checkpoint.channels;
+        self.transition = checkpoint.transition;
     }
 
     /// Changes bypass state without allocating.
@@ -1355,6 +1382,19 @@ pub struct NativeCompressorProcessor {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct NativeCompressorProcessorCheckpoint {
+    enabled: bool,
+    state: NativeCompressorState,
+    threshold_decibels: f64,
+    ratio: f64,
+    attack_coefficient: f64,
+    release_coefficient: f64,
+    makeup_gain: f64,
+    gain_reduction_decibels: f64,
+    transition: Option<CompressorTransition>,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct CompressorTransition {
     threshold_decibels: f64,
     ratio: f64,
@@ -1407,6 +1447,32 @@ impl NativeCompressorProcessor {
     #[must_use]
     pub const fn state(&self) -> NativeCompressorState {
         self.state
+    }
+
+    const fn checkpoint(&self) -> NativeCompressorProcessorCheckpoint {
+        NativeCompressorProcessorCheckpoint {
+            enabled: self.enabled,
+            state: self.state,
+            threshold_decibels: self.threshold_decibels,
+            ratio: self.ratio,
+            attack_coefficient: self.attack_coefficient,
+            release_coefficient: self.release_coefficient,
+            makeup_gain: self.makeup_gain,
+            gain_reduction_decibels: self.gain_reduction_decibels,
+            transition: self.transition,
+        }
+    }
+
+    fn restore_checkpoint(&mut self, checkpoint: NativeCompressorProcessorCheckpoint) {
+        self.enabled = checkpoint.enabled;
+        self.state = checkpoint.state;
+        self.threshold_decibels = checkpoint.threshold_decibels;
+        self.ratio = checkpoint.ratio;
+        self.attack_coefficient = checkpoint.attack_coefficient;
+        self.release_coefficient = checkpoint.release_coefficient;
+        self.makeup_gain = checkpoint.makeup_gain;
+        self.gain_reduction_decibels = checkpoint.gain_reduction_decibels;
+        self.transition = checkpoint.transition;
     }
 
     /// Changes bypass state without allocating.
@@ -1586,6 +1652,12 @@ enum NativeDeviceProcessor {
     Compressor(NativeCompressorProcessor),
 }
 
+#[derive(Clone, Copy, Debug)]
+enum NativeDeviceProcessorCheckpoint {
+    Filter(NativeFilterProcessorCheckpoint),
+    Compressor(NativeCompressorProcessorCheckpoint),
+}
+
 impl NativeDeviceProcessor {
     const fn enabled(&self) -> bool {
         match self {
@@ -1605,6 +1677,46 @@ impl NativeDeviceProcessor {
         match self {
             Self::Filter(processor) => NativeDeviceState::Filter(processor.state()),
             Self::Compressor(processor) => NativeDeviceState::Compressor(processor.state()),
+        }
+    }
+
+    const fn same_checkpoint_kind(&self, checkpoint: &NativeDeviceProcessorCheckpoint) -> bool {
+        matches!(
+            (self, checkpoint),
+            (Self::Filter(_), NativeDeviceProcessorCheckpoint::Filter(_))
+                | (
+                    Self::Compressor(_),
+                    NativeDeviceProcessorCheckpoint::Compressor(_)
+                )
+        )
+    }
+
+    const fn checkpoint(&self) -> NativeDeviceProcessorCheckpoint {
+        match self {
+            Self::Filter(processor) => {
+                NativeDeviceProcessorCheckpoint::Filter(processor.checkpoint())
+            }
+            Self::Compressor(processor) => {
+                NativeDeviceProcessorCheckpoint::Compressor(processor.checkpoint())
+            }
+        }
+    }
+
+    fn restore_checkpoint(&mut self, checkpoint: NativeDeviceProcessorCheckpoint) -> bool {
+        match (self, checkpoint) {
+            (Self::Filter(processor), NativeDeviceProcessorCheckpoint::Filter(checkpoint)) => {
+                processor.restore_checkpoint(checkpoint);
+                true
+            }
+            (
+                Self::Compressor(processor),
+                NativeDeviceProcessorCheckpoint::Compressor(checkpoint),
+            ) => {
+                processor.restore_checkpoint(checkpoint);
+                true
+            }
+            (Self::Filter(_), NativeDeviceProcessorCheckpoint::Compressor(_))
+            | (Self::Compressor(_), NativeDeviceProcessorCheckpoint::Filter(_)) => false,
         }
     }
 
@@ -1640,6 +1752,18 @@ impl NativeDeviceProcessor {
             Self::Compressor(processor) => processor.process_in_place(left, right),
         }
     }
+}
+
+/// Exact allocation-free checkpoint of one prepared native-device chain.
+///
+/// Unlike persisted device state, this retains private filter histories,
+/// compressor detector state, and any active parameter transitions. A
+/// checkpoint can be restored only to a prepared chain with the same device
+/// count and processor-kind layout.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeDeviceChainCheckpoint {
+    devices: [Option<NativeDeviceProcessorCheckpoint>; MAX_DEVICES_PER_CHAIN],
+    device_count: usize,
 }
 
 #[derive(Debug)]
@@ -1689,6 +1813,44 @@ impl NativeDeviceChainProcessor {
     #[must_use]
     pub fn device_state(&self, index: usize) -> Option<NativeDeviceState> {
         self.devices.get(index).map(NativeDeviceProcessor::state)
+    }
+
+    /// Captures every mutable processor field without allocating.
+    #[must_use]
+    pub fn checkpoint(&self) -> NativeDeviceChainCheckpoint {
+        let mut devices = [None; MAX_DEVICES_PER_CHAIN];
+        for (checkpoint, device) in devices.iter_mut().zip(&self.devices) {
+            *checkpoint = Some(device.checkpoint());
+        }
+        NativeDeviceChainCheckpoint {
+            devices,
+            device_count: self.devices.len(),
+        }
+    }
+
+    /// Restores an exact checkpoint without invoking live-control smoothing.
+    ///
+    /// Returns `false` without mutation when the prepared device count or kind
+    /// layout differs from the checkpoint.
+    pub fn restore_checkpoint(&mut self, checkpoint: &NativeDeviceChainCheckpoint) -> bool {
+        if checkpoint.device_count != self.devices.len()
+            || self
+                .devices
+                .iter()
+                .zip(checkpoint.devices.iter().flatten())
+                .any(|(device, checkpoint)| !device.same_checkpoint_kind(checkpoint))
+        {
+            return false;
+        }
+        for (device, checkpoint) in self
+            .devices
+            .iter_mut()
+            .zip(checkpoint.devices.iter().flatten().copied())
+        {
+            let restored = device.restore_checkpoint(checkpoint);
+            debug_assert!(restored, "checkpoint kinds were validated before mutation");
+        }
+        true
     }
 
     /// Changes one prepared device's bypass state without allocating.
@@ -2460,6 +2622,108 @@ mod tests {
         assert_eq!(
             replay_right.map(f32::to_bits),
             fresh_right.map(f32::to_bits)
+        );
+    }
+
+    #[test]
+    fn prepared_chain_checkpoint_restores_histories_and_active_transitions_exactly() {
+        let filter = NativeDeviceInstance::try_new_filter(
+            DEVICE_ID.to_owned(),
+            true,
+            state(NativeFilterMode::LowPass),
+        )
+        .unwrap();
+        let compressor = NativeDeviceInstance::try_new_compressor(
+            "018f47a2-6b2d-7c11-8a44-001122334492".to_owned(),
+            true,
+            compressor_state(),
+        )
+        .unwrap();
+        let prepared_chain = DeviceChain::try_new(
+            CHAIN_ID.to_owned(),
+            PROJECT_ID.to_owned(),
+            TRACK_ID.to_owned(),
+            vec![filter, compressor],
+        )
+        .unwrap();
+        let mut restored =
+            NativeDeviceChainProcessor::try_new(&prepared_chain, PROJECT_SAMPLE_RATE_HZ).unwrap();
+        let mut control =
+            NativeDeviceChainProcessor::try_new(&prepared_chain, PROJECT_SAMPLE_RATE_HZ).unwrap();
+
+        let mut restored_left = [0.25_f32; 64];
+        let mut restored_right = [-0.125_f32; 64];
+        let mut control_left = restored_left;
+        let mut control_right = restored_right;
+        restored
+            .process_in_place(&mut restored_left, &mut restored_right)
+            .unwrap();
+        control
+            .process_in_place(&mut control_left, &mut control_right)
+            .unwrap();
+
+        let filter_state = NativeDeviceState::Filter(
+            NativeFilterState::try_new(NativeFilterMode::HighPass, 4_000_000, 1_500_000).unwrap(),
+        );
+        let retuned_compressor = NativeDeviceState::Compressor(
+            NativeCompressorState::try_new(-24_000, 8_000_000, 1_000, 250_000, 3_000).unwrap(),
+        );
+        for processor in [&mut restored, &mut control] {
+            assert!(processor.set_device_state(0, filter_state));
+            assert!(processor.set_device_state(1, retuned_compressor));
+        }
+        restored_left.fill(0.5);
+        restored_right.fill(-0.25);
+        control_left = restored_left;
+        control_right = restored_right;
+        restored
+            .process_in_place(&mut restored_left, &mut restored_right)
+            .unwrap();
+        control
+            .process_in_place(&mut control_left, &mut control_right)
+            .unwrap();
+        let checkpoint = restored.checkpoint();
+
+        assert!(restored.set_device_enabled(0, false));
+        assert!(restored.set_device_enabled(1, false));
+        assert!(restored.set_device_state(
+            0,
+            NativeDeviceState::Filter(state(NativeFilterMode::LowPass))
+        ));
+        assert!(restored.set_device_state(1, NativeDeviceState::Compressor(compressor_state())));
+        assert!(restored.set_device_enabled(0, true));
+        assert!(restored.set_device_enabled(1, true));
+        assert!(restored.restore_checkpoint(&checkpoint));
+
+        let wrong_kinds = NativeDeviceChainProcessor::try_new(
+            &prepared_chain.try_with_moved_device(DEVICE_ID, 1).unwrap(),
+            PROJECT_SAMPLE_RATE_HZ,
+        )
+        .unwrap()
+        .checkpoint();
+        assert!(!restored.restore_checkpoint(&wrong_kinds));
+        let wrong_count = NativeDeviceChainProcessor::try_new(&chain(true), PROJECT_SAMPLE_RATE_HZ)
+            .unwrap()
+            .checkpoint();
+        assert!(!restored.restore_checkpoint(&wrong_count));
+
+        restored_left.fill(-0.375);
+        restored_right.fill(0.75);
+        control_left = restored_left;
+        control_right = restored_right;
+        restored
+            .process_in_place(&mut restored_left, &mut restored_right)
+            .unwrap();
+        control
+            .process_in_place(&mut control_left, &mut control_right)
+            .unwrap();
+        assert_eq!(
+            restored_left.map(f32::to_bits),
+            control_left.map(f32::to_bits)
+        );
+        assert_eq!(
+            restored_right.map(f32::to_bits),
+            control_right.map(f32::to_bits)
         );
     }
 

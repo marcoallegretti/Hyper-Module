@@ -960,12 +960,27 @@ fn native_device_fence_preserves_state_coalescing_across_its_boundary() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "paired transports prove public rollback state, fence authority, and signal-level retry equivalence"
+)]
 fn native_device_state_and_fence_are_rolled_back_when_later_cycle_work_fails() {
     let fixture = playback_fixture();
     let graph = fixture.compile_playback();
     let prepared = fixture.cache.prepare_playback(&graph).unwrap();
     let chain = native_filter_chain(true);
+    let original_state = *chain.devices()[0].state();
+    let changed_state = NativeDeviceState::Filter(
+        NativeFilterState::try_new(NativeFilterMode::HighPass, 4_000_000, 1_500_000).unwrap(),
+    );
     let runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        core::slice::from_ref(&chain),
+        64,
+    )
+    .unwrap();
+    let control_runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
         &prepared,
         &fixture.mixer,
         core::slice::from_ref(&chain),
@@ -974,6 +989,10 @@ fn native_device_state_and_fence_are_rolled_back_when_later_cycle_work_fails() {
     .unwrap();
     let (mut transport_sender, _mixer_sender, mut native_sender, mut transport) =
         PreparedPlaybackTransportRuntime::with_command_queues_and_native_device_commands(runtime);
+    let (_control_transport_sender, _control_mixer_sender, _control_native_sender, mut control) =
+        PreparedPlaybackTransportRuntime::with_command_queues_and_native_device_commands(
+            control_runtime,
+        );
     let device = native_sender
         .resolve_device(ARRANGEMENT_TRACK_ID, chain.devices()[0].id())
         .unwrap();
@@ -982,6 +1001,12 @@ fn native_device_state_and_fence_are_rolled_back_when_later_cycle_work_fails() {
         .try_send(NativeDeviceCommand::SetEnabled {
             device,
             enabled: false,
+        })
+        .unwrap();
+    native_sender
+        .try_send(NativeDeviceCommand::SetState {
+            device,
+            state: changed_state,
         })
         .unwrap();
     assert_eq!(native_sender.try_send_fence().unwrap(), Some(1));
@@ -1002,8 +1027,13 @@ fn native_device_state_and_fence_are_rolled_back_when_later_cycle_work_fails() {
     assert_eq!(transport.state(), TransportState::Stopped);
     assert_eq!(native_sender.committed_fence(), 0);
     assert_eq!(transport.native_device_state().enabled(0, 0), Some(true));
+    assert_eq!(
+        transport.native_device_state().state(0, 0),
+        Some(original_state)
+    );
 
     transport_sender.try_send(TransportCommand::Start).unwrap();
+    control.apply_command(TransportCommand::Start).unwrap();
     let mut arrangement_left = [0.0_f32; 64];
     let mut arrangement_right = [0.0_f32; 64];
     let mut scene_left = [0.0_f32; 64];
@@ -1014,6 +1044,19 @@ fn native_device_state_and_fence_are_rolled_back_when_later_cycle_work_fails() {
     ];
     let mut left = [0.0_f32; 64];
     let mut right = [0.0_f32; 64];
+    let mut control_arrangement_left = [0.0_f32; 64];
+    let mut control_arrangement_right = [0.0_f32; 64];
+    let mut control_scene_left = [0.0_f32; 64];
+    let mut control_scene_right = [0.0_f32; 64];
+    let mut control_scratch = [
+        RenderScratchSlot::new(
+            &mut control_arrangement_left,
+            &mut control_arrangement_right,
+        ),
+        RenderScratchSlot::new(&mut control_scene_left, &mut control_scene_right),
+    ];
+    let mut control_left = [0.0_f32; 64];
+    let mut control_right = [0.0_f32; 64];
     let recovered = transport
         .process_cycle(
             &mut scratch,
@@ -1023,11 +1066,23 @@ fn native_device_state_and_fence_are_rolled_back_when_later_cycle_work_fails() {
             },
         )
         .unwrap();
+    control
+        .process_cycle(
+            &mut control_scratch,
+            StereoOutput {
+                left: &mut control_left,
+                right: &mut control_right,
+            },
+        )
+        .unwrap();
     assert_eq!(recovered.applied_native_device_command_count(), 0);
     assert_eq!(recovered.committed_native_device_fence(), 0);
     assert_eq!(native_sender.committed_fence(), 0);
     let recovered_native_state = transport.native_device_state();
     assert_eq!(recovered_native_state.enabled(0, 0), Some(true));
+    assert_eq!(recovered_native_state.state(0, 0), Some(original_state));
+    assert_eq!(left.map(f32::to_bits), control_left.map(f32::to_bits));
+    assert_eq!(right.map(f32::to_bits), control_right.map(f32::to_bits));
     let (mut recovery_publisher, recovery) = playback_recovery_channel(None, None);
     recovery_publisher.publish_cycle_with_native_device_state(
         recovered,
@@ -1037,6 +1092,192 @@ fn native_device_state_and_fence_are_rolled_back_when_later_cycle_work_fails() {
     let snapshot = recovery.snapshot();
     assert_eq!(snapshot.committed_native_device_fence(), 0);
     assert_eq!(snapshot.native_device_state(), Some(recovered_native_state));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "paired transports prove exact rollback of live DSP history and an active parameter transition"
+)]
+fn native_device_rollback_restores_live_history_and_the_committed_transition() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let chain = native_filter_chain(true);
+    let first_runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        core::slice::from_ref(&chain),
+        64,
+    )
+    .unwrap();
+    let control_runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        core::slice::from_ref(&chain),
+        64,
+    )
+    .unwrap();
+    let (_first_transport_sender, _first_mixer_sender, mut first_sender, mut first) =
+        PreparedPlaybackTransportRuntime::with_command_queues_and_native_device_commands(
+            first_runtime,
+        );
+    let (_control_transport_sender, _control_mixer_sender, mut control_sender, mut control) =
+        PreparedPlaybackTransportRuntime::with_command_queues_and_native_device_commands(
+            control_runtime,
+        );
+    let first_device = first_sender
+        .resolve_device(ARRANGEMENT_TRACK_ID, chain.devices()[0].id())
+        .unwrap();
+    let control_device = control_sender
+        .resolve_device(ARRANGEMENT_TRACK_ID, chain.devices()[0].id())
+        .unwrap();
+    first.apply_command(TransportCommand::Start).unwrap();
+    control.apply_command(TransportCommand::Start).unwrap();
+
+    let mut first_arrangement_left = [0.0_f32; 64];
+    let mut first_arrangement_right = [0.0_f32; 64];
+    let mut first_scene_left = [0.0_f32; 64];
+    let mut first_scene_right = [0.0_f32; 64];
+    let mut first_scratch = [
+        RenderScratchSlot::new(&mut first_arrangement_left, &mut first_arrangement_right),
+        RenderScratchSlot::new(&mut first_scene_left, &mut first_scene_right),
+    ];
+    let mut control_arrangement_left = [0.0_f32; 64];
+    let mut control_arrangement_right = [0.0_f32; 64];
+    let mut control_scene_left = [0.0_f32; 64];
+    let mut control_scene_right = [0.0_f32; 64];
+    let mut control_scratch = [
+        RenderScratchSlot::new(
+            &mut control_arrangement_left,
+            &mut control_arrangement_right,
+        ),
+        RenderScratchSlot::new(&mut control_scene_left, &mut control_scene_right),
+    ];
+    let mut first_left = [0.0_f32; 64];
+    let mut first_right = [0.0_f32; 64];
+    let mut control_left = [0.0_f32; 64];
+    let mut control_right = [0.0_f32; 64];
+
+    for _ in 0..2 {
+        first
+            .process_cycle(
+                &mut first_scratch,
+                StereoOutput {
+                    left: &mut first_left,
+                    right: &mut first_right,
+                },
+            )
+            .unwrap();
+        control
+            .process_cycle(
+                &mut control_scratch,
+                StereoOutput {
+                    left: &mut control_left,
+                    right: &mut control_right,
+                },
+            )
+            .unwrap();
+        assert_eq!(first_left.map(f32::to_bits), control_left.map(f32::to_bits));
+        assert_eq!(
+            first_right.map(f32::to_bits),
+            control_right.map(f32::to_bits)
+        );
+    }
+
+    let committed_state = NativeDeviceState::Filter(
+        NativeFilterState::try_new(NativeFilterMode::HighPass, 4_000_000, 1_500_000).unwrap(),
+    );
+    for (sender, device) in [
+        (&mut first_sender, first_device),
+        (&mut control_sender, control_device),
+    ] {
+        sender
+            .try_send(NativeDeviceCommand::SetState {
+                device,
+                state: committed_state,
+            })
+            .unwrap();
+    }
+    first
+        .process_cycle(
+            &mut first_scratch,
+            StereoOutput {
+                left: &mut first_left,
+                right: &mut first_right,
+            },
+        )
+        .unwrap();
+    control
+        .process_cycle(
+            &mut control_scratch,
+            StereoOutput {
+                left: &mut control_left,
+                right: &mut control_right,
+            },
+        )
+        .unwrap();
+    assert_eq!(first_left.map(f32::to_bits), control_left.map(f32::to_bits));
+    assert_eq!(
+        first_right.map(f32::to_bits),
+        control_right.map(f32::to_bits)
+    );
+
+    let rejected_state = NativeDeviceState::Filter(
+        NativeFilterState::try_new(NativeFilterMode::LowPass, 8_000_000, 500_000).unwrap(),
+    );
+    first_sender
+        .try_send(NativeDeviceCommand::SetState {
+            device: first_device,
+            state: rejected_state,
+        })
+        .unwrap();
+    assert_eq!(first_sender.try_send_fence().unwrap(), Some(1));
+    let mut incomplete_scratch = [];
+    let mut failed_left = [9.0_f32; 1];
+    let mut failed_right = [9.0_f32; 1];
+    assert!(matches!(
+        first.process_cycle(
+            &mut incomplete_scratch,
+            StereoOutput {
+                left: &mut failed_left,
+                right: &mut failed_right,
+            },
+        ),
+        Err(RuntimeProcessError::PlaybackRender(_))
+    ));
+    assert_eq!(first.state(), TransportState::Rolling);
+    assert_eq!(first_sender.committed_fence(), 0);
+    assert_eq!(
+        first.native_device_state().state(0, 0),
+        Some(committed_state)
+    );
+
+    let recovered = first
+        .process_cycle(
+            &mut first_scratch,
+            StereoOutput {
+                left: &mut first_left,
+                right: &mut first_right,
+            },
+        )
+        .unwrap();
+    control
+        .process_cycle(
+            &mut control_scratch,
+            StereoOutput {
+                left: &mut control_left,
+                right: &mut control_right,
+            },
+        )
+        .unwrap();
+    assert_eq!(recovered.applied_native_device_command_count(), 0);
+    assert_eq!(recovered.committed_native_device_fence(), 0);
+    assert_eq!(first_left.map(f32::to_bits), control_left.map(f32::to_bits));
+    assert_eq!(
+        first_right.map(f32::to_bits),
+        control_right.map(f32::to_bits)
+    );
 }
 
 #[test]

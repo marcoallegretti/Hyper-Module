@@ -18,8 +18,8 @@ use hyper_audio_engine::{
 };
 use hyper_media_cache::{PreparedPlayback, PreparedSceneAvailability, PreparedSchedule};
 use hyper_native_device::{
-    DeviceChain, MAX_DEVICES_PER_CHAIN, NativeDeviceChainProcessor, NativeDeviceCreationError,
-    NativeDeviceProcessError, NativeDeviceState, PROJECT_SAMPLE_RATE_HZ,
+    DeviceChain, MAX_DEVICES_PER_CHAIN, NativeDeviceChainCheckpoint, NativeDeviceChainProcessor,
+    NativeDeviceCreationError, NativeDeviceProcessError, NativeDeviceState, PROJECT_SAMPLE_RATE_HZ,
 };
 use hyper_playback_compiler::FrameTimelineError;
 use hyper_playback_compiler::scene::{SceneRuntimeCheckpoint, SceneRuntimeError};
@@ -1540,6 +1540,11 @@ pub struct NativeDeviceStateSnapshot {
     enabled: [[bool; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS],
     states: [[Option<NativeDeviceState>; MAX_DEVICES_PER_CHAIN]; MAX_MAIN_MIXER_SLOTS],
     device_counts: [usize; MAX_MAIN_MIXER_SLOTS],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeDeviceProcessCheckpoint {
+    chains: [Option<NativeDeviceChainCheckpoint>; MAX_MAIN_MIXER_SLOTS],
 }
 
 impl NativeDeviceStateSnapshot {
@@ -4118,6 +4123,37 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
         .expect("prepared native device chains stay within their declared bounds")
     }
 
+    fn capture_native_device_process_checkpoint(&self) -> NativeDeviceProcessCheckpoint {
+        let mut chains = [None; MAX_MAIN_MIXER_SLOTS];
+        for (checkpoint, slot) in chains.iter_mut().zip(&self.slots) {
+            if let Some(device) = &slot.device {
+                *checkpoint = Some(device.processor.checkpoint());
+            }
+        }
+        NativeDeviceProcessCheckpoint { chains }
+    }
+
+    fn restore_native_device_process_checkpoint(
+        &mut self,
+        checkpoint: &NativeDeviceProcessCheckpoint,
+    ) {
+        for (slot, checkpoint) in self.slots.iter_mut().zip(&checkpoint.chains) {
+            let Some(checkpoint) = checkpoint else {
+                debug_assert!(slot.device.is_none());
+                continue;
+            };
+            let device = slot
+                .device
+                .as_mut()
+                .expect("a native-device checkpoint retains its prepared chain");
+            let restored = device.processor.restore_checkpoint(checkpoint);
+            debug_assert!(
+                restored,
+                "a native-device checkpoint retains its prepared processor layout"
+            );
+        }
+    }
+
     fn restore_native_device_state(
         &mut self,
         state: &NativeDeviceStateSnapshot,
@@ -4142,18 +4178,20 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 .as_mut()
                 .expect("a matching native device count has a prepared chain");
             for device_index in 0..count {
+                let enabled_restored = processor
+                    .processor
+                    .set_device_enabled(device_index, state.enabled[slot_index][device_index]);
                 debug_assert!(
-                    processor
-                        .processor
-                        .set_device_enabled(device_index, state.enabled[slot_index][device_index]),
+                    enabled_restored,
                     "a matching native device state addresses a prepared device"
                 );
+                let device_state_restored = processor.processor.set_device_state(
+                    device_index,
+                    state.states[slot_index][device_index]
+                        .expect("a matching native device state retains every device kind"),
+                );
                 debug_assert!(
-                    processor.processor.set_device_state(
-                        device_index,
-                        state.states[slot_index][device_index]
-                            .expect("a matching native device state retains every device kind"),
-                    ),
+                    device_state_restored,
                     "a matching native device state retains each prepared device kind"
                 );
             }
@@ -5350,7 +5388,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         let committed_loop_enabled = self.loop_enabled;
         let committed_metronome = self.metronome.as_ref().map(Metronome::checkpoint);
         let committed_parameters = self.runtime.capture_parameter_state();
-        let committed_native_devices = self.runtime.capture_native_device_state();
+        let committed_native_devices = self.runtime.capture_native_device_process_checkpoint();
         let committed_renderer = self.runtime.renderer_checkpoint();
         let transport_command_drain = match self.drain_commands() {
             Ok(drain) => drain,
@@ -5368,7 +5406,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 self.runtime
                     .restore_parameter_state_unchecked(&committed_parameters);
                 self.runtime
-                    .restore_native_device_state_unchecked(&committed_native_devices);
+                    .restore_native_device_process_checkpoint(&committed_native_devices);
                 return Err(match source {
                     TransportCommandApplyError::Scene(source) => RuntimeProcessError::Scene(source),
                     source @ TransportCommandApplyError::MetronomeUnavailable { .. } => {
@@ -5442,7 +5480,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 self.runtime
                     .restore_parameter_state_unchecked(&committed_parameters);
                 self.runtime
-                    .restore_native_device_state_unchecked(&committed_native_devices);
+                    .restore_native_device_process_checkpoint(&committed_native_devices);
                 return Err(source);
             }
         };
