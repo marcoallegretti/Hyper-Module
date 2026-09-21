@@ -458,6 +458,12 @@ impl RuntimeScenePerformanceCaptureController {
         Arc::clone(&self.observation)
     }
 
+    /// Returns whether playback-owner replacement can occur without
+    /// abandoning an active or stopping capture.
+    pub(super) const fn is_idle(&self) -> bool {
+        self.active.is_none()
+    }
+
     /// Replaces the sole receiver after a fully stopped playback owner has
     /// published its replacement. Active and stopping captures retain their
     /// original receiver until they reach a terminal outcome.

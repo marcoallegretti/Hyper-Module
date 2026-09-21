@@ -175,6 +175,28 @@ impl SessionHost {
     fn take_input_meter_receiver(&mut self) -> Option<InputMeterReceiver> {
         self.session.take_monitoring_input_meter_receiver()
     }
+
+    /// Returns the first owner whose in-flight work prevents a playback-owner
+    /// transition. The caller must run this before native teardown because a
+    /// replacement session cannot complete any fence or capture owned by the
+    /// current playback generation.
+    fn recording_transition_blocker(&self) -> Option<&'static str> {
+        if self.session.has_panel() {
+            Some("an external panel is connected")
+        } else if !self.scene_performance.is_idle() {
+            Some("scene-performance capture is active or stopping")
+        } else if !self.automation_capture.is_idle() {
+            Some("automation capture is active or stopping")
+        } else if !self.mixer_update.is_idle() {
+            Some("a mixer-update export is pending")
+        } else if !self.native_device_update.is_idle() {
+            Some("a native-device update export is pending")
+        } else if !self.loop_update.is_idle() {
+            Some("a loop-update export is pending")
+        } else {
+            None
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -1357,16 +1379,22 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         loop_update: loop_update_observation,
         scene_performance: scene_performance_observation,
     };
+    let host = SessionHost {
+        session,
+        automation_capture,
+        mixer_update,
+        native_device_update,
+        loop_update,
+        scene_performance,
+        panel_connected,
+    };
+    if let Some(blocker) = host.recording_transition_blocker() {
+        return Err(format!(
+            "verified Runtime host unexpectedly started with a recording-transition blocker: {blocker}"
+        ));
+    }
     Ok(StartedRuntime {
-        host: SessionHost {
-            session,
-            automation_capture,
-            mixer_update,
-            native_device_update,
-            loop_update,
-            scene_performance,
-            panel_connected,
-        },
+        host,
         observers,
         native_device_chains,
         automation_targets,

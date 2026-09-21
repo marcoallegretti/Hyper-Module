@@ -339,6 +339,12 @@ impl RuntimeNativeDeviceUpdateController {
         Arc::clone(&self.observation)
     }
 
+    /// Returns whether playback-owner replacement can occur without losing a
+    /// requested native-device fence or its eventual publication outcome.
+    pub(super) const fn is_idle(&self) -> bool {
+        self.pending.is_none()
+    }
+
     /// Queues one explicit boundary after all earlier accepted native-device commands.
     ///
     /// The `chain_index` refers only to this controller's immutable startup

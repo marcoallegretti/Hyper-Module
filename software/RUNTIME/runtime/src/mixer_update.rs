@@ -271,6 +271,12 @@ impl RuntimeMixerUpdateController {
         Arc::clone(&self.observation)
     }
 
+    /// Returns whether playback-owner replacement can occur without losing a
+    /// requested mixer fence or its eventual publication outcome.
+    pub(super) const fn is_idle(&self) -> bool {
+        self.pending.is_none()
+    }
+
     /// Queues one explicit boundary after all earlier accepted mixer commands.
     ///
     /// It neither reads state nor creates a file. Publication is deferred until
