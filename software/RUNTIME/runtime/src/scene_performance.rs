@@ -161,8 +161,8 @@ impl RuntimeScenePerformanceCaptureConfiguration {
         } else {
             "Waiting for committed Runtime transport recovery".to_owned()
         };
-        RuntimeScenePerformanceCaptureController {
-            receiver,
+        let mut controller = RuntimeScenePerformanceCaptureController {
+            receiver: None,
             source: self.source,
             scenes: self.scenes,
             recordable_grid_scene_indices: self.recordable_grid_scene_indices,
@@ -175,7 +175,11 @@ impl RuntimeScenePerformanceCaptureConfiguration {
                 start_enabled: false,
                 stop_enabled: false,
             })),
-        }
+        };
+        controller
+            .rebind_receiver(receiver)
+            .expect("a newly constructed scene-performance controller has no active capture");
+        controller
     }
 }
 
@@ -436,7 +440,7 @@ pub(super) enum RuntimeScenePerformanceCapturePoll {
 /// timer observational: it never competes with audio transport ownership or
 /// consumes capture evidence.
 pub(super) struct RuntimeScenePerformanceCaptureController {
-    receiver: InteractiveSceneLaunchReceiver,
+    receiver: Option<InteractiveSceneLaunchReceiver>,
     source: RuntimeScenePerformanceSource,
     scenes: Vec<ScenePerformanceScene>,
     recordable_grid_scene_indices: Vec<usize>,
@@ -452,6 +456,36 @@ impl RuntimeScenePerformanceCaptureController {
     #[must_use]
     pub(super) fn observation(&self) -> Arc<Mutex<RuntimeScenePerformanceCaptureObservation>> {
         Arc::clone(&self.observation)
+    }
+
+    /// Replaces the sole receiver after a fully stopped playback owner has
+    /// published its replacement. Active and stopping captures retain their
+    /// original receiver until they reach a terminal outcome.
+    pub(super) fn rebind_receiver(
+        &mut self,
+        receiver: InteractiveSceneLaunchReceiver,
+    ) -> Result<(), RuntimeScenePerformanceCaptureError> {
+        if self.active.is_some() {
+            return Err(RuntimeScenePerformanceCaptureError::AlreadyCapturing);
+        }
+        self.receiver = Some(receiver);
+        self.last_status = None;
+        let mut observation = self
+            .observation
+            .lock()
+            .expect("Runtime scene-performance observation lock is not poisoned");
+        observation.state = if self.output_directory.is_none() {
+            "Capture unavailable: no external performance-update directory".to_owned()
+        } else if self.maximum_launch_count == 0 {
+            "Capture unavailable: arrangement scene-launch capacity is exhausted".to_owned()
+        } else if self.recordable_grid_scene_indices.is_empty() {
+            "Capture unavailable: no enabled grid-quantized scene".to_owned()
+        } else {
+            "Waiting for committed Runtime transport recovery".to_owned()
+        };
+        observation.start_enabled = false;
+        observation.stop_enabled = false;
+        Ok(())
     }
 
     /// Explicitly starts one bounded capture through the sole transport owner.
@@ -492,7 +526,7 @@ impl RuntimeScenePerformanceCaptureController {
         // History before the capture-start command belongs to no capture.
         // It is safe to discard overflow from that history, but a missing
         // producer cannot be made lossless by starting a new capture.
-        let discarded_history = self.receiver.drain(|_| {});
+        let discarded_history = self.receiver_mut().drain(|_| {});
         if discarded_history.sender_disconnected() {
             return Err(RuntimeScenePerformanceCaptureError::EventSourceDisconnected);
         }
@@ -532,22 +566,25 @@ impl RuntimeScenePerformanceCaptureController {
             // Keep this transferred receiver bounded even while capture is
             // unavailable or idle. Its stale events must never become part of
             // a later explicit capture.
-            let _ = self.receiver.drain(|_| {});
+            let _ = self.receiver_mut().drain(|_| {});
             self.refresh_observation(session);
             return None;
         }
         let recovery = session.capture_recovery();
         let (drain, mut observation_failure) = {
-            let active = self
-                .active
+            let (receiver, active) = (&mut self.receiver, &mut self.active);
+            let active = active
                 .as_mut()
                 .expect("active capture was checked before draining evidence");
             let mut observation_failure = None;
-            let drain = self.receiver.drain(|observation| {
-                if observation_failure.is_none() {
-                    observation_failure = active.observe(observation).err();
-                }
-            });
+            let drain = receiver
+                .as_mut()
+                .expect("an attached Runtime scene-performance controller retains one receiver")
+                .drain(|observation| {
+                    if observation_failure.is_none() {
+                        observation_failure = active.observe(observation).err();
+                    }
+                });
             (drain, observation_failure)
         };
         if drain.dropped_event_count() > 0 {
@@ -607,6 +644,12 @@ impl RuntimeScenePerformanceCaptureController {
                 RuntimeScenePerformanceCapturePoll::Failed(error)
             }
         })
+    }
+
+    fn receiver_mut(&mut self) -> &mut InteractiveSceneLaunchReceiver {
+        self.receiver
+            .as_mut()
+            .expect("an attached Runtime scene-performance controller retains one receiver")
     }
 
     fn queue_stop<S: RuntimeScenePerformanceSession>(
@@ -809,7 +852,7 @@ mod tests {
         let (publisher, receiver) = interactive_scene_launch_channel();
         (
             RuntimeScenePerformanceCaptureController {
-                receiver,
+                receiver: Some(receiver),
                 source: source(),
                 scenes: vec![scene(FIRST_SCENE_ID, true), scene(SECOND_SCENE_ID, false)],
                 recordable_grid_scene_indices: vec![0],
@@ -836,6 +879,41 @@ mod tests {
             .unwrap(),
             capture_start_sequence,
         )
+    }
+
+    #[test]
+    fn receiver_rebind_replaces_idle_history_and_refuses_active_capture() {
+        let (mut controller, original) = controller(None);
+        let (replacement, receiver) = interactive_scene_launch_channel();
+
+        controller.last_status = Some("previous owner published a capture".to_owned());
+        controller.rebind_receiver(receiver).unwrap();
+        assert_eq!(controller.last_status, None);
+        assert_eq!(
+            controller.observation.lock().unwrap().state,
+            "Capture unavailable: no external performance-update directory"
+        );
+        drop(original);
+        assert!(
+            !controller
+                .receiver_mut()
+                .drain(|_| {})
+                .sender_disconnected()
+        );
+        drop(replacement);
+        assert!(
+            controller
+                .receiver_mut()
+                .drain(|_| {})
+                .sender_disconnected()
+        );
+
+        let (_replacement, receiver) = interactive_scene_launch_channel();
+        controller.active = Some(active(5));
+        assert!(matches!(
+            controller.rebind_receiver(receiver),
+            Err(RuntimeScenePerformanceCaptureError::AlreadyCapturing)
+        ));
     }
 
     #[derive(Debug)]

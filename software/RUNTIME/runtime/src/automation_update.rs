@@ -227,8 +227,8 @@ impl RuntimeAutomationCaptureConfiguration {
             self.maximum_point_count,
             self.targets.len(),
         );
-        RuntimeAutomationCaptureController {
-            receiver,
+        let mut controller = RuntimeAutomationCaptureController {
+            receiver: None,
             receiver_disconnected: false,
             source: self.source,
             targets: self.targets,
@@ -243,7 +243,11 @@ impl RuntimeAutomationCaptureConfiguration {
                 start_enabled: false,
                 stop_enabled: false,
             })),
-        }
+        };
+        controller
+            .rebind_receiver(receiver)
+            .expect("a newly constructed automation controller has no active capture");
+        controller
     }
 }
 
@@ -843,7 +847,7 @@ pub(super) enum RuntimeAutomationCapturePoll {
 
 /// Runtime-side controller for an explicit one-target automation capture.
 pub(super) struct RuntimeAutomationCaptureController {
-    receiver: InteractiveMixerParameterReceiver,
+    receiver: Option<InteractiveMixerParameterReceiver>,
     receiver_disconnected: bool,
     source: RuntimeAutomationUpdateSource,
     targets: Vec<RuntimeAutomationTargetCatalogEntry>,
@@ -861,6 +865,34 @@ impl RuntimeAutomationCaptureController {
     #[must_use]
     pub(super) fn observation(&self) -> Arc<Mutex<RuntimeAutomationCaptureObservation>> {
         Arc::clone(&self.observation)
+    }
+
+    /// Replaces the sole receiver after a fully stopped playback owner has
+    /// published its replacement. Active and stopping captures retain their
+    /// original receiver until they reach a terminal outcome.
+    pub(super) fn rebind_receiver(
+        &mut self,
+        receiver: InteractiveMixerParameterReceiver,
+    ) -> Result<(), RuntimeAutomationCaptureError> {
+        if self.active.is_some() {
+            return Err(RuntimeAutomationCaptureError::AlreadyCapturing);
+        }
+        self.receiver = Some(receiver);
+        self.receiver_disconnected = false;
+        self.last_status = None;
+        let mut observation = self
+            .observation
+            .lock()
+            .expect("Runtime automation observation lock is not poisoned");
+        observation.state = initial_state(
+            self.output_directory.is_some(),
+            self.take_capacity_available,
+            self.maximum_point_count,
+            self.targets.len(),
+        );
+        observation.start_enabled = false;
+        observation.stop_enabled = false;
+        Ok(())
     }
 
     /// Explicitly starts one bounded capture through the sole transport owner.
@@ -911,7 +943,7 @@ impl RuntimeAutomationCaptureController {
         // History before capture-start belongs to no capture. Overflow in that
         // stale history is discardable; a disconnected source cannot supply a
         // lossless later capture and remains terminal.
-        let discarded_history = self.receiver.drain(|_| {});
+        let discarded_history = self.receiver_mut().drain(|_| {});
         if discarded_history.sender_disconnected() {
             self.receiver_disconnected = true;
             self.refresh_observation(session);
@@ -956,16 +988,19 @@ impl RuntimeAutomationCaptureController {
         }
         let recovery = session.automation_capture_recovery();
         let (drain, mut observation_failure) = {
-            let active = self
-                .active
+            let (receiver, active) = (&mut self.receiver, &mut self.active);
+            let active = active
                 .as_mut()
                 .expect("active capture was checked before draining evidence");
             let mut observation_failure = None;
-            let drain = self.receiver.drain(|observation| {
-                if observation_failure.is_none() {
-                    observation_failure = active.observe(observation).err();
-                }
-            });
+            let drain = receiver
+                .as_mut()
+                .expect("an attached Runtime automation controller retains one receiver")
+                .drain(|observation| {
+                    if observation_failure.is_none() {
+                        observation_failure = active.observe(observation).err();
+                    }
+                });
             (drain, observation_failure)
         };
         if drain.dropped_event_count() > 0 {
@@ -1028,10 +1063,16 @@ impl RuntimeAutomationCaptureController {
     }
 
     fn drain_idle_history(&mut self) {
-        let drain = self.receiver.drain(|_| {});
+        let drain = self.receiver_mut().drain(|_| {});
         if drain.sender_disconnected() {
             self.receiver_disconnected = true;
         }
+    }
+
+    fn receiver_mut(&mut self) -> &mut InteractiveMixerParameterReceiver {
+        self.receiver
+            .as_mut()
+            .expect("an attached Runtime automation controller retains one receiver")
     }
 
     fn queue_stop<S: RuntimeAutomationCaptureSession>(
@@ -1251,7 +1292,7 @@ mod tests {
         let (publisher, receiver) = interactive_mixer_parameter_channel();
         (
             RuntimeAutomationCaptureController {
-                receiver,
+                receiver: Some(receiver),
                 receiver_disconnected: false,
                 source: source(),
                 targets: vec![target()],
@@ -1280,6 +1321,41 @@ mod tests {
             sequence,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn receiver_rebind_replaces_idle_history_and_refuses_active_capture() {
+        let (mut controller, original) = controller(None, 3);
+        let (replacement, receiver) = interactive_mixer_parameter_channel();
+
+        controller.last_status = Some("previous owner published a take".to_owned());
+        controller.rebind_receiver(receiver).unwrap();
+        assert_eq!(controller.last_status, None);
+        assert_eq!(
+            controller.observation.lock().unwrap().state,
+            "Capture unavailable: no external automation-update directory"
+        );
+        drop(original);
+        assert!(
+            !controller
+                .receiver_mut()
+                .drain(|_| {})
+                .sender_disconnected()
+        );
+        drop(replacement);
+        assert!(
+            controller
+                .receiver_mut()
+                .drain(|_| {})
+                .sender_disconnected()
+        );
+
+        let (_replacement, receiver) = interactive_mixer_parameter_channel();
+        controller.active = Some(active(5));
+        assert!(matches!(
+            controller.rebind_receiver(receiver),
+            Err(RuntimeAutomationCaptureError::AlreadyCapturing)
+        ));
     }
 
     #[derive(Debug)]
