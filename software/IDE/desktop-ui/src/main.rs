@@ -19758,6 +19758,77 @@ mod tests {
     }
 
     #[test]
+    fn generated_recording_shortcut_uses_only_visible_owned_authority() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let starts = Rc::new(Cell::new(0_usize));
+        let starts_by_callback = Rc::clone(&starts);
+        ui.global::<IdeActions>().on_start_recording(move || {
+            starts_by_callback.set(starts_by_callback.get() + 1);
+        });
+        let stops = Rc::new(Cell::new(0_usize));
+        let stops_by_callback = Rc::clone(&stops);
+        ui.global::<IdeActions>().on_stop_recording(move || {
+            stops_by_callback.set(stops_by_callback.get() + 1);
+        });
+        ui.set_recording_target_names(ModelRc::from(Rc::new(VecModel::from(vec!["Audio".into()]))));
+        ui.set_selected_recording_target_index(0);
+        ui.set_monitoring_active(true);
+        ui.set_app_mode(AppMode::Running);
+        ui.show().unwrap();
+
+        dispatch_ide_special_key(&ui, "r".into(), false, false, false, false, false);
+        dispatch_ide_shortcut(&ui, "r", false, true);
+        dispatch_ide_shortcut(&ui, "R", true, false);
+        dispatch_ide_shortcut_with_modifiers(&ui, "r", false, true, false, false);
+        dispatch_ide_shortcut_with_modifiers(&ui, "r", false, false, true, false);
+        assert_eq!(starts.get(), 0);
+        assert_eq!(stops.get(), 0);
+
+        dispatch_ide_shortcut(&ui, "r", false, false);
+        assert_eq!(starts.get(), 1);
+        assert_eq!(stops.get(), 0);
+
+        ui.set_selected_recording_target_index(-1);
+        dispatch_ide_shortcut(&ui, "r", false, false);
+        ui.set_selected_recording_target_index(1);
+        dispatch_ide_shortcut(&ui, "r", false, false);
+        ui.set_selected_recording_target_index(0);
+        ui.set_monitoring_active(false);
+        dispatch_ide_shortcut(&ui, "r", false, false);
+        assert_eq!(starts.get(), 1, "revoked start authority remains inert");
+
+        ui.set_monitoring_active(true);
+        ui.set_new_track_visible(true);
+        dispatch_ide_shortcut(&ui, "r", false, false);
+        ui.set_new_track_visible(false);
+        ui.set_takes_visible(true);
+        dispatch_ide_shortcut(&ui, "r", false, false);
+        ui.set_takes_visible(false);
+        assert_eq!(
+            starts.get(),
+            1,
+            "local forms and other workspaces cannot start hidden recording"
+        );
+
+        ui.set_app_mode(AppMode::PreparingRecording);
+        dispatch_ide_shortcut(&ui, "r", false, false);
+        assert_eq!(starts.get(), 1);
+        assert_eq!(stops.get(), 0);
+
+        ui.set_app_mode(AppMode::Recording);
+        ui.set_monitoring_active(false);
+        dispatch_ide_shortcut(&ui, "R", false, false);
+        assert_eq!(starts.get(), 1);
+        assert_eq!(
+            stops.get(),
+            1,
+            "active recording retains stop authority after monitoring changes"
+        );
+        ui.hide().unwrap();
+    }
+
+    #[test]
     fn generated_shortcut_help_is_modal_and_dismissible() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();
@@ -19783,6 +19854,7 @@ mod tests {
             "Ctrl+I: Import audio in Clips",
             "Ctrl+E: Export project mix",
             "Ctrl+W: Close project",
+            "Ctrl+R: Start or stop recording",
             "Ctrl+Z: Undo last project edit",
             "Ctrl+Shift+Z / Ctrl+Y: Redo project edit",
             "Space: Start or stop transport",

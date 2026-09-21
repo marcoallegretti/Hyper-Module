@@ -295,6 +295,60 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
 }
 
 #[test]
+fn generated_recording_shortcut_uses_only_committed_authority() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = OperatorWindow::new().unwrap();
+    let intents = Rc::new(RefCell::new(Vec::<Option<i32>>::new()));
+    let start_intents = Rc::clone(&intents);
+    ui.on_start_recording_requested(move |target| {
+        start_intents.borrow_mut().push(Some(target));
+    });
+    let stop_intents = Rc::clone(&intents);
+    ui.on_stop_recording_requested(move || {
+        stop_intents.borrow_mut().push(None);
+    });
+    ui.set_recording_target_names(ModelRc::from(Rc::new(VecModel::from(vec!["Audio".into()]))));
+    ui.set_selected_recording_target_index(0);
+    ui.show().unwrap();
+
+    dispatch_operator_key(&ui, "r".into(), false, false, false, false, false);
+    ui.set_recording_start_enabled(true);
+    dispatch_operator_key(&ui, "r".into(), true, false, false, false, true);
+    dispatch_operator_key(&ui, "R".into(), true, true, false, false, false);
+    dispatch_operator_key(&ui, "r".into(), true, false, true, false, false);
+    dispatch_operator_key(&ui, "r".into(), true, false, false, true, false);
+    assert!(intents.borrow().is_empty());
+
+    dispatch_operator_key(&ui, "r".into(), true, false, false, false, false);
+    assert_eq!(intents.borrow().as_slice(), [Some(0)]);
+
+    ui.set_selected_recording_target_index(-1);
+    dispatch_operator_key(&ui, "r".into(), true, false, false, false, false);
+    ui.set_selected_recording_target_index(1);
+    dispatch_operator_key(&ui, "r".into(), true, false, false, false, false);
+    assert_eq!(
+        intents.borrow().as_slice(),
+        [Some(0)],
+        "a stale target cannot start recording"
+    );
+
+    ui.set_selected_recording_target_index(0);
+    ui.set_recording_stop_enabled(true);
+    dispatch_operator_key(&ui, "R".into(), true, false, false, false, false);
+    assert_eq!(
+        intents.borrow().as_slice(),
+        [Some(0), None],
+        "committed stop authority takes precedence"
+    );
+
+    ui.set_recording_start_enabled(false);
+    ui.set_recording_stop_enabled(false);
+    dispatch_operator_key(&ui, "r".into(), true, false, false, false, false);
+    assert_eq!(intents.borrow().as_slice(), [Some(0), None]);
+    ui.hide().unwrap();
+}
+
+#[test]
 fn generated_shortcut_help_is_modal_and_dismissible() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = OperatorWindow::new().unwrap();
@@ -312,6 +366,7 @@ fn generated_shortcut_help_is_modal_and_dismissible() {
         "Space: Start or stop transport",
         "Home: Return transport to start",
         "End: Seek exact playback end",
+        "Ctrl+R: Start or stop recording",
         "Up / Down: Select previous or next ready scene",
         "Return: Launch selected ready scene",
         "Shift+Space: Stop interactive scenes",

@@ -819,6 +819,21 @@ export component OperatorWindow inherits Window {
                 }
                 return accept;
             }
+            if event.modifiers.control
+                && !event.modifiers.shift
+                && !event.modifiers.alt
+                && !event.modifiers.meta
+                && !event.repeat
+                && (event.text == "r" || event.text == "R") {
+                if root.recording-stop-enabled {
+                    root.stop-recording-requested();
+                } else if root.recording-start-enabled
+                    && root.selected-recording-target-index >= 0
+                    && root.selected-recording-target-index < root.recording-target-names.length {
+                    root.start-recording-requested(root.selected-recording-target-index);
+                }
+                return accept;
+            }
             if event.text == Key.UpArrow {
                 if !event.modifiers.control
                     && !event.modifiers.shift
@@ -1663,7 +1678,7 @@ export component OperatorWindow inherits Window {
 
             Rectangle {
                 width: 620px;
-                height: 390px;
+                height: 430px;
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
                 background: #151a24;
@@ -1708,6 +1723,7 @@ export component OperatorWindow inherits Window {
                             ShortcutReferenceRow { chord: "Space"; action: "Start or stop transport"; }
                             ShortcutReferenceRow { chord: "Home"; action: "Return transport to start"; }
                             ShortcutReferenceRow { chord: "End"; action: "Seek exact playback end"; }
+                            ShortcutReferenceRow { chord: "Ctrl+R"; action: "Start or stop recording"; }
                             ShortcutReferenceRow { chord: "Up / Down"; action: "Select previous or next ready scene"; }
                             ShortcutReferenceRow { chord: "Return"; action: "Launch selected ready scene"; }
                             ShortcutReferenceRow { chord: "Shift+Space"; action: "Stop interactive scenes"; }
