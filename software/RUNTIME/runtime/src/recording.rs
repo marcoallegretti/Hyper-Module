@@ -449,6 +449,33 @@ mod tests {
         }
     }
 
+    fn assert_duplicate_publication_refused(
+        configuration: &super::RuntimeRecordingConfiguration,
+        update_id: String,
+        finalized: &FinalizedRecordingMetadata,
+        update_path: &Path,
+        output_path: &Path,
+    ) {
+        let published_bytes = fs::read(update_path).unwrap();
+        let duplicate = match configuration.publish(update_id, finalized) {
+            Err(super::RuntimeRecordingError::Update(duplicate)) => duplicate,
+            Err(error) => panic!("duplicate Runtime update was misclassified: {error}"),
+            Ok(_) => panic!("a duplicate Runtime update identity must not be published"),
+        };
+        assert_eq!(
+            duplicate.kind(),
+            RuntimeRecordingUpdateErrorKind::PublicationConflict
+        );
+        assert_eq!(fs::read(update_path).unwrap(), published_bytes);
+        assert!(fs::read_dir(output_path).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".pending")
+        }));
+    }
+
     #[test]
     fn recording_paths_are_direct_children_with_distinct_suffixes() {
         let root = Path::new("C:/recordings");
@@ -652,6 +679,14 @@ mod tests {
         );
         assert_eq!(update.handoff().metadata().track_id(), track_id);
         assert_eq!(update.handoff().metadata().frame_count(), 3);
+
+        assert_duplicate_publication_refused(
+            &configuration,
+            update_id,
+            &finalized,
+            &update_path,
+            &output_path,
+        );
         prepared.package().confirm_unchanged().unwrap();
     }
 
