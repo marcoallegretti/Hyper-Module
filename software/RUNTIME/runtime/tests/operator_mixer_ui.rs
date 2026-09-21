@@ -76,6 +76,14 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
         },
     );
     assert_eq!(*toggles.borrow(), 1);
+    dispatch_operator_key(&ui, Key::Space.into(), true, false, false, false, false);
+    dispatch_operator_key(&ui, Key::Space.into(), false, false, true, false, false);
+    dispatch_operator_key(&ui, Key::Space.into(), false, false, false, true, false);
+    assert_eq!(
+        *toggles.borrow(),
+        1,
+        "modified Space chords must not toggle transport"
+    );
 
     let scene_stops = Rc::new(RefCell::new(0_usize));
     let scene_stop_requested = Rc::clone(&scene_stops);
@@ -85,12 +93,19 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
     ui.set_stop_interactive_scenes_enabled(true);
     dispatch_shift_space(&ui, false);
     dispatch_shift_space(&ui, true);
+    dispatch_operator_key(&ui, Key::Space.into(), true, true, false, false, false);
+    dispatch_operator_key(&ui, Key::Space.into(), false, true, true, false, false);
+    dispatch_operator_key(&ui, Key::Space.into(), false, true, false, true, false);
     assert_eq!(
         *toggles.borrow(),
         1,
         "Shift+Space must not toggle transport"
     );
-    assert_eq!(*scene_stops.borrow(), 1);
+    assert_eq!(
+        *scene_stops.borrow(),
+        1,
+        "only exact Shift+Space may stop interactive scenes"
+    );
 
     ui.set_stop_interactive_scenes_enabled(false);
     dispatch_shift_space(&ui, false);
@@ -169,8 +184,15 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
     );
     assert_eq!(seek_intents.borrow().as_slice(), [100.0_f32.to_bits()]);
 
-    dispatch_shift_key(&ui, Key::Home.into());
-    dispatch_shift_key(&ui, Key::End.into());
+    for (control, shift, alt, meta) in [
+        (true, false, false, false),
+        (false, true, false, false),
+        (false, false, true, false),
+        (false, false, false, true),
+    ] {
+        dispatch_operator_key(&ui, Key::Home.into(), control, shift, alt, meta, false);
+        dispatch_operator_key(&ui, Key::End.into(), control, shift, alt, meta, false);
+    }
     assert_eq!(*returns.borrow(), 1);
     assert_eq!(seek_intents.borrow().as_slice(), [100.0_f32.to_bits()]);
 
@@ -383,6 +405,8 @@ fn generated_scene_selection_uses_keyboard_and_accessible_tiles() {
     );
     assert_eq!(*moved.borrow(), [-1, 1]);
     assert_eq!(*launched.borrow(), 1);
+
+    assert_modified_scene_shortcuts_are_inert(&ui, &moved, &launched);
 
     ui.set_scene_selection_enabled(false);
     dispatch_key(
@@ -828,53 +852,88 @@ fn dispatch_key(ui: &OperatorWindow, event: WindowEvent) {
 }
 
 fn dispatch_shift_space(ui: &OperatorWindow, repeated: bool) {
-    dispatch_key(
-        ui,
-        WindowEvent::KeyPressed {
-            text: Key::Shift.into(),
-        },
+    dispatch_operator_key(ui, Key::Space.into(), false, true, false, false, repeated);
+}
+
+fn assert_modified_scene_shortcuts_are_inert(
+    ui: &OperatorWindow,
+    moved: &Rc<RefCell<Vec<i32>>>,
+    launched: &Rc<RefCell<usize>>,
+) {
+    for (control, shift, alt, meta) in [
+        (true, false, false, false),
+        (false, true, false, false),
+        (false, false, true, false),
+        (false, false, false, true),
+    ] {
+        dispatch_operator_key(ui, Key::UpArrow.into(), control, shift, alt, meta, false);
+        dispatch_operator_key(ui, Key::DownArrow.into(), control, shift, alt, meta, true);
+        dispatch_operator_key(ui, Key::Return.into(), control, shift, alt, meta, false);
+    }
+    assert_eq!(
+        *moved.borrow(),
+        [-1, 1],
+        "modified arrows must not move Runtime scene selection"
     );
-    dispatch_key(
-        ui,
-        if repeated {
-            WindowEvent::KeyPressRepeated {
-                text: Key::Space.into(),
-            }
-        } else {
-            WindowEvent::KeyPressed {
-                text: Key::Space.into(),
-            }
-        },
-    );
-    dispatch_key(
-        ui,
-        WindowEvent::KeyReleased {
-            text: Key::Space.into(),
-        },
-    );
-    dispatch_key(
-        ui,
-        WindowEvent::KeyReleased {
-            text: Key::Shift.into(),
-        },
+    assert_eq!(
+        *launched.borrow(),
+        1,
+        "modified Return must not launch a Runtime scene"
     );
 }
 
-fn dispatch_shift_key(ui: &OperatorWindow, key: slint::SharedString) {
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "the test mirrors independently dispatched keyboard modifier state"
+)]
+fn dispatch_operator_key(
+    ui: &OperatorWindow,
+    key: slint::SharedString,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    meta: bool,
+    repeated: bool,
+) {
+    for (active, modifier) in [
+        (control, Key::Control),
+        (shift, Key::Shift),
+        (alt, Key::Alt),
+        (meta, Key::Meta),
+    ] {
+        if active {
+            dispatch_key(
+                ui,
+                WindowEvent::KeyPressed {
+                    text: modifier.into(),
+                },
+            );
+        }
+    }
     dispatch_key(
         ui,
-        WindowEvent::KeyPressed {
-            text: Key::Shift.into(),
+        if repeated {
+            WindowEvent::KeyPressRepeated { text: key.clone() }
+        } else {
+            WindowEvent::KeyPressed { text: key.clone() }
         },
     );
-    dispatch_key(ui, WindowEvent::KeyPressed { text: key.clone() });
     dispatch_key(ui, WindowEvent::KeyReleased { text: key });
-    dispatch_key(
-        ui,
-        WindowEvent::KeyReleased {
-            text: Key::Shift.into(),
-        },
-    );
+    for (active, modifier) in [
+        (meta, Key::Meta),
+        (alt, Key::Alt),
+        (shift, Key::Shift),
+        (control, Key::Control),
+    ] {
+        if active {
+            dispatch_key(
+                ui,
+                WindowEvent::KeyReleased {
+                    text: modifier.into(),
+                },
+            );
+        }
+    }
 }
 
 fn drag_to_right_edge(element: &ElementHandle) {

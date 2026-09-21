@@ -1145,7 +1145,12 @@ export component MainWindow inherits Window {
         height: parent.height;
 
         capture-key-pressed(event) => {
-            if !event.repeat && event.text == Key.Escape {
+            if !event.repeat
+                && !event.modifiers.control
+                && !event.modifiers.shift
+                && !event.modifiers.alt
+                && !event.modifiers.meta
+                && event.text == Key.Escape {
                 if root.new-project-visible && root.app-mode == AppMode.closed {
                     root.new-project-visible = false;
                     return accept;
@@ -1201,7 +1206,11 @@ export component MainWindow inherits Window {
                 }
                 return accept;
             }
-            if event.modifiers.control && !event.repeat && (event.text == "z" || event.text == "Z") {
+            if event.modifiers.control
+                && !event.modifiers.alt
+                && !event.modifiers.meta
+                && !event.repeat
+                && (event.text == "z" || event.text == "Z") {
                 if event.modifiers.shift {
                     if root.redo-available {
                         IdeActions.redo-edit();
@@ -1211,13 +1220,23 @@ export component MainWindow inherits Window {
                 }
                 return accept;
             }
-            if event.modifiers.control && !event.repeat && (event.text == "y" || event.text == "Y") {
+            if event.modifiers.control
+                && !event.modifiers.shift
+                && !event.modifiers.alt
+                && !event.modifiers.meta
+                && !event.repeat
+                && (event.text == "y" || event.text == "Y") {
                 if root.redo-available {
                     IdeActions.redo-edit();
                 }
                 return accept;
             }
-            if event.modifiers.control && !event.modifiers.shift && !event.repeat && (event.text == "s" || event.text == "S") {
+            if event.modifiers.control
+                && !event.modifiers.shift
+                && !event.modifiers.alt
+                && !event.modifiers.meta
+                && !event.repeat
+                && (event.text == "s" || event.text == "S") {
                 if root.app-mode == AppMode.running && root.mixer-main-state-available {
                     IdeActions.save-project();
                 }
@@ -1243,13 +1262,23 @@ export component MainWindow inherits Window {
                 }
                 return accept;
             }
-            if event.modifiers.control && !event.modifiers.shift && !event.repeat && (event.text == "o" || event.text == "O") {
+            if event.modifiers.control
+                && !event.modifiers.shift
+                && !event.modifiers.alt
+                && !event.modifiers.meta
+                && !event.repeat
+                && (event.text == "o" || event.text == "O") {
                 if root.app-mode == AppMode.closed && !root.new-project-visible && !root.new-track-visible {
                     IdeActions.choose-project();
                 }
                 return accept;
             }
-            if event.modifiers.control && !event.modifiers.shift && !event.repeat && (event.text == "t" || event.text == "T") {
+            if event.modifiers.control
+                && !event.modifiers.shift
+                && !event.modifiers.alt
+                && !event.modifiers.meta
+                && !event.repeat
+                && (event.text == "t" || event.text == "T") {
                 if root.app-mode == AppMode.running && root.track-count < 8 && !root.new-project-visible && !root.new-track-visible {
                     root.new-track-visible = true;
                 }

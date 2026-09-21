@@ -18639,9 +18639,16 @@ mod tests {
         dispatch_ide_shortcut(ui, "Z", true, false);
         dispatch_ide_shortcut(ui, "y", false, false);
         dispatch_ide_shortcut(ui, "z", false, true);
+        dispatch_ide_shortcut_with_modifiers(ui, "z", false, true, false, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "z", false, false, true, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "Z", true, true, false, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "Z", true, false, true, false);
+        dispatch_ide_shortcut(ui, "y", true, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "y", false, true, false, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "y", false, false, true, false);
         assert_restore_shortcut_commands(
             &submitted,
-            "the root maps only one non-repeating primary shortcut to each existing action",
+            "the root maps only one exact non-repeating primary chord to each existing action",
         );
 
         ui.set_app_mode(AppMode::RestoringEdit);
@@ -18683,6 +18690,8 @@ mod tests {
         dispatch_ide_shortcut(ui, "s", false, false);
         dispatch_ide_shortcut(ui, "s", false, true);
         dispatch_ide_shortcut(ui, "S", true, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "s", false, true, false, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "s", false, false, true, false);
         assert!(
             matches!(
                 submitted.borrow().as_slice(),
@@ -19153,10 +19162,12 @@ mod tests {
 
         dispatch_ide_shortcut(ui, "o", false, true);
         dispatch_ide_shortcut(ui, "O", true, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "o", false, true, false, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "o", false, false, true, false);
         assert_eq!(
             opened.get(),
             1,
-            "repeat and Shift must not reopen the picker"
+            "repeat and unassigned modifiers must not reopen the picker"
         );
 
         ui.set_app_mode(AppMode::Running);
@@ -19195,9 +19206,11 @@ mod tests {
         ui.set_new_track_visible(false);
         dispatch_ide_shortcut(ui, "t", false, true);
         dispatch_ide_shortcut(ui, "T", true, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "t", false, true, false, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "t", false, false, true, false);
         assert!(
             !ui.get_new_track_visible(),
-            "repeated and shifted add-track chords remain reserved rather than reopening a form"
+            "repeated and modified add-track chords remain reserved rather than reopening a form"
         );
 
         ui.set_track_count(8);
@@ -20642,6 +20655,18 @@ mod tests {
         ui.set_app_mode(AppMode::Closed);
         ui.set_new_project_visible(true);
         ui.set_new_track_visible(false);
+        for (control, shift, alt, meta) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            dispatch_ide_special_key(ui, Key::Escape.into(), control, shift, alt, meta, false);
+        }
+        assert!(
+            ui.get_new_project_visible(),
+            "modified Escape chords remain reserved while the local form is open"
+        );
         dispatch_ide_escape(ui, false);
         assert!(
             !ui.get_new_project_visible(),

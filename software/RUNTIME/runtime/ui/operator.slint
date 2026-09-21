@@ -747,12 +747,17 @@ export component OperatorWindow inherits Window {
 
         key-pressed(event) => {
             if event.text == Key.Space {
-                if event.modifiers.shift {
-                    if !event.repeat && root.stop-interactive-scenes-enabled {
-                        root.stop-interactive-scenes-requested();
+                if !event.repeat
+                    && !event.modifiers.control
+                    && !event.modifiers.alt
+                    && !event.modifiers.meta {
+                    if event.modifiers.shift {
+                        if root.stop-interactive-scenes-enabled {
+                            root.stop-interactive-scenes-requested();
+                        }
+                    } else if root.transport-start-enabled || root.transport-stop-enabled {
+                        root.toggle-transport-requested();
                     }
-                } else if !event.repeat && (root.transport-start-enabled || root.transport-stop-enabled) {
-                    root.toggle-transport-requested();
                 }
                 return accept;
             }
@@ -779,19 +784,32 @@ export component OperatorWindow inherits Window {
                 return accept;
             }
             if event.text == Key.UpArrow {
-                if root.scene-selection-enabled {
+                if !event.modifiers.control
+                    && !event.modifiers.shift
+                    && !event.modifiers.alt
+                    && !event.modifiers.meta
+                    && root.scene-selection-enabled {
                     root.move-scene-selection-requested(-1);
                 }
                 return accept;
             }
             if event.text == Key.DownArrow {
-                if root.scene-selection-enabled {
+                if !event.modifiers.control
+                    && !event.modifiers.shift
+                    && !event.modifiers.alt
+                    && !event.modifiers.meta
+                    && root.scene-selection-enabled {
                     root.move-scene-selection-requested(1);
                 }
                 return accept;
             }
             if event.text == Key.Return {
-                if !event.repeat && root.scene-selection-enabled {
+                if !event.repeat
+                    && !event.modifiers.control
+                    && !event.modifiers.shift
+                    && !event.modifiers.alt
+                    && !event.modifiers.meta
+                    && root.scene-selection-enabled {
                     root.launch-selected-scene-requested();
                 }
                 return accept;
