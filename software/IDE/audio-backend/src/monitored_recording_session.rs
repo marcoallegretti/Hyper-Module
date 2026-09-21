@@ -1,6 +1,6 @@
 use super::monitoring_session::{MonitoringCounters, try_monitoring_transport};
 use super::recording_session::{
-    RecordingCoreStartError, RecordingSessionCore, start_recording_core,
+    MonitoredRecordingProducer, RecordingCoreStartError, RecordingSessionCore, start_recording_core,
 };
 use super::{
     CaptureStreamCounters, DesktopFinalizedRecording, DesktopInputStartError,
@@ -24,9 +24,7 @@ use super::{
 use core::error::Error;
 use core::fmt;
 use hyper_recording_metadata::{RecordingMetadataBuildError, RecordingMetadataContext};
-use hyper_recording_transport::{
-    RecordingProducer, RecordingPushError, RecordingTransportBuildError, RecordingTransportSnapshot,
-};
+use hyper_recording_transport::{RecordingTransportBuildError, RecordingTransportSnapshot};
 use hyper_recording_worker::{RecordingWorkerCompletion, RecordingWorkerStartError};
 use std::path::{Path, PathBuf};
 
@@ -145,19 +143,6 @@ pub type DesktopMonitoredFinalizedRecording =
     DesktopMonitoredRecordingOutcome<DesktopFinalizedRecording>;
 pub type DesktopMonitoredRecordingAbort =
     DesktopMonitoredRecordingOutcome<RecordingWorkerCompletion>;
-
-struct MonitoredRecordingProducer {
-    recording: RecordingProducer,
-    monitoring: super::monitoring_session::MonitoringProducer,
-}
-
-impl MonitoredRecordingProducer {
-    fn push(&mut self, samples: &[f32]) -> Result<(), RecordingPushError> {
-        self.recording.push(samples)?;
-        self.monitoring.push(samples);
-        Ok(())
-    }
-}
 
 #[derive(Debug)]
 pub enum DesktopMonitoredRecordingStartError {
@@ -450,10 +435,7 @@ impl DesktopMonitoredRecordingSession {
                     DesktopMonitoredRecordingStartError::RecordingWriter(source)
                 }
             })?;
-        let mut producer = MonitoredRecordingProducer {
-            recording: recording_producer,
-            monitoring: monitoring_producer,
-        };
+        let mut producer = MonitoredRecordingProducer::new(recording_producer, monitoring_producer);
         let input = match NativeInputStream::start(native_input, move |samples: &[f32]| {
             producer.push(samples)
         }) {
@@ -682,7 +664,7 @@ mod tests {
     use super::*;
     use crate::DesktopMonitoringControlError;
     use hyper_recording_journal::JournalConfig;
-    use hyper_recording_transport::try_recording_transport;
+    use hyper_recording_transport::{RecordingPushError, try_recording_transport};
     use hyper_recording_worker::RecordingWorkerConfig;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -785,10 +767,7 @@ mod tests {
         let (recording, _recording_consumer) = try_recording_transport(2).unwrap();
         let (monitoring, _monitoring_consumer, counters, _control, mut meter) =
             try_monitoring_transport(config.monitoring()).unwrap();
-        let mut producer = MonitoredRecordingProducer {
-            recording,
-            monitoring,
-        };
+        let mut producer = MonitoredRecordingProducer::new(recording, monitoring);
         let samples = [0.25; 4];
 
         producer.push(&samples).unwrap();
@@ -819,10 +798,7 @@ mod tests {
         let (recording, _recording_consumer) = try_recording_transport(256).unwrap();
         let (monitoring, _monitoring_consumer, _counters, _control, _meter) =
             try_monitoring_transport(config.monitoring()).unwrap();
-        let mut producer = MonitoredRecordingProducer {
-            recording,
-            monitoring,
-        };
+        let mut producer = MonitoredRecordingProducer::new(recording, monitoring);
         let samples = [0.25; 128];
         let measurement = HeapMeasurement::start_verified();
 

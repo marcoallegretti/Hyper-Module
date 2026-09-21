@@ -12,8 +12,8 @@ use hyper_recording_metadata::{
     FinalizedRecordingMetadata, RecordingMetadataBuildError, RecordingMetadataContext,
 };
 use hyper_recording_transport::{
-    RecordingProducer, RecordingTransportBuildError, RecordingTransportCounters,
-    RecordingTransportSnapshot, try_recording_transport,
+    RecordingProducer, RecordingPushError, RecordingTransportBuildError,
+    RecordingTransportCounters, RecordingTransportSnapshot, try_recording_transport,
 };
 use hyper_recording_worker::{
     RecordingDispositionError, RecordingWorker, RecordingWorkerCompletion, RecordingWorkerConfig,
@@ -445,6 +445,35 @@ pub(crate) struct RecordingSessionCore {
     journal_path: PathBuf,
     completion_timeout: Duration,
     transport_counters: RecordingTransportCounters,
+}
+
+/// One input callback fan-out with lossless recording as the first consumer.
+///
+/// Monitoring is intentionally best-effort, while recording must surface every
+/// transport refusal to the native input owner before it can claim a finalized
+/// take. Keeping this ordering in the shared recording module lets every
+/// playback owner use the same one-input authority.
+pub(crate) struct MonitoredRecordingProducer {
+    recording: RecordingProducer,
+    monitoring: super::monitoring_session::MonitoringProducer,
+}
+
+impl MonitoredRecordingProducer {
+    pub(crate) const fn new(
+        recording: RecordingProducer,
+        monitoring: super::monitoring_session::MonitoringProducer,
+    ) -> Self {
+        Self {
+            recording,
+            monitoring,
+        }
+    }
+
+    pub(crate) fn push(&mut self, samples: &[f32]) -> Result<(), RecordingPushError> {
+        self.recording.push(samples)?;
+        self.monitoring.push(samples);
+        Ok(())
+    }
 }
 
 pub(crate) enum RecordingCoreStartError {
