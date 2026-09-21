@@ -964,6 +964,7 @@ fn arguments_name_a_deployment_target_and_optionally_a_panel_address() {
     );
     assert_eq!(parsed.panel_listen(), None);
     assert_eq!(parsed.performance_updates(), None);
+    assert_eq!(parsed.recording_updates(), None);
     assert_eq!(parsed.audio_output(), None);
     assert!(!parsed.operator_ui());
 
@@ -972,6 +973,8 @@ fn arguments_name_a_deployment_target_and_optionally_a_panel_address() {
         "127.0.0.1:9000".to_owned(),
         "--performance-updates".to_owned(),
         "/performances/demo".to_owned(),
+        "--recording-updates".to_owned(),
+        "/recordings/demo".to_owned(),
         "--audio-output".to_owned(),
         "studio-right".to_owned(),
         "--operator-ui".to_owned(),
@@ -990,6 +993,10 @@ fn arguments_name_a_deployment_target_and_optionally_a_panel_address() {
         parsed.performance_updates(),
         Some(std::path::Path::new("/performances/demo"))
     );
+    assert_eq!(
+        parsed.recording_updates(),
+        Some(std::path::Path::new("/recordings/demo"))
+    );
     assert_eq!(parsed.audio_output(), Some("studio-right"));
     assert!(parsed.operator_ui());
 }
@@ -1007,6 +1014,10 @@ fn a_malformed_argument_list_is_reported_rather_than_assumed() {
     assert_eq!(
         RuntimeArguments::parse(["--performance-updates".to_owned()]),
         Err(ArgumentError::MissingValue("--performance-updates"))
+    );
+    assert_eq!(
+        RuntimeArguments::parse(["--recording-updates".to_owned()]),
+        Err(ArgumentError::MissingValue("--recording-updates"))
     );
     assert_eq!(
         RuntimeArguments::parse(["--audio-output".to_owned()]),

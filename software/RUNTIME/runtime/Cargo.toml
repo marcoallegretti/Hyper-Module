@@ -25,6 +25,9 @@ hyper-playback-json = { path = "../../../crates/playback-json" }
 hyper-playback-session = { path = "../../../crates/playback-session" }
 hyper-project-loader = { path = "../../../crates/project-loader" }
 hyper-project-model = { path = "../../../crates/project-model" }
+hyper-recording-journal = { path = "../../../crates/recording-journal" }
+hyper-recording-metadata = { path = "../../../crates/recording-metadata" }
+hyper-recording-worker = { path = "../../../crates/recording-worker" }
 hyper-runtime-deployment = { path = "../deployment" }
 hyper-runtime-host = { path = "../runtime-host" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
@@ -35,6 +38,8 @@ hyper-runtime-loop-update = { path = "../../../crates/runtime-loop-update" }
 hyper-scene-performance = { path = "../../../crates/scene-performance" }
 hyper-storage-engine = { path = "../../../crates/storage-engine" }
 hyper-runtime-native-device-update = { path = "../../../crates/runtime-native-device-update" }
+hyper-runtime-recording-update = { path = "../../../crates/runtime-recording-update" }
+chrono = "=0.4.45"
 slint = { version = "=1.17.1", default-features = false, features = [
     "accessibility",
     "backend-winit",

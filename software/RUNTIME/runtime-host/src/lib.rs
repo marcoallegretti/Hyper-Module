@@ -81,6 +81,7 @@ pub struct RuntimeArguments {
     deployment_root: PathBuf,
     panel_listen: Option<SocketAddr>,
     performance_updates: Option<PathBuf>,
+    recording_updates: Option<PathBuf>,
     automation_updates: Option<PathBuf>,
     mixer_updates: Option<PathBuf>,
     loop_updates: Option<PathBuf>,
@@ -136,6 +137,16 @@ fn assign_unique_option<T>(
     Ok(())
 }
 
+fn assign_unique_path(
+    arguments: &mut impl Iterator<Item = String>,
+    destination: &mut Option<PathBuf>,
+    option: &'static str,
+) -> Result<(), ArgumentError> {
+    assign_unique_option(arguments, destination, option, |value| {
+        Ok(PathBuf::from(value))
+    })
+}
+
 impl RuntimeArguments {
     /// Reads the arguments following the program name.
     ///
@@ -150,6 +161,7 @@ impl RuntimeArguments {
         let mut deployment_root = None;
         let mut panel_listen = None;
         let mut performance_updates = None;
+        let mut recording_updates = None;
         let mut automation_updates = None;
         let mut mixer_updates = None;
         let mut loop_updates = None;
@@ -179,43 +191,37 @@ impl RuntimeArguments {
                     )?;
                 }
                 "--performance-updates" => {
-                    assign_unique_option(
+                    assign_unique_path(
                         &mut arguments,
                         &mut performance_updates,
                         "--performance-updates",
-                        |value| Ok(PathBuf::from(value)),
+                    )?;
+                }
+                "--recording-updates" => {
+                    assign_unique_path(
+                        &mut arguments,
+                        &mut recording_updates,
+                        "--recording-updates",
                     )?;
                 }
                 "--automation-updates" => {
-                    assign_unique_option(
+                    assign_unique_path(
                         &mut arguments,
                         &mut automation_updates,
                         "--automation-updates",
-                        |value| Ok(PathBuf::from(value)),
                     )?;
                 }
                 "--mixer-updates" => {
-                    assign_unique_option(
-                        &mut arguments,
-                        &mut mixer_updates,
-                        "--mixer-updates",
-                        |value| Ok(PathBuf::from(value)),
-                    )?;
+                    assign_unique_path(&mut arguments, &mut mixer_updates, "--mixer-updates")?;
                 }
                 "--loop-updates" => {
-                    assign_unique_option(
-                        &mut arguments,
-                        &mut loop_updates,
-                        "--loop-updates",
-                        |value| Ok(PathBuf::from(value)),
-                    )?;
+                    assign_unique_path(&mut arguments, &mut loop_updates, "--loop-updates")?;
                 }
                 "--native-device-updates" => {
-                    assign_unique_option(
+                    assign_unique_path(
                         &mut arguments,
                         &mut native_device_updates,
                         "--native-device-updates",
-                        |value| Ok(PathBuf::from(value)),
                     )?;
                 }
                 "--audio-output" => {
@@ -239,6 +245,7 @@ impl RuntimeArguments {
             deployment_root: deployment_root.ok_or(ArgumentError::MissingDeploymentRoot)?,
             panel_listen,
             performance_updates,
+            recording_updates,
             automation_updates,
             mixer_updates,
             loop_updates,
@@ -263,6 +270,12 @@ impl RuntimeArguments {
     #[must_use]
     pub fn performance_updates(&self) -> Option<&Path> {
         self.performance_updates.as_deref()
+    }
+
+    /// Returns the explicit Runtime recording-update directory, when enabled.
+    #[must_use]
+    pub fn recording_updates(&self) -> Option<&Path> {
+        self.recording_updates.as_deref()
     }
 
     /// Returns the explicit Runtime automation-update directory, when enabled.
@@ -318,6 +331,8 @@ mod argument_tests {
         let arguments = RuntimeArguments::parse([
             "--performance-updates".to_owned(),
             "scene-updates".to_owned(),
+            "--recording-updates".to_owned(),
+            "recording-updates".to_owned(),
             "--automation-updates".to_owned(),
             "automation-updates".to_owned(),
             "--mixer-updates".to_owned(),
@@ -338,6 +353,10 @@ mod argument_tests {
         assert_eq!(
             arguments.performance_updates(),
             Some(Path::new("scene-updates"))
+        );
+        assert_eq!(
+            arguments.recording_updates(),
+            Some(Path::new("recording-updates"))
         );
         assert_eq!(
             arguments.automation_updates(),
@@ -443,6 +462,24 @@ mod argument_tests {
         assert_eq!(
             RuntimeArguments::parse(["--audio-input".to_owned()]),
             Err(ArgumentError::MissingValue("--audio-input"))
+        );
+    }
+
+    #[test]
+    fn refuses_repeated_or_value_less_recording_output() {
+        assert_eq!(
+            RuntimeArguments::parse([
+                "--recording-updates".to_owned(),
+                "first".to_owned(),
+                "--recording-updates".to_owned(),
+                "second".to_owned(),
+                "deployment".to_owned(),
+            ]),
+            Err(ArgumentError::Repeated("--recording-updates"))
+        );
+        assert_eq!(
+            RuntimeArguments::parse(["--recording-updates".to_owned()]),
+            Err(ArgumentError::MissingValue("--recording-updates"))
         );
     }
 }

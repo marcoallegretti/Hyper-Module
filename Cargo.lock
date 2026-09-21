@@ -2461,6 +2461,7 @@ dependencies = [
 name = "hyper-runtime"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "hyper-arrangement-renderer",
  "hyper-audio-engine",
  "hyper-audio-source",
@@ -2475,12 +2476,16 @@ dependencies = [
  "hyper-playback-session",
  "hyper-project-loader",
  "hyper-project-model",
+ "hyper-recording-journal",
+ "hyper-recording-metadata",
+ "hyper-recording-worker",
  "hyper-runtime-automation-update",
  "hyper-runtime-deployment",
  "hyper-runtime-host",
  "hyper-runtime-loop-update",
  "hyper-runtime-mixer-update",
  "hyper-runtime-native-device-update",
+ "hyper-runtime-recording-update",
  "hyper-scene-performance",
  "hyper-storage-engine",
  "i-slint-backend-testing",

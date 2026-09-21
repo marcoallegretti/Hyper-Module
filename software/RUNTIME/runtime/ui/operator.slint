@@ -642,6 +642,11 @@ export component OperatorWindow inherits Window {
     in property <string> scene-performance-state: "Waiting for committed Runtime transport recovery";
     in property <bool> scene-performance-start-enabled: false;
     in property <bool> scene-performance-stop-enabled: false;
+    in property <[string]> recording-target-names;
+    in-out property <int> selected-recording-target-index: -1;
+    in property <string> recording-state: "Recording unavailable";
+    in property <bool> recording-start-enabled: false;
+    in property <bool> recording-stop-enabled: false;
     in property <[string]> automation-target-names;
     in-out property <int> selected-automation-target-index: -1;
     in-out property <string> automation-capture-name: "Runtime automation";
@@ -715,6 +720,8 @@ export component OperatorWindow inherits Window {
     callback stop-interactive-scenes-requested();
     callback start-scene-performance-capture-requested();
     callback stop-scene-performance-capture-requested();
+    callback start-recording-requested(int);
+    callback stop-recording-requested();
     callback start-automation-capture-requested(int, string);
     callback stop-automation-capture-requested();
     callback quit-requested();
@@ -936,6 +943,54 @@ export component OperatorWindow inherits Window {
             FactCard { label: "DEPLOYMENT"; value: "generation " + root.deployment-generation; }
             FactCard { label: "CALLBACKS"; value: root.callback-count; }
             FactCard { label: "STREAM FAILURES / XRUNS"; value: root.stream-failures + " / " + root.native-xruns; }
+        }
+
+        Rectangle {
+            background: #171b24;
+            border-color: #2c3445;
+            border-width: 1px;
+            border-radius: 8px;
+            min-height: 104px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 7px;
+                HorizontalLayout {
+                    Text { text: "RUNTIME AUDIO RECORDING · EXTERNAL HANDOFF"; color: #8d99ad; font-size: 11px; font-weight: 700; }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: root.recording-state; color: #8d99ad; font-size: 10px; overflow: elide; width: 300px; vertical-alignment: center; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "TRACK"; color: #69778c; font-size: 9px; font-weight: 700; width: 48px; vertical-alignment: center; }
+                    ComboBox {
+                        horizontal-stretch: 1;
+                        model: root.recording-target-names;
+                        current-index <=> root.selected-recording-target-index;
+                        enabled: root.recording-start-enabled && root.recording-target-names.length > 0;
+                        accessible-label: "Runtime audio recording target";
+                    }
+                    Text {
+                        text: "Records the selected monitored input to an external WAV. The verified project is never changed by Runtime.";
+                        color: #69778c;
+                        font-size: 9px;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                    }
+                    Button {
+                        text: "Record";
+                        enabled: root.recording-start-enabled;
+                        accessible-label: "Start Runtime audio recording";
+                        clicked => { root.start-recording-requested(root.selected-recording-target-index); }
+                    }
+                    Button {
+                        text: "Stop recording";
+                        enabled: root.recording-stop-enabled;
+                        accessible-label: "Stop and publish Runtime audio recording";
+                        clicked => { root.stop-recording-requested(); }
+                    }
+                }
+            }
         }
 
         Rectangle {
