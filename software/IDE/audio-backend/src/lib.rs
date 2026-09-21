@@ -931,7 +931,12 @@ mod playback_session;
 ))]
 pub use playback_session::{
     DesktopControlMappingBuildError, DesktopMixerSend, DesktopMixerSendTap, DesktopNativeDevice,
-    DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackRecovery,
+    DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackFinalizedRecording,
+    DesktopPlaybackPublishedRecording, DesktopPlaybackRecordingAbort,
+    DesktopPlaybackRecordingCommitError, DesktopPlaybackRecordingFinalizeError,
+    DesktopPlaybackRecordingOutcome, DesktopPlaybackRecordingRecovery,
+    DesktopPlaybackRecordingSession, DesktopPlaybackRecordingStartError,
+    DesktopPlaybackRecordingStopError, DesktopPlaybackRecovery,
     DesktopPlaybackRecoveryPendingStart, DesktopPlaybackRecoveryPendingStop,
     DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackRecoveryPendingWait,
     DesktopPlaybackRecoveryStartError, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
