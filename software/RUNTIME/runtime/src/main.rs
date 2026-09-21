@@ -971,10 +971,7 @@ impl SessionHost {
         &mut self,
         poll: RuntimePlaybackOwnerPoll,
     ) -> Result<Option<String>, String> {
-        if poll.playback_replaced {
-            self.refresh_playback_generation()?;
-        }
-        Ok(poll.message)
+        finish_runtime_playback_owner_poll(poll, || self.refresh_playback_generation())
     }
 
     fn refresh_recording_blocker_observation(&self) {
@@ -1019,6 +1016,16 @@ impl SessionHost {
             None
         }
     }
+}
+
+fn finish_runtime_playback_owner_poll(
+    poll: RuntimePlaybackOwnerPoll,
+    refresh_playback_generation: impl FnOnce() -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    if poll.playback_replaced {
+        refresh_playback_generation()?;
+    }
+    Ok(poll.message)
 }
 
 impl RuntimeRecordingControl for SessionHost {
@@ -8040,6 +8047,52 @@ mod tests {
         assert!(replacement.input.is_none());
         drop(replacement.output);
         assert!(receivers.take().is_none());
+    }
+
+    #[test]
+    fn playback_owner_poll_rebinds_exactly_one_completed_replacement() {
+        let refreshes = Cell::new(0_u8);
+        let pending = finish_runtime_playback_owner_poll(
+            RuntimePlaybackOwnerPoll {
+                message: Some("waiting for native shutdown".to_owned()),
+                playback_replaced: false,
+            },
+            || {
+                refreshes.set(refreshes.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(pending.as_deref(), Some("waiting for native shutdown"));
+        assert_eq!(refreshes.get(), 0);
+
+        let replaced = finish_runtime_playback_owner_poll(
+            RuntimePlaybackOwnerPoll {
+                message: Some("Runtime playback restored".to_owned()),
+                playback_replaced: true,
+            },
+            || {
+                refreshes.set(refreshes.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(replaced.as_deref(), Some("Runtime playback restored"));
+        assert_eq!(refreshes.get(), 1);
+
+        let error = finish_runtime_playback_owner_poll(
+            RuntimePlaybackOwnerPoll {
+                message: None,
+                playback_replaced: true,
+            },
+            || {
+                refreshes.set(refreshes.get() + 1);
+                Err("receiver rebind failed".to_owned())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "receiver rebind failed");
+        assert_eq!(refreshes.get(), 2);
     }
 
     #[test]

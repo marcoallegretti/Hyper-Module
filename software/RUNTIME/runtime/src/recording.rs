@@ -414,8 +414,35 @@ mod tests {
         publication_outcome_is_uncertain, recording_session_config,
     };
     use hyper_desktop_audio::DesktopInputConfig;
-    use hyper_runtime_recording_update::RuntimeRecordingUpdateErrorKind;
-    use std::path::Path;
+    use hyper_runtime_recording_update::{
+        RuntimeRecordingUpdateErrorKind, RuntimeRecordingUpdateSource, sha256_hex,
+    };
+    use hyper_storage_engine::{ProjectCreationRequest, create_project};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use uuid::Uuid;
+
+    struct TemporaryProjectParent {
+        path: PathBuf,
+    }
+
+    impl TemporaryProjectParent {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "hyper-runtime-recording-policy-{}-{}",
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TemporaryProjectParent {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn recording_paths_are_direct_children_with_distinct_suffixes() {
@@ -462,6 +489,74 @@ mod tests {
             super::super::SAMPLE_RATE_HZ
         );
         assert_eq!(session.completion_timeout, RECORDING_COMPLETION_TIMEOUT);
+    }
+
+    #[test]
+    fn configuration_catalogs_the_verified_audio_target_without_mutating_the_project() {
+        let temporary = TemporaryProjectParent::new();
+        let creation = create_project(
+            &temporary.path,
+            ProjectCreationRequest {
+                directory_name: "Runtime Capture",
+                project_name: "Runtime Capture",
+            },
+        )
+        .unwrap();
+        let prepared = hyper_project_loader::prepare_project_playback(
+            creation.project().root(),
+            super::super::limits().unwrap(),
+        )
+        .unwrap();
+        let manifest = prepared.package().manifest();
+        let source = RuntimeRecordingUpdateSource::try_new(
+            manifest.project_id().to_owned(),
+            manifest.revision(),
+            sha256_hex(prepared.package().manifest_sha256()),
+            "a".repeat(64),
+            7,
+        )
+        .unwrap();
+
+        let configuration =
+            super::RuntimeRecordingConfiguration::try_new(source, &prepared, None).unwrap();
+
+        assert_eq!(configuration.target_labels().unwrap(), ["Audio 1"]);
+        assert!(configuration.has_targets());
+        assert!(!configuration.output_configured());
+        prepared.package().confirm_unchanged().unwrap();
+    }
+
+    #[test]
+    fn configuration_rejects_source_facts_from_another_project_revision() {
+        let temporary = TemporaryProjectParent::new();
+        let creation = create_project(
+            &temporary.path,
+            ProjectCreationRequest {
+                directory_name: "Runtime Capture",
+                project_name: "Runtime Capture",
+            },
+        )
+        .unwrap();
+        let prepared = hyper_project_loader::prepare_project_playback(
+            creation.project().root(),
+            super::super::limits().unwrap(),
+        )
+        .unwrap();
+        let manifest = prepared.package().manifest();
+        let source = RuntimeRecordingUpdateSource::try_new(
+            manifest.project_id().to_owned(),
+            manifest.revision() + 1,
+            sha256_hex(prepared.package().manifest_sha256()),
+            "a".repeat(64),
+            7,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            super::RuntimeRecordingConfiguration::try_new(source, &prepared, None),
+            Err(super::RuntimeRecordingError::ProjectChanged)
+        ));
+        prepared.package().confirm_unchanged().unwrap();
     }
 
     #[test]
