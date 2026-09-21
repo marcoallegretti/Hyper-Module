@@ -993,7 +993,7 @@ fn clear_and_remove_transaction(
     transaction: Dir,
     name: &str,
 ) -> Result<(), RecordingImportError> {
-    let quarantine = format!(".recording-import-cleanup-{}", Uuid::new_v4());
+    let quarantine = format!(".cleanup-recording-import-{}", Uuid::new_v4());
     backups
         .rename(name, backups, &quarantine)
         .map_err(|error| caused("quarantine recording import transaction", error))?;
@@ -1022,10 +1022,21 @@ fn clear_and_remove_transaction(
     transaction: Dir,
     name: &str,
 ) -> Result<(), RecordingImportError> {
-    clear_transaction(&transaction)?;
+    // Windows cannot rename an open directory. The project-wide transaction
+    // lock remains held, so no other importer can replace this name after the
+    // capability is dropped and before the quarantined directory is reopened.
     drop(transaction);
+    let quarantine = format!(".cleanup-recording-import-{}", Uuid::new_v4());
     backups
-        .remove_dir(name)
+        .rename(name, backups, &quarantine)
+        .map_err(|error| caused("quarantine recording import transaction", error))?;
+    let moved = backups
+        .open_dir(&quarantine)
+        .map_err(|error| caused("open quarantined recording import transaction", error))?;
+    clear_transaction(&moved)?;
+    drop(moved);
+    backups
+        .remove_dir(&quarantine)
         .map_err(|error| caused("remove recording import transaction", error))?;
     sync_dir(backups)
 }
@@ -1486,6 +1497,48 @@ mod tests {
                 .iter()
                 .any(|resource| resource.id() == METADATA_ID)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_residue_is_quarantined_without_blocking_future_recovery() {
+        let fixture = Fixture::new(false);
+        let error = import_recording_observed(&fixture.root, fixture.request(), |root| {
+            let transaction = fs::read_dir(root.join("backups"))
+                .map_err(|error| caused("find recording cleanup fixture transaction", error))?
+                .filter_map(Result::ok)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(TRANSACTION_PREFIX)
+                })
+                .ok_or_else(|| failure("recording cleanup fixture lost its transaction"))?;
+            fs::write(
+                transaction.path().join("cleanup-residue"),
+                b"fixture residue",
+            )
+            .map_err(|error| caused("write recording cleanup fixture residue", error))
+        })
+        .unwrap_err();
+
+        assert!(error.published());
+        let backup_names = fs::read_dir(fixture.root.join("backups"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            backup_names
+                .iter()
+                .any(|name| name.starts_with(".cleanup-recording-import-")),
+            "cleanup residue must be retained outside the active transaction namespace: {backup_names:?}"
+        );
+        assert!(
+            backup_names
+                .iter()
+                .all(|name| !name.starts_with(TRANSACTION_PREFIX))
+        );
+        assert!(recover_recording_imports(&fixture.root).unwrap().is_empty());
     }
 
     #[test]
