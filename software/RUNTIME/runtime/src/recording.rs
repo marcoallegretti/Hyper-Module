@@ -411,11 +411,16 @@ mod tests {
     use super::{
         RECORDING_COMPLETION_TIMEOUT, RECORDING_DRAIN_FRAMES, RECORDING_MAXIMUM_CHUNK_FRAMES,
         RECORDING_MAXIMUM_FRAMES, RECORDING_TRANSPORT_FRAMES, RuntimeRecordingPaths,
-        publication_outcome_is_uncertain, recording_session_config,
+        RuntimeRecordingPublication, publication_outcome_is_uncertain, recording_session_config,
     };
     use hyper_desktop_audio::DesktopInputConfig;
+    use hyper_recording_journal::{JournalConfig, JournalWriter, publish_wav};
+    use hyper_recording_metadata::{
+        FinalizedRecordingMetadata, RecordingCaptureKind, RecordingMetadataContext,
+    };
     use hyper_runtime_recording_update::{
-        RuntimeRecordingUpdateErrorKind, RuntimeRecordingUpdateSource, sha256_hex,
+        RuntimeRecordingUpdateDirectory, RuntimeRecordingUpdateErrorKind,
+        RuntimeRecordingUpdateSource, read_runtime_recording_update, sha256_hex,
     };
     use hyper_storage_engine::{ProjectCreationRequest, create_project};
     use std::fs;
@@ -556,6 +561,97 @@ mod tests {
             super::RuntimeRecordingConfiguration::try_new(source, &prepared, None),
             Err(super::RuntimeRecordingError::ProjectChanged)
         ));
+        prepared.package().confirm_unchanged().unwrap();
+    }
+
+    #[test]
+    fn finalized_runtime_publication_round_trips_verified_wav_and_project_provenance() {
+        let temporary = TemporaryProjectParent::new();
+        let creation = create_project(
+            &temporary.path,
+            ProjectCreationRequest {
+                directory_name: "Runtime Capture",
+                project_name: "Runtime Capture",
+            },
+        )
+        .unwrap();
+        let prepared = hyper_project_loader::prepare_project_playback(
+            creation.project().root(),
+            super::super::limits().unwrap(),
+        )
+        .unwrap();
+        let manifest = prepared.package().manifest();
+        let source = RuntimeRecordingUpdateSource::try_new(
+            manifest.project_id().to_owned(),
+            manifest.revision(),
+            sha256_hex(prepared.package().manifest_sha256()),
+            "a".repeat(64),
+            7,
+        )
+        .unwrap();
+        let output_path = temporary.path.join("recording-updates");
+        fs::create_dir(&output_path).unwrap();
+        let output = RuntimeRecordingUpdateDirectory::open(&output_path).unwrap();
+        let configuration =
+            super::RuntimeRecordingConfiguration::try_new(source.clone(), &prepared, Some(output))
+                .unwrap();
+
+        let journal_path = output_path.join("verified-take.journal");
+        let wav_path = output_path.join("verified-take.wav");
+        let mut writer = JournalWriter::create(
+            &journal_path,
+            JournalConfig {
+                sample_rate: super::super::SAMPLE_RATE_HZ,
+                max_chunk_frames: 3,
+                max_total_frames: 3,
+            },
+        )
+        .unwrap();
+        writer
+            .append(&[0.25, -0.25, 0.5, -0.5, 0.75, -0.75])
+            .unwrap();
+        drop(writer);
+        let publication = publish_wav(&journal_path, &wav_path).unwrap();
+        let publication_sha256 = *publication.wav_sha256();
+        let publication_bytes = publication.byte_length();
+        let recording_id = Uuid::new_v4().hyphenated().to_string();
+        let track_id = configuration.targets[0].track_id.clone();
+        let finalized = FinalizedRecordingMetadata::try_new(
+            publication,
+            RecordingMetadataContext {
+                id: recording_id.clone(),
+                project_id: source.project_id().to_owned(),
+                asset_id: Uuid::new_v4().hyphenated().to_string(),
+                track_id: track_id.clone(),
+                capture_kind: RecordingCaptureKind::New,
+                captured_at_utc: "2026-09-21T12:00:00.000Z".to_owned(),
+                timeline_start_tick: 0,
+                source_input_indices: vec![0, 1],
+            },
+        )
+        .unwrap();
+        let update_id = Uuid::new_v4().hyphenated().to_string();
+
+        let RuntimeRecordingPublication::Published(update_path) = configuration
+            .publish(update_id.clone(), &finalized)
+            .unwrap()
+        else {
+            panic!("a stable local directory must publish a determinate update");
+        };
+        let update = read_runtime_recording_update(&update_path).unwrap();
+
+        assert_eq!(update.id(), update_id);
+        assert_eq!(update.source(), &source);
+        assert_eq!(update.handoff().recording_path(), wav_path);
+        assert_eq!(update.handoff().recording_byte_length(), publication_bytes);
+        assert_eq!(update.handoff().recording_sha256(), &publication_sha256);
+        assert_eq!(update.handoff().metadata().id(), recording_id);
+        assert_eq!(
+            update.handoff().metadata().project_id(),
+            source.project_id()
+        );
+        assert_eq!(update.handoff().metadata().track_id(), track_id);
+        assert_eq!(update.handoff().metadata().frame_count(), 3);
         prepared.package().confirm_unchanged().unwrap();
     }
 
