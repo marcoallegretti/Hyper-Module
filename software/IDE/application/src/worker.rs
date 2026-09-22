@@ -11,6 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use hyper_control_runtime::{ControlBindingAvailability, ControlBindingUnavailableReason};
 use hyper_desktop_audio::{DesktopAudioPreviewSnapshot, DesktopAudioPreviewState};
 use hyper_fs_authority::path_is_proven_absent;
 #[cfg(feature = "ui-test-support")]
@@ -1468,6 +1469,7 @@ pub enum IdeMixerChannelDestination {
 pub struct IdeControlBinding {
     id: String,
     enabled: bool,
+    runtime_status: IdeControlBindingRuntimeStatus,
     source: String,
     scope: String,
     target: String,
@@ -1483,6 +1485,11 @@ impl IdeControlBinding {
     #[must_use]
     pub const fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    #[must_use]
+    pub const fn runtime_status(&self) -> IdeControlBindingRuntimeStatus {
+        self.runtime_status
     }
 
     #[must_use]
@@ -1504,6 +1511,81 @@ impl IdeControlBinding {
     pub fn transform(&self) -> &str {
         &self.transform
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeControlBindingRuntimeStatus {
+    Disabled,
+    Live,
+    Unavailable(IdeControlBindingUnavailableReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeControlBindingUnavailableReason {
+    CueOutputUnavailable,
+    SceneDisabled,
+    SceneConsolidationRequired,
+    SceneAudioNotPrepared,
+}
+
+const fn ide_control_binding_runtime_status(
+    enabled: bool,
+    availability: Option<ControlBindingAvailability>,
+) -> Option<IdeControlBindingRuntimeStatus> {
+    match (enabled, availability) {
+        (false, None) => Some(IdeControlBindingRuntimeStatus::Disabled),
+        (true, Some(ControlBindingAvailability::Live)) => {
+            Some(IdeControlBindingRuntimeStatus::Live)
+        }
+        (true, Some(ControlBindingAvailability::Unavailable(reason))) => {
+            Some(IdeControlBindingRuntimeStatus::Unavailable(match reason {
+                ControlBindingUnavailableReason::CueOutputUnavailable => {
+                    IdeControlBindingUnavailableReason::CueOutputUnavailable
+                }
+                ControlBindingUnavailableReason::SceneDisabled => {
+                    IdeControlBindingUnavailableReason::SceneDisabled
+                }
+                ControlBindingUnavailableReason::SceneConsolidationRequired => {
+                    IdeControlBindingUnavailableReason::SceneConsolidationRequired
+                }
+                ControlBindingUnavailableReason::SceneAudioNotPrepared => {
+                    IdeControlBindingUnavailableReason::SceneAudioNotPrepared
+                }
+            }))
+        }
+        (false, Some(_)) | (true, None) => None,
+    }
+}
+
+fn validated_control_binding_availability(
+    bindings: &[ControlBinding],
+    statuses: impl IntoIterator<Item = (usize, ControlBindingAvailability)>,
+) -> Result<Vec<Option<ControlBindingAvailability>>, IdeWorkerCommandFailure> {
+    let mut availability = Vec::new();
+    availability
+        .try_reserve_exact(bindings.len())
+        .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
+    availability.resize(bindings.len(), None);
+    for (binding_index, binding_availability) in statuses {
+        let Some(binding) = bindings.get(binding_index) else {
+            return Err(IdeWorkerCommandFailure::ControlBindingStatusUnavailable);
+        };
+        if !binding.enabled()
+            || availability[binding_index]
+                .replace(binding_availability)
+                .is_some()
+        {
+            return Err(IdeWorkerCommandFailure::ControlBindingStatusUnavailable);
+        }
+    }
+    if bindings
+        .iter()
+        .zip(&availability)
+        .any(|(binding, availability)| binding.enabled() != availability.is_some())
+    {
+        return Err(IdeWorkerCommandFailure::ControlBindingStatusUnavailable);
+    }
+    Ok(availability)
 }
 
 const fn control_edge_name(edge: Edge) -> &'static str {
@@ -1617,11 +1699,13 @@ fn control_transform_label(transform: ControlTransform) -> String {
 
 fn ide_control_binding(
     binding: &ControlBinding,
+    runtime_status: IdeControlBindingRuntimeStatus,
     snapshot: &RunningIdeSnapshot<'_>,
 ) -> Result<IdeControlBinding, IdeWorkerCommandFailure> {
     Ok(IdeControlBinding {
         id: try_project_owned(binding.id())?,
         enabled: binding.enabled(),
+        runtime_status,
         source: control_source_label(binding.source()),
         scope: control_scope_label(binding.scope(), snapshot),
         target: control_target_label(binding.target(), snapshot),
@@ -3484,6 +3568,7 @@ pub enum IdeWorkerCommandFailure {
     Publication(OutputInventoryError),
     InputPublication(InputInventoryError),
     ProjectPublicationCapacityUnavailable,
+    ControlBindingStatusUnavailable,
     ProjectSnapshotUnavailable,
 }
 
@@ -3670,6 +3755,9 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::ProjectPublicationCapacityUnavailable => {
                 formatter.write_str("project observation capacity is unavailable")
             }
+            Self::ControlBindingStatusUnavailable => formatter.write_str(
+                "control-binding Runtime availability is inconsistent with the verified project",
+            ),
             Self::ProjectSnapshotUnavailable => {
                 formatter.write_str("running playback exposes no verified project snapshot")
             }
@@ -3678,6 +3766,10 @@ impl fmt::Display for IdeWorkerCommandFailure {
 }
 
 impl Error for IdeWorkerCommandFailure {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive typed-failure source mapping keeps every worker error inspectable"
+    )]
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Discovery(source) => Some(source),
@@ -3776,6 +3868,7 @@ impl Error for IdeWorkerCommandFailure {
             | Self::InvalidState
             | Self::RecentProjectMissing(_)
             | Self::ProjectPublicationCapacityUnavailable
+            | Self::ControlBindingStatusUnavailable
             | Self::ProjectSnapshotUnavailable
             | Self::NothingToRestore => None,
         }
@@ -21520,8 +21613,21 @@ fn running_observation(
     control_bindings
         .try_reserve_exact(snapshot.control_bindings.len())
         .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
-    for binding in snapshot.control_bindings {
-        control_bindings.push(ide_control_binding(binding, &snapshot)?);
+    let control_binding_availability = validated_control_binding_availability(
+        snapshot.control_bindings,
+        snapshot
+            .control_binding_statuses
+            .iter()
+            .map(|status| (status.source_binding_index(), status.availability())),
+    )?;
+    for (binding, availability) in snapshot
+        .control_bindings
+        .iter()
+        .zip(control_binding_availability)
+    {
+        let runtime_status = ide_control_binding_runtime_status(binding.enabled(), availability)
+            .ok_or(IdeWorkerCommandFailure::ControlBindingStatusUnavailable)?;
+        control_bindings.push(ide_control_binding(binding, runtime_status, &snapshot)?);
     }
     Ok(IdeRunningObservation {
         playback_session_generation: snapshot.playback_session_generation,
@@ -21769,7 +21875,7 @@ mod tests {
     use crate::{
         IdeAudioOutputInventory, IdeOutputTestSessionOwner, IdeOutputTestSnapshot,
         IdeOutputTestState, IdePlaybackExtent, IdePlaybackSessionOwner,
-        OutputTestingDesktopIdeApplication, TestPlaybackSession,
+        OutputTestingDesktopIdeApplication, TestPlaybackSession, TransportAction, TriggerBehavior,
     };
     use hyper_audio_engine::{LinearGain, Pan};
     use hyper_audio_source::{AudioContainer, DecodeLimits, decode_bytes};
@@ -21820,6 +21926,117 @@ mod tests {
     const RUNTIME_PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334463";
     const RUNTIME_MIXER_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334464";
     const RUNTIME_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334465";
+
+    fn control_binding_fixture(id_suffix: u8, enabled: bool) -> ControlBinding {
+        ControlBinding::try_new(
+            format!("018f47a2-6b2d-7c11-8a44-0011223344{id_suffix:02x}"),
+            enabled,
+            ControlSource::ClockInput { edge: Edge::Rising },
+            ControlScope::Global,
+            ControlTransform::Trigger {
+                behavior: TriggerBehavior::Invoke,
+            },
+            ControlTarget::Transport {
+                action: TransportAction::Play,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn control_binding_runtime_statuses_follow_persisted_source_indices() {
+        let bindings = vec![
+            control_binding_fixture(0x70, false),
+            control_binding_fixture(0x71, true),
+            control_binding_fixture(0x72, true),
+        ];
+        let availability = validated_control_binding_availability(
+            &bindings,
+            [
+                (
+                    2,
+                    ControlBindingAvailability::Unavailable(
+                        ControlBindingUnavailableReason::SceneAudioNotPrepared,
+                    ),
+                ),
+                (1, ControlBindingAvailability::Live),
+            ],
+        )
+        .unwrap();
+        assert_eq!(availability[0], None);
+        assert_eq!(availability[1], Some(ControlBindingAvailability::Live));
+        assert_eq!(
+            availability[2],
+            Some(ControlBindingAvailability::Unavailable(
+                ControlBindingUnavailableReason::SceneAudioNotPrepared
+            ))
+        );
+    }
+
+    #[test]
+    fn control_binding_runtime_status_conversion_preserves_every_reason() {
+        assert_eq!(
+            ide_control_binding_runtime_status(false, None),
+            Some(IdeControlBindingRuntimeStatus::Disabled)
+        );
+        assert_eq!(
+            ide_control_binding_runtime_status(true, Some(ControlBindingAvailability::Live)),
+            Some(IdeControlBindingRuntimeStatus::Live)
+        );
+        for (source, expected) in [
+            (
+                ControlBindingUnavailableReason::CueOutputUnavailable,
+                IdeControlBindingUnavailableReason::CueOutputUnavailable,
+            ),
+            (
+                ControlBindingUnavailableReason::SceneDisabled,
+                IdeControlBindingUnavailableReason::SceneDisabled,
+            ),
+            (
+                ControlBindingUnavailableReason::SceneConsolidationRequired,
+                IdeControlBindingUnavailableReason::SceneConsolidationRequired,
+            ),
+            (
+                ControlBindingUnavailableReason::SceneAudioNotPrepared,
+                IdeControlBindingUnavailableReason::SceneAudioNotPrepared,
+            ),
+        ] {
+            assert_eq!(
+                ide_control_binding_runtime_status(
+                    true,
+                    Some(ControlBindingAvailability::Unavailable(source))
+                ),
+                Some(IdeControlBindingRuntimeStatus::Unavailable(expected))
+            );
+        }
+        assert_eq!(ide_control_binding_runtime_status(true, None), None);
+        assert_eq!(
+            ide_control_binding_runtime_status(false, Some(ControlBindingAvailability::Live)),
+            None
+        );
+    }
+
+    #[test]
+    fn inconsistent_control_binding_runtime_statuses_fail_closed() {
+        let bindings = vec![
+            control_binding_fixture(0x70, false),
+            control_binding_fixture(0x71, true),
+        ];
+        for statuses in [
+            vec![],
+            vec![(0, ControlBindingAvailability::Live)],
+            vec![(2, ControlBindingAvailability::Live)],
+            vec![
+                (1, ControlBindingAvailability::Live),
+                (1, ControlBindingAvailability::Live),
+            ],
+        ] {
+            assert!(matches!(
+                validated_control_binding_availability(&bindings, statuses),
+                Err(IdeWorkerCommandFailure::ControlBindingStatusUnavailable)
+            ));
+        }
+    }
 
     fn runtime_scene_performance_update() -> RuntimeScenePerformanceUpdate {
         let source = hyper_scene_performance::RuntimeScenePerformanceSource::try_new(

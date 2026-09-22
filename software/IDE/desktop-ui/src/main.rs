@@ -19,9 +19,10 @@ use hyper_desktop_ide::{
     IdeApplicationConfig, IdeAudioClip, IdeAudioClipSourceRange, IdeAudioClipWaveform,
     IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
     IdeAutomationLaneAddRequest, IdeAutomationLaneEditRequest, IdeAutomationTakeRequest,
-    IdeAutomationTarget, IdeControlBindingRequest, IdeControlChannelParameter,
-    IdeControlMainParameter, IdeControlMappingEdit, IdeInputMeterObservation, IdeInputSelection,
-    IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
+    IdeAutomationTarget, IdeControlBindingRequest, IdeControlBindingRuntimeStatus,
+    IdeControlBindingUnavailableReason, IdeControlChannelParameter, IdeControlMainParameter,
+    IdeControlMappingEdit, IdeInputMeterObservation, IdeInputSelection, IdeLoopRangeFrames,
+    IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
     IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
     IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerChannelKind,
     IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice,
@@ -15962,16 +15963,65 @@ fn set_control_mappings(
         observation
             .control_bindings()
             .iter()
-            .map(|binding| ControlBindingRow {
-                id: binding.id().into(),
-                enabled: binding.enabled(),
-                source: binding.source().into(),
-                scope: binding.scope().into(),
-                target: binding.target().into(),
-                transform: binding.transform().into(),
+            .map(|binding| {
+                let runtime = control_binding_runtime_presentation(binding.runtime_status());
+                ControlBindingRow {
+                    id: binding.id().into(),
+                    enabled: binding.enabled(),
+                    runtime_state: runtime.state.into(),
+                    runtime_detail: runtime.detail.into(),
+                    runtime_live: runtime.live,
+                    runtime_unavailable: runtime.unavailable,
+                    source: binding.source().into(),
+                    scope: binding.scope().into(),
+                    target: binding.target().into(),
+                    transform: binding.transform().into(),
+                }
             })
             .collect::<Vec<_>>(),
     ))));
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ControlBindingRuntimePresentation {
+    state: &'static str,
+    detail: &'static str,
+    live: bool,
+    unavailable: bool,
+}
+
+const fn control_binding_runtime_presentation(
+    status: IdeControlBindingRuntimeStatus,
+) -> ControlBindingRuntimePresentation {
+    match status {
+        IdeControlBindingRuntimeStatus::Disabled => ControlBindingRuntimePresentation {
+            state: "DISABLED",
+            detail: "",
+            live: false,
+            unavailable: false,
+        },
+        IdeControlBindingRuntimeStatus::Live => ControlBindingRuntimePresentation {
+            state: "LIVE",
+            detail: "",
+            live: true,
+            unavailable: false,
+        },
+        IdeControlBindingRuntimeStatus::Unavailable(reason) => ControlBindingRuntimePresentation {
+            state: "UNAVAILABLE",
+            detail: match reason {
+                IdeControlBindingUnavailableReason::CueOutputUnavailable => "No cue output",
+                IdeControlBindingUnavailableReason::SceneDisabled => "Scene disabled",
+                IdeControlBindingUnavailableReason::SceneConsolidationRequired => {
+                    "Consolidate scene"
+                }
+                IdeControlBindingUnavailableReason::SceneAudioNotPrepared => {
+                    "Scene audio not ready"
+                }
+            },
+            live: false,
+            unavailable: true,
+        },
+    }
 }
 
 fn apply_control_mapping_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -25480,6 +25530,58 @@ mod tests {
                 action: SceneAction::Launch,
             }
         );
+    }
+
+    #[test]
+    fn control_binding_runtime_presentation_distinguishes_disabled_live_and_unavailable() {
+        assert_eq!(
+            control_binding_runtime_presentation(IdeControlBindingRuntimeStatus::Disabled),
+            ControlBindingRuntimePresentation {
+                state: "DISABLED",
+                detail: "",
+                live: false,
+                unavailable: false,
+            }
+        );
+        assert_eq!(
+            control_binding_runtime_presentation(IdeControlBindingRuntimeStatus::Live),
+            ControlBindingRuntimePresentation {
+                state: "LIVE",
+                detail: "",
+                live: true,
+                unavailable: false,
+            }
+        );
+        for (reason, detail) in [
+            (
+                IdeControlBindingUnavailableReason::CueOutputUnavailable,
+                "No cue output",
+            ),
+            (
+                IdeControlBindingUnavailableReason::SceneDisabled,
+                "Scene disabled",
+            ),
+            (
+                IdeControlBindingUnavailableReason::SceneConsolidationRequired,
+                "Consolidate scene",
+            ),
+            (
+                IdeControlBindingUnavailableReason::SceneAudioNotPrepared,
+                "Scene audio not ready",
+            ),
+        ] {
+            assert_eq!(
+                control_binding_runtime_presentation(IdeControlBindingRuntimeStatus::Unavailable(
+                    reason
+                )),
+                ControlBindingRuntimePresentation {
+                    state: "UNAVAILABLE",
+                    detail,
+                    live: false,
+                    unavailable: true,
+                }
+            );
+        }
     }
 
     fn assert_control_targets_repopulate_after_a_project_reset(ui: &MainWindow) {

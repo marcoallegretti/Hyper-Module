@@ -252,6 +252,10 @@ export struct ArrangementRow {
 export struct ControlBindingRow {
     id: string,
     enabled: bool,
+    runtime-state: string,
+    runtime-detail: string,
+    runtime-live: bool,
+    runtime-unavailable: bool,
     source: string,
     scope: string,
     target: string,
@@ -3771,12 +3775,23 @@ export component MainWindow inherits Window {
                                     Text { text: binding.source + "  to  " + binding.target; color: #dce5ef; font-size: 12px; font-weight: 600; overflow: elide; }
                                     Text { text: binding.scope + " - " + binding.transform; color: #8fa0b4; font-size: 9px; overflow: elide; }
                                 }
-                                Text {
-                                    width: 72px;
-                                    text: binding.enabled ? "ENABLED" : "DISABLED";
-                                    color: binding.enabled ? #63e6b5 : #728196;
-                                    font-size: 9px;
-                                    vertical-alignment: center;
+                                VerticalLayout {
+                                    width: 126px;
+                                    padding-top: binding.runtime-detail == "" ? 17px : 9px;
+                                    padding-bottom: binding.runtime-detail == "" ? 17px : 8px;
+                                    Text {
+                                        text: binding.runtime-state;
+                                        color: binding.runtime-live ? #63e6b5 : binding.runtime-unavailable ? #f0b35b : #728196;
+                                        font-size: 9px;
+                                        font-weight: 700;
+                                        overflow: elide;
+                                    }
+                                    if binding.runtime-detail != "" : Text {
+                                        text: binding.runtime-detail;
+                                        color: binding.runtime-unavailable ? #c99755 : #728196;
+                                        font-size: 8px;
+                                        overflow: elide;
+                                    }
                                 }
                                 VerticalLayout {
                                     width: 76px;

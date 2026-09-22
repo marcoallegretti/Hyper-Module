@@ -2204,6 +2204,7 @@ dependencies = [
  "hyper-audio-source",
  "hyper-clip-engine",
  "hyper-control-mappings",
+ "hyper-control-runtime",
  "hyper-desktop-audio",
  "hyper-fs-authority",
  "hyper-mapping-compiler",

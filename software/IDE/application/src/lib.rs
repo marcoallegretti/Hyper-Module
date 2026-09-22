@@ -24,6 +24,7 @@ pub use hyper_control_mappings::{
     MainParameter as IdeControlMainParameter, SceneAction,
     SendParameter as IdeControlSendParameter, TransportAction, TriggerBehavior,
 };
+use hyper_control_runtime::ControlBindingStatus;
 use hyper_desktop_audio::{
     CaptureStreamSnapshot, DesktopAudioPreviewCommandError, DesktopAudioPreviewControlError,
     DesktopAudioPreviewSnapshot, DesktopDirectControlError, DesktopInputConfig,
@@ -248,6 +249,7 @@ pub use recording::{
 pub use worker::{
     DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeAudioClip,
     IdeAudioClipEditCommittedWarning, IdeAudioPreviewObservation, IdeClosedSnapshot,
+    IdeControlBindingRuntimeStatus, IdeControlBindingUnavailableReason,
     IdeMixerAutomationCaptureError, IdeMixerChannel, IdeMixerChannelDestination, IdeMixerSend,
     IdeNativeCompressor, IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError,
     IdeRecordingCaptureKind, IdeRecordingState, IdeRecordingTake, IdeRunningObservation,
@@ -10723,6 +10725,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub mixer_main_state: Option<IdeMixerMainState>,
     pub mixer_unsaved_changes: bool,
     pub control_bindings: &'a [ControlBinding],
+    pub(crate) control_binding_statuses: &'a [ControlBindingStatus],
     pub output_state: OutputStreamState,
     pub output: OutputStreamSnapshot,
     pub monitoring: Option<IdeMonitoringState>,
@@ -16939,6 +16942,7 @@ impl RunningDesktopIdeApplication {
             control_bindings: project
                 .control_mapping()
                 .map_or(&[] as &[ControlBinding], ControlMappingDocument::bindings),
+            control_binding_statuses: session.control_mapping_statuses(),
             output_state: session.output_status().state(),
             output: session.counters().snapshot(),
             monitoring,

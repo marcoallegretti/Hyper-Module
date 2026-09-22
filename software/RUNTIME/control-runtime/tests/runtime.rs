@@ -514,6 +514,76 @@ fn unsupported_domains_are_reported_and_never_reach_the_sink() {
 }
 
 #[test]
+fn statuses_preserve_persisted_indices_across_disabled_bindings() {
+    let disabled_transport = ControlBinding::try_new(
+        binding_id(510),
+        false,
+        ControlSource::ClockInput { edge: Edge::Rising },
+        ControlScope::MixerPage,
+        ControlTransform::Trigger {
+            behavior: TriggerBehavior::Invoke,
+        },
+        ControlTarget::Transport {
+            action: TransportAction::Play,
+        },
+    )
+    .unwrap();
+    let disabled_main_gain = ControlBinding::try_new(
+        binding_id(512),
+        false,
+        ControlSource::CvInput { input_index: 0 },
+        ControlScope::MixerPage,
+        ControlTransform::Linear {
+            input_min: -1_000_000,
+            input_max: 1_000_000,
+            output_min: 0,
+            output_max: 1_000_000,
+        },
+        ControlTarget::MixerMain {
+            parameter: MainParameter::Gain,
+        },
+    )
+    .unwrap();
+    let compiled = table(vec![
+        disabled_transport,
+        trigger_binding(
+            511,
+            ControlScope::Global,
+            TriggerBehavior::Invoke,
+            ControlTarget::Transport {
+                action: TransportAction::Stop,
+            },
+        ),
+        disabled_main_gain,
+        cv_binding(
+            513,
+            ControlScope::Global,
+            ControlTarget::MixerCue {
+                parameter: CueParameter::Gain,
+            },
+        ),
+    ]);
+    let runtime = ControlRuntime::try_new(compiled, Sink::default()).unwrap();
+
+    assert_eq!(
+        runtime
+            .statuses()
+            .iter()
+            .map(|status| (status.source_binding_index(), status.availability()))
+            .collect::<Vec<_>>(),
+        [
+            (1, ControlBindingAvailability::Live),
+            (
+                3,
+                ControlBindingAvailability::Unavailable(
+                    ControlBindingUnavailableReason::CueOutputUnavailable
+                )
+            ),
+        ]
+    );
+}
+
+#[test]
 fn momentary_bindings_use_the_configured_edge_for_activation_and_the_opposite_for_release() {
     let compiled = table(vec![
         trigger_binding_from(
