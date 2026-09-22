@@ -211,13 +211,17 @@ export function resolveAudioValidatorPath() {
   if (process.env.HYPER_AUDIO_VALIDATOR) {
     return resolve(process.env.HYPER_AUDIO_VALIDATOR);
   }
-  const executable = process.platform === "win32"
-    ? "hyper-audio-validate.exe"
-    : "hyper-audio-validate";
-  const debugPath = resolve(workspaceRoot, "target", "debug", executable);
+  const executable =
+    process.platform === "win32"
+      ? "hyper-audio-validate.exe"
+      : "hyper-audio-validate";
+  const targetDirectory = process.env.CARGO_TARGET_DIR
+    ? resolve(process.env.CARGO_TARGET_DIR)
+    : resolve(workspaceRoot, "target");
+  const debugPath = resolve(targetDirectory, "debug", executable);
   return existsSync(debugPath)
     ? debugPath
-    : resolve(workspaceRoot, "target", "release", executable);
+    : resolve(targetDirectory, "release", executable);
 }
 
 async function validateNativeAudio(

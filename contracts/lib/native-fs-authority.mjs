@@ -14,13 +14,17 @@ export function resolveFilesystemAuthorityPath() {
   if (process.env.HYPER_FS_AUTHORITY) {
     return resolve(process.env.HYPER_FS_AUTHORITY);
   }
-  const executable = process.platform === "win32"
-    ? "hyper-fs-authority.exe"
-    : "hyper-fs-authority";
-  const debugPath = resolve(workspaceRoot, "target", "debug", executable);
+  const executable =
+    process.platform === "win32"
+      ? "hyper-fs-authority.exe"
+      : "hyper-fs-authority";
+  const targetDirectory = process.env.CARGO_TARGET_DIR
+    ? resolve(process.env.CARGO_TARGET_DIR)
+    : resolve(workspaceRoot, "target");
+  const debugPath = resolve(targetDirectory, "debug", executable);
   return existsSync(debugPath)
     ? debugPath
-    : resolve(workspaceRoot, "target", "release", executable);
+    : resolve(targetDirectory, "release", executable);
 }
 
 function retainedAuthority(handle, ambientPath, childDescriptor) {

@@ -12,7 +12,7 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 import canonicalize from "canonicalize";
@@ -33,6 +33,47 @@ const playbackDomainCases = JSON.parse(
 );
 
 const audioValidatorExecutable = resolveAudioValidatorPath();
+const validatorPathRoot = await mkdtemp(
+  join(tmpdir(), "hyper-audio-validator-path-"),
+);
+const previousAudioValidator = process.env.HYPER_AUDIO_VALIDATOR;
+const previousTargetDirectory = process.env.CARGO_TARGET_DIR;
+try {
+  const configuredTarget = join(validatorPathRoot, "configured-target");
+  const executable =
+    process.platform === "win32"
+      ? "hyper-audio-validate.exe"
+      : "hyper-audio-validate";
+  const configuredExecutable = join(configuredTarget, "debug", executable);
+  const explicitExecutable = join(validatorPathRoot, "explicit-validator");
+  await mkdir(join(configuredTarget, "debug"), { recursive: true });
+  await writeFile(configuredExecutable, "path resolution only");
+  process.env.CARGO_TARGET_DIR = relative(process.cwd(), configuredTarget);
+  process.env.HYPER_AUDIO_VALIDATOR = explicitExecutable;
+  assert.equal(
+    resolveAudioValidatorPath(),
+    resolve(explicitExecutable),
+    "the explicit audio-validator override must precede Cargo's target directory",
+  );
+  delete process.env.HYPER_AUDIO_VALIDATOR;
+  assert.equal(
+    resolveAudioValidatorPath(),
+    resolve(configuredExecutable),
+    "the audio-validator helper must follow Cargo's configured target directory",
+  );
+} finally {
+  if (previousAudioValidator === undefined) {
+    delete process.env.HYPER_AUDIO_VALIDATOR;
+  } else {
+    process.env.HYPER_AUDIO_VALIDATOR = previousAudioValidator;
+  }
+  if (previousTargetDirectory === undefined) {
+    delete process.env.CARGO_TARGET_DIR;
+  } else {
+    process.env.CARGO_TARGET_DIR = previousTargetDirectory;
+  }
+  await rm(validatorPathRoot, { recursive: true, force: true });
+}
 await assert.rejects(
   runNativeProcess(audioValidatorExecutable, ["0"]),
   /unsupported audio validator protocol version/,
@@ -2124,7 +2165,9 @@ try {
     /project must contain at most one control-mapping resource/,
   );
 
-  console.log("Project verifier passed: 78 filesystem cases");
+  console.log(
+    "Project verifier passed: 78 filesystem cases and 2 path-resolution cases",
+  );
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

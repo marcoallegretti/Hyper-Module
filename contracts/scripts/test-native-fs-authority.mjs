@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 
 import { openRetainedDirectory } from "../lib/durable-files.mjs";
 import { runNativeProcess } from "../lib/native-process.mjs";
@@ -31,6 +31,44 @@ import {
 
 const temporaryRoot = await mkdtemp(join(tmpdir(), "hyper-fs-authority-"));
 try {
+  const previousAuthority = process.env.HYPER_FS_AUTHORITY;
+  const previousTargetDirectory = process.env.CARGO_TARGET_DIR;
+  const configuredTarget = join(temporaryRoot, "configured-target");
+  const executable =
+    process.platform === "win32"
+      ? "hyper-fs-authority.exe"
+      : "hyper-fs-authority";
+  const configuredExecutable = join(configuredTarget, "debug", executable);
+  const explicitExecutable = join(temporaryRoot, "explicit-authority");
+  await mkdir(join(configuredTarget, "debug"), { recursive: true });
+  await writeFile(configuredExecutable, "path resolution only");
+  try {
+    process.env.CARGO_TARGET_DIR = relative(process.cwd(), configuredTarget);
+    process.env.HYPER_FS_AUTHORITY = explicitExecutable;
+    assert.equal(
+      resolveFilesystemAuthorityPath(),
+      resolve(explicitExecutable),
+      "the explicit filesystem-authority override must precede Cargo's target directory",
+    );
+    delete process.env.HYPER_FS_AUTHORITY;
+    assert.equal(
+      resolveFilesystemAuthorityPath(),
+      resolve(configuredExecutable),
+      "the filesystem-authority helper must follow Cargo's configured target directory",
+    );
+  } finally {
+    if (previousAuthority === undefined) {
+      delete process.env.HYPER_FS_AUTHORITY;
+    } else {
+      process.env.HYPER_FS_AUTHORITY = previousAuthority;
+    }
+    if (previousTargetDirectory === undefined) {
+      delete process.env.CARGO_TARGET_DIR;
+    } else {
+      process.env.CARGO_TARGET_DIR = previousTargetDirectory;
+    }
+  }
+
   await preflightFilesystemAuthority("native authority test");
   const authorityExecutable = resolveFilesystemAuthorityPath();
   await assert.rejects(
@@ -482,7 +520,9 @@ try {
   } finally {
     await parentHandle.close();
   }
-  console.log("Native filesystem authority passed: 20 identity cases");
+  console.log(
+    "Native filesystem authority passed: 20 identity cases and 2 path-resolution cases",
+  );
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }
