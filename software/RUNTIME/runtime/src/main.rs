@@ -25,8 +25,9 @@ use chrono::{SecondsFormat, Utc};
 use hyper_audio_engine::{LinearGain, LoudnessMeasurementCommand, LoudnessMeasurementState, Pan};
 use hyper_audio_source::DecodeLimits;
 use hyper_control_runtime::{
-    PanelBinding, PanelConnectError, PanelConnection, PanelDispatchError, PanelDispatchOutcome,
-    PanelDisplay, PanelReleaseFailure, UnboundReason,
+    ControlBindingAvailability, ControlBindingUnavailableReason, PanelBinding, PanelConnectError,
+    PanelConnection, PanelDispatchError, PanelDispatchOutcome, PanelDisplay, PanelReleaseFailure,
+    UnboundReason,
 };
 use hyper_desktop_audio::{
     CaptureStreamCounters, DesktopControlSinkError, DesktopMixerSendTap, DesktopMonitoringConfig,
@@ -1545,6 +1546,7 @@ impl RuntimeAudioObservationHandles {
 
 struct OperatorReady {
     observers: RuntimeObservers,
+    control_mapping: OperatorControlMappingSummary,
     scenes: Vec<OperatorScene>,
     mixer_channels: Vec<OperatorMixerChannel>,
     mixer_sends: Vec<OperatorMixerSend>,
@@ -1552,6 +1554,35 @@ struct OperatorReady {
     native_device_chains: Vec<OperatorNativeDeviceChain>,
     automation_targets: Vec<String>,
     recording_targets: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OperatorControlMappingSummary {
+    live: usize,
+    cue_output_unavailable: usize,
+    scene_disabled: usize,
+    scene_consolidation_required: usize,
+    scene_audio_not_prepared: usize,
+}
+
+impl OperatorControlMappingSummary {
+    const fn unavailable(self) -> usize {
+        self.cue_output_unavailable
+            .saturating_add(self.scene_disabled)
+            .saturating_add(self.scene_consolidation_required)
+            .saturating_add(self.scene_audio_not_prepared)
+    }
+
+    const fn enabled(self) -> usize {
+        self.live.saturating_add(self.unavailable())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperatorControlMappingPresentation {
+    state: String,
+    detail: String,
+    warning: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1725,6 +1756,7 @@ impl OperatorMeterObserver {
 struct StartedRuntime {
     host: SessionHost,
     observers: RuntimeObservers,
+    control_mapping: OperatorControlMappingSummary,
     native_device_chains: Vec<OperatorNativeDeviceChain>,
     automation_targets: Vec<String>,
     recording_targets: Vec<String>,
@@ -2663,6 +2695,12 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
         || prepare_runtime_audio(arguments),
         attach_runtime_host,
     )?;
+    let control_mapping = operator_control_mapping_summary(
+        session
+            .control_mapping_statuses()
+            .iter()
+            .map(|status| status.availability()),
+    );
     let panel_connected = Arc::new(AtomicBool::new(false));
     let audio_observers = RuntimeAudioObservers::new(&session);
     let meter_receivers = RuntimeMeterReceivers::default();
@@ -2708,6 +2746,7 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
     Ok(StartedRuntime {
         host,
         observers,
+        control_mapping,
         native_device_chains,
         automation_targets,
         recording_targets,
@@ -3021,6 +3060,18 @@ fn announce_runtime(arguments: &RuntimeArguments, runtime: &StartedRuntime) {
     if let Some(recovered) = &runtime.observers.facts.recovered_from {
         println!("recovered from rejected bundle {recovered}");
     }
+    println!(
+        "{}",
+        runtime_control_mapping_announcement(runtime.control_mapping)
+    );
+}
+
+fn runtime_control_mapping_announcement(summary: OperatorControlMappingSummary) -> String {
+    let presentation = operator_control_mapping_presentation(summary, true, false);
+    format!(
+        "control mapping: {} — {}",
+        presentation.state, presentation.detail
+    )
 }
 
 fn run_headless(arguments: &RuntimeArguments, stop: &Arc<AtomicBool>) -> Result<(), String> {
@@ -3828,6 +3879,107 @@ fn build_operator_mixer_catalog(
     Ok(channels)
 }
 
+fn operator_control_mapping_summary(
+    statuses: impl IntoIterator<Item = ControlBindingAvailability>,
+) -> OperatorControlMappingSummary {
+    let mut summary = OperatorControlMappingSummary::default();
+    for availability in statuses {
+        match availability {
+            ControlBindingAvailability::Live => {
+                summary.live = summary.live.saturating_add(1);
+            }
+            ControlBindingAvailability::Unavailable(reason) => {
+                let count = match reason {
+                    ControlBindingUnavailableReason::CueOutputUnavailable => {
+                        &mut summary.cue_output_unavailable
+                    }
+                    ControlBindingUnavailableReason::SceneDisabled => &mut summary.scene_disabled,
+                    ControlBindingUnavailableReason::SceneConsolidationRequired => {
+                        &mut summary.scene_consolidation_required
+                    }
+                    ControlBindingUnavailableReason::SceneAudioNotPrepared => {
+                        &mut summary.scene_audio_not_prepared
+                    }
+                };
+                *count = count.saturating_add(1);
+            }
+        }
+    }
+    summary
+}
+
+fn operator_control_mapping_presentation(
+    summary: OperatorControlMappingSummary,
+    playback_available: bool,
+    runtime_terminal: bool,
+) -> OperatorControlMappingPresentation {
+    if runtime_terminal {
+        return OperatorControlMappingPresentation {
+            state: "RUNTIME STOPPED".to_owned(),
+            detail: "Binding dispatch is unavailable".to_owned(),
+            warning: true,
+        };
+    }
+    if !playback_available {
+        let enabled = summary.enabled();
+        let binding_label = if enabled == 1 { "binding" } else { "bindings" };
+        return OperatorControlMappingPresentation {
+            state: "PLAYBACK TRANSITION".to_owned(),
+            detail: format!(
+                "{enabled} enabled {binding_label} · dispatch resumes after owner recovery"
+            ),
+            warning: true,
+        };
+    }
+    let unavailable = summary.unavailable();
+    if summary.enabled() == 0 {
+        return OperatorControlMappingPresentation {
+            state: "NO ENABLED BINDINGS".to_owned(),
+            detail: "Persisted disabled bindings do not enter Runtime".to_owned(),
+            warning: false,
+        };
+    }
+    if unavailable == 0 {
+        return OperatorControlMappingPresentation {
+            state: format!("{} LIVE", summary.live),
+            detail: "All enabled bindings accepted by the current playback owner".to_owned(),
+            warning: false,
+        };
+    }
+    let mut reasons = Vec::new();
+    for (count, label) in [
+        (summary.cue_output_unavailable, "No cue output"),
+        (summary.scene_disabled, "Scene disabled"),
+        (
+            summary.scene_consolidation_required,
+            "Scene consolidation required",
+        ),
+        (summary.scene_audio_not_prepared, "Scene audio not prepared"),
+    ] {
+        if count > 0 {
+            reasons.push(format!("{label}: {count}"));
+        }
+    }
+    OperatorControlMappingPresentation {
+        state: format!("{} LIVE · {unavailable} UNAVAILABLE", summary.live),
+        detail: reasons.join(" · "),
+        warning: true,
+    }
+}
+
+fn apply_operator_control_mapping_observation(
+    ui: &OperatorWindow,
+    summary: OperatorControlMappingSummary,
+    playback_available: bool,
+    runtime_terminal: bool,
+) {
+    let presentation =
+        operator_control_mapping_presentation(summary, playback_available, runtime_terminal);
+    ui.set_control_mapping_state(presentation.state.into());
+    ui.set_control_mapping_detail(presentation.detail.into());
+    ui.set_control_mapping_warning(presentation.warning);
+}
+
 fn spawn_operator_worker(
     arguments: RuntimeArguments,
     stop: Arc<AtomicBool>,
@@ -3839,6 +3991,7 @@ fn spawn_operator_worker(
     let handle = std::thread::spawn(move || {
         let result = match start_runtime(&arguments) {
             Ok(mut runtime) => {
+                let control_mapping = runtime.control_mapping;
                 let native_device_chains = runtime.native_device_chains.clone();
                 let automation_targets = runtime.automation_targets.clone();
                 let recording_targets = runtime.recording_targets.clone();
@@ -3855,6 +4008,7 @@ fn spawn_operator_worker(
                                         operator_native_device_catalog(playback).map(
                                             |native_devices| OperatorReady {
                                                 observers: runtime.observers.clone(),
+                                                control_mapping,
                                                 scenes,
                                                 mixer_channels,
                                                 mixer_sends,
@@ -3943,6 +4097,7 @@ fn run_operator_ui(arguments: RuntimeArguments, stop: &Arc<AtomicBool>) -> Resul
     };
     let OperatorReady {
         observers,
+        control_mapping,
         scenes,
         mixer_channels,
         mixer_sends,
@@ -4013,6 +4168,7 @@ fn run_operator_ui(arguments: RuntimeArguments, stop: &Arc<AtomicBool>) -> Resul
     ui.set_selected_recording_target_index(if recording_target_count == 0 { -1 } else { 0 });
 
     apply_static_facts(&ui, &observers.facts);
+    apply_operator_control_mapping_observation(&ui, control_mapping, true, false);
     wire_operator_transport_controls(&ui, &commands_tx, &diagnostic, &transport_authority);
     wire_operator_seek(&ui, &commands_tx, &diagnostic, &seek_authority);
     wire_operator_timeline_marker_navigation(
@@ -4184,6 +4340,12 @@ fn run_operator_ui(arguments: RuntimeArguments, stop: &Arc<AtomicBool>) -> Resul
             let runtime_terminal = completion_observed || output_state == OutputStreamState::Failed;
             let playback_unavailable = !timer_observers.playback_available.load(Ordering::Acquire);
             let playback_terminal = runtime_terminal || playback_unavailable;
+            apply_operator_control_mapping_observation(
+                &ui,
+                control_mapping,
+                !playback_unavailable,
+                runtime_terminal,
+            );
             apply_operator_cycle_observation(
                 &ui,
                 &timer_observers,
@@ -8467,6 +8629,113 @@ mod tests {
         ] {
             assert!(RUNTIME_HELP.contains(option), "help must describe {option}");
         }
+    }
+
+    #[test]
+    fn control_mapping_summary_preserves_every_native_unavailability_reason() {
+        let summary = operator_control_mapping_summary([
+            ControlBindingAvailability::Live,
+            ControlBindingAvailability::Live,
+            ControlBindingAvailability::Unavailable(
+                ControlBindingUnavailableReason::CueOutputUnavailable,
+            ),
+            ControlBindingAvailability::Unavailable(ControlBindingUnavailableReason::SceneDisabled),
+            ControlBindingAvailability::Unavailable(
+                ControlBindingUnavailableReason::SceneConsolidationRequired,
+            ),
+            ControlBindingAvailability::Unavailable(
+                ControlBindingUnavailableReason::SceneAudioNotPrepared,
+            ),
+        ]);
+        assert_eq!(summary.live, 2);
+        assert_eq!(summary.unavailable(), 4);
+        assert_eq!(summary.enabled(), 6);
+        assert_eq!(summary.cue_output_unavailable, 1);
+        assert_eq!(summary.scene_disabled, 1);
+        assert_eq!(summary.scene_consolidation_required, 1);
+        assert_eq!(summary.scene_audio_not_prepared, 1);
+
+        assert_eq!(
+            operator_control_mapping_presentation(summary, true, false),
+            OperatorControlMappingPresentation {
+                state: "2 LIVE · 4 UNAVAILABLE".to_owned(),
+                detail: "No cue output: 1 · Scene disabled: 1 · Scene consolidation required: 1 · Scene audio not prepared: 1".to_owned(),
+                warning: true,
+            }
+        );
+        assert_eq!(
+            runtime_control_mapping_announcement(summary),
+            "control mapping: 2 LIVE · 4 UNAVAILABLE — No cue output: 1 · Scene disabled: 1 · Scene consolidation required: 1 · Scene audio not prepared: 1"
+        );
+    }
+
+    #[test]
+    fn control_mapping_presentation_revokes_live_claims_without_playback_authority() {
+        let summary = operator_control_mapping_summary([ControlBindingAvailability::Live]);
+        assert_eq!(
+            operator_control_mapping_presentation(summary, true, false),
+            OperatorControlMappingPresentation {
+                state: "1 LIVE".to_owned(),
+                detail: "All enabled bindings accepted by the current playback owner".to_owned(),
+                warning: false,
+            }
+        );
+        assert_eq!(
+            operator_control_mapping_presentation(summary, false, false),
+            OperatorControlMappingPresentation {
+                state: "PLAYBACK TRANSITION".to_owned(),
+                detail: "1 enabled binding · dispatch resumes after owner recovery".to_owned(),
+                warning: true,
+            }
+        );
+        assert_eq!(
+            operator_control_mapping_presentation(summary, true, true),
+            OperatorControlMappingPresentation {
+                state: "RUNTIME STOPPED".to_owned(),
+                detail: "Binding dispatch is unavailable".to_owned(),
+                warning: true,
+            }
+        );
+        assert_eq!(
+            operator_control_mapping_presentation(
+                OperatorControlMappingSummary::default(),
+                true,
+                false,
+            ),
+            OperatorControlMappingPresentation {
+                state: "NO ENABLED BINDINGS".to_owned(),
+                detail: "Persisted disabled bindings do not enter Runtime".to_owned(),
+                warning: false,
+            }
+        );
+    }
+
+    #[test]
+    fn control_mapping_observation_updates_the_operator_surface() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = OperatorWindow::new().unwrap();
+        let summary = operator_control_mapping_summary([
+            ControlBindingAvailability::Live,
+            ControlBindingAvailability::Unavailable(
+                ControlBindingUnavailableReason::SceneAudioNotPrepared,
+            ),
+        ]);
+
+        apply_operator_control_mapping_observation(&ui, summary, true, false);
+        assert_eq!(ui.get_control_mapping_state(), "1 LIVE · 1 UNAVAILABLE");
+        assert_eq!(
+            ui.get_control_mapping_detail(),
+            "Scene audio not prepared: 1"
+        );
+        assert!(ui.get_control_mapping_warning());
+
+        apply_operator_control_mapping_observation(&ui, summary, false, false);
+        assert_eq!(ui.get_control_mapping_state(), "PLAYBACK TRANSITION");
+        assert!(ui.get_control_mapping_warning());
+
+        apply_operator_control_mapping_observation(&ui, summary, true, true);
+        assert_eq!(ui.get_control_mapping_state(), "RUNTIME STOPPED");
+        assert!(ui.get_control_mapping_warning());
     }
 
     #[test]

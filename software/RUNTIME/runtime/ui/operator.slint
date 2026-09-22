@@ -100,6 +100,34 @@ component FactCard inherits Rectangle {
     }
 }
 
+component ControlMappingFactCard inherits Rectangle {
+    in property <string> state;
+    in property <string> detail;
+    in property <bool> warning-state;
+    background: #171b24;
+    border-color: root.warning-state ? #7a5830 : #2c3445;
+    border-width: 1px;
+    border-radius: 8px;
+    min-height: 68px;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 5px;
+        HorizontalLayout {
+            Text { text: "CONTROL MAPPING"; color: #8d99ad; font-size: 11px; font-weight: 700; }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            Text {
+                text: root.state;
+                accessible-label: "Control mapping " + root.state + ": " + root.detail;
+                color: root.warning-state ? #f0b35b : #6fd6bd;
+                font-size: 11px;
+                font-weight: 700;
+            }
+        }
+        Text { text: root.detail; color: #8d99ad; font-size: 10px; wrap: word-wrap; }
+    }
+}
+
 component LoopFactCard inherits Rectangle {
     in property <string> label;
     in property <string> value;
@@ -632,6 +660,9 @@ export component OperatorWindow inherits Window {
     in property <string> stream-failures;
     in property <string> native-xruns;
     in property <string> panel-state;
+    in property <string> control-mapping-state: "Waiting for verified playback owner";
+    in property <string> control-mapping-detail: "";
+    in property <bool> control-mapping-warning: false;
     in property <float> left-output-level;
     in property <string> left-output-reading;
     in property <string> left-output-peak-reading;
@@ -936,6 +967,13 @@ export component OperatorWindow inherits Window {
             FactCard { width: 156px; label: "METRONOME"; value: root.metronome-state; }
             FactCard { width: 156px; label: "AUDIO OWNER"; value: root.stream-state; detail: root.output-route; }
             FactCard { width: 156px; label: "PANEL LINK"; value: root.panel-state; }
+        }
+
+        ControlMappingFactCard {
+            width: root.width - 48px;
+            state: root.control-mapping-state;
+            detail: root.control-mapping-detail;
+            warning-state: root.control-mapping-warning;
         }
 
         HorizontalLayout {

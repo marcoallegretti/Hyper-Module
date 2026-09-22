@@ -28,6 +28,25 @@ enum LoopIntent {
 }
 
 #[test]
+fn generated_control_mapping_health_exposes_the_complete_operator_summary() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = OperatorWindow::new().unwrap();
+    ui.set_control_mapping_state("2 LIVE · 4 UNAVAILABLE".into());
+    ui.set_control_mapping_detail(
+        "No cue output: 1 · Scene disabled: 1 · Scene consolidation required: 1 · Scene audio not prepared: 1".into(),
+    );
+    ui.set_control_mapping_warning(true);
+    ui.show().unwrap();
+
+    let status = find_control(
+        &ui,
+        "Control mapping 2 LIVE · 4 UNAVAILABLE: No cue output: 1 · Scene disabled: 1 · Scene consolidation required: 1 · Scene audio not prepared: 1",
+    );
+    assert!(status.size().width > 0.0);
+    assert!(status.size().height > 0.0);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "one generated-window contract keeps shortcut routing and recovery-enabled controls together"
@@ -1253,7 +1272,7 @@ fn scroll_down(ui: &OperatorWindow) {
     ui.window().dispatch_event(WindowEvent::PointerScrolled {
         position: LogicalPosition::new(440.0, 800.0),
         delta_x: 0.0,
-        delta_y: -600.0,
+        delta_y: -700.0,
     });
 }
 
