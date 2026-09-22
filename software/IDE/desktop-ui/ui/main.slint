@@ -510,6 +510,7 @@ export global IdeActions {
     callback preview-gain(float);
     callback preview-mute();
     callback close-project();
+    callback save-close-project();
     callback confirm-close-project();
     callback cancel-close-project();
     callback restore-mixer-recovery();
@@ -1517,7 +1518,7 @@ export component MainWindow inherits Window {
                 Text {
                     horizontal-stretch: 1;
                     text: root.mixer-unsaved-changes
-                        ? "Playback output ended. Close requires an explicit decision about unsaved live mixer changes."
+                        ? "Playback output ended. Save the final committed mixer state or explicitly discard it before closing."
                         : "Playback output ended. Close the project before selecting an output and reopening it.";
                     color: #ffd1cf;
                     font-size: 10px;
@@ -2030,23 +2031,38 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-                        if root.close-unsaved-mixer-confirming : HorizontalLayout {
-                            spacing: 8px;
+                        if root.close-unsaved-mixer-confirming : VerticalLayout {
+                            spacing: 6px;
                             Text {
-                                horizontal-stretch: 1;
-                                text: "Live mixer changes have not been saved.";
+                                text: root.app-mode == AppMode.output-failed
+                                    ? "The final committed live mixer state has not been saved."
+                                    : "Live mixer changes have not been saved.";
                                 color: #ffcf70;
-                                vertical-alignment: center;
+                                font-size: 10px;
+                                wrap: word-wrap;
                             }
-                            Button {
-                                text: "Keep editing";
-                                enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing || root.app-mode == AppMode.output-failed;
-                                clicked => { IdeActions.cancel-close-project(); }
-                            }
-                            Button {
-                                text: "Discard live mixer changes";
-                                enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing || root.app-mode == AppMode.output-failed;
-                                clicked => { IdeActions.confirm-close-project(); }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                if root.app-mode == AppMode.output-failed : Button {
+                                    horizontal-stretch: 1;
+                                    text: "Save & close";
+                                    accessible-label: "Save the final committed live mixer state and close the failed project";
+                                    clicked => { IdeActions.save-close-project(); }
+                                }
+                                Button {
+                                    horizontal-stretch: 1;
+                                    text: root.app-mode == AppMode.output-failed ? "Keep open" : "Keep editing";
+                                    accessible-label: root.app-mode == AppMode.output-failed ? "Keep the failed project open without saving or discarding" : "Keep editing the project";
+                                    enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing || root.app-mode == AppMode.output-failed;
+                                    clicked => { IdeActions.cancel-close-project(); }
+                                }
+                                Button {
+                                    horizontal-stretch: 1;
+                                    text: root.app-mode == AppMode.output-failed ? "Discard" : "Discard changes";
+                                    accessible-label: "Discard live mixer changes and close the project";
+                                    enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing || root.app-mode == AppMode.output-failed;
+                                    clicked => { IdeActions.confirm-close-project(); }
+                                }
                             }
                         }
                         if !root.new-project-visible && !root.new-track-visible : HorizontalLayout {

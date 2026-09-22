@@ -8726,6 +8726,12 @@ struct IdeMixerSavePlan {
 }
 
 #[derive(Debug)]
+enum IdeFailedOutputMixerSave {
+    Saved { revision: u64, changed: bool },
+    CommittedWithWarning(Box<ProjectResourcePublicationError>),
+}
+
+#[derive(Debug)]
 struct IdeAudioClipCreationPlan {
     mixer: IdeMixerSavePlan,
     clip_id: String,
@@ -10810,12 +10816,22 @@ struct TestPlaybackSession {
     next_mixer_fence: u64,
     next_capture_start_sequence: u64,
     close_requires_discard: Option<bool>,
+    close_timeouts: usize,
+    failed_output_mixer_save: Option<TestFailedOutputMixerSave>,
     extent: IdePlaybackExtent,
     arrangement_project_id: String,
     arrangement_placements: Vec<(String, usize)>,
     arrangement_scene_launches: Vec<(String, usize)>,
     timeline_marker_project_id: String,
     timeline_markers: Vec<(String, usize)>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestFailedOutputMixerSave {
+    Saved { revision: u64, changed: bool },
+    RetryableFailure,
+    CommittedWithWarning,
 }
 
 #[cfg(test)]
@@ -10847,6 +10863,8 @@ impl Default for TestPlaybackSession {
             next_mixer_fence: 1,
             next_capture_start_sequence: 1,
             close_requires_discard: Some(false),
+            close_timeouts: 0,
+            failed_output_mixer_save: None,
             extent: IdePlaybackExtent::Bounded { end_frame: 0 },
             arrangement_project_id: String::new(),
             arrangement_placements: Vec::new(),
@@ -11056,6 +11074,68 @@ impl RunningDesktopIdeApplication {
             .ok_or(IdeProjectSaveError::ProjectSnapshotUnavailable)?;
         let checkpoint = recovery.checkpoint();
         Self::prepare_mixer_save_from_snapshot(application, project, &checkpoint)
+    }
+
+    /// Publishes the final committed mixer checkpoint after terminal output
+    /// failure without starting or replacing any native owner.
+    ///
+    /// The worker calls this only while it owns the failed playback session.
+    /// Keeping that owner alive until publication finishes makes a retryable
+    /// storage failure non-destructive: the exact checkpoint and verified
+    /// project authority remain available for another explicit decision.
+    fn save_failed_output_mixer(&self) -> Result<IdeFailedOutputMixerSave, IdeProjectSaveError> {
+        debug_assert_eq!(self.output_state(), OutputStreamState::Failed);
+        #[cfg(test)]
+        if let IdePlaybackSessionOwner::Test(session) = &self.session {
+            return match session.failed_output_mixer_save {
+                Some(TestFailedOutputMixerSave::Saved { revision, changed }) => {
+                    Ok(IdeFailedOutputMixerSave::Saved { revision, changed })
+                }
+                Some(TestFailedOutputMixerSave::RetryableFailure) => {
+                    Err(IdeProjectSaveError::Publication(Box::new(
+                        ProjectResourcePublicationError::for_test(
+                            hyper_storage_engine::ProjectResourcePublicationErrorKind::Io,
+                            "controlled retryable failed-output mixer publication failure",
+                            false,
+                        ),
+                    )))
+                }
+                Some(TestFailedOutputMixerSave::CommittedWithWarning) => {
+                    Ok(IdeFailedOutputMixerSave::CommittedWithWarning(Box::new(
+                        ProjectResourcePublicationError::for_test(
+                            hyper_storage_engine::ProjectResourcePublicationErrorKind::Recovery,
+                            "controlled committed failed-output mixer publication warning",
+                            true,
+                        ),
+                    )))
+                }
+                None => Err(IdeProjectSaveError::ProjectSnapshotUnavailable),
+            };
+        }
+        #[cfg(test)]
+        let session = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            IdePlaybackSessionOwner::Test(_) => {
+                unreachable!("the test playback branch returned its controlled save outcome")
+            }
+        };
+        #[cfg(not(test))]
+        let IdePlaybackSessionOwner::Native(session) = &self.session;
+        let project = session
+            .prepared_project()
+            .ok_or(IdeProjectSaveError::ProjectSnapshotUnavailable)?;
+        let checkpoint = session.recovery_checkpoint().snapshot();
+        let plan = Self::prepare_mixer_save_from_snapshot(&self.application, project, &checkpoint)?;
+        match plan.publish() {
+            Ok(outcome) => Ok(IdeFailedOutputMixerSave::Saved {
+                revision: outcome.project_revision(),
+                changed: outcome.changed(),
+            }),
+            Err(source) if source.published() => Ok(
+                IdeFailedOutputMixerSave::CommittedWithWarning(Box::new(source)),
+            ),
+            Err(source) => Err(IdeProjectSaveError::Publication(Box::new(source))),
+        }
     }
 
     fn prepare_mixer_save_from_snapshot(
@@ -17785,6 +17865,15 @@ impl RunningDesktopIdeApplication {
             IdePlaybackSessionOwner::Native(session) => session,
             #[cfg(test)]
             IdePlaybackSessionOwner::Test(session) => {
+                if session.close_timeouts > 0 {
+                    return IdeCloseOutcome::Pending(DesktopIdePendingClose {
+                        application,
+                        owner: DesktopIdePendingCloseOwner::Test {
+                            remaining_timeouts: session.close_timeouts,
+                            failure: session.close_failure,
+                        },
+                    });
+                }
                 return IdeCloseOutcome::Closed {
                     application,
                     failure: session.close_failure,
@@ -17801,7 +17890,7 @@ impl RunningDesktopIdeApplication {
                 match error.into_pending() {
                     Ok(pending) => IdeCloseOutcome::Pending(DesktopIdePendingClose {
                         application,
-                        pending,
+                        owner: DesktopIdePendingCloseOwner::Native(pending),
                     }),
                     Err(error) => {
                         drop(error);
@@ -18111,7 +18200,24 @@ impl DesktopIdePendingSaveClose {
 #[derive(Debug)]
 pub struct DesktopIdePendingClose {
     application: DesktopIdeApplication,
-    pending: DesktopPlaybackRecoveryPendingStop,
+    owner: DesktopIdePendingCloseOwner,
+}
+
+#[derive(Debug)]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::large_enum_variant,
+        reason = "the small deterministic test owner must not allocate or weaken the release-only native owner"
+    )
+)]
+enum DesktopIdePendingCloseOwner {
+    Native(DesktopPlaybackRecoveryPendingStop),
+    #[cfg(test)]
+    Test {
+        remaining_timeouts: usize,
+        failure: Option<IdeNativeCloseFailure>,
+    },
 }
 
 #[derive(Debug)]
@@ -18130,30 +18236,53 @@ pub enum IdePendingCloseWait {
 impl DesktopIdePendingClose {
     #[must_use]
     pub fn wait(self, timeout: Duration) -> IdePendingCloseWait {
-        match self.pending.wait(timeout) {
-            DesktopPlaybackRecoveryPendingStopWait::Completed(_recovery) => {
-                IdePendingCloseWait::Closed {
-                    application: self.application,
-                    failure: None,
+        let Self { application, owner } = self;
+        match owner {
+            DesktopIdePendingCloseOwner::Native(pending) => match pending.wait(timeout) {
+                DesktopPlaybackRecoveryPendingStopWait::Completed(_recovery) => {
+                    IdePendingCloseWait::Closed {
+                        application,
+                        failure: None,
+                    }
                 }
-            }
-            DesktopPlaybackRecoveryPendingStopWait::Failed(_recovery) => {
-                IdePendingCloseWait::Closed {
-                    application: self.application,
-                    failure: Some(IdeNativeCloseFailure::RuntimeFailed),
+                DesktopPlaybackRecoveryPendingStopWait::Failed(_recovery) => {
+                    IdePendingCloseWait::Closed {
+                        application,
+                        failure: Some(IdeNativeCloseFailure::RuntimeFailed),
+                    }
                 }
-            }
-            DesktopPlaybackRecoveryPendingStopWait::Panicked(_recovery) => {
-                IdePendingCloseWait::Closed {
-                    application: self.application,
-                    failure: Some(IdeNativeCloseFailure::ThreadPanicked),
+                DesktopPlaybackRecoveryPendingStopWait::Panicked(_recovery) => {
+                    IdePendingCloseWait::Closed {
+                        application,
+                        failure: Some(IdeNativeCloseFailure::ThreadPanicked),
+                    }
                 }
-            }
-            DesktopPlaybackRecoveryPendingStopWait::TimedOut(pending) => {
-                IdePendingCloseWait::TimedOut(Self {
-                    application: self.application,
-                    pending,
-                })
+                DesktopPlaybackRecoveryPendingStopWait::TimedOut(pending) => {
+                    IdePendingCloseWait::TimedOut(Self {
+                        application,
+                        owner: DesktopIdePendingCloseOwner::Native(pending),
+                    })
+                }
+            },
+            #[cfg(test)]
+            DesktopIdePendingCloseOwner::Test {
+                remaining_timeouts,
+                failure,
+            } => {
+                if remaining_timeouts == 0 {
+                    IdePendingCloseWait::Closed {
+                        application,
+                        failure,
+                    }
+                } else {
+                    IdePendingCloseWait::TimedOut(Self {
+                        application,
+                        owner: DesktopIdePendingCloseOwner::Test {
+                            remaining_timeouts: remaining_timeouts - 1,
+                            failure,
+                        },
+                    })
+                }
             }
         }
     }
@@ -19117,6 +19246,76 @@ mod tests {
             track_id,
             |_| false
         ));
+    }
+
+    #[test]
+    fn failed_output_mixer_plan_publishes_the_checkpoint_state() {
+        let parent = TestDirectory::new();
+        let created = hyper_storage_engine::create_project(
+            &parent.0,
+            hyper_storage_engine::ProjectCreationRequest {
+                directory_name: "Project",
+                project_name: "Failed output checkpoint",
+            },
+        )
+        .unwrap();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(created.project().root(), limits)
+                .unwrap();
+        let (_, mixer, _, _) = prepared.session().parts();
+        let channels: Vec<_> = mixer
+            .slots()
+            .iter()
+            .map(|slot| {
+                let sends: Vec<_> = slot
+                    .sends()
+                    .iter()
+                    .map(|send| {
+                        hyper_mixer_runtime::MixerSendParameterState::for_test(
+                            send.parameters(),
+                            send.enabled(),
+                        )
+                    })
+                    .collect();
+                hyper_mixer_runtime::MixerChannelParameterState::for_test(
+                    slot.parameters(),
+                    slot.muted(),
+                    slot.solo(),
+                    &sends,
+                )
+            })
+            .collect();
+        let expected_gain = LinearGain::from_millionths(750_000).unwrap();
+        let live = hyper_mixer_runtime::MixerParameterStateSnapshot::for_test(
+            &channels,
+            expected_gain,
+            mixer.main_muted(),
+        );
+        let (_, checkpoint) = hyper_mixer_runtime::playback_recovery_channel(None, Some(&live));
+        let snapshot = checkpoint.snapshot();
+        let application = DesktopIdeApplication::from_inventory(
+            desktop_ide_application_config().unwrap(),
+            IdeAudioOutputInventory::try_new(&[("output", "Output")]).unwrap(),
+        );
+
+        let plan = RunningDesktopIdeApplication::prepare_mixer_save_from_snapshot(
+            &application,
+            &prepared,
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&plan.resource_bytes).unwrap()["main"]["gain_millionths"],
+            json!(750_000)
+        );
+        assert!(plan.publish().unwrap().changed());
+
+        let reloaded =
+            hyper_project_loader::prepare_project_playback(created.project().root(), limits)
+                .unwrap();
+        let (_, mixer, _, _) = reloaded.session().parts();
+        assert_eq!(mixer.main_gain(), expected_gain);
     }
 
     #[test]

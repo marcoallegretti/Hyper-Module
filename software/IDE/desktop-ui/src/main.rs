@@ -2450,6 +2450,17 @@ fn bind_project_close_callback_with(ui: &MainWindow, submitter: UiCommandSubmitt
         close_submitter(&ui, IdeWorkerCommand::CloseProject);
     });
     let weak = ui.as_weak();
+    let save_submitter = Rc::clone(&submitter);
+    actions.on_save_close_project(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::OutputFailed || !ui.get_close_unsaved_mixer_confirming() {
+            return;
+        }
+        save_submitter(&ui, IdeWorkerCommand::SaveCloseProject);
+    });
+    let weak = ui.as_weak();
     let confirm_submitter = Rc::clone(&submitter);
     actions.on_confirm_close_project(move || {
         let Some(ui) = weak.upgrade() else {
@@ -7522,6 +7533,37 @@ fn apply_event(
         IdeWorkerEvent::CloseDiscardCancelled => {
             apply_close_discard_cancelled(ui);
         }
+        IdeWorkerEvent::OutputFailureProjectSaving => {
+            ui.set_app_mode(AppMode::Saving);
+            ui.set_close_unsaved_mixer_confirming(false);
+            ui.set_status_text(
+                "Saving the final committed mixer state before closing failed output…".into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::OutputFailureProjectSaved { revision, changed } => {
+            ui.set_close_unsaved_mixer_confirming(false);
+            ui.set_status_text(
+                if changed {
+                    format!(
+                        "Project revision {revision} saved from the final committed mixer state after output failure"
+                    )
+                } else {
+                    format!(
+                        "Project revision {revision} already matched the final committed mixer state; failed output closed"
+                    )
+                }
+                .into(),
+            );
+        }
+        IdeWorkerEvent::OutputFailureProjectSaveCommittedWithWarning { warning } => {
+            ui.set_close_unsaved_mixer_confirming(false);
+            ui.set_status_text(
+                "Final mixer state was committed after output failure, but project recovery needs attention"
+                    .into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
         IdeWorkerEvent::MonitoringApplied(_) => {
             ui.set_status_text("Input cue control applied".into());
             ui.set_error_text(SharedString::default());
@@ -8101,6 +8143,11 @@ fn apply_event(
             if matches!(&reason, IdeWorkerCommandFailure::NativeOutputFailed) {
                 apply_output_failure_observation(ui);
             } else {
+                if command == IdeWorkerCommandKind::CloseProject
+                    && ui.get_app_mode() == AppMode::Saving
+                {
+                    ui.set_close_unsaved_mixer_confirming(true);
+                }
                 ui.set_app_mode(mode_after_failure(ui.get_app_mode(), command));
             }
             ui.set_error_text(format!("{}: {reason}", command_status(command)).into());
@@ -8112,7 +8159,7 @@ fn apply_close_discard_required(ui: &MainWindow) {
     ui.set_close_unsaved_mixer_confirming(true);
     if ui.get_app_mode() == AppMode::OutputFailed {
         ui.set_status_text(
-            "Native audio output ended unexpectedly; live mixer changes need an explicit discard before closing"
+            "Native audio output ended unexpectedly; save the final committed mixer state or explicitly discard it before closing"
                 .into(),
         );
         ui.set_error_text(
@@ -12210,6 +12257,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::OpenProject if current == AppMode::Opening => AppMode::Closed,
         IdeWorkerCommandKind::Observe if current == AppMode::Opening => AppMode::Running,
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
+        IdeWorkerCommandKind::CloseProject if current == AppMode::Saving => AppMode::OutputFailed,
         IdeWorkerCommandKind::SaveProject
         | IdeWorkerCommandKind::DiscardRecordingTake
         | IdeWorkerCommandKind::RenameRecordingTake
@@ -19750,15 +19798,49 @@ mod tests {
         assert!(!ui.get_transport_seek_available());
         assert!(!ui.get_metronome_available());
         assert!(ui.get_status_text().contains("output ended unexpectedly"));
+        assert!(
+            ui.get_status_text()
+                .contains("save the final committed mixer state or explicitly discard it")
+        );
         assert!(ui.get_error_text().contains("locked"));
 
-        ui.global::<IdeActions>().invoke_cancel_close_project();
+        ui.global::<IdeActions>().invoke_save_close_project();
         assert!(matches!(
             submitted.borrow().as_slice(),
             [
                 IdeWorkerCommand::CloseProject,
-                IdeWorkerCommand::CancelCloseProject
+                IdeWorkerCommand::SaveCloseProject
             ]
+        ));
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::OutputFailureProjectSaving,
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Saving);
+        assert!(!ui.get_close_unsaved_mixer_confirming());
+        assert!(ui.get_status_text().contains("final committed mixer state"));
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CloseProject,
+                reason: IdeWorkerCommandFailure::ProjectSave(
+                    hyper_desktop_ide::IdeProjectSaveError::ProjectSnapshotUnavailable,
+                ),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::OutputFailed);
+        assert!(ui.get_close_unsaved_mixer_confirming());
+        assert!(ui.get_error_text().contains("verified project snapshot"));
+        submitted.borrow_mut().clear();
+
+        ui.global::<IdeActions>().invoke_cancel_close_project();
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::CancelCloseProject]
         ));
         apply_event(
             ui,

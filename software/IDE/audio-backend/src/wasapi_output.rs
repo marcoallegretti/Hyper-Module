@@ -585,7 +585,7 @@ where
     C: FnMut(),
 {
     let _com = initialize_com()?;
-    let mut output = open_render_output(config, signals.status, signals.disconnect_reason)?;
+    let mut output = open_render_output(config, signals.disconnect_reason)?;
     let initial_frames = usize::try_from(
         output
             .client
@@ -611,7 +611,9 @@ where
         .map_err(|source| backend_error(WasapiStartupStage::Start, source))?;
     let _started = StartedStream(&output.client);
     signals.status.mark_running();
-    if signals.status.state() != OutputStreamState::Running {
+    if settle_disconnect(signals.status, signals.disconnect_reason)
+        || signals.status.state() != OutputStreamState::Running
+    {
         return Err(WasapiStartError::Backend {
             stage: WasapiStartupStage::State,
             detail: match decode_disconnect_reason(
@@ -628,11 +630,17 @@ where
     while !signals.stop_requested.load(Ordering::Acquire)
         && signals.status.state() != OutputStreamState::Failed
     {
+        if settle_disconnect(signals.status, signals.disconnect_reason) {
+            break;
+        }
         if output
             .event
             .wait_for_event(EVENT_WAIT_MILLISECONDS)
             .is_err()
         {
+            if settle_disconnect(signals.status, signals.disconnect_reason) {
+                break;
+            }
             consecutive_event_timeouts = consecutive_event_timeouts.saturating_add(1);
             if consecutive_event_timeouts >= MAX_CONSECUTIVE_EVENT_TIMEOUTS {
                 signals.status.mark_failed();
@@ -661,6 +669,9 @@ where
             signals.counters.record_stream_error();
             break;
         }
+        if settle_disconnect(signals.status, signals.disconnect_reason) {
+            break;
+        }
     }
     Ok(())
 }
@@ -686,7 +697,6 @@ fn initialize_com() -> Result<ComGuard, WasapiStartError> {
 
 fn open_render_output(
     config: &WasapiOutputConfig,
-    status: &OutputStreamStatus,
     disconnect_reason: &Arc<AtomicU8>,
 ) -> Result<WasapiRenderOutput, WasapiStartError> {
     let enumerator = wasapi::DeviceEnumerator::new()
@@ -742,10 +752,9 @@ fn open_render_output(
         .get_audiosessioncontrol()
         .map_err(|source| backend_error(WasapiStartupStage::SessionControl, source))?;
     let mut callbacks = EventCallbacks::new();
-    let callback_status = status.clone();
     let callback_reason = Arc::clone(disconnect_reason);
     callbacks.set_disconnected_callback(move |reason| {
-        publish_disconnect(&reason, &callback_status, &callback_reason);
+        publish_output_disconnect(&reason, &callback_reason);
     });
     let notifications = session_control
         .register_session_notification(callbacks)
@@ -908,8 +917,22 @@ pub(crate) fn publish_disconnect(
     status: &OutputStreamStatus,
     destination: &AtomicU8,
 ) {
-    destination.store(map_disconnect_reason(reason) as u8, Ordering::Release);
+    publish_output_disconnect(reason, destination);
     status.mark_failed();
+}
+
+fn publish_output_disconnect(reason: &DisconnectReason, destination: &AtomicU8) {
+    // Session callbacks must remain nonblocking. The render owner consumes this
+    // reason at a cycle boundary so Failed cannot overtake an in-flight commit.
+    destination.store(map_disconnect_reason(reason) as u8, Ordering::Release);
+}
+
+fn settle_disconnect(status: &OutputStreamStatus, source: &AtomicU8) -> bool {
+    if decode_disconnect_reason(source.load(Ordering::Acquire)).is_none() {
+        return false;
+    }
+    status.mark_failed();
+    true
 }
 
 fn validate_transport_capacity(
@@ -1286,13 +1309,37 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_reason_is_published_before_terminal_failure() {
+    fn disconnect_failure_settles_after_an_in_flight_commit() {
         let status = OutputStreamStatus::default();
         let reason = AtomicU8::new(0);
         status.mark_running();
+        let mut callback = OutputCallback::try_new(
+            |output: &mut [f32]| {
+                output.fill(0.25);
+                Ok::<_, ()>(())
+            },
+            1,
+        )
+        .unwrap();
+        let mut samples = [0.0_f32; 2];
+        let mut commits = 0;
 
-        publish_disconnect(&DisconnectReason::DeviceRemoval, &status, &reason);
+        render_frames(
+            1,
+            1,
+            &mut samples,
+            &mut callback,
+            |_, _| {
+                publish_output_disconnect(&DisconnectReason::DeviceRemoval, &reason);
+                assert_eq!(status.state(), OutputStreamState::Running);
+                Ok::<_, ()>(())
+            },
+            &mut || commits += 1,
+        )
+        .unwrap();
 
+        assert_eq!(commits, 1);
+        assert!(settle_disconnect(&status, &reason));
         assert_eq!(status.state(), OutputStreamState::Failed);
         assert_eq!(
             decode_disconnect_reason(reason.load(Ordering::Acquire)),
