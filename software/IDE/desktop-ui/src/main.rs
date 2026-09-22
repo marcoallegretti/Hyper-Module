@@ -2399,15 +2399,21 @@ fn bind_window_close_callback(ui: &MainWindow) {
 }
 
 fn window_close_response(ui: &MainWindow) -> CloseRequestResponse {
-    if matches!(
-        ui.get_app_mode(),
-        AppMode::Running | AppMode::Previewing | AppMode::OutputFailed
-    ) {
-        ui.global::<IdeActions>().invoke_close_project();
-        CloseRequestResponse::KeepWindowShown
-    } else {
-        CloseRequestResponse::HideWindow
+    let actions = ui.global::<IdeActions>();
+    match ui.get_app_mode() {
+        AppMode::Running | AppMode::Previewing | AppMode::OutputFailed => {
+            actions.invoke_close_project();
+        }
+        AppMode::OutputTesting => actions.invoke_stop_output_test(),
+        AppMode::Recording => actions.invoke_stop_recording(),
+        AppMode::CapturingScenePerformance => actions.invoke_stop_scene_performance_capture(),
+        AppMode::CapturingMixerAutomation => actions.invoke_stop_mixer_automation_capture(),
+        AppMode::Discovering | AppMode::Closed | AppMode::Unavailable => {
+            return CloseRequestResponse::HideWindow;
+        }
+        _ => {}
     }
+    CloseRequestResponse::KeepWindowShown
 }
 
 fn bind_project_save_callback(
@@ -19957,6 +19963,107 @@ mod tests {
             "a focused text field owns grave without leaking a metronome request"
         );
         ui.hide().unwrap();
+    }
+
+    #[test]
+    fn native_close_settles_active_owners_and_refuses_pending_work() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let intents = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let actions = ui.global::<IdeActions>();
+
+        let intents_by_callback = Rc::clone(&intents);
+        actions.on_close_project(move || intents_by_callback.borrow_mut().push("close-project"));
+        let intents_by_callback = Rc::clone(&intents);
+        actions.on_stop_output_test(move || {
+            intents_by_callback.borrow_mut().push("stop-output-test");
+        });
+        let intents_by_callback = Rc::clone(&intents);
+        actions.on_stop_recording(move || {
+            intents_by_callback.borrow_mut().push("stop-recording");
+        });
+        let intents_by_callback = Rc::clone(&intents);
+        actions.on_abort_recording(move || {
+            intents_by_callback.borrow_mut().push("abort-recording");
+        });
+        let intents_by_callback = Rc::clone(&intents);
+        actions.on_stop_scene_performance_capture(move || {
+            intents_by_callback.borrow_mut().push("stop-scene-capture");
+        });
+        let intents_by_callback = Rc::clone(&intents);
+        actions.on_stop_mixer_automation_capture(move || {
+            intents_by_callback
+                .borrow_mut()
+                .push("stop-automation-capture");
+        });
+
+        for mode in [AppMode::Running, AppMode::Previewing, AppMode::OutputFailed] {
+            ui.set_app_mode(mode);
+            assert_eq!(
+                window_close_response(&ui),
+                CloseRequestResponse::KeepWindowShown
+            );
+        }
+        for mode in [
+            AppMode::OutputTesting,
+            AppMode::Recording,
+            AppMode::CapturingScenePerformance,
+            AppMode::CapturingMixerAutomation,
+        ] {
+            ui.set_app_mode(mode);
+            assert_eq!(
+                window_close_response(&ui),
+                CloseRequestResponse::KeepWindowShown
+            );
+        }
+        assert_eq!(
+            intents.borrow().as_slice(),
+            [
+                "close-project",
+                "close-project",
+                "close-project",
+                "stop-output-test",
+                "stop-recording",
+                "stop-scene-capture",
+                "stop-automation-capture",
+            ],
+            "native close must reuse each active owner's settlement route and never abort recording"
+        );
+
+        for mode in [
+            AppMode::StartingOutputTest,
+            AppMode::StoppingOutputTest,
+            AppMode::PreparingRecording,
+            AppMode::FinalizingRecording,
+            AppMode::StoppingScenePerformance,
+            AppMode::SavingScenePerformance,
+            AppMode::StoppingMixerAutomation,
+            AppMode::SavingMixerAutomation,
+            AppMode::Saving,
+            AppMode::Closing,
+        ] {
+            ui.set_app_mode(mode);
+            assert_eq!(
+                window_close_response(&ui),
+                CloseRequestResponse::KeepWindowShown,
+                "pending mode {mode:?} must retain the window"
+            );
+        }
+        assert_eq!(
+            intents.borrow().len(),
+            7,
+            "pending work has no close side effect"
+        );
+
+        for mode in [AppMode::Discovering, AppMode::Closed, AppMode::Unavailable] {
+            ui.set_app_mode(mode);
+            assert_eq!(
+                window_close_response(&ui),
+                CloseRequestResponse::HideWindow,
+                "projectless or terminal mode {mode:?} may exit immediately"
+            );
+        }
+        assert_eq!(intents.borrow().len(), 7);
     }
 
     #[test]
