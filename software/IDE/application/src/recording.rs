@@ -51,6 +51,23 @@ pub(crate) struct IdeRecordingTarget {
     observed_frame: usize,
 }
 
+#[cfg(test)]
+impl IdeRecordingTarget {
+    pub(crate) fn for_worker_test() -> Self {
+        Self {
+            project_path: PathBuf::from("test-project"),
+            project_id: "test-project".to_owned(),
+            project_name: "Test Project".to_owned(),
+            channel_index: 0,
+            track_id: "test-track".to_owned(),
+            track_name: "Test Track".to_owned(),
+            monitor_gain: 0.0,
+            monitor_muted: true,
+            observed_frame: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct IdeRecordingPlan {
     project_path: PathBuf,

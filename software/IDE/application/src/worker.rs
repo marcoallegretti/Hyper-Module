@@ -6918,6 +6918,85 @@ fn transition_running_output_failure(
     send_event(events, IdeWorkerEvent::NativeOutputFailed)
 }
 
+#[derive(Clone, Copy)]
+enum InflightOutputFailure {
+    Autosave,
+    Command(IdeWorkerCommandKind),
+    Close,
+}
+
+fn inflight_output_failure(state: &WorkerState) -> Option<InflightOutputFailure> {
+    match state {
+        WorkerState::AutosaveFence { application, .. }
+            if application.output_state() == OutputStreamState::Failed =>
+        {
+            Some(InflightOutputFailure::Autosave)
+        }
+        WorkerState::SaveFence {
+            application,
+            operation,
+            ..
+        } if application.output_state() == OutputStreamState::Failed => {
+            Some(InflightOutputFailure::Command(operation.command()))
+        }
+        WorkerState::RecordingFence { application, .. }
+            if application.output_state() == OutputStreamState::Failed =>
+        {
+            Some(InflightOutputFailure::Command(
+                IdeWorkerCommandKind::StartRecording,
+            ))
+        }
+        WorkerState::AudioPreviewFence {
+            application,
+            target,
+            ..
+        } if application.output_state() == OutputStreamState::Failed => Some(
+            InflightOutputFailure::Command(audio_preview_command_kind(target)),
+        ),
+        WorkerState::CloseFence { application, .. }
+            if application.output_state() == OutputStreamState::Failed =>
+        {
+            Some(InflightOutputFailure::Close)
+        }
+        _ => None,
+    }
+}
+
+fn settle_inflight_output_failure(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    history: &mut UndoHistory,
+) -> Option<bool> {
+    let transition = inflight_output_failure(state)?;
+    let (WorkerState::AutosaveFence { application, .. }
+    | WorkerState::SaveFence { application, .. }
+    | WorkerState::RecordingFence { application, .. }
+    | WorkerState::AudioPreviewFence { application, .. }
+    | WorkerState::CloseFence { application, .. }) = std::mem::replace(state, WorkerState::Empty)
+    else {
+        unreachable!("the in-flight output-failure state was classified before transfer")
+    };
+    *state = WorkerState::OutputFailed(application);
+    if !send_event(events, IdeWorkerEvent::NativeOutputFailed) {
+        return Some(false);
+    }
+    match transition {
+        InflightOutputFailure::Autosave => Some(true),
+        InflightOutputFailure::Command(command) => Some(publish_failure(
+            events,
+            command,
+            IdeWorkerCommandFailure::NativeOutputFailed,
+        )),
+        InflightOutputFailure::Close => Some(request_output_failed_project_close(
+            state,
+            events,
+            unpublished_native_failure,
+            history,
+        )),
+    }
+}
+
 fn command_is_blocked_by_output_failure(state: &WorkerState, command: &IdeWorkerCommand) -> bool {
     matches!(state, WorkerState::OutputFailed(_))
         && !matches!(
@@ -20958,6 +21037,11 @@ fn poll_pending_state(
     history: &mut UndoHistory,
     project_history: Option<&ProjectHistory>,
 ) -> bool {
+    if let Some(settled) =
+        settle_inflight_output_failure(state, events, unpublished_native_failure, history)
+    {
+        return settled;
+    }
     match std::mem::replace(state, WorkerState::Empty) {
         WorkerState::Running(mut application) => {
             // The callback publisher cannot notify this control thread directly.
@@ -24632,6 +24716,17 @@ mod tests {
             IdeAudioOutputInventory::try_new(&[("route-a", "Output A")]).unwrap(),
             IdeAudioInputInventory::try_new(&[("input-a", "Input A")]).unwrap(),
         )
+    }
+
+    fn failed_running(close_requires_discard: Option<bool>) -> RunningDesktopIdeApplication {
+        RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                output_state: OutputStreamState::Failed,
+                close_requires_discard,
+                ..TestPlaybackSession::default()
+            }),
+        }
     }
 
     fn store_project_mixer_recovery(project: &std::path::Path) {
@@ -34933,6 +35028,163 @@ mod tests {
         assert!(matches!(
             state,
             WorkerState::AutosaveFence { sequence: 1, .. }
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn output_loss_settles_autosave_without_a_false_commit_timeout() {
+        let mut state = WorkerState::AutosaveFence {
+            application: failed_running(Some(true)),
+            sequence: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        let (events, receiver) = sync_channel(2);
+        let mut history = UndoHistory::default();
+        let mut native = None;
+
+        assert!(poll_pending_state(
+            &mut state,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+
+        assert!(matches!(state, WorkerState::OutputFailed(_)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::NativeOutputFailed)
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn output_loss_settles_every_uncommitted_user_fence_with_its_command() {
+        let cases = [
+            (
+                WorkerState::SaveFence {
+                    application: failed_running(Some(true)),
+                    operation: ProjectMutation::SaveMixer,
+                    sequence: 1,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                },
+                IdeWorkerCommandKind::SaveProject,
+            ),
+            (
+                WorkerState::RecordingFence {
+                    application: failed_running(Some(true)),
+                    target: IdeRecordingTarget::for_worker_test(),
+                    sequence: 1,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                },
+                IdeWorkerCommandKind::StartRecording,
+            ),
+            (
+                WorkerState::AudioPreviewFence {
+                    application: failed_running(Some(true)),
+                    target: IdeAudioPreviewTarget::Clip("clip".to_owned()),
+                    sequence: 1,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                },
+                IdeWorkerCommandKind::StartAudioClipPreview,
+            ),
+        ];
+
+        for (mut state, expected_command) in cases {
+            let (events, receiver) = sync_channel(3);
+            let mut history = UndoHistory::default();
+            let mut native = None;
+            assert!(poll_pending_state(
+                &mut state,
+                &events,
+                &mut native,
+                &mut history,
+                None,
+            ));
+            assert!(matches!(state, WorkerState::OutputFailed(_)));
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::NativeOutputFailed)
+            ));
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::CommandFailed {
+                    command,
+                    reason: IdeWorkerCommandFailure::NativeOutputFailed,
+                }) if command == expected_command
+            ));
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn output_loss_during_close_enters_the_failed_output_decision_immediately() {
+        let mut state = WorkerState::CloseFence {
+            application: failed_running(Some(true)),
+            sequence: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        let (events, receiver) = sync_channel(3);
+        let mut history = UndoHistory::default();
+        let mut native = None;
+        history.record_edit(labelled("scene", "scene rename"));
+        while receiver.try_recv().is_ok() {}
+
+        assert!(poll_pending_state(
+            &mut state,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+
+        assert!(matches!(
+            state,
+            WorkerState::AwaitingCloseDiscard {
+                output_failed: true,
+                ..
+            }
+        ));
+        assert_eq!(history.undo.len(), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::NativeOutputFailed)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CloseDiscardRequired)
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn output_loss_during_clean_close_needs_no_second_close_request() {
+        let mut state = WorkerState::CloseFence {
+            application: failed_running(Some(false)),
+            sequence: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        let (events, receiver) = sync_channel(3);
+        let mut history = UndoHistory::default();
+        let mut native = None;
+
+        assert!(poll_pending_state(
+            &mut state,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+
+        assert!(matches!(state, WorkerState::Closed(_)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::NativeOutputFailed)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::Closed { .. })
         ));
         assert!(receiver.try_recv().is_err());
     }
