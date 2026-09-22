@@ -402,6 +402,58 @@ fn generated_loop_shortcut_uses_only_committed_authority() {
 }
 
 #[test]
+fn generated_metronome_shortcut_uses_only_committed_authority() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = OperatorWindow::new().unwrap();
+    let toggles = Rc::new(RefCell::new(0_usize));
+    let toggles_by_callback = Rc::clone(&toggles);
+    ui.on_toggle_metronome_requested(move || {
+        *toggles_by_callback.borrow_mut() += 1;
+    });
+    ui.show().unwrap();
+
+    dispatch_operator_key(&ui, "`".into(), false, false, false, false, false);
+    ui.set_metronome_toggle_enabled(true);
+    dispatch_operator_key(&ui, "`".into(), false, false, false, false, true);
+    dispatch_operator_key(&ui, "`".into(), true, false, false, false, false);
+    dispatch_operator_key(&ui, "`".into(), false, true, false, false, false);
+    dispatch_operator_key(&ui, "`".into(), false, false, true, false, false);
+    dispatch_operator_key(&ui, "`".into(), false, false, false, true, false);
+    assert_eq!(*toggles.borrow(), 0);
+
+    dispatch_operator_key(&ui, "`".into(), false, false, false, false, false);
+    assert_eq!(*toggles.borrow(), 1);
+
+    let show = find_control(&ui, "Show Runtime keyboard shortcuts");
+    show.mock_single_click(PointerEventButton::Left);
+    dispatch_operator_key(&ui, "`".into(), false, false, false, false, false);
+    assert_eq!(*toggles.borrow(), 1, "the shortcut sheet is modal");
+    dispatch_operator_key(&ui, Key::Escape.into(), false, false, false, false, false);
+
+    ui.set_metronome_toggle_enabled(false);
+    dispatch_operator_key(&ui, "`".into(), false, false, false, false, false);
+    assert_eq!(
+        *toggles.borrow(),
+        1,
+        "revoked committed authority remains inert"
+    );
+
+    ui.set_metronome_toggle_enabled(true);
+    ui.set_automation_capture_start_enabled(true);
+    scroll_down(&ui);
+    let take_name = find_control(&ui, "Runtime automation take name");
+    assert_eq!(take_name.accessible_enabled(), Some(true));
+    take_name.mock_single_click(PointerEventButton::Left);
+    dispatch_operator_key(&ui, "`".into(), false, false, false, false, false);
+    assert_eq!(
+        *toggles.borrow(),
+        1,
+        "a focused text field owns grave without leaking a metronome request"
+    );
+    ui.hide().unwrap();
+}
+
+#[test]
 fn generated_shortcut_help_is_modal_and_dismissible() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = OperatorWindow::new().unwrap();
@@ -421,6 +473,7 @@ fn generated_shortcut_help_is_modal_and_dismissible() {
         "End: Seek exact playback end",
         "Ctrl+R: Start or stop recording",
         "L: Enable or disable the armed loop",
+        "Grave: Enable or disable the session metronome",
         "Up / Down: Select previous or next ready scene",
         "Return: Launch selected ready scene",
         "Shift+Space: Stop interactive scenes",
