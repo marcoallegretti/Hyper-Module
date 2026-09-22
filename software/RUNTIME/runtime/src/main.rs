@@ -33,10 +33,11 @@ use hyper_desktop_audio::{
     CaptureStreamCounters, DesktopControlSinkError, DesktopMixerSendTap, DesktopMonitoringConfig,
     DesktopMonitoringControl, DesktopNativeDevice, DesktopPlaybackRecordingSession,
     DesktopPlaybackRecovery, DesktopPlaybackRecoveryPendingStart,
-    DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopWait,
-    DesktopPlaybackRecoveryPendingWait, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
-    DesktopSceneAvailability, InputMeterReceiver, OutputStreamCounters, OutputStreamSnapshot,
-    OutputStreamState, OutputStreamStatus, StreamState, StreamStatus,
+    DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopFailure,
+    DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackRecoveryPendingWait,
+    DesktopPlaybackRecoveryStopError, DesktopPlaybackSession, DesktopSceneAvailability,
+    InputMeterReceiver, OutputStreamCounters, OutputStreamSnapshot, OutputStreamState,
+    OutputStreamStatus, StreamState, StreamStatus,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
@@ -290,6 +291,7 @@ impl RuntimePlaybackOwner {
                                 "{warning}; waiting for native shutdown before recording"
                             )),
                             playback_replaced: false,
+                            terminal_output_failure: false,
                         }
                     }
                 }
@@ -313,8 +315,20 @@ impl RuntimePlaybackOwner {
             });
         };
         self.playback_available.store(false, Ordering::Release);
+        let result = self.finalize_recording(session, capture, None);
+        self.refresh_recording_observation();
+        Ok(result)
+    }
+
+    fn finalize_recording(
+        &mut self,
+        session: Box<DesktopPlaybackRecordingSession>,
+        capture: ActiveRuntimeRecording,
+        interruption: Option<RuntimeRecordingInterruption>,
+    ) -> RuntimePlaybackOwnerPoll {
         let (context, update_id, target_label) = capture.into_parts();
-        let result = match (*session).finalize(context) {
+        let prefix = interruption.map(RuntimeRecordingInterruption::message);
+        match (*session).finalize(context) {
             Ok(finalized) => {
                 let (recording, recovery) = finalized.into_parts();
                 let publication = self.recording.publish(update_id, &recording);
@@ -336,17 +350,23 @@ impl RuntimePlaybackOwner {
                         recording.publication().final_wav_path().display()
                     ),
                 };
-                self.accept_recording_recovery(recovery, message)
+                self.accept_finalized_recording_recovery(
+                    recovery,
+                    join_runtime_messages(prefix.map(str::to_owned), message),
+                    interruption,
+                )
             }
             Err(error) => {
                 let message = format!(
                     "Runtime recording for {target_label} failed during finalization: {error}"
                 );
-                self.accept_recording_recovery(error.into_recovery(), message)
+                self.accept_finalized_recording_recovery(
+                    error.into_recovery(),
+                    join_runtime_messages(prefix.map(str::to_owned), message),
+                    interruption,
+                )
             }
-        };
-        self.refresh_recording_observation();
-        Ok(result)
+        }
     }
 
     fn abort_recording_for_shutdown(&mut self) -> Result<Option<String>, String> {
@@ -515,17 +535,29 @@ impl RuntimePlaybackOwner {
             return RuntimePlaybackOwnerPoll {
                 message: Some("Runtime playback ownership is unavailable".to_owned()),
                 playback_replaced: false,
+                terminal_output_failure: false,
             };
         };
         let result = match state {
             state @ (RuntimePlaybackOwnerState::Playback(_)
-            | RuntimePlaybackOwnerState::Recording { .. }
             | RuntimePlaybackOwnerState::ShutdownPlayback(_)
             | RuntimePlaybackOwnerState::ShutdownRecovery(_)
             | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
             | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
             | RuntimePlaybackOwnerState::ShutdownStopError(_)) => {
                 self.retain_without_progress(state)
+            }
+            RuntimePlaybackOwnerState::Recording { session, capture } => {
+                match runtime_recording_interruption(&session) {
+                    Some(interruption) => {
+                        self.playback_available.store(false, Ordering::Release);
+                        self.finalize_recording(session, capture, Some(interruption))
+                    }
+                    None => self.retain_without_progress(RuntimePlaybackOwnerState::Recording {
+                        session,
+                        capture,
+                    }),
+                }
             }
             RuntimePlaybackOwnerState::PendingStop { pending, action } => {
                 self.poll_pending_stop(pending, action)
@@ -536,6 +568,7 @@ impl RuntimePlaybackOwner {
                     RuntimePlaybackOwnerPoll {
                         message: None,
                         playback_replaced: false,
+                        terminal_output_failure: false,
                     }
                 } else {
                     self.restart_playback(*recovery, None)
@@ -550,6 +583,7 @@ impl RuntimePlaybackOwner {
                         RuntimePlaybackOwnerPoll {
                             message: None,
                             playback_replaced: false,
+                            terminal_output_failure: false,
                         }
                     }
                 }
@@ -567,6 +601,7 @@ impl RuntimePlaybackOwner {
         RuntimePlaybackOwnerPoll {
             message: None,
             playback_replaced: false,
+            terminal_output_failure: false,
         }
     }
 
@@ -584,16 +619,45 @@ impl RuntimePlaybackOwner {
             DesktopPlaybackRecoveryPendingStopWait::Completed(recovery) => {
                 self.advance_recovery(recovery, action, None)
             }
-            DesktopPlaybackRecoveryPendingStopWait::Failed(recovery) => self.advance_recovery(
-                recovery,
-                action,
-                Some("native shutdown failed before the playback-owner transition".to_owned()),
-            ),
-            DesktopPlaybackRecoveryPendingStopWait::Panicked(recovery) => self.advance_recovery(
-                recovery,
-                action,
-                Some("native shutdown panicked before the playback-owner transition".to_owned()),
-            ),
+            DesktopPlaybackRecoveryPendingStopWait::Failed(failure) => self
+                .settle_pending_stop_failure(
+                    failure,
+                    action,
+                    "native shutdown failed before the playback-owner transition",
+                ),
+            DesktopPlaybackRecoveryPendingStopWait::Panicked(failure) => self
+                .settle_pending_stop_failure(
+                    failure,
+                    action,
+                    "native shutdown panicked before the playback-owner transition",
+                ),
+        }
+    }
+
+    fn settle_pending_stop_failure(
+        &mut self,
+        failure: DesktopPlaybackRecoveryPendingStopFailure,
+        action: RuntimePlaybackRecoveryAction,
+        message: &'static str,
+    ) -> RuntimePlaybackOwnerPoll {
+        let output_shutdown_failed = failure.output_shutdown_failed();
+        let recovery = failure.into_recovery();
+        match route_pending_stop_recovery(recovery, action, output_shutdown_failed) {
+            RuntimePendingStopRecoveryRoute::RetainForShutdown(recovery) => {
+                self.state = Some(RuntimePlaybackOwnerState::ShutdownRecovery(Box::new(
+                    recovery,
+                )));
+                RuntimePlaybackOwnerPoll {
+                    message: Some(format!(
+                        "{message}; Runtime shutdown retained finalized-recording recovery"
+                    )),
+                    playback_replaced: false,
+                    terminal_output_failure: true,
+                }
+            }
+            RuntimePendingStopRecoveryRoute::Continue { recovery, action } => {
+                self.advance_recovery(recovery, action, Some(message.to_owned()))
+            }
         }
     }
 
@@ -654,6 +718,7 @@ impl RuntimePlaybackOwner {
                                 format!("Runtime recording started for {target_label}"),
                             )),
                             playback_replaced: true,
+                            terminal_output_failure: false,
                         }
                     }
                     Err(error) => {
@@ -665,7 +730,7 @@ impl RuntimePlaybackOwner {
                     }
                 }
             }
-            RuntimePlaybackRecoveryAction::RestorePlayback => {
+            RuntimePlaybackRecoveryAction::RestoreFinalizedRecordingPlayback => {
                 self.restart_playback(recovery, prefix)
             }
         }
@@ -682,28 +747,54 @@ impl RuntimePlaybackOwner {
                 Ok(pending) => {
                     self.state = Some(RuntimePlaybackOwnerState::PendingStop {
                         pending: Box::new(pending),
-                        action: RuntimePlaybackRecoveryAction::RestorePlayback,
+                        action: RuntimePlaybackRecoveryAction::RestoreFinalizedRecordingPlayback,
                     });
                     RuntimePlaybackOwnerPoll {
                         message: Some(format!(
                             "{message}; waiting for native shutdown before restoring playback"
                         )),
                         playback_replaced: false,
+                        terminal_output_failure: false,
                     }
                 }
                 Err(error) => {
                     self.state = Some(RuntimePlaybackOwnerState::StopError {
                         error: Box::new(error),
-                        action: RuntimePlaybackRecoveryAction::RestorePlayback,
+                        action: RuntimePlaybackRecoveryAction::RestoreFinalizedRecordingPlayback,
                     });
                     RuntimePlaybackOwnerPoll {
                         message: Some(format!(
                             "{message}; playback recovery remains retained after an inconsistent stop outcome"
                         )),
                         playback_replaced: false,
+                        terminal_output_failure: false,
                     }
                 }
             },
+        }
+    }
+
+    fn accept_finalized_recording_recovery(
+        &mut self,
+        recovery: hyper_desktop_audio::DesktopPlaybackRecordingRecovery,
+        message: String,
+        interruption: Option<RuntimeRecordingInterruption>,
+    ) -> RuntimePlaybackOwnerPoll {
+        let output_shutdown_failed = recovery.output_shutdown_failed();
+        let terminal_output_failure = output_shutdown_failed
+            || interruption.is_some_and(RuntimeRecordingInterruption::output_failed);
+        match route_finalized_recording_recovery(recovery, interruption, output_shutdown_failed) {
+            RuntimeFinalizedRecordingRecoveryRoute::RetainForShutdown(recovery) => {
+                self.retain_shutdown_recovery(recovery);
+                RuntimePlaybackOwnerPoll {
+                    message: Some(message),
+                    playback_replaced: false,
+                    terminal_output_failure,
+                }
+            }
+            RuntimeFinalizedRecordingRecoveryRoute::RestorePlayback(recovery) => {
+                self.accept_recording_recovery(recovery, message)
+            }
         }
     }
 
@@ -743,6 +834,7 @@ impl RuntimePlaybackOwner {
                         "Runtime playback restored".to_owned(),
                     )),
                     playback_replaced: true,
+                    terminal_output_failure: false,
                 }
             }
             Err(error) => {
@@ -761,6 +853,7 @@ impl RuntimePlaybackOwner {
                 RuntimePlaybackOwnerPoll {
                     message: Some(message),
                     playback_replaced: false,
+                    terminal_output_failure: false,
                 }
             }
         }
@@ -907,6 +1000,121 @@ fn join_runtime_messages(prefix: Option<String>, message: String) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeRecordingInputInterruption {
+    Unavailable,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeRecordingInterruption {
+    input: Option<RuntimeRecordingInputInterruption>,
+    output_failed: bool,
+}
+
+impl RuntimeRecordingInterruption {
+    fn message(self) -> &'static str {
+        match (self.input, self.output_failed) {
+            (Some(RuntimeRecordingInputInterruption::Unavailable), false) => {
+                "Runtime recording stopped automatically because input ownership became unavailable"
+            }
+            (Some(RuntimeRecordingInputInterruption::Failed), false) => {
+                "Runtime recording stopped automatically because native input ended unexpectedly"
+            }
+            (None, true) => {
+                "Runtime recording stopped automatically because native output ended unexpectedly"
+            }
+            (Some(RuntimeRecordingInputInterruption::Unavailable), true) => {
+                "Runtime recording stopped automatically because input ownership became unavailable and native output ended unexpectedly"
+            }
+            (Some(RuntimeRecordingInputInterruption::Failed), true) => {
+                "Runtime recording stopped automatically because native input and output ended unexpectedly"
+            }
+            (None, false) => unreachable!("an interruption requires terminal native evidence"),
+        }
+    }
+
+    const fn output_failed(self) -> bool {
+        self.output_failed
+    }
+}
+
+fn classify_runtime_recording_interruption(
+    input: Option<StreamState>,
+    output: OutputStreamState,
+) -> Option<RuntimeRecordingInterruption> {
+    let input = match input {
+        None => Some(RuntimeRecordingInputInterruption::Unavailable),
+        Some(StreamState::Failed) => Some(RuntimeRecordingInputInterruption::Failed),
+        Some(_) => None,
+    };
+    let output_failed = output == OutputStreamState::Failed;
+    if input.is_none() && !output_failed {
+        None
+    } else {
+        Some(RuntimeRecordingInterruption {
+            input,
+            output_failed,
+        })
+    }
+}
+
+fn runtime_recording_interruption(
+    session: &DesktopPlaybackRecordingSession,
+) -> Option<RuntimeRecordingInterruption> {
+    classify_runtime_recording_interruption(
+        session
+            .playback()
+            .monitoring_input_status()
+            .map(|status| status.state()),
+        session.playback().output_status().state(),
+    )
+}
+
+enum RuntimeFinalizedRecordingRecoveryRoute<T> {
+    RestorePlayback(T),
+    RetainForShutdown(T),
+}
+
+enum RuntimePendingStopRecoveryRoute<T> {
+    Continue {
+        recovery: T,
+        action: RuntimePlaybackRecoveryAction,
+    },
+    RetainForShutdown(T),
+}
+
+fn route_finalized_recording_recovery<T>(
+    recovery: T,
+    interruption: Option<RuntimeRecordingInterruption>,
+    output_shutdown_failed: bool,
+) -> RuntimeFinalizedRecordingRecoveryRoute<T> {
+    if output_shutdown_failed
+        || interruption.is_some_and(RuntimeRecordingInterruption::output_failed)
+    {
+        RuntimeFinalizedRecordingRecoveryRoute::RetainForShutdown(recovery)
+    } else {
+        RuntimeFinalizedRecordingRecoveryRoute::RestorePlayback(recovery)
+    }
+}
+
+fn route_pending_stop_recovery<T>(
+    recovery: T,
+    action: RuntimePlaybackRecoveryAction,
+    output_shutdown_failed: bool,
+) -> RuntimePendingStopRecoveryRoute<T> {
+    if output_shutdown_failed
+        && matches!(
+            action,
+            RuntimePlaybackRecoveryAction::RestoreFinalizedRecordingPlayback
+        )
+    {
+        RuntimePendingStopRecoveryRoute::RetainForShutdown(recovery)
+    } else {
+        RuntimePendingStopRecoveryRoute::Continue { recovery, action }
+    }
+}
+
 enum RuntimePlaybackOwnerState {
     Playback(Box<DesktopPlaybackSession>),
     Recording {
@@ -994,12 +1202,19 @@ const fn runtime_playback_shutdown_action(
 #[derive(Clone, Copy)]
 enum RuntimePlaybackRecoveryAction {
     StartRecording { target_index: usize },
-    RestorePlayback,
+    RestoreFinalizedRecordingPlayback,
 }
 
+#[derive(Debug)]
 struct RuntimePlaybackOwnerPoll {
     message: Option<String>,
     playback_replaced: bool,
+    terminal_output_failure: bool,
+}
+
+struct RuntimeRecordingControlOutcome {
+    message: Option<String>,
+    terminal_output_failure: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1126,7 +1341,7 @@ impl SessionHost {
     fn finish_owner_poll(
         &mut self,
         poll: RuntimePlaybackOwnerPoll,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<RuntimePlaybackOwnerPoll, String> {
         finish_runtime_playback_owner_poll(poll, || self.refresh_playback_generation())
     }
 
@@ -1177,11 +1392,11 @@ impl SessionHost {
 fn finish_runtime_playback_owner_poll(
     poll: RuntimePlaybackOwnerPoll,
     refresh_playback_generation: impl FnOnce() -> Result<(), String>,
-) -> Result<Option<String>, String> {
+) -> Result<RuntimePlaybackOwnerPoll, String> {
     if poll.playback_replaced {
         refresh_playback_generation()?;
     }
-    Ok(poll.message)
+    Ok(poll)
 }
 
 impl RuntimeRecordingControl for SessionHost {
@@ -1191,23 +1406,36 @@ impl RuntimeRecordingControl for SessionHost {
         }
         let poll = self.owner.start_recording(target_index)?;
         self.finish_owner_poll(poll)?
+            .message
             .ok_or_else(|| "recording transition produced no operator outcome".to_owned())
     }
 
-    fn stop_recording(&mut self) -> Result<String, String> {
+    fn stop_recording(&mut self) -> Result<RuntimeRecordingControlOutcome, String> {
         if let Some(blocker) = self.recording_transition_blocker() {
             return Err(format!("recording transition is blocked by {blocker}"));
         }
         let poll = self.owner.stop_recording()?;
-        self.finish_owner_poll(poll)?
-            .ok_or_else(|| "recording transition produced no operator outcome".to_owned())
+        let poll = self.finish_owner_poll(poll)?;
+        if poll.message.is_none() {
+            return Err("recording transition produced no operator outcome".to_owned());
+        }
+        Ok(RuntimeRecordingControlOutcome {
+            message: poll.message,
+            terminal_output_failure: poll.terminal_output_failure,
+        })
     }
 
-    fn poll_recording(&mut self) -> Option<String> {
+    fn poll_recording(&mut self) -> RuntimeRecordingControlOutcome {
         let poll = self.owner.poll();
         let result = match self.finish_owner_poll(poll) {
-            Ok(message) => message,
-            Err(error) => Some(format!("Runtime recording lifecycle failed: {error}")),
+            Ok(poll) => RuntimeRecordingControlOutcome {
+                message: poll.message,
+                terminal_output_failure: poll.terminal_output_failure,
+            },
+            Err(error) => RuntimeRecordingControlOutcome {
+                message: Some(format!("Runtime recording lifecycle failed: {error}")),
+                terminal_output_failure: false,
+            },
         };
         self.refresh_recording_blocker_observation();
         result
@@ -1930,9 +2158,9 @@ trait RuntimeOperatorControl {
 trait RuntimeRecordingControl {
     fn start_recording(&mut self, target_index: usize) -> Result<String, String>;
 
-    fn stop_recording(&mut self) -> Result<String, String>;
+    fn stop_recording(&mut self) -> Result<RuntimeRecordingControlOutcome, String>;
 
-    fn poll_recording(&mut self) -> Option<String>;
+    fn poll_recording(&mut self) -> RuntimeRecordingControlOutcome;
 
     fn abort_recording_for_shutdown(&mut self) -> Result<Option<String>, String>;
 }
@@ -3093,6 +3321,57 @@ fn run_headless(arguments: &RuntimeArguments, stop: &Arc<AtomicBool>) -> Result<
     Ok(())
 }
 
+fn run_runtime_owner_turn<H, O>(
+    host: &mut H,
+    output_status: &O,
+    terminal_output_failure: &Cell<bool>,
+    stop: &AtomicBool,
+    commands: Option<&Receiver<OperatorCommand>>,
+    diagnostic: &dyn Fn(String),
+) where
+    H: RuntimeAutomationCaptureControl
+        + RuntimeMixerUpdateControl
+        + RuntimeNativeDeviceUpdateControl
+        + RuntimeLoopUpdateControl
+        + RuntimeOperatorControl
+        + RuntimeRecordingControl
+        + RuntimeScenePerformanceControl,
+    O: RuntimeOutputObservation,
+{
+    let output_failed = output_status.output_state() == OutputStreamState::Failed;
+    let recording = host.poll_recording();
+    if let Some(message) = recording.message {
+        diagnostic(message);
+    }
+    if output_failed || recording.terminal_output_failure {
+        terminal_output_failure.set(true);
+        stop.store(true, Ordering::Release);
+        return;
+    }
+    if let Some(commands) = commands
+        && drain_operator_commands(host, commands, stop, diagnostic)
+    {
+        terminal_output_failure.set(true);
+        stop.store(true, Ordering::Release);
+        return;
+    }
+    if let Some(message) = host.poll_scene_performance_capture() {
+        diagnostic(message);
+    }
+    if let Some(message) = host.poll_automation_capture() {
+        diagnostic(message);
+    }
+    if let Some(message) = host.poll_mixer_update_export() {
+        diagnostic(message);
+    }
+    if let Some(message) = host.poll_native_device_update_export() {
+        diagnostic(message);
+    }
+    if let Some(message) = host.poll_loop_update_export() {
+        diagnostic(message);
+    }
+}
+
 fn host_runtime<H, O>(
     arguments: &RuntimeArguments,
     host: &mut H,
@@ -3112,32 +3391,16 @@ where
         + RuntimeScenePerformanceControl,
     O: RuntimeOutputObservation,
 {
+    let terminal_output_failure = Cell::new(false);
     let mut owner_turn = |host: &mut H| {
-        if output_status.output_state() == OutputStreamState::Failed {
-            stop.store(true, Ordering::Release);
-            return;
-        }
-        if let Some(commands) = commands {
-            drain_operator_commands(host, commands, stop, diagnostic);
-        }
-        if let Some(message) = host.poll_recording() {
-            diagnostic(message);
-        }
-        if let Some(message) = host.poll_scene_performance_capture() {
-            diagnostic(message);
-        }
-        if let Some(message) = host.poll_automation_capture() {
-            diagnostic(message);
-        }
-        if let Some(message) = host.poll_mixer_update_export() {
-            diagnostic(message);
-        }
-        if let Some(message) = host.poll_native_device_update_export() {
-            diagnostic(message);
-        }
-        if let Some(message) = host.poll_loop_update_export() {
-            diagnostic(message);
-        }
+        run_runtime_owner_turn(
+            host,
+            output_status,
+            &terminal_output_failure,
+            stop,
+            commands,
+            diagnostic,
+        );
     };
 
     let Some(address) = arguments.panel_listen() else {
@@ -3146,14 +3409,24 @@ where
             owner_turn(host);
             std::thread::sleep(hyper_runtime_host::ACCEPT_POLL_INTERVAL);
         }
-        return finish_runtime_host(host, output_status, diagnostic);
+        return finish_runtime_host(
+            host,
+            output_status,
+            terminal_output_failure.get(),
+            diagnostic,
+        );
     };
 
     let listener = match prepare_panel_listener(address) {
         Ok(listener) => listener,
         Err(error) => {
             contain_panel_service_failure(host, stop, diagnostic, error, &mut owner_turn);
-            return finish_runtime_host(host, output_status, diagnostic);
+            return finish_runtime_host(
+                host,
+                output_status,
+                terminal_output_failure.get(),
+                diagnostic,
+            );
         }
     };
     diagnostic(format!(
@@ -3172,7 +3445,12 @@ where
                 format!("panel link configuration is invalid: {error:?}"),
                 &mut owner_turn,
             );
-            return finish_runtime_host(host, output_status, diagnostic);
+            return finish_runtime_host(
+                host,
+                output_status,
+                terminal_output_failure.get(),
+                diagnostic,
+            );
         }
     };
     let started = Instant::now();
@@ -3195,15 +3473,21 @@ where
             &mut owner_turn,
         );
     }
-    finish_runtime_host(host, output_status, diagnostic)
+    finish_runtime_host(
+        host,
+        output_status,
+        terminal_output_failure.get(),
+        diagnostic,
+    )
 }
 
 fn finish_runtime_host<H: RuntimeRecordingControl, O: RuntimeOutputObservation>(
     host: &mut H,
     output_status: &O,
+    terminal_output_failure: bool,
     diagnostic: &dyn Fn(String),
 ) -> Result<(), String> {
-    let output = finish_runtime_output(output_status, diagnostic);
+    let output = finish_runtime_output(output_status, terminal_output_failure, diagnostic);
     let recording = host.abort_recording_for_shutdown();
     if let Ok(Some(message)) = &recording {
         diagnostic(message.clone());
@@ -3252,9 +3536,10 @@ fn contain_panel_service_failure<H, I>(
 
 fn finish_runtime_output<O: RuntimeOutputObservation>(
     output_status: &O,
+    terminal_output_failure: bool,
     diagnostic: &dyn Fn(String),
 ) -> Result<(), String> {
-    if output_status.output_state() == OutputStreamState::Failed {
+    if terminal_output_failure || output_status.output_state() == OutputStreamState::Failed {
         let message = "native audio ownership ended unexpectedly".to_owned();
         diagnostic(message.clone());
         Err(message)
@@ -3280,7 +3565,7 @@ fn drain_operator_commands<
     commands: &Receiver<OperatorCommand>,
     stop: &AtomicBool,
     diagnostic: &dyn Fn(String),
-) {
+) -> bool {
     for _ in 0..OPERATOR_COMMAND_CAPACITY {
         let command = match commands.try_recv() {
             Ok(command) => command,
@@ -3306,7 +3591,14 @@ fn drain_operator_commands<
                 }
             }
             OperatorCommand::StopRecording => match host.stop_recording() {
-                Ok(message) => diagnostic(message),
+                Ok(outcome) => {
+                    if let Some(message) = outcome.message {
+                        diagnostic(message);
+                    }
+                    if outcome.terminal_output_failure {
+                        return true;
+                    }
+                }
                 Err(error) => diagnostic(format!("Runtime recording stop refused: {error}")),
             },
             OperatorCommand::ExportMixerUpdate => match host.export_mixer_update() {
@@ -3490,6 +3782,7 @@ fn drain_operator_commands<
             OperatorCommand::Quit => stop.store(true, Ordering::Release),
         }
     }
+    false
 }
 
 fn queue_operator_loop_range<H: RuntimeOperatorControl>(
@@ -8447,6 +8740,7 @@ mod tests {
             RuntimePlaybackOwnerPoll {
                 message: Some("waiting for native shutdown".to_owned()),
                 playback_replaced: false,
+                terminal_output_failure: false,
             },
             || {
                 refreshes.set(refreshes.get() + 1);
@@ -8454,13 +8748,18 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(pending.as_deref(), Some("waiting for native shutdown"));
+        assert_eq!(
+            pending.message.as_deref(),
+            Some("waiting for native shutdown")
+        );
+        assert!(!pending.terminal_output_failure);
         assert_eq!(refreshes.get(), 0);
 
         let replaced = finish_runtime_playback_owner_poll(
             RuntimePlaybackOwnerPoll {
                 message: Some("Runtime playback restored".to_owned()),
                 playback_replaced: true,
+                terminal_output_failure: false,
             },
             || {
                 refreshes.set(refreshes.get() + 1);
@@ -8468,13 +8767,18 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(replaced.as_deref(), Some("Runtime playback restored"));
+        assert_eq!(
+            replaced.message.as_deref(),
+            Some("Runtime playback restored")
+        );
+        assert!(!replaced.terminal_output_failure);
         assert_eq!(refreshes.get(), 1);
 
         let error = finish_runtime_playback_owner_poll(
             RuntimePlaybackOwnerPoll {
                 message: None,
                 playback_replaced: true,
+                terminal_output_failure: false,
             },
             || {
                 refreshes.set(refreshes.get() + 1);
@@ -8520,6 +8824,124 @@ mod tests {
         ] {
             assert_eq!(runtime_playback_shutdown_action(phase), expected);
         }
+    }
+
+    #[test]
+    fn recording_interruption_requires_terminal_native_evidence() {
+        let input_states = [
+            None,
+            Some(StreamState::Starting),
+            Some(StreamState::Running),
+            Some(StreamState::StopRequested),
+            Some(StreamState::Stopped),
+            Some(StreamState::Failed),
+        ];
+        for input in input_states {
+            for output in [OutputStreamState::Running, OutputStreamState::Failed] {
+                let interruption = classify_runtime_recording_interruption(input, output);
+                assert_eq!(
+                    interruption.is_some_and(RuntimeRecordingInterruption::output_failed),
+                    output == OutputStreamState::Failed
+                );
+                assert_eq!(
+                    interruption.and_then(|interruption| interruption.input),
+                    match input {
+                        None => Some(RuntimeRecordingInputInterruption::Unavailable),
+                        Some(StreamState::Failed) => {
+                            Some(RuntimeRecordingInputInterruption::Failed)
+                        }
+                        Some(_) => None,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finalized_recording_recovery_routes_one_move_only_owner() {
+        struct MoveOnlyRecovery(u8);
+
+        let restored = route_finalized_recording_recovery(MoveOnlyRecovery(1), None, false);
+        let RuntimeFinalizedRecordingRecoveryRoute::RestorePlayback(restored) = restored else {
+            panic!("clean manual finalization must restore playback")
+        };
+        assert_eq!(restored.0, 1);
+
+        let input_failure = RuntimeRecordingInterruption {
+            input: Some(RuntimeRecordingInputInterruption::Failed),
+            output_failed: false,
+        };
+        let restored =
+            route_finalized_recording_recovery(MoveOnlyRecovery(2), Some(input_failure), false);
+        let RuntimeFinalizedRecordingRecoveryRoute::RestorePlayback(restored) = restored else {
+            panic!("input-only finalization may restore playback")
+        };
+        assert_eq!(restored.0, 2);
+
+        let output_failure = RuntimeRecordingInterruption {
+            input: None,
+            output_failed: true,
+        };
+        for (token, interruption, finalized_output_failure) in [
+            (3, Some(output_failure), false),
+            (4, None, true),
+            (5, Some(input_failure), true),
+        ] {
+            let retained = route_finalized_recording_recovery(
+                MoveOnlyRecovery(token),
+                interruption,
+                finalized_output_failure,
+            );
+            let RuntimeFinalizedRecordingRecoveryRoute::RetainForShutdown(retained) = retained
+            else {
+                panic!("any pre- or post-finalization output failure must retain shutdown")
+            };
+            assert_eq!(retained.0, token);
+        }
+    }
+
+    #[test]
+    fn pending_recording_recovery_routes_terminal_output_without_replacement() {
+        struct MoveOnlyRecovery(u8);
+
+        let retained = route_pending_stop_recovery(
+            MoveOnlyRecovery(1),
+            RuntimePlaybackRecoveryAction::RestoreFinalizedRecordingPlayback,
+            true,
+        );
+        let RuntimePendingStopRecoveryRoute::RetainForShutdown(retained) = retained else {
+            panic!("terminal finalized-recording output must remain shutdown-retained")
+        };
+        assert_eq!(retained.0, 1);
+
+        let completed = route_pending_stop_recovery(
+            MoveOnlyRecovery(2),
+            RuntimePlaybackRecoveryAction::RestoreFinalizedRecordingPlayback,
+            false,
+        );
+        let RuntimePendingStopRecoveryRoute::Continue {
+            recovery: completed,
+            action: RuntimePlaybackRecoveryAction::RestoreFinalizedRecordingPlayback,
+        } = completed
+        else {
+            panic!("clean finalized-recording teardown may restore playback")
+        };
+        assert_eq!(completed.0, 2);
+
+        let unrelated = route_pending_stop_recovery(
+            MoveOnlyRecovery(3),
+            RuntimePlaybackRecoveryAction::StartRecording { target_index: 4 },
+            true,
+        );
+        let RuntimePendingStopRecoveryRoute::Continue {
+            recovery: unrelated,
+            action: RuntimePlaybackRecoveryAction::StartRecording { target_index },
+        } = unrelated
+        else {
+            panic!("only finalized-recording recovery uses the shutdown-retain policy")
+        };
+        assert_eq!(unrelated.0, 3);
+        assert_eq!(target_index, 4);
     }
 
     #[test]
@@ -9633,7 +10055,17 @@ mod tests {
     fn native_output_failure_ends_the_same_production_host_loop() {
         let arguments = RuntimeArguments::parse(["deployment".to_owned()]).unwrap();
         let stop = AtomicBool::new(false);
-        let mut owner = OperatorControl::default();
+        let output_state = Arc::new(Mutex::new(OutputStreamState::Failed));
+        let mut owner = OperatorControl {
+            recording_poll: Some("recording owner settled before shutdown".to_owned()),
+            recording_poll_output_rebind: Some(Arc::clone(&output_state)),
+            scene_performance_poll: Some("unexpected scene-performance poll".to_owned()),
+            automation_capture_poll: Some("unexpected automation poll".to_owned()),
+            mixer_update_poll: Some("unexpected mixer-update poll".to_owned()),
+            native_device_update_poll: Some("unexpected native-device poll".to_owned()),
+            loop_update_poll: Some("unexpected loop-update poll".to_owned()),
+            ..OperatorControl::default()
+        };
         let diagnostics = RefCell::new(Vec::new());
         let (commands, command_receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
         commands
@@ -9643,7 +10075,7 @@ mod tests {
         let error = host_runtime(
             &arguments,
             &mut owner,
-            &OutputObservation(OutputStreamState::Failed),
+            &RebindableOutputObservation(Arc::clone(&output_state)),
             &stop,
             Some(&command_receiver),
             &|message| diagnostics.borrow_mut().push(message),
@@ -9652,6 +10084,13 @@ mod tests {
 
         assert_eq!(error, "native audio ownership ended unexpectedly");
         assert!(stop.load(Ordering::Acquire));
+        assert!(owner.recording_poll.is_none());
+        assert!(owner.scene_performance_poll.is_some());
+        assert!(owner.automation_capture_poll.is_some());
+        assert!(owner.mixer_update_poll.is_some());
+        assert!(owner.native_device_update_poll.is_some());
+        assert!(owner.loop_update_poll.is_some());
+        assert_eq!(*output_state.lock().unwrap(), OutputStreamState::Running);
         assert_eq!(
             owner.disconnects, 0,
             "there was no panel service to release"
@@ -9659,6 +10098,112 @@ mod tests {
         assert!(
             owner.commands.is_empty(),
             "terminal output is observed before queued controls are forwarded"
+        );
+        assert_eq!(
+            diagnostics.borrow().as_slice(),
+            [
+                "no panel link requested",
+                "recording owner settled before shutdown",
+                "native audio ownership ended unexpectedly",
+            ]
+        );
+    }
+
+    #[test]
+    fn finalization_output_failure_ends_host_without_failed_observer() {
+        let arguments = RuntimeArguments::parse(["deployment".to_owned()]).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut owner = OperatorControl {
+            recording_poll: Some("recording finalization found output panic".to_owned()),
+            recording_poll_terminal_output_failure: true,
+            scene_performance_poll: Some("unexpected scene-performance poll".to_owned()),
+            automation_capture_poll: Some("unexpected automation poll".to_owned()),
+            mixer_update_poll: Some("unexpected mixer-update poll".to_owned()),
+            native_device_update_poll: Some("unexpected native-device poll".to_owned()),
+            loop_update_poll: Some("unexpected loop-update poll".to_owned()),
+            ..OperatorControl::default()
+        };
+        let diagnostics = RefCell::new(Vec::new());
+        let (commands, command_receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        commands
+            .send(OperatorCommand::SetLoopEnabled { enabled: true })
+            .unwrap();
+
+        let error = host_runtime(
+            &arguments,
+            &mut owner,
+            &OutputObservation(OutputStreamState::StopRequested),
+            &stop,
+            Some(&command_receiver),
+            &|message| diagnostics.borrow_mut().push(message),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "native audio ownership ended unexpectedly");
+        assert!(stop.load(Ordering::Acquire));
+        assert!(owner.recording_poll.is_none());
+        assert!(owner.commands.is_empty());
+        assert!(owner.scene_performance_poll.is_some());
+        assert!(owner.automation_capture_poll.is_some());
+        assert!(owner.mixer_update_poll.is_some());
+        assert!(owner.native_device_update_poll.is_some());
+        assert!(owner.loop_update_poll.is_some());
+        assert_eq!(
+            diagnostics.borrow().as_slice(),
+            [
+                "no panel link requested",
+                "recording finalization found output panic",
+                "native audio ownership ended unexpectedly",
+            ]
+        );
+    }
+
+    #[test]
+    fn operator_recording_stop_failure_interrupts_command_drain() {
+        let arguments = RuntimeArguments::parse(["deployment".to_owned()]).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut owner = OperatorControl {
+            recording_stop_terminal_output_failure: true,
+            scene_performance_poll: Some("unexpected scene-performance poll".to_owned()),
+            automation_capture_poll: Some("unexpected automation poll".to_owned()),
+            mixer_update_poll: Some("unexpected mixer-update poll".to_owned()),
+            native_device_update_poll: Some("unexpected native-device poll".to_owned()),
+            loop_update_poll: Some("unexpected loop-update poll".to_owned()),
+            ..OperatorControl::default()
+        };
+        let diagnostics = RefCell::new(Vec::new());
+        let (commands, command_receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        commands.send(OperatorCommand::StopRecording).unwrap();
+        commands
+            .send(OperatorCommand::SetLoopEnabled { enabled: true })
+            .unwrap();
+
+        let error = host_runtime(
+            &arguments,
+            &mut owner,
+            &OutputObservation(OutputStreamState::Running),
+            &stop,
+            Some(&command_receiver),
+            &|message| diagnostics.borrow_mut().push(message),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "native audio ownership ended unexpectedly");
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(owner.recording_commands, [OperatorRecordingAction::Stop]);
+        assert!(owner.commands.is_empty());
+        assert!(owner.scene_performance_poll.is_some());
+        assert!(owner.automation_capture_poll.is_some());
+        assert!(owner.mixer_update_poll.is_some());
+        assert!(owner.native_device_update_poll.is_some());
+        assert!(owner.loop_update_poll.is_some());
+        assert_eq!(
+            diagnostics.borrow().as_slice(),
+            [
+                "no panel link requested",
+                "Runtime recording stopped",
+                "native audio ownership ended unexpectedly",
+            ]
         );
     }
 
@@ -9711,6 +10256,9 @@ mod tests {
         automation_capture_poll: Option<String>,
         recording_commands: Vec<OperatorRecordingAction>,
         recording_poll: Option<String>,
+        recording_poll_terminal_output_failure: bool,
+        recording_poll_output_rebind: Option<Arc<Mutex<OutputStreamState>>>,
+        recording_stop_terminal_output_failure: bool,
         recording_abort: Option<Result<Option<String>, String>>,
         scene_performance_commands: Vec<OperatorScenePerformanceAction>,
         scene_performance_poll: Option<String>,
@@ -9829,17 +10377,33 @@ mod tests {
             }
         }
 
-        fn stop_recording(&mut self) -> Result<String, String> {
+        fn stop_recording(&mut self) -> Result<RuntimeRecordingControlOutcome, String> {
             if self.reject {
                 Err("owner busy".to_owned())
             } else {
                 self.recording_commands.push(OperatorRecordingAction::Stop);
-                Ok("Runtime recording stopped".to_owned())
+                Ok(RuntimeRecordingControlOutcome {
+                    message: Some("Runtime recording stopped".to_owned()),
+                    terminal_output_failure: std::mem::take(
+                        &mut self.recording_stop_terminal_output_failure,
+                    ),
+                })
             }
         }
 
-        fn poll_recording(&mut self) -> Option<String> {
-            self.recording_poll.take()
+        fn poll_recording(&mut self) -> RuntimeRecordingControlOutcome {
+            let message = self.recording_poll.take();
+            if message.is_some()
+                && let Some(output) = self.recording_poll_output_rebind.take()
+            {
+                *output.lock().unwrap() = OutputStreamState::Running;
+            }
+            RuntimeRecordingControlOutcome {
+                message,
+                terminal_output_failure: std::mem::take(
+                    &mut self.recording_poll_terminal_output_failure,
+                ),
+            }
         }
 
         fn abort_recording_for_shutdown(&mut self) -> Result<Option<String>, String> {
@@ -9998,6 +10562,15 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RebindableOutputObservation(Arc<Mutex<OutputStreamState>>);
+
+    impl RuntimeOutputObservation for RebindableOutputObservation {
+        fn output_state(&self) -> OutputStreamState {
+            *self.0.lock().unwrap()
+        }
+    }
+
     #[test]
     fn runtime_shutdown_preserves_output_and_recording_outcomes() {
         let diagnostics = RefCell::new(Vec::new());
@@ -10009,6 +10582,7 @@ mod tests {
             finish_runtime_host(
                 &mut clean,
                 &OutputObservation(OutputStreamState::Running),
+                false,
                 &|message| diagnostics.borrow_mut().push(message),
             ),
             Ok(())
@@ -10027,6 +10601,7 @@ mod tests {
             finish_runtime_host(
                 &mut recording_failed,
                 &OutputObservation(OutputStreamState::Running),
+                false,
                 &|message| diagnostics.borrow_mut().push(message),
             ),
             Err("recording settlement failed".to_owned())
@@ -10038,6 +10613,7 @@ mod tests {
             finish_runtime_host(
                 &mut output_failed,
                 &OutputObservation(OutputStreamState::Failed),
+                false,
                 &|message| diagnostics.borrow_mut().push(message),
             ),
             Err("native audio ownership ended unexpectedly".to_owned())
@@ -10056,6 +10632,7 @@ mod tests {
             finish_runtime_host(
                 &mut both_failed,
                 &OutputObservation(OutputStreamState::Failed),
+                false,
                 &|message| diagnostics.borrow_mut().push(message),
             ),
             Err(

@@ -938,11 +938,11 @@ pub use playback_session::{
     DesktopPlaybackRecordingSession, DesktopPlaybackRecordingStartError,
     DesktopPlaybackRecordingStopError, DesktopPlaybackRecovery,
     DesktopPlaybackRecoveryPendingStart, DesktopPlaybackRecoveryPendingStop,
-    DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackRecoveryPendingWait,
-    DesktopPlaybackRecoveryStartError, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
-    DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
-    DesktopPlaybackSessionStartError, DesktopPlaybackSessionStopError, DesktopProjectOpenError,
-    DesktopSceneAvailability,
+    DesktopPlaybackRecoveryPendingStopFailure, DesktopPlaybackRecoveryPendingStopWait,
+    DesktopPlaybackRecoveryPendingWait, DesktopPlaybackRecoveryStartError,
+    DesktopPlaybackRecoveryStopError, DesktopPlaybackSession, DesktopPlaybackSessionBuildError,
+    DesktopPlaybackSessionInput, DesktopPlaybackSessionStartError, DesktopPlaybackSessionStopError,
+    DesktopProjectOpenError, DesktopSceneAvailability,
 };
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),

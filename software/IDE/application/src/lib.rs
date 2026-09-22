@@ -18173,17 +18173,17 @@ impl DesktopIdePendingSaveClose {
                     failure: None,
                 }
             }
-            DesktopPlaybackRecoveryPendingStopWait::Failed(recovery) => {
+            DesktopPlaybackRecoveryPendingStopWait::Failed(failure) => {
                 IdePendingSaveCloseWait::Closed {
                     application: self.application,
-                    recovery,
+                    recovery: failure.into_recovery(),
                     failure: Some(IdeNativeCloseFailure::RuntimeFailed),
                 }
             }
-            DesktopPlaybackRecoveryPendingStopWait::Panicked(recovery) => {
+            DesktopPlaybackRecoveryPendingStopWait::Panicked(failure) => {
                 IdePendingSaveCloseWait::Closed {
                     application: self.application,
-                    recovery,
+                    recovery: failure.into_recovery(),
                     failure: Some(IdeNativeCloseFailure::ThreadPanicked),
                 }
             }
@@ -18245,13 +18245,13 @@ impl DesktopIdePendingClose {
                         failure: None,
                     }
                 }
-                DesktopPlaybackRecoveryPendingStopWait::Failed(_recovery) => {
+                DesktopPlaybackRecoveryPendingStopWait::Failed(_failure) => {
                     IdePendingCloseWait::Closed {
                         application,
                         failure: Some(IdeNativeCloseFailure::RuntimeFailed),
                     }
                 }
-                DesktopPlaybackRecoveryPendingStopWait::Panicked(_recovery) => {
+                DesktopPlaybackRecoveryPendingStopWait::Panicked(_failure) => {
                     IdePendingCloseWait::Closed {
                         application,
                         failure: Some(IdeNativeCloseFailure::ThreadPanicked),
