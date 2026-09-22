@@ -104,6 +104,7 @@ jobs:
             printf 'report.ide-tests.log=cargo test -p hyper-desktop-ide --all-targets --locked -- --test-threads=1\n'
             printf 'report.vendored-pipewire-tests.log=cargo test --manifest-path third_party/pipewire/Cargo.toml\n'
             printf 'condition.vendored-pipewire-tests.log=runner_os==Linux\n'
+            printf 'report.application-inspection-smoke.log=optimized hyper-desktop-ui and hyper-runtime help/version commands\n'
             printf 'report.optimized-audio-tests.log=cargo test --locked --release -p hyper-audio-engine -p hyper-mixer-runtime -p hyper-desktop-audio\n'
             printf 'report.live-pipewire-output.log=bash software/IDE/audio-backend/scripts/test-pipewire-live.sh\n'
             printf 'condition.live-pipewire-output.log=runner_os==Linux\n'
@@ -143,6 +144,22 @@ jobs:
 
       - name: Build optimized workspace
         run: cargo build --workspace --all-targets --locked --release
+
+      - name: Smoke-test optimized application inspection commands
+        shell: bash
+        run: |
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            suffix=".exe"
+          fi
+          desktop_ide="./target/release/hyper-desktop-ui${suffix}"
+          runtime="./target/release/hyper-runtime${suffix}"
+          {
+            "$desktop_ide" --help &&
+              "$desktop_ide" --version &&
+              "$runtime" --help &&
+              "$runtime" --version
+          } 2>&1 | tee "$REPORT_DIR/application-inspection-smoke.log"
 
       - name: Test optimized audio paths
         shell: bash

@@ -3,8 +3,10 @@
 use core::error::Error;
 use core::fmt;
 use std::cell::{Cell, RefCell};
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -511,14 +513,110 @@ struct RecentProjectPresentation {
     paths: Vec<SharedString>,
 }
 
-fn main() {
-    if let Err(error) = run() {
-        eprintln!("desktop IDE failed: {error}");
-        std::process::exit(1);
+const DESKTOP_IDE_HELP: &str = r"Hyper Module Desktop IDE
+
+Usage:
+  hyper-desktop-ui -h | --help
+  hyper-desktop-ui -V | --version
+  hyper-desktop-ui [PROJECT_DIRECTORY]
+  hyper-desktop-ui -- PROJECT_DIRECTORY
+
+Arguments:
+  PROJECT_DIRECTORY  Project package to recover, verify, and open
+
+Options:
+  -h, --help         Show this help and exit
+  -V, --version      Show the package version and exit";
+
+const DESKTOP_IDE_VERSION: &str = concat!("hyper-desktop-ui ", env!("CARGO_PKG_VERSION"));
+
+fn main() -> ExitCode {
+    let invocation = parse_desktop_invocation(std::env::args_os().skip(1));
+    match invocation {
+        Ok(DesktopInvocation::Help) => {
+            println!("{DESKTOP_IDE_HELP}");
+            ExitCode::SUCCESS
+        }
+        Ok(DesktopInvocation::Version) => {
+            println!("{DESKTOP_IDE_VERSION}");
+            ExitCode::SUCCESS
+        }
+        Ok(DesktopInvocation::Launch { project }) => match run(project) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("hyper-desktop-ui: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("hyper-desktop-ui: {error}\n\n{DESKTOP_IDE_HELP}");
+            ExitCode::FAILURE
+        }
     }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DesktopInvocation {
+    Help,
+    Version,
+    Launch { project: Option<PathBuf> },
+}
+
+fn parse_desktop_invocation<I>(arguments: I) -> Result<DesktopInvocation, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let arguments: Vec<_> = arguments.into_iter().collect();
+    if matches!(arguments.as_slice(), [option] if is_help_option(option)) {
+        return Ok(DesktopInvocation::Help);
+    }
+    if matches!(arguments.as_slice(), [option] if is_version_option(option)) {
+        return Ok(DesktopInvocation::Version);
+    }
+    if let [separator, project] = arguments.as_slice()
+        && separator == OsStr::new("--")
+    {
+        if project.is_empty() {
+            return Err("project directory must not be empty".to_owned());
+        }
+        return Ok(DesktopInvocation::Launch {
+            project: Some(PathBuf::from(project)),
+        });
+    }
+    if arguments.iter().any(|argument| {
+        is_help_option(argument.as_os_str()) || is_version_option(argument.as_os_str())
+    }) {
+        return Err("help and version options must be used by themselves".to_owned());
+    }
+    match arguments.as_slice() {
+        [] => Ok(DesktopInvocation::Launch { project: None }),
+        [argument] if argument == OsStr::new("--") => {
+            Err("-- must be followed by one project directory".to_owned())
+        }
+        [argument] if argument.is_empty() => Err("project directory must not be empty".to_owned()),
+        [argument]
+            if argument
+                .to_str()
+                .is_some_and(|argument| argument.starts_with('-')) =>
+        {
+            Err(format!("unknown option: {}", argument.to_string_lossy()))
+        }
+        [project] => Ok(DesktopInvocation::Launch {
+            project: Some(PathBuf::from(project)),
+        }),
+        _ => Err("at most one project directory may be specified".to_owned()),
+    }
+}
+
+fn is_help_option(argument: &OsStr) -> bool {
+    argument == OsStr::new("-h") || argument == OsStr::new("--help")
+}
+
+fn is_version_option(argument: &OsStr) -> bool {
+    argument == OsStr::new("-V") || argument == OsStr::new("--version")
+}
+
+fn run(startup_project: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let ui = MainWindow::new()?;
     configure_ui_contracts(&ui);
     let application = application_config()?;
@@ -540,6 +638,9 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     bind_callbacks(&ui, &worker, &routes, &project_state);
     let timer = start_event_pump(&ui, &worker, &routes, &project_state);
+    if let Some(path) = startup_project {
+        begin_project_open(&ui, &worker, path);
+    }
     let run_result = ui.run();
     timer.stop();
 
@@ -1243,11 +1344,7 @@ fn bind_project_open_callback(ui: &MainWindow, worker: &WorkerCell) {
                 ui.set_status_text("Project selection cancelled".into());
                 return;
             };
-            let path = selection.path().to_path_buf();
-            ui.set_project_location(path.to_string_lossy().into_owned().into());
-            ui.set_app_mode(AppMode::Opening);
-            ui.set_status_text("Recovering and verifying project…".into());
-            submit_path(&ui, &worker, path);
+            begin_project_open(&ui, &worker, selection.path().to_path_buf());
         });
         if let Err(error) = spawn_result
             && let Some(ui) = error_weak.upgrade()
@@ -1257,6 +1354,20 @@ fn bind_project_open_callback(ui: &MainWindow, worker: &WorkerCell) {
             ui.set_error_text(format!("Project dialog could not start: {error}").into());
         }
     });
+}
+
+fn begin_project_open(ui: &MainWindow, worker: &WorkerCell, path: PathBuf) {
+    begin_project_open_with(ui, path, |command| {
+        submit_to_ui(ui, worker, command);
+    });
+}
+
+fn begin_project_open_with(ui: &MainWindow, path: PathBuf, submit: impl FnOnce(IdeWorkerCommand)) {
+    ui.set_project_location(path.to_string_lossy().into_owned().into());
+    ui.set_app_mode(AppMode::Opening);
+    ui.set_error_text(SharedString::default());
+    ui.set_status_text("Recovering and verifying project…".into());
+    submit(IdeWorkerCommand::OpenProject(path));
 }
 
 fn bind_output_test_callbacks(ui: &MainWindow, worker: &WorkerCell) {
@@ -6773,10 +6884,6 @@ fn submit(weak: &slint::Weak<MainWindow>, worker: &WorkerCell, command: IdeWorke
         return;
     };
     submit_to_ui(&ui, worker, command);
-}
-
-fn submit_path(ui: &MainWindow, worker: &WorkerCell, path: PathBuf) {
-    submit_to_ui(ui, worker, IdeWorkerCommand::OpenProject(path));
 }
 
 fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand) {
@@ -17890,6 +17997,95 @@ mod tests {
     use i_slint_backend_testing::{ElementHandle, ElementRoot};
     use slint::LogicalPosition;
     use slint::platform::{Key, PointerEventButton, WindowEvent};
+
+    fn parse_invocation(arguments: &[&str]) -> Result<DesktopInvocation, String> {
+        parse_desktop_invocation(arguments.iter().copied().map(OsString::from))
+    }
+
+    #[test]
+    fn desktop_invocation_keeps_help_version_and_empty_launch_side_effect_free() {
+        assert_eq!(
+            parse_invocation(&[]),
+            Ok(DesktopInvocation::Launch { project: None })
+        );
+        for option in ["-h", "--help"] {
+            assert_eq!(parse_invocation(&[option]), Ok(DesktopInvocation::Help));
+        }
+        for option in ["-V", "--version"] {
+            assert_eq!(parse_invocation(&[option]), Ok(DesktopInvocation::Version));
+        }
+        assert!(DESKTOP_IDE_HELP.contains("hyper-desktop-ui [PROJECT_DIRECTORY]"));
+        assert!(DESKTOP_IDE_HELP.contains("hyper-desktop-ui -- PROJECT_DIRECTORY"));
+        assert_eq!(
+            DESKTOP_IDE_VERSION,
+            format!("hyper-desktop-ui {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn desktop_invocation_preserves_one_project_path_and_option_delimiter() {
+        let project = PathBuf::from("projects/Session α");
+        assert_eq!(
+            parse_desktop_invocation([project.clone().into_os_string()]),
+            Ok(DesktopInvocation::Launch {
+                project: Some(project)
+            })
+        );
+        assert_eq!(
+            parse_invocation(&["--", "--session"]),
+            Ok(DesktopInvocation::Launch {
+                project: Some(PathBuf::from("--session"))
+            })
+        );
+    }
+
+    #[test]
+    fn desktop_invocation_refuses_ambiguous_or_unknown_arguments() {
+        for arguments in [
+            &["--help", "project"][..],
+            &["project", "--version"][..],
+            &["--unknown"][..],
+            &["--"][..],
+            &[""][..],
+            &["--", ""][..],
+            &["project-a", "project-b"][..],
+            &["--", "project-a", "project-b"][..],
+        ] {
+            assert!(
+                parse_invocation(arguments).is_err(),
+                "{arguments:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_project_uses_the_existing_open_presentation_and_worker_command() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Closed);
+        ui.set_error_text("stale error".into());
+        let project = PathBuf::from("projects/Session α");
+        let submitted = RefCell::new(None);
+
+        begin_project_open_with(&ui, project.clone(), |command| {
+            submitted.replace(Some(command));
+        });
+
+        assert_eq!(ui.get_app_mode(), AppMode::Opening);
+        assert_eq!(
+            ui.get_project_location(),
+            SharedString::from(project.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            ui.get_status_text(),
+            SharedString::from("Recovering and verifying project…")
+        );
+        assert!(ui.get_error_text().is_empty());
+        let Some(IdeWorkerCommand::OpenProject(actual)) = submitted.take() else {
+            panic!("startup must submit exactly one open-project command");
+        };
+        assert_eq!(actual, project);
+    }
 
     fn configure_waveform_selection_test_view(
         ui: &MainWindow,
