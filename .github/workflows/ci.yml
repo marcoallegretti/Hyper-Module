@@ -15,22 +15,57 @@ jobs:
   public-boundary:
     name: Public repository boundary
     runs-on: ubuntu-24.04
+    env:
+      REPORT_DIR: ci-reports
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
 
+      - name: Initialize public-boundary test report
+        shell: bash
+        run: |
+          mkdir -p "$REPORT_DIR"
+          {
+            printf 'schema=hyper-ci-test-report-v1\n'
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'workflow_commit=%s\n' "$GITHUB_WORKFLOW_SHA"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'job=%s\n' "$GITHUB_JOB"
+            printf 'runner_os=%s\n' "$RUNNER_OS"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'report.reject-private-paths.log=node contracts/scripts/check-public-boundary.mjs\n'
+            printf 'report.private-path-policy.log=node contracts/scripts/test-public-boundary.mjs\n'
+          } > "$REPORT_DIR/manifest.txt"
+
       - name: Reject private paths
-        run: node contracts/scripts/check-public-boundary.mjs
+        shell: bash
+        run: node contracts/scripts/check-public-boundary.mjs 2>&1 | tee "$REPORT_DIR/reject-private-paths.log"
 
       - name: Test private-path policy
-        run: node contracts/scripts/test-public-boundary.mjs
+        shell: bash
+        run: node contracts/scripts/test-public-boundary.mjs 2>&1 | tee "$REPORT_DIR/private-path-policy.log"
+
+      - name: Upload public-boundary test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: hyper-test-report-public-boundary-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/ci-reports
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
 
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
+    env:
+      REPORT_DIR: ci-reports
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +81,33 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+
+      - name: Initialize Rust test report
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          mkdir -p "$REPORT_DIR"
+          {
+            printf 'schema=hyper-ci-test-report-v1\n'
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'workflow_commit=%s\n' "$GITHUB_WORKFLOW_SHA"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'job=%s\n' "$GITHUB_JOB"
+            printf 'matrix_os=%s\n' "$MATRIX_OS"
+            printf 'runner_os=%s\n' "$RUNNER_OS"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'report.workspace-tests.log=cargo test --workspace --exclude hyper-desktop-ide --all-targets --locked\n'
+            printf 'report.ide-tests.log=cargo test -p hyper-desktop-ide --all-targets --locked -- --test-threads=1\n'
+            printf 'report.vendored-pipewire-tests.log=cargo test --manifest-path third_party/pipewire/Cargo.toml\n'
+            printf 'condition.vendored-pipewire-tests.log=runner_os==Linux\n'
+            printf 'report.optimized-audio-tests.log=cargo test --locked --release -p hyper-audio-engine -p hyper-mixer-runtime -p hyper-desktop-audio\n'
+            printf 'report.live-pipewire-output.log=bash software/IDE/audio-backend/scripts/test-pipewire-live.sh\n'
+            printf 'condition.live-pipewire-output.log=runner_os==Linux\n'
+          } > "$REPORT_DIR/manifest.txt"
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.93.0 --profile minimal --component clippy,rustfmt
@@ -63,28 +125,33 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Test workspace outside the bounded IDE worker harness
-        run: cargo test --workspace --exclude hyper-desktop-ide --all-targets --locked
+        shell: bash
+        run: cargo test --workspace --exclude hyper-desktop-ide --all-targets --locked 2>&1 | tee "$REPORT_DIR/workspace-tests.log"
 
       - name: Test bounded IDE worker harness
-        run: cargo test -p hyper-desktop-ide --all-targets --locked -- --test-threads=1
+        shell: bash
+        run: cargo test -p hyper-desktop-ide --all-targets --locked -- --test-threads=1 2>&1 | tee "$REPORT_DIR/ide-tests.log"
 
       - name: Lint and test vendored PipeWire bindings
         if: runner.os == 'Linux'
         env:
           CARGO_TARGET_DIR: target
+        shell: bash
         run: |
           cargo clippy --manifest-path third_party/pipewire/Cargo.toml --all-targets -- -D warnings
-          cargo test --manifest-path third_party/pipewire/Cargo.toml
+          cargo test --manifest-path third_party/pipewire/Cargo.toml 2>&1 | tee "$REPORT_DIR/vendored-pipewire-tests.log"
 
       - name: Build optimized workspace
         run: cargo build --workspace --all-targets --locked --release
 
       - name: Test optimized audio paths
-        run: cargo test --locked --release -p hyper-audio-engine -p hyper-mixer-runtime -p hyper-desktop-audio
+        shell: bash
+        run: cargo test --locked --release -p hyper-audio-engine -p hyper-mixer-runtime -p hyper-desktop-audio 2>&1 | tee "$REPORT_DIR/optimized-audio-tests.log"
 
       - name: Test live PipeWire output
         if: runner.os == 'Linux'
-        run: bash software/IDE/audio-backend/scripts/test-pipewire-live.sh
+        shell: bash
+        run: bash software/IDE/audio-backend/scripts/test-pipewire-live.sh 2>&1 | tee "$REPORT_DIR/live-pipewire-output.log"
 
       - name: Check documentation
         env:
@@ -121,7 +188,7 @@ jobs:
         if: runner.os == 'Linux' && matrix.experimental == false
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: hyper-module-linux-x86_64-${{ github.sha }}
+          name: hyper-module-linux-x86_64-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/hyper-module-linux-x86_64.tar.gz
             ${{ runner.temp }}/hyper-module-linux-x86_64.tar.gz.sha256
@@ -133,7 +200,7 @@ jobs:
         if: runner.os == 'Windows' && matrix.experimental == false
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: hyper-module-windows-x86_64-${{ github.sha }}
+          name: hyper-module-windows-x86_64-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/hyper-module-windows-x86_64.zip
             ${{ runner.temp }}/hyper-module-windows-x86_64.zip.sha256
@@ -141,9 +208,21 @@ jobs:
           retention-days: 14
           compression-level: 0
 
+      - name: Upload Rust test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: hyper-test-report-rust-${{ matrix.os }}-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/ci-reports
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
+
   contracts:
     name: Contracts (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      REPORT_DIR: ../ci-reports
     strategy:
       fail-fast: false
       matrix:
@@ -159,6 +238,27 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Initialize contract test report
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          mkdir -p "$REPORT_DIR"
+          {
+            printf 'schema=hyper-ci-test-report-v1\n'
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'workflow_commit=%s\n' "$GITHUB_WORKFLOW_SHA"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'job=%s\n' "$GITHUB_JOB"
+            printf 'matrix_os=%s\n' "$MATRIX_OS"
+            printf 'runner_os=%s\n' "$RUNNER_OS"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'report.contract-tests.log=npm test\n'
+          } > "$REPORT_DIR/manifest.txt"
+
       - name: Install Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
@@ -171,4 +271,15 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Test contracts
-        run: npm test
+        shell: bash
+        run: npm test 2>&1 | tee "$REPORT_DIR/contract-tests.log"
+
+      - name: Upload contract test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: hyper-test-report-contracts-${{ matrix.os }}-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/ci-reports
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
