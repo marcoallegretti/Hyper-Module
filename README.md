@@ -26,7 +26,8 @@ hyper-runtime <DEPLOYMENT_DIRECTORY> --operator-ui
 ```
 
 The target must already contain an installed and activated bundle. Application
-archives include the tested local deployment kit and its locked dependencies;
+archives include the tested local deployment kit, its locked dependencies, and
+the matching native filesystem and audio-validation helpers;
 running it requires Node.js 22 or newer (CI uses 24.13.0). For a new local
 development target, create the target directory and choose a storage policy
 appropriate to that disk. The kit includes

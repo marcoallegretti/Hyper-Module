@@ -6,6 +6,7 @@ import { resolveFilesystemAuthorityPath } from "../lib/native-fs-authority.mjs";
 import { runNativeProcess } from "../lib/native-process.mjs";
 import { buildProjectBundle } from "./build-project-bundle.mjs";
 import { createMinimalProject } from "./test-project-fixture.mjs";
+import { resolveAudioValidatorPath } from "./verify-project.mjs";
 
 assert.equal(
   process.argv.length,
@@ -21,15 +22,35 @@ assert.equal(
   join(contractRoot, "bin", executable),
   "packaged filesystem authority must be selected",
 );
+assert.equal(
+  resolveAudioValidatorPath(),
+  join(
+    contractRoot,
+    "bin",
+    process.platform === "win32" ? "hyper-audio-validate.exe" : "hyper-audio-validate",
+  ),
+  "packaged audio validator must be selected",
+);
 
 const project = await createMinimalProject(scratch, "project", {
-  audioTrack: true,
+  audioClip: true,
 });
 assert.equal(
   project.project.resources.filter((resource) => resource.role === "track").length,
   1,
   "packaged deployment smoke must exercise an audio track",
 );
+assert.equal(
+  project.project.resources.filter((resource) => resource.role === "clip").length,
+  1,
+  "packaged deployment smoke must exercise an audio clip",
+);
+assert.equal(
+  project.project.resources.filter((resource) => resource.role === "arrangement").length,
+  1,
+  "packaged deployment smoke must exercise an arrangement placement",
+);
+assert.equal(project.project.assets.length, 1);
 const bundle = join(scratch, "project.runtime");
 const target = join(scratch, "target");
 await buildProjectBundle(project.root, bundle, runtimeVersion);

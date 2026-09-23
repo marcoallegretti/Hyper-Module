@@ -215,6 +215,8 @@ export function resolveAudioValidatorPath() {
     process.platform === "win32"
       ? "hyper-audio-validate.exe"
       : "hyper-audio-validate";
+  const packagedPath = resolve(import.meta.dirname, "..", "bin", executable);
+  if (existsSync(packagedPath)) return packagedPath;
   const targetDirectory = process.env.CARGO_TARGET_DIR
     ? resolve(process.env.CARGO_TARGET_DIR)
     : resolve(workspaceRoot, "target");

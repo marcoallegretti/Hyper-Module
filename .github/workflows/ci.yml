@@ -201,7 +201,7 @@ jobs:
             printf 'matrix_os=%s\n' "$MATRIX_OS"
             printf 'runner_os=%s\n' "$RUNNER_OS"
             printf 'runner_arch=%s\n' "$RUNNER_ARCH"
-            printf 'report.optimized-applications.log=cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-fs-authority\n'
+            printf 'report.optimized-applications.log=cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-fs-authority -p hyper-audio-source\n'
             printf 'report.application-inspection-smoke.log=optimized hyper-desktop-ui and hyper-runtime help/version commands\n'
             printf 'report.package-deployment-smoke.log=extracted kit deployment\n'
             printf 'report.native-deployment-promotion.log=native Runtime promotion of extracted kit deployment\n'
@@ -216,9 +216,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends libpipewire-0.3-dev pipewire pipewire-bin wireplumber
 
-      - name: Build optimized applications and filesystem authority
+      - name: Build optimized applications and deployment helpers
         shell: bash
-        run: cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-fs-authority 2>&1 | tee "$REPORT_DIR/optimized-applications.log"
+        run: cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-fs-authority -p hyper-audio-source 2>&1 | tee "$REPORT_DIR/optimized-applications.log"
 
       - name: Smoke-test optimized application inspection commands
         shell: bash
@@ -259,6 +259,7 @@ jobs:
           cp contracts/fixtures/valid/deployment-storage-policy.json "$kit/storage-policy.example.json"
           cp -R contracts/lib contracts/scripts contracts/schemas contracts/node_modules "$kit"
           cp target/release/hyper-fs-authority "$kit/bin"
+          cp target/release/hyper-audio-validate "$kit/bin"
           archive="$RUNNER_TEMP/hyper-module-linux-x86_64.tar.gz"
           tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner --format=gnu -I 'gzip -n' -cf "$archive" -C "$output" hyper-desktop-ui hyper-runtime README.md THIRD_PARTY_NOTICES.md deployment-kit
           sha256sum "$archive" | sed "s|  $archive|  hyper-module-linux-x86_64.tar.gz|" > "$archive.sha256"
@@ -289,6 +290,7 @@ jobs:
           Copy-Item -LiteralPath "contracts/fixtures/valid/deployment-storage-policy.json" -Destination (Join-Path $kit "storage-policy.example.json")
           Copy-Item -LiteralPath "contracts/lib", "contracts/scripts", "contracts/schemas", "contracts/node_modules" -Destination $kit -Recurse
           Copy-Item -LiteralPath "target/release/hyper-fs-authority.exe" -Destination (Join-Path $kit "bin")
+          Copy-Item -LiteralPath "target/release/hyper-audio-validate.exe" -Destination (Join-Path $kit "bin")
           $timestamp = [DateTimeOffset]::Parse("1980-01-01T00:00:00Z")
           $archive = Join-Path $env:RUNNER_TEMP "hyper-module-windows-x86_64.zip"
           $zip = [System.IO.Compression.ZipFile]::Open($archive, [System.IO.Compression.ZipArchiveMode]::Create)
