@@ -454,6 +454,41 @@ impl IdeRecordingObservation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IdeRecordingInterruption {
+    input_failed: bool,
+    output_failed: bool,
+}
+
+impl IdeRecordingInterruption {
+    #[must_use]
+    pub(crate) const fn classify(
+        input_state: StreamState,
+        output_state: StreamState,
+    ) -> Option<Self> {
+        let input_failed = matches!(input_state, StreamState::Failed);
+        let output_failed = matches!(output_state, StreamState::Failed);
+        if input_failed || output_failed {
+            Some(Self {
+                input_failed,
+                output_failed,
+            })
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn input_failed(self) -> bool {
+        self.input_failed
+    }
+
+    #[must_use]
+    pub(crate) const fn output_failed(self) -> bool {
+        self.output_failed
+    }
+}
+
 #[derive(Debug)]
 pub struct IdeRecordingImportOutcome {
     project_revision: u64,
@@ -732,6 +767,14 @@ impl RecordingDesktopIdeApplication {
     #[must_use]
     pub(crate) fn journal_path(&self) -> &Path {
         self.session.journal_path()
+    }
+
+    #[must_use]
+    pub(crate) fn interruption(&self) -> Option<IdeRecordingInterruption> {
+        IdeRecordingInterruption::classify(
+            self.session.input_status().state(),
+            self.session.output_status().state(),
+        )
     }
 
     #[must_use]
@@ -1131,6 +1174,28 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn recording_interruption_requires_terminal_native_failure() {
+        let states = [
+            StreamState::Starting,
+            StreamState::Running,
+            StreamState::StopRequested,
+            StreamState::Stopped,
+            StreamState::Failed,
+        ];
+
+        for input in states {
+            for output in states {
+                let interruption = IdeRecordingInterruption::classify(input, output);
+                assert_eq!(
+                    interruption.map(|cause| (cause.input_failed(), cause.output_failed())),
+                    (input == StreamState::Failed || output == StreamState::Failed)
+                        .then_some((input == StreamState::Failed, output == StreamState::Failed))
+                );
+            }
+        }
+    }
 
     #[test]
     fn workspace_is_created_only_under_project_backups() {

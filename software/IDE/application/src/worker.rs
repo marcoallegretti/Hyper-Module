@@ -2,6 +2,7 @@ use core::error::Error;
 use core::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{
     Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
@@ -76,7 +77,9 @@ use hyper_storage_engine::{
 use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSnapshot};
 
 use super::IdeFailedOutputMixerSave;
-use super::recording::{IdeRecordingPlan, IdeRecordingTarget, RecordingDesktopIdeApplication};
+use super::recording::{
+    IdeRecordingInterruption, IdeRecordingPlan, IdeRecordingTarget, RecordingDesktopIdeApplication,
+};
 use super::{
     ControlBinding, ControlScope, ControlSource, ControlTarget, ControlTransform,
     DesktopIdeApplication, DesktopIdePendingClose, DesktopIdePendingSaveClose,
@@ -4403,6 +4406,10 @@ pub enum IdeWorkerEvent {
     },
     RecordingPreparing,
     Recording(IdeRecordingState),
+    RecordingInterrupted {
+        input_failed: bool,
+        output_failed: bool,
+    },
     RecordingFinalizing,
     RecordingImported(IdeRecordingImportOutcome),
     RecordingImportCommittedWithWarning {
@@ -4741,6 +4748,7 @@ impl Error for IdeWorkerJoinError {}
 
 pub struct DesktopIdeWorker {
     commands: SyncSender<IdeWorkerCommand>,
+    shutdown_requested: Arc<AtomicBool>,
     events: Option<Receiver<IdeWorkerEvent>>,
     completion: Receiver<()>,
     handle: Option<JoinHandle<IdeWorkerShutdownReport>>,
@@ -4826,6 +4834,8 @@ impl DesktopIdeWorker {
         let (command_sender, command_receiver) = sync_channel(command_capacity);
         let (event_sender, event_receiver) = sync_channel(event_capacity);
         let (completion_sender, completion_receiver) = sync_channel(1);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let worker_shutdown_requested = Arc::clone(&shutdown_requested);
         let permit = acquire_worker_permit().map_err(IdeWorkerStartError::ThreadSpawn)?;
         let handle = thread::Builder::new()
             .name("hyper-desktop-ide".to_owned())
@@ -4836,11 +4846,13 @@ impl DesktopIdeWorker {
                     project_history.as_ref(),
                     &command_receiver,
                     &event_sender,
+                    worker_shutdown_requested.as_ref(),
                 )
             })
             .map_err(IdeWorkerStartError::ThreadSpawn)?;
         Ok(Self {
             commands: command_sender,
+            shutdown_requested,
             events: Some(event_receiver),
             completion: completion_receiver,
             handle: Some(handle),
@@ -4884,10 +4896,18 @@ impl DesktopIdeWorker {
 
     /// Enqueues one UI command without blocking its event loop.
     ///
+    /// Shutdown is latched outside the bounded command queue and returns success
+    /// once requested; its queued command is only a best-effort wake token.
+    ///
     /// # Errors
     ///
-    /// Returns the unchanged command when the bounded queue is full or closed.
+    /// Returns an unchanged non-shutdown command when the bounded queue is full
+    /// or closed.
     pub fn try_send(&self, command: IdeWorkerCommand) -> Result<(), IdeWorkerSendError> {
+        if matches!(command, IdeWorkerCommand::Shutdown) {
+            request_worker_shutdown(&self.shutdown_requested, &self.commands);
+            return Ok(());
+        }
         #[cfg(test)]
         let reserved_native_output_test_lock = self.reserve_native_output_test_lock(&command);
         let result = self
@@ -4933,7 +4953,7 @@ impl DesktopIdeWorker {
     /// not be delivered as an event is returned in the terminal report.
     #[must_use]
     pub fn shutdown(mut self, timeout: Duration) -> IdeWorkerShutdownOutcome {
-        let _ = self.commands.try_send(IdeWorkerCommand::Shutdown);
+        request_worker_shutdown(&self.shutdown_requested, &self.commands);
         drop(self.events.take());
         match self.completion.recv_timeout(timeout) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => {
@@ -4957,7 +4977,7 @@ impl DesktopIdeWorker {
 
 impl Drop for DesktopIdeWorker {
     fn drop(&mut self) {
-        let _ = self.commands.try_send(IdeWorkerCommand::Shutdown);
+        request_worker_shutdown(&self.shutdown_requested, &self.commands);
         let Some(handle) = self.handle.take() else {
             return;
         };
@@ -6441,6 +6461,7 @@ fn run_worker(
     project_history: Option<&ProjectHistory>,
     commands: &Receiver<IdeWorkerCommand>,
     events: &SyncSender<IdeWorkerEvent>,
+    shutdown_requested: &AtomicBool,
 ) -> IdeWorkerShutdownReport {
     let mut unpublished_native_failure = None;
     let mut history = UndoHistory::default();
@@ -6452,6 +6473,9 @@ fn run_worker(
         return finish_worker(state, unpublished_native_failure);
     }
     loop {
+        if worker_shutdown_requested(shutdown_requested) {
+            break;
+        }
         if !poll_pending_state(
             &mut state,
             events,
@@ -6485,6 +6509,7 @@ fn run_worker(
                 | WorkerState::Running(_)
                 | WorkerState::ScenePerformanceCapture { .. }
                 | WorkerState::MixerAutomationCapture { .. }
+                | WorkerState::Recording(_)
                 | WorkerState::RecordingClosing { .. }
                 | WorkerState::OutputTestStopping { .. }
                 | WorkerState::Closing(_)
@@ -6502,7 +6527,9 @@ fn run_worker(
                 Err(RecvError) => break,
             }
         };
-        if matches!(command, IdeWorkerCommand::Shutdown) {
+        if worker_shutdown_requested(shutdown_requested)
+            || matches!(command, IdeWorkerCommand::Shutdown)
+        {
             break;
         }
         if !process_command(
@@ -6517,6 +6544,18 @@ fn run_worker(
         }
     }
     finish_worker(state, unpublished_native_failure)
+}
+
+fn request_worker_shutdown(
+    shutdown_requested: &AtomicBool,
+    commands: &SyncSender<IdeWorkerCommand>,
+) {
+    shutdown_requested.store(true, std::sync::atomic::Ordering::Release);
+    let _ = commands.try_send(IdeWorkerCommand::Shutdown);
+}
+
+fn worker_shutdown_requested(shutdown_requested: &AtomicBool) -> bool {
+    shutdown_requested.load(std::sync::atomic::Ordering::Acquire)
 }
 
 fn publish_project_history(
@@ -10075,6 +10114,15 @@ fn finalize_recording(
     let WorkerState::Recording(recording) = std::mem::replace(state, WorkerState::Empty) else {
         unreachable!("recording state was checked before finalization");
     };
+    finalize_recording_owner(state, recording, events, history)
+}
+
+fn finalize_recording_owner(
+    state: &mut WorkerState,
+    recording: RecordingDesktopIdeApplication,
+    events: &SyncSender<IdeWorkerEvent>,
+    history: &mut UndoHistory,
+) -> bool {
     match recording.finalize() {
         Ok(finalized) => reopen_after_recording_import(state, finalized, events, history),
         Err(failure) => {
@@ -10098,6 +10146,28 @@ fn finalize_recording(
             )
         }
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RecordingSupervision<R> {
+    Active(R),
+    NotificationFailed(R),
+    Settled(bool),
+}
+
+fn supervise_recording_owner<R>(
+    recording: R,
+    interruption: Option<IdeRecordingInterruption>,
+    notify: impl FnOnce(IdeRecordingInterruption) -> bool,
+    settle: impl FnOnce(R) -> bool,
+) -> RecordingSupervision<R> {
+    let Some(interruption) = interruption else {
+        return RecordingSupervision::Active(recording);
+    };
+    if !notify(interruption) {
+        return RecordingSupervision::NotificationFailed(recording);
+    }
+    RecordingSupervision::Settled(settle(recording))
 }
 
 fn abort_recording(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) -> bool {
@@ -21118,6 +21188,33 @@ fn poll_pending_state(
                 true
             }
         },
+        WorkerState::Recording(recording) => {
+            let interruption = recording.interruption();
+            match supervise_recording_owner(
+                recording,
+                interruption,
+                |interruption| {
+                    send_event(
+                        events,
+                        IdeWorkerEvent::RecordingInterrupted {
+                            input_failed: interruption.input_failed(),
+                            output_failed: interruption.output_failed(),
+                        },
+                    )
+                },
+                |recording| finalize_recording_owner(state, recording, events, history),
+            ) {
+                RecordingSupervision::Active(recording) => {
+                    *state = WorkerState::Recording(recording);
+                    true
+                }
+                RecordingSupervision::NotificationFailed(recording) => {
+                    *state = WorkerState::Recording(recording);
+                    false
+                }
+                RecordingSupervision::Settled(settled) => settled,
+            }
+        }
         WorkerState::AutosaveFence {
             application,
             sequence,
@@ -31836,6 +31933,116 @@ mod tests {
             ));
         }
         assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn shutdown_signal_bypasses_a_saturated_command_queue_and_wakes_an_idle_worker() {
+        let saturated = AtomicBool::new(false);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        sender.send(IdeWorkerCommand::StopRecording).unwrap();
+
+        request_worker_shutdown(&saturated, &sender);
+
+        assert!(worker_shutdown_requested(&saturated));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerCommand::StopRecording)
+        ));
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+        let idle = AtomicBool::new(false);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        request_worker_shutdown(&idle, &sender);
+
+        assert!(worker_shutdown_requested(&idle));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerCommand::Shutdown)
+        ));
+    }
+
+    #[test]
+    fn recording_interruption_retains_or_settles_one_move_only_owner() {
+        struct MoveOnly {
+            id: u8,
+            drops: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl Drop for MoveOnly {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        let stages = std::cell::RefCell::new(Vec::new());
+        let interruption = IdeRecordingInterruption::classify(
+            hyper_desktop_audio::StreamState::Failed,
+            hyper_desktop_audio::StreamState::Running,
+        )
+        .unwrap();
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+
+        let routed = supervise_recording_owner(
+            MoveOnly {
+                id: 7,
+                drops: std::rc::Rc::clone(&drops),
+            },
+            Some(interruption),
+            |cause| {
+                assert!(cause.input_failed());
+                assert!(!cause.output_failed());
+                stages.borrow_mut().push("notify");
+                true
+            },
+            |owner| {
+                assert_eq!(owner.id, 7);
+                stages.borrow_mut().push("settle");
+                true
+            },
+        );
+        assert!(matches!(routed, RecordingSupervision::Settled(true)));
+        assert_eq!(drops.get(), 1);
+        stages.borrow_mut().push("next-command");
+        assert_eq!(stages.into_inner(), ["notify", "settle", "next-command"]);
+
+        let settled = std::cell::Cell::new(false);
+        let routed = supervise_recording_owner(
+            MoveOnly {
+                id: 9,
+                drops: std::rc::Rc::clone(&drops),
+            },
+            Some(interruption),
+            |_| false,
+            |_| {
+                settled.set(true);
+                true
+            },
+        );
+        assert!(!settled.get());
+        let RecordingSupervision::NotificationFailed(owner) = routed else {
+            panic!("notification failure must return the recording owner");
+        };
+        assert_eq!(owner.id, 9);
+        assert_eq!(drops.get(), 1);
+        drop(owner);
+        assert_eq!(drops.get(), 2);
+
+        let routed = supervise_recording_owner(
+            MoveOnly {
+                id: 11,
+                drops: std::rc::Rc::clone(&drops),
+            },
+            None,
+            |_| false,
+            |_| false,
+        );
+        let RecordingSupervision::Active(owner) = routed else {
+            panic!("healthy recording must remain active");
+        };
+        assert_eq!(owner.id, 11);
+        assert_eq!(drops.get(), 2);
+        drop(owner);
+        assert_eq!(drops.get(), 3);
     }
 
     #[test]

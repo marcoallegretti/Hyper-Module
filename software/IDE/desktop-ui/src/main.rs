@@ -8069,6 +8069,10 @@ fn apply_event(
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::Recording(observation) => apply_recording_event(ui, &observation),
+        IdeWorkerEvent::RecordingInterrupted {
+            input_failed,
+            output_failed,
+        } => apply_recording_interrupted(ui, input_failed, output_failed),
         IdeWorkerEvent::RecordingFinalizing => {
             ui.set_app_mode(AppMode::FinalizingRecording);
             ui.set_status_text("Stopping capture and verifying the recorded WAV…".into());
@@ -10235,6 +10239,21 @@ fn apply_recording_imported(ui: &MainWindow, outcome: &IdeRecordingImportOutcome
         .into(),
     );
     ui.set_error_text(SharedString::default());
+}
+
+fn apply_recording_interrupted(ui: &MainWindow, input_failed: bool, output_failed: bool) {
+    let cause = match (input_failed, output_failed) {
+        (true, true) => "Native recording input and cue output ended unexpectedly",
+        (true, false) => "Native recording input ended unexpectedly",
+        (false, true) => "Native recording cue output ended unexpectedly",
+        (false, false) => "Native recording ownership ended unexpectedly",
+    };
+    ui.set_app_mode(AppMode::FinalizingRecording);
+    ui.set_status_text(format!("{cause}; settling capture before queued work…").into());
+    ui.set_error_text(
+        "The take will be imported only if input shutdown and writer integrity can be proven."
+            .into(),
+    );
 }
 
 fn apply_recording_import_committed_warning(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -18183,6 +18202,33 @@ mod tests {
             panic!("startup must submit exactly one open-project command");
         };
         assert_eq!(actual, project);
+    }
+
+    #[test]
+    fn recording_interruption_reports_each_native_failure_before_settlement() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+
+        for (input_failed, output_failed, expected_cause) in [
+            (true, false, "recording input ended unexpectedly"),
+            (false, true, "recording cue output ended unexpectedly"),
+            (
+                true,
+                true,
+                "recording input and cue output ended unexpectedly",
+            ),
+        ] {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("stale status".into());
+            ui.set_error_text("stale error".into());
+
+            apply_recording_interrupted(&ui, input_failed, output_failed);
+
+            assert_eq!(ui.get_app_mode(), AppMode::FinalizingRecording);
+            assert!(ui.get_status_text().contains(expected_cause));
+            assert!(ui.get_status_text().contains("settling capture"));
+            assert!(ui.get_error_text().contains("writer integrity"));
+        }
     }
 
     fn configure_waveform_selection_test_view(
