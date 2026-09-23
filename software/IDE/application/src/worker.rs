@@ -6681,6 +6681,11 @@ fn process_command(
     history: &mut UndoHistory,
     project_history: Option<&ProjectHistory>,
 ) -> bool {
+    if let Some(settled) = settle_close_confirmation_output_failure(state, events)
+        && !settled
+    {
+        return false;
+    }
     if let Some(settled) = settle_active_capture_output_failure(state, events)
         && !settled
     {
@@ -6962,6 +6967,27 @@ fn transition_running_output_failure(
     };
     *state = WorkerState::OutputFailed(application);
     send_event(events, IdeWorkerEvent::NativeOutputFailed)
+}
+
+fn settle_close_confirmation_output_failure(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> Option<bool> {
+    let WorkerState::AwaitingCloseDiscard {
+        application,
+        output_failed,
+    } = state
+    else {
+        return None;
+    };
+    if *output_failed || application.output_state() != OutputStreamState::Failed {
+        return None;
+    }
+    *output_failed = true;
+    Some(
+        send_event(events, IdeWorkerEvent::NativeOutputFailed)
+            && send_event(events, IdeWorkerEvent::CloseDiscardRequired),
+    )
 }
 
 fn settle_active_capture_output_failure(
@@ -21147,6 +21173,9 @@ fn poll_pending_state(
     history: &mut UndoHistory,
     project_history: Option<&ProjectHistory>,
 ) -> bool {
+    if let Some(settled) = settle_close_confirmation_output_failure(state, events) {
+        return settled;
+    }
     if let Some(settled) = settle_active_capture_output_failure(state, events) {
         return settled;
     }
@@ -34965,6 +34994,158 @@ mod tests {
                 changed: true,
             })
         ));
+    }
+
+    #[test]
+    fn output_loss_in_close_confirmation_preserves_final_checkpoint_save() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                output_state: OutputStreamState::Failed,
+                close_requires_discard: Some(true),
+                failed_output_mixer_save: Some(TestFailedOutputMixerSave::Saved {
+                    revision: 7,
+                    changed: true,
+                }),
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let (events, receiver) = sync_channel(8);
+        let mut state = WorkerState::AwaitingCloseDiscard {
+            application: running,
+            output_failed: false,
+        };
+        let mut history = UndoHistory::default();
+        history.record_edit(labelled("scene", "scene rename"));
+        let mut native = None;
+
+        assert!(poll_pending_state(
+            &mut state,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(
+            state,
+            WorkerState::AwaitingCloseDiscard {
+                output_failed: true,
+                ..
+            }
+        ));
+        assert_eq!(history.undo.len(), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::NativeOutputFailed)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CloseDiscardRequired)
+        ));
+        assert!(receiver.try_recv().is_err());
+
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::SaveCloseProject,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(state, WorkerState::Closed(_)));
+        assert!(history.undo.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::OutputFailureProjectSaving)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::UndoStateChanged { .. })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::Closed { .. })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::OutputFailureProjectSaved {
+                revision: 7,
+                changed: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn output_loss_before_close_cancellation_retains_failed_owner() {
+        let (events, receiver) = sync_channel(4);
+        let mut state = WorkerState::AwaitingCloseDiscard {
+            application: failed_running(Some(true)),
+            output_failed: false,
+        };
+        let mut history = UndoHistory::default();
+        let mut native = None;
+
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::CancelCloseProject,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(state, WorkerState::OutputFailed(_)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::NativeOutputFailed)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CloseDiscardRequired)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CloseDiscardCancelled)
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn undelivered_close_confirmation_failure_retains_owner_for_shutdown() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                output_state: OutputStreamState::Failed,
+                close_failure: Some(IdeNativeCloseFailure::ThreadPanicked),
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let mut state = WorkerState::AwaitingCloseDiscard {
+            application: running,
+            output_failed: false,
+        };
+        let (events, receiver) = sync_channel(1);
+        drop(receiver);
+        let mut history = UndoHistory::default();
+        let mut native = None;
+
+        assert!(!poll_pending_state(
+            &mut state,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(
+            state,
+            WorkerState::AwaitingCloseDiscard {
+                output_failed: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            finish_worker(state, native).native_failure(),
+            Some(IdeNativeCloseFailure::ThreadPanicked)
+        );
     }
 
     #[test]
