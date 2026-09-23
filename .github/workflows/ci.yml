@@ -204,7 +204,7 @@ jobs:
             printf 'report.optimized-applications.log=cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-fs-authority -p hyper-audio-source\n'
             printf 'report.application-inspection-smoke.log=optimized hyper-desktop-ui and hyper-runtime help/version commands\n'
             printf 'report.package-deployment-smoke.log=extracted kit deployment\n'
-            printf 'report.native-deployment-promotion.log=native Runtime promotion of extracted kit deployment\n'
+            printf 'report.native-deployment-promotion.log=native Runtime promotion and offline render of extracted kit deployment\n'
           } > "$REPORT_DIR/manifest.txt"
 
       - name: Install pinned Rust toolchain

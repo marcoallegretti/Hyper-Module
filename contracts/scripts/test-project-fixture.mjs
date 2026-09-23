@@ -187,7 +187,7 @@ export async function createMinimalProject(
   const assets = [];
   if (audioAsset || audioClip) {
     const assetPath = "assets/samples/reference.wav";
-    const assetBytes = pcm16Wave(audioClip ? 48000 : 128);
+    const assetBytes = pcm16Wave(audioClip ? 48000 : 128, audioClip ? 8192 : 0);
     await mkdir(join(root, "assets", "samples"), { recursive: true });
     await writeFile(join(root, ...assetPath.split("/")), assetBytes);
     assets.push({
@@ -231,7 +231,7 @@ export async function createMinimalProject(
   return { project, projectBytes, root, timelineBytes, timelinePath };
 }
 
-function pcm16Wave(frameCount) {
+function pcm16Wave(frameCount, sample = 0) {
   const channels = 1;
   const sampleRate = 48_000;
   const bytesPerSample = 2;
@@ -251,5 +251,8 @@ function pcm16Wave(frameCount) {
   buffer.writeUInt16LE(bytesPerSample * 8, 34);
   buffer.write("data", 36, "ascii");
   buffer.writeUInt32LE(dataBytes, 40);
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    buffer.writeInt16LE(sample, 44 + frame * blockAlign);
+  }
   return buffer;
 }

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use hyper_audio_source::DecodeLimits;
+use hyper_desktop_audio::{OfflineExportSpec, render_prepared_project_offline_with_mixer};
 use hyper_media_cache::CacheLimits;
 use hyper_playback_json::LoaderLimits;
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
@@ -65,6 +66,19 @@ fn resolves_a_javascript_managed_deployment_target() {
         assert!(placements[0].active());
         assert_eq!(placements[0].start_frame(), 0);
         assert_eq!(placements[0].end_frame(), 48_000);
+        let rendered = render_prepared_project_offline_with_mixer(
+            resolved.bundle().project(),
+            OfflineExportSpec { block_frames: 256 },
+            None,
+        )
+        .unwrap();
+        assert_eq!(rendered.sample_rate_hz(), 48_000);
+        assert_eq!(rendered.channels(), 2);
+        assert_eq!(rendered.frame_count(), 48_000);
+        for channel in 0..2 {
+            let samples = rendered.plane(channel).unwrap();
+            assert!(samples[24_000] > 0.0);
+        }
     }
 
     match mode.as_str() {

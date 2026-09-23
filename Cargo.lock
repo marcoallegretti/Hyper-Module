@@ -2580,6 +2580,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "hyper-audio-source",
+ "hyper-desktop-audio",
  "hyper-fs-authority",
  "hyper-media-cache",
  "hyper-playback-json",
