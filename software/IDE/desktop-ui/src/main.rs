@@ -12062,6 +12062,7 @@ fn reset_project(
     ui.set_rename_project_visible(false);
     ui.set_rename_project_name(SharedString::default());
     ui.set_project_name("No project open".into());
+    ui.set_project_location("No project selected".into());
     ui.set_project_id("—".into());
     ui.set_sample_rate("—".into());
     ui.set_scene_count("—".into());
@@ -12169,6 +12170,9 @@ fn reset_project(
     project_state.automation_take_ids.borrow_mut().clear();
     project_state.control_targets.borrow_mut().clear();
     project_state.scene_launch_evidence.borrow_mut().clear();
+    *project_state.timeline.borrow_mut() = ProjectTimeline::default();
+    project_state.sample_rate_hz.set(0);
+    project_state.playhead_frame.set(0);
     ui.set_transport_extent_bounded(false);
     ui.set_transport_seek_available(false);
     ui.set_transport_progress_percent(0.0);
@@ -12179,6 +12183,7 @@ fn reset_project(
     ui.set_transport_return_start_available(false);
     ui.set_stream_state("No stream".into());
     ui.set_frame_position("0".into());
+    ui.set_musical_position(SharedString::default());
     ui.set_transport_clock("00:00:00.000".into());
     ui.set_callback_count("0".into());
     ui.set_xrun_count("Unavailable".into());
@@ -22626,6 +22631,44 @@ mod tests {
             "",
             "a project whose timeline is not loaded shows nothing rather than a wrong bar"
         );
+    }
+
+    #[test]
+    fn project_close_revokes_location_and_musical_playhead() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let state = Rc::new(ProjectUiState::default());
+        let recording_routes: RecordingRoutes = Rc::default();
+        let take_routes: TakeRoutes = Rc::default();
+        *state.timeline.borrow_mut() = ProjectTimeline {
+            project_id: "project-a".to_owned(),
+            sample_rate_hz: 48_000,
+            tempo_events: vec![TempoEvent {
+                tick: 0,
+                microseconds_per_quarter: 500_000,
+            }],
+            meter_events: vec![MeterEvent {
+                tick: 0,
+                numerator: 4,
+                denominator: 4,
+            }],
+            ..ProjectTimeline::default()
+        };
+        state.sample_rate_hz.set(48_000);
+        ui.set_project_name("A project".into());
+        ui.set_project_location("C:\\projects\\a".into());
+        set_playhead(&ui, &state, 96_000);
+        assert_eq!(ui.get_musical_position(), "2|1|000");
+
+        reset_project(&ui, &recording_routes, &take_routes, &state);
+
+        assert_eq!(ui.get_project_name(), "No project open");
+        assert_eq!(ui.get_project_location(), "No project selected");
+        assert_eq!(ui.get_frame_position(), "0");
+        assert!(ui.get_musical_position().is_empty());
+        assert_eq!(state.playhead_frame.get(), 0);
+        assert_eq!(state.sample_rate_hz.get(), 0);
+        assert!(state.timeline.borrow().project_id.is_empty());
     }
 
     #[test]
