@@ -7478,6 +7478,7 @@ fn apply_event(
             ui.set_error_text(SharedString::default());
         }
         event @ (IdeWorkerEvent::OutputTest(_)
+        | IdeWorkerEvent::OutputTestInterrupted(_)
         | IdeWorkerEvent::OutputTestStopping
         | IdeWorkerEvent::OutputTestStopped) => apply_output_test_event(ui, &event),
         IdeWorkerEvent::TransportQueued(command) => {
@@ -10136,6 +10137,42 @@ fn apply_output_test_event(ui: &MainWindow, event: &IdeWorkerEvent) {
                 .into(),
             );
             apply_output_test_status(ui, snapshot.state());
+        }
+        IdeWorkerEvent::OutputTestInterrupted(state) => {
+            ui.set_app_mode(AppMode::StoppingOutputTest);
+            ui.set_output_test_confirming(false);
+            ui.set_output_test_detail(
+                format!(
+                    "{} · releasing exclusive output",
+                    output_test_state_label(*state)
+                )
+                .into(),
+            );
+            match state {
+                IdeOutputTestState::Failed => {
+                    ui.set_status_text(
+                        "Output diagnostic failed; releasing the exclusive output…".into(),
+                    );
+                    ui.set_error_text(
+                        "Native output stopped rendering; diagnostic cleanup is in progress".into(),
+                    );
+                }
+                IdeOutputTestState::Stopped => {
+                    ui.set_status_text(
+                        "Output diagnostic ended; releasing the exclusive output…".into(),
+                    );
+                    ui.set_error_text(SharedString::default());
+                }
+                IdeOutputTestState::Starting
+                | IdeOutputTestState::Running
+                | IdeOutputTestState::StopRequested => {
+                    ui.set_status_text(
+                        "Output diagnostic interruption detected; releasing the exclusive output…"
+                            .into(),
+                    );
+                    ui.set_error_text(SharedString::default());
+                }
+            }
         }
         IdeWorkerEvent::OutputTestStopping => {
             ui.set_app_mode(AppMode::StoppingOutputTest);
@@ -18228,6 +18265,46 @@ mod tests {
             assert!(ui.get_status_text().contains(expected_cause));
             assert!(ui.get_status_text().contains("settling capture"));
             assert!(ui.get_error_text().contains("writer integrity"));
+        }
+    }
+
+    #[test]
+    fn output_diagnostic_interruption_replaces_stale_active_presentation() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+
+        for (state, expected_status, expected_error) in [
+            (
+                IdeOutputTestState::Failed,
+                "failed; releasing the exclusive output",
+                Some("Native output stopped rendering"),
+            ),
+            (
+                IdeOutputTestState::Stopped,
+                "ended; releasing the exclusive output",
+                None,
+            ),
+        ] {
+            ui.set_app_mode(AppMode::OutputTesting);
+            ui.set_output_test_confirming(true);
+            ui.set_output_test_detail("Running · stale counters".into());
+            ui.set_status_text("stale active status".into());
+            ui.set_error_text("stale error".into());
+
+            apply_output_test_event(&ui, &IdeWorkerEvent::OutputTestInterrupted(state));
+
+            assert_eq!(ui.get_app_mode(), AppMode::StoppingOutputTest);
+            assert!(!ui.get_output_test_confirming());
+            assert!(
+                ui.get_output_test_detail()
+                    .contains(output_test_state_label(state))
+            );
+            assert!(ui.get_output_test_detail().contains("releasing"));
+            assert!(ui.get_status_text().contains(expected_status));
+            match expected_error {
+                Some(expected) => assert!(ui.get_error_text().contains(expected)),
+                None => assert!(ui.get_error_text().is_empty()),
+            }
         }
     }
 

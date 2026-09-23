@@ -1865,11 +1865,16 @@ enum IdeOutputTestSessionOwner {
     #[cfg(test)]
     Test {
         snapshot: IdeOutputTestSnapshot,
+        state: Arc<std::sync::Mutex<IdeOutputTestState>>,
         stop_failure: Option<IdeNativeCloseFailure>,
     },
 }
 
 impl OutputTestingDesktopIdeApplication {
+    pub(crate) fn interruption(&self) -> Option<IdeOutputTestState> {
+        output_test_interruption(self.snapshot().state())
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> IdeOutputTestSnapshot {
         match &self.session {
@@ -1883,10 +1888,14 @@ impl OutputTestingDesktopIdeApplication {
                 }
             }
             #[cfg(test)]
-            IdeOutputTestSessionOwner::Test { snapshot, .. } => IdeOutputTestSnapshot {
+            IdeOutputTestSessionOwner::Test {
+                snapshot, state, ..
+            } => IdeOutputTestSnapshot {
                 frequency_hz: snapshot.frequency_hz,
                 level_dbfs: snapshot.level_dbfs,
-                state: snapshot.state,
+                state: *state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
                 output: snapshot.output,
             },
         }
@@ -1933,6 +1942,15 @@ impl OutputTestingDesktopIdeApplication {
                 }
             }
         }
+    }
+}
+
+const fn output_test_interruption(state: IdeOutputTestState) -> Option<IdeOutputTestState> {
+    match state {
+        IdeOutputTestState::Stopped | IdeOutputTestState::Failed => Some(state),
+        IdeOutputTestState::Starting
+        | IdeOutputTestState::Running
+        | IdeOutputTestState::StopRequested => None,
     }
 }
 
@@ -25028,6 +25046,20 @@ mod tests {
             application.output_test_config(),
             Err(IdeOutputTestError::SelectedOutputUnavailable)
         ));
+    }
+
+    #[test]
+    fn output_diagnostic_interruption_classifies_only_terminal_stream_states() {
+        for state in [
+            IdeOutputTestState::Starting,
+            IdeOutputTestState::Running,
+            IdeOutputTestState::StopRequested,
+        ] {
+            assert_eq!(output_test_interruption(state), None);
+        }
+        for state in [IdeOutputTestState::Stopped, IdeOutputTestState::Failed] {
+            assert_eq!(output_test_interruption(state), Some(state));
+        }
     }
 
     #[test]
