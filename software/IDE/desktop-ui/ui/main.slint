@@ -2189,6 +2189,8 @@ export component MainWindow inherits Window {
                 if root.performance-visible : Panel {
                     width: parent.width;
                     height: parent.height;
+                    ScrollView {
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                     VerticalLayout {
                     padding: 22px;
                     spacing: 18px;
@@ -2236,7 +2238,7 @@ export component MainWindow inherits Window {
                     Rectangle { height: 1px; background: #27313d; }
 
                     HorizontalLayout {
-                        height: 132px;
+                        height: 240px;
                         spacing: 18px;
                         VerticalLayout {
                             horizontal-stretch: 1;
@@ -2467,9 +2469,10 @@ export component MainWindow inherits Window {
                     Rectangle { height: 1px; background: #27313d; }
 
                     VerticalLayout {
-                        height: 125px;
+                        min-height: 125px;
                         spacing: 4px;
                         HorizontalLayout {
+                            height: 32px;
                             Text { text: "SCENE LAUNCHER"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; vertical-alignment: center; }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button {
@@ -2579,6 +2582,7 @@ export component MainWindow inherits Window {
                             row: 1; col: 3; height: 64px; background: #0e141b; border-radius: 6px;
                             VerticalLayout { padding: 10px; Text { text: "UNDERFLOWS"; color: #65758a; font-size: 9px; } Text { text: root.monitoring-underflow-count; color: root.monitoring-underflow-count == "0" ? #dce5ef : #ff9d76; font-size: 15px; } }
                         }
+                    }
                     }
                     }
                 }
