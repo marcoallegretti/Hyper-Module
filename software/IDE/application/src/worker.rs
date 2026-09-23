@@ -6681,6 +6681,11 @@ fn process_command(
     history: &mut UndoHistory,
     project_history: Option<&ProjectHistory>,
 ) -> bool {
+    if let Some(settled) = settle_active_capture_output_failure(state, events)
+        && !settled
+    {
+        return false;
+    }
     if !transition_running_output_failure(state, events) {
         return false;
     }
@@ -6957,6 +6962,36 @@ fn transition_running_output_failure(
     };
     *state = WorkerState::OutputFailed(application);
     send_event(events, IdeWorkerEvent::NativeOutputFailed)
+}
+
+fn settle_active_capture_output_failure(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> Option<bool> {
+    let command = match state {
+        WorkerState::ScenePerformanceCapture { application, .. }
+            if application.output_state() == OutputStreamState::Failed =>
+        {
+            IdeWorkerCommandKind::CaptureScenePerformance
+        }
+        WorkerState::MixerAutomationCapture { application, .. }
+            if application.output_state() == OutputStreamState::Failed =>
+        {
+            IdeWorkerCommandKind::CaptureMixerAutomation
+        }
+        _ => return None,
+    };
+    let (WorkerState::ScenePerformanceCapture { application, .. }
+    | WorkerState::MixerAutomationCapture { application, .. }) =
+        std::mem::replace(state, WorkerState::Empty)
+    else {
+        unreachable!("active capture was classified before output-failure transfer");
+    };
+    *state = WorkerState::OutputFailed(application);
+    Some(
+        send_event(events, IdeWorkerEvent::NativeOutputFailed)
+            && publish_failure(events, command, IdeWorkerCommandFailure::NativeOutputFailed),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -21112,6 +21147,9 @@ fn poll_pending_state(
     history: &mut UndoHistory,
     project_history: Option<&ProjectHistory>,
 ) -> bool {
+    if let Some(settled) = settle_active_capture_output_failure(state, events) {
+        return settled;
+    }
     if let Some(settled) =
         settle_inflight_output_failure(state, events, unpublished_native_failure, history)
     {
@@ -35457,6 +35495,175 @@ mod tests {
             ));
             assert!(receiver.try_recv().is_err());
         }
+    }
+
+    fn failed_active_capture_states() -> Vec<(WorkerState, IdeWorkerCommandKind)> {
+        let mut scene = scene_performance_capture(vec![capture_scene(CAPTURE_SCENE_A, true)], 2, 1);
+        scene.observe_launch(0, Some(960), 1, false).unwrap();
+        let mut stopping_scene =
+            scene_performance_capture(vec![capture_scene(CAPTURE_SCENE_A, true)], 2, 1);
+        stopping_scene
+            .observe_launch(0, Some(960), 1, false)
+            .unwrap();
+        stopping_scene.begin_stopping(0, None);
+
+        let target = AutomationTarget::Main {
+            parameter: AutomationMainParameter::Gain,
+        };
+        let automation = || {
+            let mut capture = mixer_automation_capture(
+                target,
+                IdeAutomationTarget::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+                2,
+            );
+            capture
+                .observe_change(0, true, false, target, AutomationValue::Integer(100_000))
+                .unwrap();
+            capture
+        };
+        let mut stopping_automation = automation();
+        stopping_automation.begin_stopping(0, None);
+
+        vec![
+            (
+                WorkerState::ScenePerformanceCapture {
+                    application: failed_running(Some(true)),
+                    capture: scene,
+                },
+                IdeWorkerCommandKind::CaptureScenePerformance,
+            ),
+            (
+                WorkerState::ScenePerformanceCapture {
+                    application: failed_running(Some(true)),
+                    capture: stopping_scene,
+                },
+                IdeWorkerCommandKind::CaptureScenePerformance,
+            ),
+            (
+                WorkerState::MixerAutomationCapture {
+                    application: failed_running(Some(true)),
+                    capture: automation(),
+                },
+                IdeWorkerCommandKind::CaptureMixerAutomation,
+            ),
+            (
+                WorkerState::MixerAutomationCapture {
+                    application: failed_running(Some(true)),
+                    capture: stopping_automation,
+                },
+                IdeWorkerCommandKind::CaptureMixerAutomation,
+            ),
+        ]
+    }
+
+    #[test]
+    fn output_loss_abandons_active_captures_without_partial_publication() {
+        for (mut state, command) in failed_active_capture_states() {
+            let (events, receiver) = sync_channel(2);
+            let mut history = UndoHistory::default();
+            let mut native = None;
+
+            assert!(poll_pending_state(
+                &mut state,
+                &events,
+                &mut native,
+                &mut history,
+                None,
+            ));
+
+            assert!(matches!(state, WorkerState::OutputFailed(_)));
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::NativeOutputFailed)
+            ));
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::CommandFailed {
+                    command: actual,
+                    reason: IdeWorkerCommandFailure::NativeOutputFailed,
+                }) if actual == command
+            ));
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn output_loss_during_capture_close_needs_no_second_request() {
+        for (mut state, command) in failed_active_capture_states() {
+            let (events, receiver) = sync_channel(3);
+            let mut history = UndoHistory::default();
+            history.record_edit(labelled("scene", "scene rename"));
+            let mut native = None;
+
+            assert!(process_command(
+                &mut state,
+                IdeWorkerCommand::CloseProject,
+                &events,
+                &mut native,
+                &mut history,
+                None,
+            ));
+
+            assert!(matches!(
+                state,
+                WorkerState::AwaitingCloseDiscard {
+                    output_failed: true,
+                    ..
+                }
+            ));
+            assert_eq!(history.undo.len(), 1);
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::NativeOutputFailed)
+            ));
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::CommandFailed {
+                    command: actual,
+                    reason: IdeWorkerCommandFailure::NativeOutputFailed,
+                }) if actual == command
+            ));
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::CloseDiscardRequired)
+            ));
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn undelivered_capture_failure_retains_the_owner_for_shutdown() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                output_state: OutputStreamState::Failed,
+                close_failure: Some(IdeNativeCloseFailure::ThreadPanicked),
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let mut state = WorkerState::ScenePerformanceCapture {
+            application: running,
+            capture: scene_performance_capture(vec![capture_scene(CAPTURE_SCENE_A, true)], 2, 1),
+        };
+        let (events, receiver) = sync_channel(1);
+        drop(receiver);
+        let mut history = UndoHistory::default();
+        let mut native = None;
+
+        assert!(!poll_pending_state(
+            &mut state,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(matches!(state, WorkerState::OutputFailed(_)));
+        assert_eq!(
+            finish_worker(state, native).native_failure(),
+            Some(IdeNativeCloseFailure::ThreadPanicked)
+        );
     }
 
     #[test]
