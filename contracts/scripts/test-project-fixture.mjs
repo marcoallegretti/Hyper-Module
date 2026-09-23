@@ -7,7 +7,12 @@ import canonicalize from "canonicalize";
 export async function createMinimalProject(
   parent,
   name = "project",
-  { audioAsset = false, playbackReady = false, revision = 7 } = {},
+  {
+    audioAsset = false,
+    audioTrack = false,
+    playbackReady = false,
+    revision = 7,
+  } = {},
 ) {
   const root = join(parent, name);
   await mkdir(join(root, "timeline"), { recursive: true });
@@ -36,13 +41,53 @@ export async function createMinimalProject(
       extensions: {},
     },
   ];
-  if (playbackReady) {
+  const trackId = "018f47a2-6b2d-7c11-8a44-001122334456";
+  if (audioTrack) {
+    const track = {
+      format: "hyper-track",
+      format_version: 1,
+      id: trackId,
+      project_id: projectId,
+      name: "Audio 1",
+      kind: "audio",
+      order: 0,
+      active: true,
+      clip_ids: [],
+      extensions: {},
+    };
+    const trackBytes = Buffer.from(canonicalize(track), "utf8");
+    const trackPath = `tracks/${trackId}.json`;
+    await mkdir(join(root, "tracks"), { recursive: true });
+    await writeFile(join(root, ...trackPath.split("/")), trackBytes);
+    resources.push({
+      id: trackId,
+      role: "track",
+      path: trackPath,
+      media_type: "application/json",
+      byte_length: trackBytes.length,
+      sha256: createHash("sha256").update(trackBytes).digest("hex"),
+      extensions: {},
+    });
+  }
+  if (playbackReady || audioTrack) {
     const mixer = {
       format: "hyper-mixer",
       format_version: 1,
       id: "018f47a2-6b2d-7c11-8a44-001122334468",
       project_id: projectId,
-      channels: [],
+      channels: audioTrack
+        ? [
+            {
+              track_id: trackId,
+              gain_millionths: 1_000_000,
+              pan_millionths: 0,
+              mute: false,
+              solo: false,
+              destination: { kind: "main" },
+              sends: [],
+            },
+          ]
+        : [],
       return_buses: [],
       main: { gain_millionths: 1_000_000, mute: false },
       cue: {

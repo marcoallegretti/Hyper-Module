@@ -23,8 +23,13 @@ assert.equal(
 );
 
 const project = await createMinimalProject(scratch, "project", {
-  playbackReady: true,
+  audioTrack: true,
 });
+assert.equal(
+  project.project.resources.filter((resource) => resource.role === "track").length,
+  1,
+  "packaged deployment smoke must exercise an audio track",
+);
 const bundle = join(scratch, "project.runtime");
 const target = join(scratch, "target");
 await buildProjectBundle(project.root, bundle, runtimeVersion);
