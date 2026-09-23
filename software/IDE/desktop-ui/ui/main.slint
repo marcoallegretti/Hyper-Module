@@ -653,6 +653,7 @@ export component MainWindow inherits Window {
     in-out property <int> selected-input-index: 0;
     in property <bool> input-discovery-available: false;
     in property <bool> monitoring-active: false;
+    in property <bool> monitoring-running: false;
     in property <float> monitoring-gain-percent: 0;
     in property <bool> monitoring-muted: false;
     in property <string> monitoring-state: "Off";
@@ -1255,7 +1256,7 @@ export component MainWindow inherits Window {
                 } else if root.app-mode == AppMode.running
                     && root.performance-visible
                     && !root.local-edit-form-visible
-                    && root.monitoring-active
+                    && root.monitoring-running
                     && root.selected-recording-target-index >= 0
                     && root.selected-recording-target-index < root.recording-target-names.length {
                     IdeActions.start-recording();
@@ -1603,7 +1604,7 @@ export component MainWindow inherits Window {
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Text {
                                 text: root.monitoring-active ? root.monitoring-state : "OFF";
-                                color: root.monitoring-active ? #63e6b5 : #728196;
+                                color: root.monitoring-running ? #63e6b5 : root.monitoring-state == "Failed" ? #ff5a55 : root.monitoring-active ? #ffb36b : #728196;
                                 font-size: 10px;
                                 vertical-alignment: center;
                             }
@@ -1637,7 +1638,7 @@ export component MainWindow inherits Window {
                                     minimum: 0;
                                     maximum: 100;
                                     value: root.monitoring-gain-percent;
-                                    enabled: (root.app-mode == AppMode.running || root.app-mode == AppMode.recording) && root.monitoring-active;
+                                    enabled: (root.app-mode == AppMode.running || root.app-mode == AppMode.recording) && root.monitoring-running;
                                     accessible-label: "Input cue gain";
                                     released(value) => { IdeActions.monitor-gain(value); }
                                 }
@@ -1645,7 +1646,7 @@ export component MainWindow inherits Window {
                             Button {
                                 width: 72px;
                                 text: root.monitoring-muted ? "MUTED" : "MUTE";
-                                enabled: (root.app-mode == AppMode.running || root.app-mode == AppMode.recording) && root.monitoring-active;
+                                enabled: (root.app-mode == AppMode.running || root.app-mode == AppMode.recording) && root.monitoring-running;
                                 clicked => { IdeActions.monitor-mute(); }
                             }
                         }
@@ -2145,7 +2146,7 @@ export component MainWindow inherits Window {
                         ComboBox {
                             model: root.recording-target-names;
                             current-index <=> root.selected-recording-target-index;
-                            enabled: root.app-mode == AppMode.running && root.monitoring-active && root.recording-target-names.length > 0;
+                            enabled: root.app-mode == AppMode.running && root.monitoring-running && root.recording-target-names.length > 0;
                             accessible-label: "Recording target audio track";
                         }
                         if root.app-mode == AppMode.recording : HorizontalLayout {
@@ -2157,7 +2158,7 @@ export component MainWindow inherits Window {
                             text: root.app-mode == AppMode.preparing-recording ? "Preparing capture…"
                                 : root.app-mode == AppMode.finalizing-recording ? "Finalizing capture…"
                                 : "Record take";
-                            enabled: root.app-mode == AppMode.running && root.monitoring-active && root.recording-target-names.length > 0;
+                            enabled: root.app-mode == AppMode.running && root.monitoring-running && root.recording-target-names.length > 0;
                             clicked => { IdeActions.start-recording(); }
                         }
                         Text {
@@ -2564,7 +2565,7 @@ export component MainWindow inherits Window {
                         }
                         Rectangle {
                             row: 1; col: 0; height: 64px; background: #0e141b; border-radius: 6px;
-                            VerticalLayout { padding: 10px; Text { text: "INPUT CUE"; color: #65758a; font-size: 9px; } Text { text: root.monitoring-state; color: root.monitoring-active ? #63e6b5 : #8fa0b4; font-size: 15px; } }
+                            VerticalLayout { padding: 10px; Text { text: "INPUT CUE"; color: #65758a; font-size: 9px; } Text { text: root.monitoring-state; color: root.monitoring-running ? #63e6b5 : root.monitoring-state == "Failed" ? #ff5a55 : root.monitoring-active ? #ffb36b : #8fa0b4; font-size: 15px; } }
                         }
                         Rectangle {
                             row: 1; col: 1; height: 64px; background: #0e141b; border-radius: 6px;

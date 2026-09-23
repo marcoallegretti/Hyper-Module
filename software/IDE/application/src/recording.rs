@@ -31,7 +31,7 @@ use super::{
     DESKTOP_RECORDING_TRANSPORT_FRAMES, DesktopDirectControlError, DesktopIdeApplication,
     IdeInputMeterObservation, IdeMixerChannelKind, IdeMonitoringCommand, IdeMonitoringCommandError,
     IdeNativeCloseFailure, IdeProjectOpenError, IdeProjectSaveError,
-    MONITOR_GAIN_MILLIONTHS_MAXIMUM, RunningDesktopIdeApplication,
+    MONITOR_GAIN_MILLIONTHS_MAXIMUM, RunningDesktopIdeApplication, monitoring_input_running,
 };
 
 const BACKUPS_DIRECTORY: &str = "backups";
@@ -806,6 +806,9 @@ impl RecordingDesktopIdeApplication {
         &mut self,
         command: IdeMonitoringCommand,
     ) -> Result<(), IdeMonitoringCommandError> {
+        if !monitoring_input_running(Some(self.session.input_status().state())) {
+            return Err(IdeMonitoringCommandError::Unavailable);
+        }
         let control = self.session.control();
         match command {
             IdeMonitoringCommand::Gain { gain_millionths } => {

@@ -16,6 +16,7 @@ hyper-playback-session = { path = "../../../crates/playback-session", features =
 i-slint-backend-testing = "=1.17.1"
 
 [dependencies]
+hyper-desktop-audio = { path = "../audio-backend" }
 hyper-desktop-ide = { path = "../application" }
 rfd = { version = "=0.17.2" }
 slint = { version = "=1.17.1", default-features = false, features = [

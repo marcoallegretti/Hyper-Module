@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyper_desktop_audio::StreamState;
 use hyper_desktop_ide::{
     AUDIO_IMPORT_FILE_FILTER_LABEL, AutomationChannelParameter, AutomationInterpolation,
     AutomationMainParameter, AutomationPoint, AutomationSendParameter, AutomationTarget,
@@ -1443,7 +1444,7 @@ fn bind_monitoring_callbacks(ui: &MainWindow, worker: &WorkerCell) {
             return;
         };
         if !matches!(ui.get_app_mode(), AppMode::Running | AppMode::Recording)
-            || !ui.get_monitoring_active()
+            || !ui.get_monitoring_running()
         {
             return;
         }
@@ -1464,7 +1465,7 @@ fn bind_monitoring_callbacks(ui: &MainWindow, worker: &WorkerCell) {
             return;
         };
         if !matches!(ui.get_app_mode(), AppMode::Running | AppMode::Recording)
-            || !ui.get_monitoring_active()
+            || !ui.get_monitoring_running()
         {
             return;
         }
@@ -1492,7 +1493,7 @@ fn bind_recording_callbacks(
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        if ui.get_app_mode() != AppMode::Running || !ui.get_monitoring_active() {
+        if ui.get_app_mode() != AppMode::Running || !ui.get_monitoring_running() {
             return;
         }
         let selected = usize::try_from(ui.get_selected_recording_target_index())
@@ -10362,6 +10363,7 @@ fn apply_running_event(
     ui.set_callback_count(observation.output().callback_count.to_string().into());
     if let Some(monitoring) = observation.monitoring() {
         ui.set_monitoring_active(true);
+        ui.set_monitoring_running(monitoring.input_state == StreamState::Running);
         ui.set_monitoring_gain_percent(monitoring.gain * 100.0);
         ui.set_monitoring_muted(monitoring.muted);
         ui.set_monitoring_state(format!("{:?}", monitoring.input_state).into());
@@ -11183,6 +11185,7 @@ fn apply_recording_event(ui: &MainWindow, state: &hyper_desktop_ide::IdeRecordin
     );
     ui.set_callback_count(observation.input().callback_count.to_string().into());
     ui.set_monitoring_active(true);
+    ui.set_monitoring_running(observation.input_state() == StreamState::Running);
     ui.set_monitoring_gain_percent(observation.monitor_gain() * 100.0);
     ui.set_monitoring_muted(observation.monitor_muted());
     ui.set_monitoring_state(format!("{:?}", observation.input_state()).into());
@@ -12290,6 +12293,7 @@ fn reset_arrangement_ui(ui: &MainWindow) {
 
 fn reset_monitoring(ui: &MainWindow) {
     ui.set_monitoring_active(false);
+    ui.set_monitoring_running(false);
     ui.set_monitoring_gain_percent(0.0);
     ui.set_monitoring_muted(false);
     ui.set_monitoring_state("Off".into());
@@ -20231,6 +20235,7 @@ mod tests {
         ui.set_recording_target_names(ModelRc::from(Rc::new(VecModel::from(vec!["Audio".into()]))));
         ui.set_selected_recording_target_index(0);
         ui.set_monitoring_active(true);
+        ui.set_monitoring_running(true);
         ui.set_app_mode(AppMode::Running);
         ui.show().unwrap();
 
@@ -20246,16 +20251,21 @@ mod tests {
         assert_eq!(starts.get(), 1);
         assert_eq!(stops.get(), 0);
 
+        ui.set_monitoring_running(false);
+        dispatch_ide_shortcut(&ui, "r", false, false);
+        assert_eq!(starts.get(), 1, "failed capture cannot start another take");
+        ui.set_monitoring_running(true);
+
         ui.set_selected_recording_target_index(-1);
         dispatch_ide_shortcut(&ui, "r", false, false);
         ui.set_selected_recording_target_index(1);
         dispatch_ide_shortcut(&ui, "r", false, false);
         ui.set_selected_recording_target_index(0);
-        ui.set_monitoring_active(false);
+        ui.set_monitoring_running(false);
         dispatch_ide_shortcut(&ui, "r", false, false);
         assert_eq!(starts.get(), 1, "revoked start authority remains inert");
 
-        ui.set_monitoring_active(true);
+        ui.set_monitoring_running(true);
         ui.set_new_track_visible(true);
         dispatch_ide_shortcut(&ui, "r", false, false);
         ui.set_new_track_visible(false);

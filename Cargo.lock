@@ -2242,6 +2242,7 @@ dependencies = [
 name = "hyper-desktop-ui"
 version = "0.1.0"
 dependencies = [
+ "hyper-desktop-audio",
  "hyper-desktop-ide",
  "hyper-mixer-runtime",
  "hyper-playback-session",

@@ -2232,6 +2232,10 @@ impl Error for IdeMonitoringCommandError {
     }
 }
 
+fn monitoring_input_running(state: Option<StreamState>) -> bool {
+    matches!(state, Some(StreamState::Running))
+}
+
 /// One lock-free control for dry recorded-take audition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdeAudioPreviewControlCommand {
@@ -17676,8 +17680,8 @@ impl RunningDesktopIdeApplication {
     ///
     /// # Errors
     ///
-    /// Returns an explicit unavailable result for ordinary playback sessions,
-    /// rejects gain above unity, and preserves backend validation failures.
+    /// Returns unavailable without running input capture, rejects gain above
+    /// unity, and preserves backend validation failures.
     #[allow(
         clippy::cast_precision_loss,
         clippy::infallible_destructuring_match,
@@ -17694,6 +17698,13 @@ impl RunningDesktopIdeApplication {
                 return Err(IdeMonitoringCommandError::Unavailable);
             }
         };
+        if !monitoring_input_running(
+            session
+                .monitoring_input_status()
+                .map(|status| status.state()),
+        ) {
+            return Err(IdeMonitoringCommandError::Unavailable);
+        }
         let control = session
             .monitoring_control()
             .ok_or(IdeMonitoringCommandError::Unavailable)?;
@@ -19064,6 +19075,20 @@ mod tests {
         );
         application.disable_input_monitoring();
         assert_eq!(application.input_selection(), &IdeInputSelection::Disabled);
+    }
+
+    #[test]
+    fn cue_control_authority_requires_running_capture() {
+        for state in [
+            None,
+            Some(StreamState::Starting),
+            Some(StreamState::StopRequested),
+            Some(StreamState::Stopped),
+            Some(StreamState::Failed),
+        ] {
+            assert!(!monitoring_input_running(state));
+        }
+        assert!(monitoring_input_running(Some(StreamState::Running)));
     }
 
     #[test]

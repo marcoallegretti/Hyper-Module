@@ -2261,25 +2261,43 @@ impl RuntimeOperatorControl for SessionHost {
     }
 
     fn set_input_monitor_gain(&mut self, gain: f32) -> Result<(), String> {
-        self.owner
-            .playback()
-            .ok_or_else(runtime_playback_unavailable)?
-            .monitoring_control()
-            .ok_or_else(|| "Runtime input monitor is unavailable".to_owned())?
-            .set_gain_linear(gain)
-            .map_err(|error| error.to_string())
+        running_input_monitor_control(
+            self.owner
+                .playback()
+                .ok_or_else(runtime_playback_unavailable)?,
+        )?
+        .set_gain_linear(gain)
+        .map_err(|error| error.to_string())
     }
 
     fn set_input_monitor_muted(&mut self, muted: bool) -> Result<(), String> {
-        let control = self
-            .owner
-            .playback()
-            .ok_or_else(runtime_playback_unavailable)?
-            .monitoring_control()
-            .ok_or_else(|| "Runtime input monitor is unavailable".to_owned())?;
+        let control = running_input_monitor_control(
+            self.owner
+                .playback()
+                .ok_or_else(runtime_playback_unavailable)?,
+        )?;
         control.set_muted(muted);
         Ok(())
     }
+}
+
+fn running_input_monitor_control(
+    playback: &DesktopPlaybackSession,
+) -> Result<DesktopMonitoringControl, String> {
+    if !runtime_input_monitor_running(
+        playback
+            .monitoring_input_status()
+            .map(|status| status.state()),
+    ) {
+        return Err("Runtime input monitor capture is not running".to_owned());
+    }
+    playback
+        .monitoring_control()
+        .ok_or_else(|| "Runtime input monitor is unavailable".to_owned())
+}
+
+fn runtime_input_monitor_running(state: Option<StreamState>) -> bool {
+    matches!(state, Some(StreamState::Running))
 }
 
 impl RuntimeScenePerformanceControl for SessionHost {
@@ -9277,6 +9295,20 @@ mod tests {
         assert!(unavailable.authority.configured());
         assert_eq!(unavailable.authority.state(), "UNAVAILABLE");
         assert!(!unavailable.authority.running());
+    }
+
+    #[test]
+    fn input_monitor_commands_require_running_capture() {
+        for state in [
+            None,
+            Some(StreamState::Starting),
+            Some(StreamState::StopRequested),
+            Some(StreamState::Stopped),
+            Some(StreamState::Failed),
+        ] {
+            assert!(!runtime_input_monitor_running(state));
+        }
+        assert!(runtime_input_monitor_running(Some(StreamState::Running)));
     }
 
     #[test]
