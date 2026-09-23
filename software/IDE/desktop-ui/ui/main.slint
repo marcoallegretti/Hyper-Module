@@ -1895,7 +1895,7 @@ export component MainWindow inherits Window {
                                     enabled: root.track-count < 8;
                                     clicked => { IdeActions.begin-routing-bus-creation(); }
                                 }
-                                Button {
+                                if root.app-mode == AppMode.closed || root.app-mode == AppMode.selecting || root.app-mode == AppMode.opening : Button {
                                     horizontal-stretch: 1;
                                     text: root.app-mode == AppMode.selecting ? "Selecting project…"
                                         : root.app-mode == AppMode.opening ? "Opening project…" : "Open project folder";
