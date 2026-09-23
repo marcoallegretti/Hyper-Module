@@ -17,6 +17,11 @@ fn resolves_a_javascript_managed_deployment_target() {
         .expect("the contract harness must supply its deployment target");
     let mode = std::env::var("HYPER_CONTRACT_DEPLOYMENT_MODE")
         .expect("the contract harness must supply its scenario");
+    let runtime_version = match std::env::var("HYPER_CONTRACT_RUNTIME_VERSION") {
+        Ok(version) => version,
+        Err(std::env::VarError::NotPresent) => "1.0.0".to_owned(),
+        Err(error) => panic!("the contract Runtime version is invalid: {error}"),
+    };
     let before = read_state(&root);
     let before_active = digest(&before, "/active/bundle_sha256");
     let before_previous = before
@@ -24,7 +29,7 @@ fn resolves_a_javascript_managed_deployment_target() {
         .and_then(Value::as_str)
         .map(str::to_owned);
 
-    let resolved = resolve_runtime_deployment(&root, "1.0.0", 1 << 30, limits()).unwrap();
+    let resolved = resolve_runtime_deployment(&root, &runtime_version, 1 << 30, limits()).unwrap();
     let after = read_state(&root);
 
     assert_eq!(

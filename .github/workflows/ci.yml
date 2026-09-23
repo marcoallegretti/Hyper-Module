@@ -209,7 +209,7 @@ jobs:
           tar -xzf "$archive" -C "$extract"
           runtime_version=$("$extract/hyper-runtime" --version | awk '{print $2}')
           node "$extract/deployment-kit/scripts/smoke-packaged-deployment.mjs" "$smoke" "$runtime_version"
-          HYPER_CONTRACT_DEPLOYMENT_TARGET="$smoke/target" HYPER_CONTRACT_DEPLOYMENT_MODE=promote \
+          HYPER_CONTRACT_DEPLOYMENT_TARGET="$smoke/target" HYPER_CONTRACT_DEPLOYMENT_MODE=promote HYPER_CONTRACT_RUNTIME_VERSION="$runtime_version" \
             cargo test --locked -p hyper-runtime-deployment --test contract \
               resolves_a_javascript_managed_deployment_target -- --ignored --exact
 
@@ -262,6 +262,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "extracted deployment kit smoke failed" }
           $env:HYPER_CONTRACT_DEPLOYMENT_TARGET = Join-Path $smoke "target"
           $env:HYPER_CONTRACT_DEPLOYMENT_MODE = "promote"
+          $env:HYPER_CONTRACT_RUNTIME_VERSION = $runtimeVersion
           cargo test --locked -p hyper-runtime-deployment --test contract resolves_a_javascript_managed_deployment_target -- --ignored --exact
           if ($LASTEXITCODE -ne 0) { throw "native Runtime rejected the packaged deployment" }
 
