@@ -178,8 +178,11 @@ jobs:
       - name: Package optimized Linux applications
         if: runner.os == 'Linux' && matrix.experimental == false
         run: |
+          output="$RUNNER_TEMP/hyper-module-linux-x86_64"
+          mkdir -p "$output"
+          cp target/release/hyper-desktop-ui target/release/hyper-runtime README.md THIRD_PARTY_NOTICES.md "$output"
           archive="$RUNNER_TEMP/hyper-module-linux-x86_64.tar.gz"
-          tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner --format=gnu -I 'gzip -n' -cf "$archive" -C target/release hyper-desktop-ui hyper-runtime
+          tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner --format=gnu -I 'gzip -n' -cf "$archive" -C "$output" hyper-desktop-ui hyper-runtime README.md THIRD_PARTY_NOTICES.md
           sha256sum "$archive" | sed "s|  $archive|  hyper-module-linux-x86_64.tar.gz|" > "$archive.sha256"
 
       - name: Package optimized Windows applications
@@ -190,12 +193,16 @@ jobs:
           New-Item -ItemType Directory -Path $output -Force | Out-Null
           Copy-Item -LiteralPath "target/release/hyper-desktop-ui.exe" -Destination $output
           Copy-Item -LiteralPath "target/release/hyper-runtime.exe" -Destination $output
+          Copy-Item -LiteralPath "README.md" -Destination $output
+          Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" -Destination $output
           $timestamp = [DateTimeOffset]::Parse("1980-01-01T00:00:00Z").UtcDateTime
           Get-ChildItem -LiteralPath $output | ForEach-Object { $_.LastWriteTimeUtc = $timestamp }
           $archive = Join-Path $env:RUNNER_TEMP "hyper-module-windows-x86_64.zip"
           $applications = @(
             (Join-Path $output "hyper-desktop-ui.exe")
             (Join-Path $output "hyper-runtime.exe")
+            (Join-Path $output "README.md")
+            (Join-Path $output "THIRD_PARTY_NOTICES.md")
           )
           Compress-Archive -LiteralPath $applications -DestinationPath $archive -CompressionLevel Optimal -Force
           $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
