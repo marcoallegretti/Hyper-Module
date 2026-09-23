@@ -18,6 +18,8 @@ export function resolveFilesystemAuthorityPath() {
     process.platform === "win32"
       ? "hyper-fs-authority.exe"
       : "hyper-fs-authority";
+  const packagedPath = resolve(import.meta.dirname, "..", "bin", executable);
+  if (existsSync(packagedPath)) return packagedPath;
   const targetDirectory = process.env.CARGO_TARGET_DIR
     ? resolve(process.env.CARGO_TARGET_DIR)
     : resolve(workspaceRoot, "target");

@@ -25,27 +25,32 @@ IDE's `.runtime` bundle directly:
 hyper-runtime <DEPLOYMENT_DIRECTORY> --operator-ui
 ```
 
-The target must already contain an installed and activated bundle. The current
-local installation workflow lives in the source checkout under
-`contracts/scripts/deployment-target.mjs` and requires Node.js and the locked
-`contracts` dependencies; it is **not included in the application archive**.
-For a new local development target, create the target directory, choose a
-storage policy appropriate to that disk (see
-`contracts/schemas/v1/deployment-storage-policy.schema.json`), then run from
-the source checkout's `contracts` directory:
+The target must already contain an installed and activated bundle. Application
+archives include the tested local deployment kit and its locked dependencies;
+running it requires Node.js 22 or newer (CI uses 24.13.0). For a new local
+development target, create the target directory and choose a storage policy
+appropriate to that disk. The kit includes
+`deployment-kit/storage-policy.example.json`; review its bundle count, byte
+quota, and free-space reserve before using it. From the extracted archive,
+run:
 
 ```text
-npm ci --ignore-scripts
-npm run deploy:local -- configure-storage <DEPLOYMENT_DIRECTORY> <POLICY_JSON>
-npm run deploy:local -- deploy <BUNDLE_DIRECTORY> <DEPLOYMENT_DIRECTORY> <RUNTIME_VERSION>
-npm run deploy:local -- status <DEPLOYMENT_DIRECTORY>
+node deployment-kit/scripts/deployment-target.mjs configure-storage <DEPLOYMENT_DIRECTORY> <POLICY_JSON>
+node deployment-kit/scripts/deployment-target.mjs deploy <BUNDLE_DIRECTORY> <DEPLOYMENT_DIRECTORY> <RUNTIME_VERSION>
+node deployment-kit/scripts/deployment-target.mjs status <DEPLOYMENT_DIRECTORY>
 ```
 
 `<RUNTIME_VERSION>` is the numeric version reported by
 `hyper-runtime --version`. The direct deployment commands are for a local,
-unauthenticated development target; they refuse mutation after deployment
-authorization is configured. The installed target is verified again at Runtime
-startup. Use `hyper-runtime --help` for optional output/input selection, panel,
+unauthenticated development target; direct install, deploy, activate, and
+rollback refuse mutation after deployment authorization is configured. The
+installed target is verified again at Runtime startup. The kit also provides
+`storage <target>` to inspect quota use, `rollback <target> <version>` to
+reactivate the previous bundle, and `gc <target>` to remove only unreferenced
+bundles. `recover <target>` is an explicit stale-lock recovery operation; it
+refuses a live owner, and `--force` is reserved for malformed lock ownership
+after independent inspection. Use `hyper-runtime --help` for optional
+output/input selection, panel,
 operator, and external-update directories. Recording requires an explicitly
 pinned output, selected input, and external recording-update directory; Runtime
 does not edit the deployed project or automatically import handbacks.
@@ -54,12 +59,13 @@ does not edit the deployed project or automatically import handbacks.
 
 The repository pins Rust 1.93.0 in `rust-toolchain.toml`. From the repository
 root, `cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime`
-builds both applications. CI additionally runs tests, strict Clippy, and
-platform-specific gates before publishing commit-addressed archives and
-adjacent SHA-256 manifests. Verify the archive against its manifest before use.
-The CI archive contains the two applications, this guide, and
-`THIRD_PARTY_NOTICES.md`; it does not bundle a deployment installer, project,
-or native audio-device configuration.
+builds both applications. The CI workflow is configured to run tests, strict
+Clippy, and platform-specific gates before producing commit-addressed archives
+and adjacent SHA-256 manifests. Verify an archive against its manifest before
+use.
+The CI archive contains the two applications, the local deployment kit, this
+guide, and third-party notices. It does not bundle Node.js, a project, or
+native audio-device configuration.
 
 The present product limit is eight track documents and native execution of
 audio tracks, Groups, and Returns. MIDI/CV execution and third-party plug-in

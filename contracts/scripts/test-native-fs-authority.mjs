@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  copyFile,
   lstat,
   mkdtemp,
   mkdir,
@@ -13,6 +14,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { openRetainedDirectory } from "../lib/durable-files.mjs";
 import { runNativeProcess } from "../lib/native-process.mjs";
@@ -42,6 +44,19 @@ try {
   const explicitExecutable = join(temporaryRoot, "explicit-authority");
   await mkdir(join(configuredTarget, "debug"), { recursive: true });
   await writeFile(configuredExecutable, "path resolution only");
+  const packagedRoot = join(temporaryRoot, "packaged");
+  const packagedExecutable = join(packagedRoot, "bin", executable);
+  await mkdir(join(packagedRoot, "lib"), { recursive: true });
+  await mkdir(join(packagedRoot, "bin"));
+  await copyFile(
+    fileURLToPath(new URL("../lib/native-fs-authority.mjs", import.meta.url)),
+    join(packagedRoot, "lib", "native-fs-authority.mjs"),
+  );
+  await copyFile(
+    fileURLToPath(new URL("../lib/native-process.mjs", import.meta.url)),
+    join(packagedRoot, "lib", "native-process.mjs"),
+  );
+  await writeFile(packagedExecutable, "path resolution only");
   try {
     process.env.CARGO_TARGET_DIR = relative(process.cwd(), configuredTarget);
     process.env.HYPER_FS_AUTHORITY = explicitExecutable;
@@ -55,6 +70,20 @@ try {
       resolveFilesystemAuthorityPath(),
       resolve(configuredExecutable),
       "the filesystem-authority helper must follow Cargo's configured target directory",
+    );
+    const packagedAuthority = await import(
+      pathToFileURL(join(packagedRoot, "lib", "native-fs-authority.mjs"))
+    );
+    assert.equal(
+      packagedAuthority.resolveFilesystemAuthorityPath(),
+      resolve(packagedExecutable),
+      "the packaged helper must win over an unrelated Cargo target directory",
+    );
+    process.env.HYPER_FS_AUTHORITY = explicitExecutable;
+    assert.equal(
+      packagedAuthority.resolveFilesystemAuthorityPath(),
+      resolve(explicitExecutable),
+      "the explicit override must retain precedence over the packaged helper",
     );
   } finally {
     if (previousAuthority === undefined) {
@@ -521,7 +550,7 @@ try {
     await parentHandle.close();
   }
   console.log(
-    "Native filesystem authority passed: 20 identity cases and 2 path-resolution cases",
+    "Native filesystem authority passed: 20 identity cases and 4 path-resolution cases",
   );
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });

@@ -175,15 +175,40 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --locked
 
+      - name: Install Node.js for local deployment kit
+        if: matrix.experimental == false
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 24.13.0
+          cache: npm
+          cache-dependency-path: contracts/package-lock.json
+          package-manager-cache: false
+
+      - name: Install locked local deployment dependencies
+        if: matrix.experimental == false
+        working-directory: contracts
+        run: npm ci --ignore-scripts
+
       - name: Package optimized Linux applications
         if: runner.os == 'Linux' && matrix.experimental == false
         run: |
           output="$RUNNER_TEMP/hyper-module-linux-x86_64"
-          mkdir -p "$output"
+          kit="$output/deployment-kit"
+          mkdir -p "$kit/bin"
           cp target/release/hyper-desktop-ui target/release/hyper-runtime README.md THIRD_PARTY_NOTICES.md "$output"
+          cp contracts/package.json contracts/package-lock.json contracts/THIRD_PARTY_NOTICES.md "$kit"
+          cp contracts/fixtures/valid/deployment-storage-policy.json "$kit/storage-policy.example.json"
+          cp -R contracts/lib contracts/scripts contracts/schemas contracts/node_modules "$kit"
+          cp target/release/hyper-fs-authority "$kit/bin"
           archive="$RUNNER_TEMP/hyper-module-linux-x86_64.tar.gz"
-          tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner --format=gnu -I 'gzip -n' -cf "$archive" -C "$output" hyper-desktop-ui hyper-runtime README.md THIRD_PARTY_NOTICES.md
+          tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner --format=gnu -I 'gzip -n' -cf "$archive" -C "$output" hyper-desktop-ui hyper-runtime README.md THIRD_PARTY_NOTICES.md deployment-kit
           sha256sum "$archive" | sed "s|  $archive|  hyper-module-linux-x86_64.tar.gz|" > "$archive.sha256"
+          extract="$RUNNER_TEMP/hyper-module-linux-extracted"
+          smoke="$RUNNER_TEMP/hyper-module-linux-deployment-smoke"
+          mkdir -p "$extract" "$smoke"
+          tar -xzf "$archive" -C "$extract"
+          runtime_version=$("$extract/hyper-runtime" --version | awk '{print $2}')
+          node "$extract/deployment-kit/scripts/smoke-packaged-deployment.mjs" "$smoke" "$runtime_version"
 
       - name: Package optimized Windows applications
         if: runner.os == 'Windows' && matrix.experimental == false
@@ -195,18 +220,43 @@ jobs:
           Copy-Item -LiteralPath "target/release/hyper-runtime.exe" -Destination $output
           Copy-Item -LiteralPath "README.md" -Destination $output
           Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" -Destination $output
-          $timestamp = [DateTimeOffset]::Parse("1980-01-01T00:00:00Z").UtcDateTime
-          Get-ChildItem -LiteralPath $output | ForEach-Object { $_.LastWriteTimeUtc = $timestamp }
+          $kit = Join-Path $output "deployment-kit"
+          New-Item -ItemType Directory -Path (Join-Path $kit "bin") -Force | Out-Null
+          Copy-Item -LiteralPath "contracts/package.json", "contracts/package-lock.json", "contracts/THIRD_PARTY_NOTICES.md" -Destination $kit
+          Copy-Item -LiteralPath "contracts/fixtures/valid/deployment-storage-policy.json" -Destination (Join-Path $kit "storage-policy.example.json")
+          Copy-Item -LiteralPath "contracts/lib", "contracts/scripts", "contracts/schemas", "contracts/node_modules" -Destination $kit -Recurse
+          Copy-Item -LiteralPath "target/release/hyper-fs-authority.exe" -Destination (Join-Path $kit "bin")
+          $timestamp = [DateTimeOffset]::Parse("1980-01-01T00:00:00Z")
           $archive = Join-Path $env:RUNNER_TEMP "hyper-module-windows-x86_64.zip"
-          $applications = @(
-            (Join-Path $output "hyper-desktop-ui.exe")
-            (Join-Path $output "hyper-runtime.exe")
-            (Join-Path $output "README.md")
-            (Join-Path $output "THIRD_PARTY_NOTICES.md")
-          )
-          Compress-Archive -LiteralPath $applications -DestinationPath $archive -CompressionLevel Optimal -Force
+          $zip = [System.IO.Compression.ZipFile]::Open($archive, [System.IO.Compression.ZipArchiveMode]::Create)
+          try {
+            foreach ($file in @(Get-ChildItem -LiteralPath $output -File -Recurse -Force | Sort-Object FullName)) {
+              $entryName = [System.IO.Path]::GetRelativePath($output, $file.FullName).Replace('\', '/')
+              $entry = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+              $entry.LastWriteTime = $timestamp
+              $entry.ExternalAttributes = 0
+              $source = [System.IO.File]::OpenRead($file.FullName)
+              $destination = $entry.Open()
+              try {
+                $source.CopyTo($destination)
+              } finally {
+                $destination.Dispose()
+                $source.Dispose()
+              }
+            }
+          } finally {
+            $zip.Dispose()
+          }
           $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  hyper-module-windows-x86_64.zip" | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii -NoNewline
+          $extract = Join-Path $env:RUNNER_TEMP "hyper-module-windows-extracted"
+          $smoke = Join-Path $env:RUNNER_TEMP "hyper-module-windows-deployment-smoke"
+          New-Item -ItemType Directory -Path $smoke -Force | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract
+          $runtimeVersion = (& (Join-Path $extract "hyper-runtime.exe") --version).Split(' ')[-1]
+          $smokeScript = Join-Path $extract "deployment-kit/scripts/smoke-packaged-deployment.mjs"
+          node $smokeScript $smoke $runtimeVersion
+          if ($LASTEXITCODE -ne 0) { throw "extracted deployment kit smoke failed" }
 
       - name: Upload optimized Linux applications
         if: runner.os == 'Linux' && matrix.experimental == false
