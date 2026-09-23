@@ -31,8 +31,8 @@ use hyper_control_runtime::{
 };
 use hyper_desktop_audio::{
     CaptureStreamCounters, DesktopControlSinkError, DesktopMixerSendTap, DesktopMonitoringConfig,
-    DesktopMonitoringControl, DesktopNativeDevice, DesktopPlaybackRecordingSession,
-    DesktopPlaybackRecovery, DesktopPlaybackRecoveryPendingStart,
+    DesktopMonitoringControl, DesktopNativeDevice, DesktopOutputStopError,
+    DesktopPlaybackRecordingSession, DesktopPlaybackRecovery, DesktopPlaybackRecoveryPendingStart,
     DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopFailure,
     DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackRecoveryPendingWait,
     DesktopPlaybackRecoveryStopError, DesktopPlaybackSession, DesktopSceneAvailability,
@@ -277,21 +277,33 @@ impl RuntimePlaybackOwner {
             ),
             Err(error) => {
                 let warning = format!("playback shutdown before recording reported: {error}");
-                match error.into_recovery() {
-                    Ok(recovery) => self.advance_recovery(
-                        recovery,
-                        RuntimePlaybackRecoveryAction::StartRecording { target_index },
-                        Some(warning),
-                    ),
-                    Err(error) => {
-                        let action = RuntimePlaybackRecoveryAction::StartRecording { target_index };
-                        self.retain_stop_error(error, action);
-                        RuntimePlaybackOwnerPoll {
-                            message: Some(format!(
-                                "{warning}; waiting for native shutdown before recording"
-                            )),
-                            playback_replaced: false,
-                            terminal_output_failure: false,
+                if terminal_playback_output_stop_failure(error.output.as_ref()) {
+                    self.retain_terminal_output_stop_error(error);
+                    RuntimePlaybackOwnerPoll {
+                        message: Some(format!(
+                            "{warning}; terminal output failure prevented recording startup"
+                        )),
+                        playback_replaced: false,
+                        terminal_output_failure: true,
+                    }
+                } else {
+                    match error.into_recovery() {
+                        Ok(recovery) => self.advance_recovery(
+                            recovery,
+                            RuntimePlaybackRecoveryAction::StartRecording { target_index },
+                            Some(warning),
+                        ),
+                        Err(error) => {
+                            let action =
+                                RuntimePlaybackRecoveryAction::StartRecording { target_index };
+                            self.retain_stop_error(error, action);
+                            RuntimePlaybackOwnerPoll {
+                                message: Some(format!(
+                                    "{warning}; waiting for native shutdown before recording"
+                                )),
+                                playback_replaced: false,
+                                terminal_output_failure: false,
+                            }
                         }
                     }
                 }
@@ -649,7 +661,7 @@ impl RuntimePlaybackOwner {
                 )));
                 RuntimePlaybackOwnerPoll {
                     message: Some(format!(
-                        "{message}; Runtime shutdown retained finalized-recording recovery"
+                        "{message}; Runtime shutdown retained playback recovery"
                     )),
                     playback_replaced: false,
                     terminal_output_failure: true,
@@ -816,6 +828,28 @@ impl RuntimePlaybackOwner {
                     action,
                 });
             }
+        }
+    }
+
+    fn retain_terminal_output_stop_error(&mut self, error: DesktopPlaybackRecoveryStopError) {
+        match error.into_recovery() {
+            Ok(recovery) => {
+                self.state = Some(RuntimePlaybackOwnerState::ShutdownRecovery(Box::new(
+                    recovery,
+                )));
+            }
+            Err(error) => match error.into_pending() {
+                Ok(pending) => {
+                    self.state = Some(RuntimePlaybackOwnerState::ShutdownPendingStop(Box::new(
+                        pending,
+                    )));
+                }
+                Err(error) => {
+                    self.state = Some(RuntimePlaybackOwnerState::ShutdownStopError(Box::new(
+                        error,
+                    )));
+                }
+            },
         }
     }
 
@@ -1071,6 +1105,13 @@ fn runtime_recording_interruption(
     )
 }
 
+fn terminal_playback_output_stop_failure(output: Option<&DesktopOutputStopError>) -> bool {
+    matches!(
+        output,
+        Some(DesktopOutputStopError::RuntimeFailed | DesktopOutputStopError::ThreadPanicked)
+    )
+}
+
 enum RuntimeFinalizedRecordingRecoveryRoute<T> {
     RestorePlayback(T),
     RetainForShutdown(T),
@@ -1103,12 +1144,7 @@ fn route_pending_stop_recovery<T>(
     action: RuntimePlaybackRecoveryAction,
     output_shutdown_failed: bool,
 ) -> RuntimePendingStopRecoveryRoute<T> {
-    if output_shutdown_failed
-        && matches!(
-            action,
-            RuntimePlaybackRecoveryAction::RestoreFinalizedRecordingPlayback
-        )
-    {
+    if output_shutdown_failed {
         RuntimePendingStopRecoveryRoute::RetainForShutdown(recovery)
     } else {
         RuntimePendingStopRecoveryRoute::Continue { recovery, action }
@@ -1400,14 +1436,22 @@ fn finish_runtime_playback_owner_poll(
 }
 
 impl RuntimeRecordingControl for SessionHost {
-    fn start_recording(&mut self, target_index: usize) -> Result<String, String> {
+    fn start_recording(
+        &mut self,
+        target_index: usize,
+    ) -> Result<RuntimeRecordingControlOutcome, String> {
         if let Some(blocker) = self.recording_transition_blocker() {
             return Err(format!("recording transition is blocked by {blocker}"));
         }
         let poll = self.owner.start_recording(target_index)?;
-        self.finish_owner_poll(poll)?
-            .message
-            .ok_or_else(|| "recording transition produced no operator outcome".to_owned())
+        let poll = self.finish_owner_poll(poll)?;
+        if poll.message.is_none() {
+            return Err("recording transition produced no operator outcome".to_owned());
+        }
+        Ok(RuntimeRecordingControlOutcome {
+            message: poll.message,
+            terminal_output_failure: poll.terminal_output_failure,
+        })
     }
 
     fn stop_recording(&mut self) -> Result<RuntimeRecordingControlOutcome, String> {
@@ -2156,7 +2200,10 @@ trait RuntimeOperatorControl {
 }
 
 trait RuntimeRecordingControl {
-    fn start_recording(&mut self, target_index: usize) -> Result<String, String>;
+    fn start_recording(
+        &mut self,
+        target_index: usize,
+    ) -> Result<RuntimeRecordingControlOutcome, String>;
 
     fn stop_recording(&mut self) -> Result<RuntimeRecordingControlOutcome, String>;
 
@@ -3613,7 +3660,14 @@ fn drain_operator_commands<
             },
             OperatorCommand::StartRecording { target_index } => {
                 match host.start_recording(target_index) {
-                    Ok(message) => diagnostic(message),
+                    Ok(outcome) => {
+                        if let Some(message) = outcome.message {
+                            diagnostic(message);
+                        }
+                        if outcome.terminal_output_failure {
+                            return true;
+                        }
+                    }
                     Err(error) => diagnostic(format!("Runtime recording start refused: {error}")),
                 }
             }
@@ -8958,20 +9012,41 @@ mod tests {
         };
         assert_eq!(completed.0, 2);
 
-        let unrelated = route_pending_stop_recovery(
+        let start_failure = route_pending_stop_recovery(
             MoveOnlyRecovery(3),
             RuntimePlaybackRecoveryAction::StartRecording { target_index: 4 },
             true,
         );
-        let RuntimePendingStopRecoveryRoute::Continue {
-            recovery: unrelated,
-            action: RuntimePlaybackRecoveryAction::StartRecording { target_index },
-        } = unrelated
-        else {
-            panic!("only finalized-recording recovery uses the shutdown-retain policy")
+        let RuntimePendingStopRecoveryRoute::RetainForShutdown(retained) = start_failure else {
+            panic!("terminal output failure before recording must not create a replacement owner")
         };
-        assert_eq!(unrelated.0, 3);
-        assert_eq!(target_index, 4);
+        assert_eq!(retained.0, 3);
+
+        let input_only_failure = route_pending_stop_recovery(
+            MoveOnlyRecovery(4),
+            RuntimePlaybackRecoveryAction::StartRecording { target_index: 5 },
+            false,
+        );
+        let RuntimePendingStopRecoveryRoute::Continue {
+            recovery,
+            action: RuntimePlaybackRecoveryAction::StartRecording { target_index },
+        } = input_only_failure
+        else {
+            panic!("input-only shutdown does not make the output terminal")
+        };
+        assert_eq!(recovery.0, 4);
+        assert_eq!(target_index, 5);
+    }
+
+    #[test]
+    fn recording_start_classifies_only_terminal_output_stop_errors() {
+        assert!(!terminal_playback_output_stop_failure(None));
+        assert!(terminal_playback_output_stop_failure(Some(
+            &DesktopOutputStopError::RuntimeFailed
+        )));
+        assert!(terminal_playback_output_stop_failure(Some(
+            &DesktopOutputStopError::ThreadPanicked
+        )));
     }
 
     #[test]
@@ -10358,6 +10433,52 @@ mod tests {
     }
 
     #[test]
+    fn operator_recording_start_output_failure_interrupts_command_drain() {
+        let arguments = RuntimeArguments::parse(["deployment".to_owned()]).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut owner = OperatorControl {
+            recording_start_output_state: Some(OutputStreamState::Failed),
+            scene_performance_poll: Some("unexpected scene-performance poll".to_owned()),
+            ..OperatorControl::default()
+        };
+        let diagnostics = RefCell::new(Vec::new());
+        let (commands, command_receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        commands
+            .send(OperatorCommand::StartRecording { target_index: 0 })
+            .unwrap();
+        commands
+            .send(OperatorCommand::SetLoopEnabled { enabled: true })
+            .unwrap();
+
+        let error = host_runtime(
+            &arguments,
+            &mut owner,
+            &OutputObservation(OutputStreamState::Running),
+            &stop,
+            Some(&command_receiver),
+            &|message| diagnostics.borrow_mut().push(message),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "native audio ownership ended unexpectedly");
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(
+            owner.recording_commands,
+            [OperatorRecordingAction::Start { target_index: 0 }]
+        );
+        assert!(owner.commands.is_empty());
+        assert!(owner.scene_performance_poll.is_some());
+        assert_eq!(
+            diagnostics.borrow().as_slice(),
+            [
+                "no panel link requested",
+                "Runtime recording started",
+                "native audio ownership ended unexpectedly",
+            ]
+        );
+    }
+
+    #[test]
     fn a_pre_requested_stop_skips_owner_work_and_settles_recording() {
         let arguments = RuntimeArguments::parse(["deployment".to_owned()]).unwrap();
         let stop = AtomicBool::new(true);
@@ -10408,6 +10529,7 @@ mod tests {
         recording_poll: Option<String>,
         recording_poll_terminal_output_failure: bool,
         recording_poll_output_rebind: Option<Arc<Mutex<OutputStreamState>>>,
+        recording_start_output_state: Option<OutputStreamState>,
         recording_stop_terminal_output_failure: bool,
         recording_abort: Option<Result<Option<String>, String>>,
         scene_performance_commands: Vec<OperatorScenePerformanceAction>,
@@ -10517,13 +10639,22 @@ mod tests {
     }
 
     impl RuntimeRecordingControl for OperatorControl {
-        fn start_recording(&mut self, target_index: usize) -> Result<String, String> {
+        fn start_recording(
+            &mut self,
+            target_index: usize,
+        ) -> Result<RuntimeRecordingControlOutcome, String> {
             if self.reject {
                 Err("owner busy".to_owned())
             } else {
                 self.recording_commands
                     .push(OperatorRecordingAction::Start { target_index });
-                Ok("Runtime recording started".to_owned())
+                Ok(RuntimeRecordingControlOutcome {
+                    message: Some("Runtime recording started".to_owned()),
+                    terminal_output_failure: matches!(
+                        self.recording_start_output_state.take(),
+                        Some(OutputStreamState::Failed)
+                    ),
+                })
             }
         }
 
