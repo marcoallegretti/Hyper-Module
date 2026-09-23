@@ -56,6 +56,16 @@ fn resolves_a_javascript_managed_deployment_target() {
         .package()
         .confirm_unchanged()
         .unwrap();
+    if let Ok(expectation) = std::env::var("HYPER_CONTRACT_EXPECT_MEDIA") {
+        assert_eq!(expectation, "one-active-audio-clip");
+        let session = resolved.bundle().project().session();
+        assert_eq!(session.mixer_channel_count(), 1);
+        let placements = session.arrangement().placements();
+        assert_eq!(placements.len(), 1);
+        assert!(placements[0].active());
+        assert_eq!(placements[0].start_frame(), 0);
+        assert_eq!(placements[0].end_frame(), 48_000);
+    }
 
     match mode.as_str() {
         "promote" => {
