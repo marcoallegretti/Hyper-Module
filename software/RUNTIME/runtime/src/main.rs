@@ -1251,6 +1251,7 @@ struct RuntimePlaybackOwnerPoll {
 struct RuntimeRecordingControlOutcome {
     message: Option<String>,
     terminal_output_failure: bool,
+    terminal_owner_failure: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1377,8 +1378,23 @@ impl SessionHost {
     fn finish_owner_poll(
         &mut self,
         poll: RuntimePlaybackOwnerPoll,
-    ) -> Result<RuntimePlaybackOwnerPoll, String> {
-        finish_runtime_playback_owner_poll(poll, || self.refresh_playback_generation())
+    ) -> RuntimeRecordingControlOutcome {
+        let message = poll.message.clone();
+        let terminal_output_failure = poll.terminal_output_failure;
+        match finish_runtime_playback_owner_poll(poll, || self.refresh_playback_generation()) {
+            Ok(poll) => RuntimeRecordingControlOutcome {
+                message: poll.message,
+                terminal_output_failure: poll.terminal_output_failure,
+                terminal_owner_failure: None,
+            },
+            Err(error) => RuntimeRecordingControlOutcome {
+                message,
+                terminal_output_failure,
+                terminal_owner_failure: Some(format!(
+                    "Runtime playback receiver transfer failed: {error}"
+                )),
+            },
+        }
     }
 
     fn refresh_recording_blocker_observation(&self) {
@@ -1444,14 +1460,11 @@ impl RuntimeRecordingControl for SessionHost {
             return Err(format!("recording transition is blocked by {blocker}"));
         }
         let poll = self.owner.start_recording(target_index)?;
-        let poll = self.finish_owner_poll(poll)?;
-        if poll.message.is_none() {
+        let outcome = self.finish_owner_poll(poll);
+        if outcome.message.is_none() && outcome.terminal_owner_failure.is_none() {
             return Err("recording transition produced no operator outcome".to_owned());
         }
-        Ok(RuntimeRecordingControlOutcome {
-            message: poll.message,
-            terminal_output_failure: poll.terminal_output_failure,
-        })
+        Ok(outcome)
     }
 
     fn stop_recording(&mut self) -> Result<RuntimeRecordingControlOutcome, String> {
@@ -1459,28 +1472,16 @@ impl RuntimeRecordingControl for SessionHost {
             return Err(format!("recording transition is blocked by {blocker}"));
         }
         let poll = self.owner.stop_recording()?;
-        let poll = self.finish_owner_poll(poll)?;
-        if poll.message.is_none() {
+        let outcome = self.finish_owner_poll(poll);
+        if outcome.message.is_none() && outcome.terminal_owner_failure.is_none() {
             return Err("recording transition produced no operator outcome".to_owned());
         }
-        Ok(RuntimeRecordingControlOutcome {
-            message: poll.message,
-            terminal_output_failure: poll.terminal_output_failure,
-        })
+        Ok(outcome)
     }
 
     fn poll_recording(&mut self) -> RuntimeRecordingControlOutcome {
         let poll = self.owner.poll();
-        let result = match self.finish_owner_poll(poll) {
-            Ok(poll) => RuntimeRecordingControlOutcome {
-                message: poll.message,
-                terminal_output_failure: poll.terminal_output_failure,
-            },
-            Err(error) => RuntimeRecordingControlOutcome {
-                message: Some(format!("Runtime recording lifecycle failed: {error}")),
-                terminal_output_failure: false,
-            },
-        };
+        let result = self.finish_owner_poll(poll);
         self.refresh_recording_blocker_observation();
         result
     }
@@ -3390,6 +3391,7 @@ fn run_runtime_owner_turn<H, O>(
     host: &mut H,
     output_status: &O,
     terminal_output_failure: &Cell<bool>,
+    terminal_owner_failure: &RefCell<Option<String>>,
     stop: &AtomicBool,
     commands: Option<&Receiver<OperatorCommand>>,
     diagnostic: &dyn Fn(String),
@@ -3411,17 +3413,41 @@ fn run_runtime_owner_turn<H, O>(
     if let Some(message) = recording.message {
         diagnostic(message);
     }
+    if let Some(error) = recording.terminal_owner_failure {
+        if output_failed || recording.terminal_output_failure {
+            terminal_output_failure.set(true);
+        }
+        diagnostic(error.clone());
+        *terminal_owner_failure.borrow_mut() = Some(error);
+        stop.store(true, Ordering::Release);
+        return;
+    }
     if output_failed || recording.terminal_output_failure {
         terminal_output_failure.set(true);
         stop.store(true, Ordering::Release);
         return;
     }
-    if let Some(commands) = commands
-        && drain_operator_commands(host, commands, stop, diagnostic)
-    {
-        terminal_output_failure.set(true);
-        stop.store(true, Ordering::Release);
-        return;
+    if let Some(commands) = commands {
+        match drain_operator_commands(host, commands, stop, diagnostic) {
+            Some(RuntimeOperatorDrainFailure::Output) => {
+                terminal_output_failure.set(true);
+                stop.store(true, Ordering::Release);
+                return;
+            }
+            Some(RuntimeOperatorDrainFailure::Owner {
+                error,
+                output_failed,
+            }) => {
+                if output_failed {
+                    terminal_output_failure.set(true);
+                }
+                diagnostic(error.clone());
+                *terminal_owner_failure.borrow_mut() = Some(error);
+                stop.store(true, Ordering::Release);
+                return;
+            }
+            None => {}
+        }
     }
     if stop.load(Ordering::Acquire) {
         return;
@@ -3463,11 +3489,13 @@ where
     O: RuntimeOutputObservation,
 {
     let terminal_output_failure = Cell::new(false);
+    let terminal_owner_failure = RefCell::new(None);
     let mut owner_turn = |host: &mut H| {
         run_runtime_owner_turn(
             host,
             output_status,
             &terminal_output_failure,
+            &terminal_owner_failure,
             stop,
             commands,
             diagnostic,
@@ -3484,6 +3512,7 @@ where
             host,
             output_status,
             terminal_output_failure.get(),
+            terminal_owner_failure.borrow().clone(),
             diagnostic,
         );
     };
@@ -3496,6 +3525,7 @@ where
                 host,
                 output_status,
                 terminal_output_failure.get(),
+                terminal_owner_failure.borrow().clone(),
                 diagnostic,
             );
         }
@@ -3520,6 +3550,7 @@ where
                 host,
                 output_status,
                 terminal_output_failure.get(),
+                terminal_owner_failure.borrow().clone(),
                 diagnostic,
             );
         }
@@ -3548,6 +3579,7 @@ where
         host,
         output_status,
         terminal_output_failure.get(),
+        terminal_owner_failure.borrow().clone(),
         diagnostic,
     )
 }
@@ -3556,6 +3588,7 @@ fn finish_runtime_host<H: RuntimeRecordingControl, O: RuntimeOutputObservation>(
     host: &mut H,
     output_status: &O,
     terminal_output_failure: bool,
+    terminal_owner_failure: Option<String>,
     diagnostic: &dyn Fn(String),
 ) -> Result<(), String> {
     let output = finish_runtime_output(output_status, terminal_output_failure, diagnostic);
@@ -3563,12 +3596,17 @@ fn finish_runtime_host<H: RuntimeRecordingControl, O: RuntimeOutputObservation>(
     if let Ok(Some(message)) = &recording {
         diagnostic(message.clone());
     }
-    match (output, recording) {
+    let result = match (output, recording) {
         (Ok(()), Ok(_)) => Ok(()),
         (Err(error), Ok(_)) | (Ok(()), Err(error)) => Err(error),
         (Err(output), Err(recording)) => Err(format!(
             "{output}; recording shutdown also failed: {recording}"
         )),
+    };
+    match (result, terminal_owner_failure) {
+        (Ok(()), None) => Ok(()),
+        (Ok(()), Some(error)) | (Err(error), None) => Err(error),
+        (Err(error), Some(owner)) => Err(format!("{error}; {owner}")),
     }
 }
 
@@ -3619,6 +3657,11 @@ fn finish_runtime_output<O: RuntimeOutputObservation>(
     }
 }
 
+enum RuntimeOperatorDrainFailure {
+    Output,
+    Owner { error: String, output_failed: bool },
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the bounded operator command dispatcher keeps every queue outcome explicit"
@@ -3636,7 +3679,7 @@ fn drain_operator_commands<
     commands: &Receiver<OperatorCommand>,
     stop: &AtomicBool,
     diagnostic: &dyn Fn(String),
-) -> bool {
+) -> Option<RuntimeOperatorDrainFailure> {
     for _ in 0..OPERATOR_COMMAND_CAPACITY {
         if stop.load(Ordering::Acquire) {
             break;
@@ -3664,8 +3707,14 @@ fn drain_operator_commands<
                         if let Some(message) = outcome.message {
                             diagnostic(message);
                         }
+                        if let Some(error) = outcome.terminal_owner_failure {
+                            return Some(RuntimeOperatorDrainFailure::Owner {
+                                error,
+                                output_failed: outcome.terminal_output_failure,
+                            });
+                        }
                         if outcome.terminal_output_failure {
-                            return true;
+                            return Some(RuntimeOperatorDrainFailure::Output);
                         }
                     }
                     Err(error) => diagnostic(format!("Runtime recording start refused: {error}")),
@@ -3676,8 +3725,14 @@ fn drain_operator_commands<
                     if let Some(message) = outcome.message {
                         diagnostic(message);
                     }
+                    if let Some(error) = outcome.terminal_owner_failure {
+                        return Some(RuntimeOperatorDrainFailure::Owner {
+                            error,
+                            output_failed: outcome.terminal_output_failure,
+                        });
+                    }
                     if outcome.terminal_output_failure {
-                        return true;
+                        return Some(RuntimeOperatorDrainFailure::Output);
                     }
                 }
                 Err(error) => diagnostic(format!("Runtime recording stop refused: {error}")),
@@ -3866,7 +3921,7 @@ fn drain_operator_commands<
             }
         }
     }
-    false
+    None
 }
 
 fn queue_operator_loop_range<H: RuntimeOperatorControl>(
@@ -10234,12 +10289,12 @@ mod tests {
         let mut owner = OperatorControl::default();
         let diagnostics = RefCell::new(Vec::new());
 
-        assert!(!drain_operator_commands(
-            &mut owner,
-            &command_receiver,
-            &stop,
-            &|message| diagnostics.borrow_mut().push(message),
-        ));
+        assert!(
+            drain_operator_commands(&mut owner, &command_receiver, &stop, &|message| diagnostics
+                .borrow_mut()
+                .push(message),)
+            .is_none()
+        );
 
         assert!(owner.commands.is_empty());
         assert!(diagnostics.borrow().is_empty());
@@ -10250,6 +10305,7 @@ mod tests {
     fn pre_requested_shutdown_skips_the_owner_turn_after_loop_entry() {
         let stop = AtomicBool::new(true);
         let terminal_output_failure = Cell::new(false);
+        let terminal_owner_failure = RefCell::new(None);
         let mut owner = OperatorControl {
             recording_poll: Some("unexpected recording poll".to_owned()),
             scene_performance_poll: Some("unexpected scene-performance poll".to_owned()),
@@ -10263,6 +10319,7 @@ mod tests {
             &mut owner,
             &OutputObservation(OutputStreamState::Failed),
             &terminal_output_failure,
+            &terminal_owner_failure,
             &stop,
             Some(&command_receiver),
             &|message| diagnostics.borrow_mut().push(message),
@@ -10379,6 +10436,112 @@ mod tests {
                 "no panel link requested",
                 "recording finalization found output panic",
                 "native audio ownership ended unexpectedly",
+            ]
+        );
+    }
+
+    #[test]
+    fn receiver_transfer_failure_in_recording_poll_ends_host_before_other_work() {
+        let arguments = RuntimeArguments::parse(["deployment".to_owned()]).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut owner = OperatorControl {
+            recording_poll: Some("recording transition settled".to_owned()),
+            recording_poll_owner_failure: Some(
+                "Runtime playback receiver transfer failed: automation receiver rebind failed"
+                    .to_owned(),
+            ),
+            recording_abort: Some(Ok(Some("recording journal retained".to_owned()))),
+            scene_performance_poll: Some("unexpected scene-performance poll".to_owned()),
+            automation_capture_poll: Some("unexpected automation poll".to_owned()),
+            ..OperatorControl::default()
+        };
+        let diagnostics = RefCell::new(Vec::new());
+        let (commands, command_receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        commands.send(OperatorCommand::Start).unwrap();
+
+        let error = host_runtime(
+            &arguments,
+            &mut owner,
+            &OutputObservation(OutputStreamState::Running),
+            &stop,
+            Some(&command_receiver),
+            &|message| diagnostics.borrow_mut().push(message),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Runtime playback receiver transfer failed: automation receiver rebind failed"
+        );
+        assert!(stop.load(Ordering::Acquire));
+        assert!(owner.commands.is_empty());
+        assert!(owner.scene_performance_poll.is_some());
+        assert!(owner.automation_capture_poll.is_some());
+        assert_eq!(command_receiver.try_recv(), Ok(OperatorCommand::Start));
+        assert_eq!(
+            diagnostics.borrow().as_slice(),
+            [
+                "no panel link requested",
+                "recording transition settled",
+                "Runtime playback receiver transfer failed: automation receiver rebind failed",
+                "recording journal retained",
+            ]
+        );
+    }
+
+    #[test]
+    fn receiver_transfer_failure_in_recording_command_interrupts_drain() {
+        let arguments = RuntimeArguments::parse(["deployment".to_owned()]).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut owner = OperatorControl {
+            recording_start_owner_failure: Some(
+                "Runtime playback receiver transfer failed: scene receiver missing".to_owned(),
+            ),
+            recording_abort: Some(Ok(Some("recording journal retained".to_owned()))),
+            scene_performance_poll: Some("unexpected scene-performance poll".to_owned()),
+            ..OperatorControl::default()
+        };
+        let diagnostics = RefCell::new(Vec::new());
+        let (commands, command_receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        commands
+            .send(OperatorCommand::StartRecording { target_index: 0 })
+            .unwrap();
+        commands
+            .send(OperatorCommand::SetLoopEnabled { enabled: true })
+            .unwrap();
+
+        let error = host_runtime(
+            &arguments,
+            &mut owner,
+            &OutputObservation(OutputStreamState::Running),
+            &stop,
+            Some(&command_receiver),
+            &|message| diagnostics.borrow_mut().push(message),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Runtime playback receiver transfer failed: scene receiver missing"
+        );
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(
+            owner.recording_commands,
+            [OperatorRecordingAction::Start { target_index: 0 }]
+        );
+        assert!(owner.commands.is_empty());
+        assert!(owner.scene_performance_poll.is_some());
+        assert_eq!(
+            command_receiver.try_recv(),
+            Ok(OperatorCommand::SetLoopEnabled { enabled: true })
+        );
+        assert_eq!(
+            diagnostics.borrow().as_slice(),
+            [
+                "no panel link requested",
+                "Runtime recording started",
+                "Runtime playback receiver transfer failed: scene receiver missing",
+                "recording journal retained",
             ]
         );
     }
@@ -10527,9 +10690,11 @@ mod tests {
         automation_capture_poll: Option<String>,
         recording_commands: Vec<OperatorRecordingAction>,
         recording_poll: Option<String>,
+        recording_poll_owner_failure: Option<String>,
         recording_poll_terminal_output_failure: bool,
         recording_poll_output_rebind: Option<Arc<Mutex<OutputStreamState>>>,
         recording_start_output_state: Option<OutputStreamState>,
+        recording_start_owner_failure: Option<String>,
         recording_stop_terminal_output_failure: bool,
         recording_abort: Option<Result<Option<String>, String>>,
         scene_performance_commands: Vec<OperatorScenePerformanceAction>,
@@ -10654,6 +10819,7 @@ mod tests {
                         self.recording_start_output_state.take(),
                         Some(OutputStreamState::Failed)
                     ),
+                    terminal_owner_failure: self.recording_start_owner_failure.take(),
                 })
             }
         }
@@ -10668,6 +10834,7 @@ mod tests {
                     terminal_output_failure: std::mem::take(
                         &mut self.recording_stop_terminal_output_failure,
                     ),
+                    terminal_owner_failure: None,
                 })
             }
         }
@@ -10684,6 +10851,7 @@ mod tests {
                 terminal_output_failure: std::mem::take(
                     &mut self.recording_poll_terminal_output_failure,
                 ),
+                terminal_owner_failure: self.recording_poll_owner_failure.take(),
             }
         }
 
@@ -10864,6 +11032,7 @@ mod tests {
                 &mut clean,
                 &OutputObservation(OutputStreamState::Running),
                 false,
+                None,
                 &|message| diagnostics.borrow_mut().push(message),
             ),
             Ok(())
@@ -10883,6 +11052,7 @@ mod tests {
                 &mut recording_failed,
                 &OutputObservation(OutputStreamState::Running),
                 false,
+                None,
                 &|message| diagnostics.borrow_mut().push(message),
             ),
             Err("recording settlement failed".to_owned())
@@ -10895,6 +11065,7 @@ mod tests {
                 &mut output_failed,
                 &OutputObservation(OutputStreamState::Failed),
                 false,
+                None,
                 &|message| diagnostics.borrow_mut().push(message),
             ),
             Err("native audio ownership ended unexpectedly".to_owned())
@@ -10914,12 +11085,28 @@ mod tests {
                 &mut both_failed,
                 &OutputObservation(OutputStreamState::Failed),
                 false,
+                None,
                 &|message| diagnostics.borrow_mut().push(message),
             ),
             Err(
                 "native audio ownership ended unexpectedly; recording shutdown also failed: recording settlement failed"
                     .to_owned()
             )
+        );
+
+        let mut owner_failed = OperatorControl {
+            recording_abort: Some(Err("recording settlement failed".to_owned())),
+            ..OperatorControl::default()
+        };
+        assert_eq!(
+            finish_runtime_host(
+                &mut owner_failed,
+                &OutputObservation(OutputStreamState::Failed),
+                false,
+                Some("playback receiver transfer failed".to_owned()),
+                &|_| {},
+            ),
+            Err("native audio ownership ended unexpectedly; recording shutdown also failed: recording settlement failed; playback receiver transfer failed".to_owned())
         );
     }
 
