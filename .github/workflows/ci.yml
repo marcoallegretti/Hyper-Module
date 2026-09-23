@@ -203,7 +203,8 @@ jobs:
             printf 'runner_arch=%s\n' "$RUNNER_ARCH"
             printf 'report.optimized-applications.log=cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-fs-authority\n'
             printf 'report.application-inspection-smoke.log=optimized hyper-desktop-ui and hyper-runtime help/version commands\n'
-            printf 'report.package-deployment-smoke.log=extracted kit deployment and native Runtime promotion\n'
+            printf 'report.package-deployment-smoke.log=extracted kit deployment\n'
+            printf 'report.native-deployment-promotion.log=native Runtime promotion of extracted kit deployment\n'
           } > "$REPORT_DIR/manifest.txt"
 
       - name: Install pinned Rust toolchain
@@ -269,7 +270,8 @@ jobs:
           node "$extract/deployment-kit/scripts/smoke-packaged-deployment.mjs" "$smoke" "$runtime_version" 2>&1 | tee "$REPORT_DIR/package-deployment-smoke.log"
           HYPER_CONTRACT_DEPLOYMENT_TARGET="$smoke/target" HYPER_CONTRACT_DEPLOYMENT_MODE=promote HYPER_CONTRACT_RUNTIME_VERSION="$runtime_version" \
             cargo test --locked -p hyper-runtime-deployment --test contract \
-              resolves_a_javascript_managed_deployment_target -- --ignored --exact 2>&1 | tee -a "$REPORT_DIR/package-deployment-smoke.log"
+              resolves_a_javascript_managed_deployment_target -- --ignored --exact 2>&1 | tee "$REPORT_DIR/native-deployment-promotion.log"
+          grep -q '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured;' "$REPORT_DIR/native-deployment-promotion.log"
 
       - name: Package optimized Windows applications
         if: runner.os == 'Windows'
@@ -322,8 +324,12 @@ jobs:
           $env:HYPER_CONTRACT_DEPLOYMENT_TARGET = Join-Path $smoke "target"
           $env:HYPER_CONTRACT_DEPLOYMENT_MODE = "promote"
           $env:HYPER_CONTRACT_RUNTIME_VERSION = $runtimeVersion
-          cargo test --locked -p hyper-runtime-deployment --test contract resolves_a_javascript_managed_deployment_target -- --ignored --exact 2>&1 | Tee-Object -FilePath $smokeLog -Append
+          $promotionLog = Join-Path $env:REPORT_DIR "native-deployment-promotion.log"
+          cargo test --locked -p hyper-runtime-deployment --test contract resolves_a_javascript_managed_deployment_target -- --ignored --exact 2>&1 | Tee-Object -FilePath $promotionLog
           if ($LASTEXITCODE -ne 0) { throw "native Runtime rejected the packaged deployment" }
+          if (-not (Select-String -LiteralPath $promotionLog -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured;' -Quiet)) {
+            throw "native Runtime promotion test did not run exactly once"
+          }
 
       - name: Upload optimized Linux applications
         if: runner.os == 'Linux'
