@@ -209,6 +209,9 @@ jobs:
           tar -xzf "$archive" -C "$extract"
           runtime_version=$("$extract/hyper-runtime" --version | awk '{print $2}')
           node "$extract/deployment-kit/scripts/smoke-packaged-deployment.mjs" "$smoke" "$runtime_version"
+          HYPER_CONTRACT_DEPLOYMENT_TARGET="$smoke/target" HYPER_CONTRACT_DEPLOYMENT_MODE=promote \
+            cargo test --locked -p hyper-runtime-deployment --test contract \
+              resolves_a_javascript_managed_deployment_target -- --ignored --exact
 
       - name: Package optimized Windows applications
         if: runner.os == 'Windows' && matrix.experimental == false
@@ -257,6 +260,10 @@ jobs:
           $smokeScript = Join-Path $extract "deployment-kit/scripts/smoke-packaged-deployment.mjs"
           node $smokeScript $smoke $runtimeVersion
           if ($LASTEXITCODE -ne 0) { throw "extracted deployment kit smoke failed" }
+          $env:HYPER_CONTRACT_DEPLOYMENT_TARGET = Join-Path $smoke "target"
+          $env:HYPER_CONTRACT_DEPLOYMENT_MODE = "promote"
+          cargo test --locked -p hyper-runtime-deployment --test contract resolves_a_javascript_managed_deployment_target -- --ignored --exact
+          if ($LASTEXITCODE -ne 0) { throw "native Runtime rejected the packaged deployment" }
 
       - name: Upload optimized Linux applications
         if: runner.os == 'Linux' && matrix.experimental == false
