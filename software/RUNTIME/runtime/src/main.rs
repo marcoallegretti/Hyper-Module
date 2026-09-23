@@ -3356,6 +3356,9 @@ fn run_runtime_owner_turn<H, O>(
         + RuntimeScenePerformanceControl,
     O: RuntimeOutputObservation,
 {
+    if stop.load(Ordering::Acquire) {
+        return;
+    }
     let output_failed = output_status.output_state() == OutputStreamState::Failed;
     let recording = host.poll_recording();
     if let Some(message) = recording.message {
@@ -3371,6 +3374,9 @@ fn run_runtime_owner_turn<H, O>(
     {
         terminal_output_failure.set(true);
         stop.store(true, Ordering::Release);
+        return;
+    }
+    if stop.load(Ordering::Acquire) {
         return;
     }
     if let Some(message) = host.poll_scene_performance_capture() {
@@ -3585,6 +3591,9 @@ fn drain_operator_commands<
     diagnostic: &dyn Fn(String),
 ) -> bool {
     for _ in 0..OPERATOR_COMMAND_CAPACITY {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         let command = match commands.try_recv() {
             Ok(command) => command,
             Err(TryRecvError::Empty) => break,
@@ -3797,7 +3806,10 @@ fn drain_operator_commands<
                     }
                 }
             }
-            OperatorCommand::Quit => stop.store(true, Ordering::Release),
+            OperatorCommand::Quit => {
+                stop.store(true, Ordering::Release);
+                break;
+            }
         }
     }
     false
@@ -10081,6 +10093,112 @@ mod tests {
         assert_eq!(owner.disconnects, 1, "the sole owner gets one release turn");
         assert!(stop.load(Ordering::Acquire));
         drop(occupied);
+    }
+
+    #[test]
+    fn operator_quit_stops_queued_controls_and_later_owner_polls() {
+        let arguments = RuntimeArguments::parse(["deployment".to_owned()]).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut owner = OperatorControl {
+            recording_poll: Some("recording owner checked before shutdown".to_owned()),
+            recording_abort: Some(Ok(Some("recording aborted for shutdown".to_owned()))),
+            scene_performance_poll: Some("unexpected scene-performance poll".to_owned()),
+            automation_capture_poll: Some("unexpected automation poll".to_owned()),
+            mixer_update_poll: Some("unexpected mixer-update poll".to_owned()),
+            native_device_update_poll: Some("unexpected native-device poll".to_owned()),
+            loop_update_poll: Some("unexpected loop-update poll".to_owned()),
+            ..OperatorControl::default()
+        };
+        let diagnostics = RefCell::new(Vec::new());
+        let (commands, command_receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        commands.send(OperatorCommand::Quit).unwrap();
+        commands.send(OperatorCommand::StopRecording).unwrap();
+        commands.send(OperatorCommand::Start).unwrap();
+
+        host_runtime(
+            &arguments,
+            &mut owner,
+            &OutputObservation(OutputStreamState::Running),
+            &stop,
+            Some(&command_receiver),
+            &|message| diagnostics.borrow_mut().push(message),
+        )
+        .unwrap();
+
+        assert!(stop.load(Ordering::Acquire));
+        assert!(owner.recording_poll.is_none());
+        assert!(owner.recording_abort.is_none());
+        assert!(owner.recording_commands.is_empty());
+        assert!(owner.commands.is_empty());
+        assert!(owner.scene_performance_poll.is_some());
+        assert!(owner.automation_capture_poll.is_some());
+        assert!(owner.mixer_update_poll.is_some());
+        assert!(owner.native_device_update_poll.is_some());
+        assert!(owner.loop_update_poll.is_some());
+        assert_eq!(
+            command_receiver.try_recv(),
+            Ok(OperatorCommand::StopRecording)
+        );
+        assert_eq!(command_receiver.try_recv(), Ok(OperatorCommand::Start));
+        assert_eq!(command_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostics.borrow().as_slice(),
+            [
+                "no panel link requested",
+                "recording owner checked before shutdown",
+                "recording aborted for shutdown",
+            ]
+        );
+    }
+
+    #[test]
+    fn pre_requested_shutdown_leaves_operator_commands_queued() {
+        let stop = AtomicBool::new(true);
+        let (commands, command_receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        commands.send(OperatorCommand::Start).unwrap();
+        let mut owner = OperatorControl::default();
+        let diagnostics = RefCell::new(Vec::new());
+
+        assert!(!drain_operator_commands(
+            &mut owner,
+            &command_receiver,
+            &stop,
+            &|message| diagnostics.borrow_mut().push(message),
+        ));
+
+        assert!(owner.commands.is_empty());
+        assert!(diagnostics.borrow().is_empty());
+        assert_eq!(command_receiver.try_recv(), Ok(OperatorCommand::Start));
+    }
+
+    #[test]
+    fn pre_requested_shutdown_skips_the_owner_turn_after_loop_entry() {
+        let stop = AtomicBool::new(true);
+        let terminal_output_failure = Cell::new(false);
+        let mut owner = OperatorControl {
+            recording_poll: Some("unexpected recording poll".to_owned()),
+            scene_performance_poll: Some("unexpected scene-performance poll".to_owned()),
+            ..OperatorControl::default()
+        };
+        let diagnostics = RefCell::new(Vec::new());
+        let (commands, command_receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        commands.send(OperatorCommand::Start).unwrap();
+
+        run_runtime_owner_turn(
+            &mut owner,
+            &OutputObservation(OutputStreamState::Failed),
+            &terminal_output_failure,
+            &stop,
+            Some(&command_receiver),
+            &|message| diagnostics.borrow_mut().push(message),
+        );
+
+        assert!(!terminal_output_failure.get());
+        assert!(owner.recording_poll.is_some());
+        assert!(owner.scene_performance_poll.is_some());
+        assert!(owner.commands.is_empty());
+        assert!(diagnostics.borrow().is_empty());
+        assert_eq!(command_receiver.try_recv(), Ok(OperatorCommand::Start));
     }
 
     #[test]
