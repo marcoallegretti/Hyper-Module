@@ -104,7 +104,6 @@ jobs:
             printf 'report.ide-tests.log=cargo test -p hyper-desktop-ide --all-targets --locked -- --test-threads=1\n'
             printf 'report.vendored-pipewire-tests.log=cargo test --manifest-path third_party/pipewire/Cargo.toml\n'
             printf 'condition.vendored-pipewire-tests.log=runner_os==Linux\n'
-            printf 'report.application-inspection-smoke.log=optimized hyper-desktop-ui and hyper-runtime help/version commands\n'
             printf 'report.optimized-audio-tests.log=cargo test --locked --release -p hyper-audio-engine -p hyper-mixer-runtime -p hyper-desktop-audio\n'
             printf 'report.live-pipewire-output.log=bash software/IDE/audio-backend/scripts/test-pipewire-live.sh\n'
             printf 'condition.live-pipewire-output.log=runner_os==Linux\n'
@@ -142,8 +141,83 @@ jobs:
           cargo clippy --manifest-path third_party/pipewire/Cargo.toml --all-targets -- -D warnings
           cargo test --manifest-path third_party/pipewire/Cargo.toml 2>&1 | tee "$REPORT_DIR/vendored-pipewire-tests.log"
 
-      - name: Build optimized workspace
-        run: cargo build --workspace --all-targets --locked --release
+      - name: Test optimized audio paths
+        shell: bash
+        run: cargo test --locked --release -p hyper-audio-engine -p hyper-mixer-runtime -p hyper-desktop-audio 2>&1 | tee "$REPORT_DIR/optimized-audio-tests.log"
+
+      - name: Test live PipeWire output
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash software/IDE/audio-backend/scripts/test-pipewire-live.sh 2>&1 | tee "$REPORT_DIR/live-pipewire-output.log"
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+
+      - name: Upload Rust test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: hyper-test-report-rust-${{ matrix.os }}-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/ci-reports
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
+
+  package:
+    name: Package (${{ matrix.os }})
+    needs: [public-boundary, rust, contracts]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - windows-2022
+    env:
+      REPORT_DIR: ci-reports
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Initialize package report
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          mkdir -p "$REPORT_DIR"
+          {
+            printf 'schema=hyper-ci-test-report-v1\n'
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'workflow_commit=%s\n' "$GITHUB_WORKFLOW_SHA"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'job=%s\n' "$GITHUB_JOB"
+            printf 'matrix_os=%s\n' "$MATRIX_OS"
+            printf 'runner_os=%s\n' "$RUNNER_OS"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'report.optimized-applications.log=cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-fs-authority\n'
+            printf 'report.application-inspection-smoke.log=optimized hyper-desktop-ui and hyper-runtime help/version commands\n'
+            printf 'report.package-deployment-smoke.log=extracted kit deployment and native Runtime promotion\n'
+          } > "$REPORT_DIR/manifest.txt"
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93.0 --profile minimal
+
+      - name: Install PipeWire development files
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends libpipewire-0.3-dev pipewire pipewire-bin wireplumber
+
+      - name: Build optimized applications and filesystem authority
+        shell: bash
+        run: cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-fs-authority 2>&1 | tee "$REPORT_DIR/optimized-applications.log"
 
       - name: Smoke-test optimized application inspection commands
         shell: bash
@@ -161,22 +235,7 @@ jobs:
               "$runtime" --version
           } 2>&1 | tee "$REPORT_DIR/application-inspection-smoke.log"
 
-      - name: Test optimized audio paths
-        shell: bash
-        run: cargo test --locked --release -p hyper-audio-engine -p hyper-mixer-runtime -p hyper-desktop-audio 2>&1 | tee "$REPORT_DIR/optimized-audio-tests.log"
-
-      - name: Test live PipeWire output
-        if: runner.os == 'Linux'
-        shell: bash
-        run: bash software/IDE/audio-backend/scripts/test-pipewire-live.sh 2>&1 | tee "$REPORT_DIR/live-pipewire-output.log"
-
-      - name: Check documentation
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps --locked
-
       - name: Install Node.js for local deployment kit
-        if: matrix.experimental == false
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: 24.13.0
@@ -185,12 +244,11 @@ jobs:
           package-manager-cache: false
 
       - name: Install locked local deployment dependencies
-        if: matrix.experimental == false
         working-directory: contracts
         run: npm ci --ignore-scripts
 
       - name: Package optimized Linux applications
-        if: runner.os == 'Linux' && matrix.experimental == false
+        if: runner.os == 'Linux'
         run: |
           output="$RUNNER_TEMP/hyper-module-linux-x86_64"
           kit="$output/deployment-kit"
@@ -208,13 +266,13 @@ jobs:
           mkdir -p "$extract" "$smoke"
           tar -xzf "$archive" -C "$extract"
           runtime_version=$("$extract/hyper-runtime" --version | awk '{print $2}')
-          node "$extract/deployment-kit/scripts/smoke-packaged-deployment.mjs" "$smoke" "$runtime_version"
+          node "$extract/deployment-kit/scripts/smoke-packaged-deployment.mjs" "$smoke" "$runtime_version" 2>&1 | tee "$REPORT_DIR/package-deployment-smoke.log"
           HYPER_CONTRACT_DEPLOYMENT_TARGET="$smoke/target" HYPER_CONTRACT_DEPLOYMENT_MODE=promote HYPER_CONTRACT_RUNTIME_VERSION="$runtime_version" \
             cargo test --locked -p hyper-runtime-deployment --test contract \
-              resolves_a_javascript_managed_deployment_target -- --ignored --exact
+              resolves_a_javascript_managed_deployment_target -- --ignored --exact 2>&1 | tee -a "$REPORT_DIR/package-deployment-smoke.log"
 
       - name: Package optimized Windows applications
-        if: runner.os == 'Windows' && matrix.experimental == false
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $output = Join-Path $env:RUNNER_TEMP "hyper-module-windows-x86_64"
@@ -258,16 +316,17 @@ jobs:
           Expand-Archive -LiteralPath $archive -DestinationPath $extract
           $runtimeVersion = (& (Join-Path $extract "hyper-runtime.exe") --version).Split(' ')[-1]
           $smokeScript = Join-Path $extract "deployment-kit/scripts/smoke-packaged-deployment.mjs"
-          node $smokeScript $smoke $runtimeVersion
+          $smokeLog = Join-Path $env:REPORT_DIR "package-deployment-smoke.log"
+          node $smokeScript $smoke $runtimeVersion 2>&1 | Tee-Object -FilePath $smokeLog
           if ($LASTEXITCODE -ne 0) { throw "extracted deployment kit smoke failed" }
           $env:HYPER_CONTRACT_DEPLOYMENT_TARGET = Join-Path $smoke "target"
           $env:HYPER_CONTRACT_DEPLOYMENT_MODE = "promote"
           $env:HYPER_CONTRACT_RUNTIME_VERSION = $runtimeVersion
-          cargo test --locked -p hyper-runtime-deployment --test contract resolves_a_javascript_managed_deployment_target -- --ignored --exact
+          cargo test --locked -p hyper-runtime-deployment --test contract resolves_a_javascript_managed_deployment_target -- --ignored --exact 2>&1 | Tee-Object -FilePath $smokeLog -Append
           if ($LASTEXITCODE -ne 0) { throw "native Runtime rejected the packaged deployment" }
 
       - name: Upload optimized Linux applications
-        if: runner.os == 'Linux' && matrix.experimental == false
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: hyper-module-linux-x86_64-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
@@ -279,7 +338,7 @@ jobs:
           compression-level: 0
 
       - name: Upload optimized Windows applications
-        if: runner.os == 'Windows' && matrix.experimental == false
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: hyper-module-windows-x86_64-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
@@ -290,11 +349,11 @@ jobs:
           retention-days: 14
           compression-level: 0
 
-      - name: Upload Rust test report
+      - name: Upload package report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: hyper-test-report-rust-${{ matrix.os }}-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          name: hyper-test-report-package-${{ matrix.os }}-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: ${{ github.workspace }}/ci-reports
           if-no-files-found: error
           retention-days: 14
