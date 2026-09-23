@@ -2425,8 +2425,10 @@ export component MainWindow inherits Window {
                                     horizontal-alignment: center;
                                 }
                                 Text {
-                                    text: root.transport-extent-bounded ? "0:00  ·  COMPILED PLAYBACK RANGE  ·  " + root.transport-end-clock : "OPEN-ENDED RECORDED SCENE AUTHORITY · SEEK RANGE UNAVAILABLE";
-                                    color: root.transport-extent-bounded ? #65758a : #b58a67;
+                                    text: root.project-id == "—" ? "NO VERIFIED PROJECT · SEEK UNAVAILABLE"
+                                        : root.transport-extent-bounded ? "0:00  ·  COMPILED PLAYBACK RANGE  ·  " + root.transport-end-clock
+                                        : "OPEN-ENDED RECORDED SCENE AUTHORITY · SEEK RANGE UNAVAILABLE";
+                                    color: root.project-id == "—" || root.transport-extent-bounded ? #65758a : #b58a67;
                                     font-size: 9px;
                                     horizontal-alignment: center;
                                 }
