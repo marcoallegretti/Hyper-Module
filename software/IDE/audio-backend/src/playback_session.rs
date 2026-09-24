@@ -1477,7 +1477,9 @@ fn observe_recording_native_shutdown(
     match shutdown.wait(timeout) {
         PendingNativeShutdownWait::Completed => true,
         PendingNativeShutdownWait::Failed => {
-            *settlement = DesktopPlaybackRecordingNativeSettlement::Failed;
+            if *settlement != DesktopPlaybackRecordingNativeSettlement::Panicked {
+                *settlement = DesktopPlaybackRecordingNativeSettlement::Failed;
+            }
             true
         }
         PendingNativeShutdownWait::Panicked => {
@@ -4318,6 +4320,12 @@ mod tests {
     }
 
     fn pending_shutdown_panic_fixture() -> (PendingNativeShutdown, SyncSender<()>) {
+        pending_shutdown_panic_fixture_with_status(OutputStreamStatus::default())
+    }
+
+    fn pending_shutdown_panic_fixture_with_status(
+        status: OutputStreamStatus,
+    ) -> (PendingNativeShutdown, SyncSender<()>) {
         let (release_sender, release_receiver) = sync_channel(1);
         let (completed_sender, completed_receiver) = sync_channel(1);
         let handle = thread::spawn(move || {
@@ -4330,10 +4338,7 @@ mod tests {
             completed_receiver,
             acquire_backend_thread_permit().unwrap(),
         );
-        (
-            PendingNativeShutdown::new(thread, OutputStreamStatus::default()),
-            release_sender,
-        )
+        (PendingNativeShutdown::new(thread, status), release_sender)
     }
 
     fn project_limits() -> ProjectPlaybackLimits {
@@ -4837,6 +4842,73 @@ mod tests {
         );
         assert_eq!(
             settled.input,
+            DesktopPlaybackRecordingNativeSettlement::Clean
+        );
+    }
+
+    #[test]
+    fn recording_start_failure_preserves_input_panic_across_output_timeout() {
+        let status = OutputStreamStatus::default();
+        status.mark_failed();
+        let (input, release_input) = pending_shutdown_panic_fixture_with_status(status);
+        let (output, release_output) = pending_shutdown_fixture();
+        let journal_path = Path::new("unpublished-take.journal").to_path_buf();
+        let error = DesktopPlaybackRecordingStartError::Playback {
+            journal_path: journal_path.clone(),
+            source: Box::new(DesktopPlaybackSessionStartError::Output(
+                DesktopOutputStartError::CancellationPending {
+                    shutdown: Box::new(output),
+                },
+            )),
+            input_cleanup: Some(DesktopInputStopError::ShutdownPending {
+                shutdown: Box::new(input),
+            }),
+            writer: Box::new(DesktopRecordingWriterSettlement::Completed(Box::new(
+                RecordingWorkerCompletion::Aborted {
+                    frames: 0,
+                    journal_path,
+                },
+            ))),
+            recovery: Box::new(recording_recovery(
+                DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+                None,
+            )),
+        };
+
+        release_input.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut pending = error.into_recovery();
+        let pending = loop {
+            let DesktopPlaybackRecordingStartRecoveryWait::TimedOut(next) =
+                pending.wait(Duration::from_millis(10))
+            else {
+                panic!("pending output must retain the panicked input settlement");
+            };
+            if next.input == DesktopPlaybackRecordingNativeSettlement::Panicked {
+                break next;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "input panic was not observed before the test deadline"
+            );
+            pending = next;
+        };
+        assert_eq!(
+            pending.input,
+            DesktopPlaybackRecordingNativeSettlement::Panicked
+        );
+        release_output.send(()).unwrap();
+        let DesktopPlaybackRecordingStartRecoveryWait::Settled(settled) =
+            pending.wait(Duration::from_secs(1))
+        else {
+            panic!("released output must allow final settlement");
+        };
+        assert_eq!(
+            settled.input,
+            DesktopPlaybackRecordingNativeSettlement::Panicked
+        );
+        assert_eq!(
+            settled.output,
             DesktopPlaybackRecordingNativeSettlement::Clean
         );
     }
