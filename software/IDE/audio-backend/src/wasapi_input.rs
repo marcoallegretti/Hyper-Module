@@ -1,3 +1,4 @@
+use super::wasapi_devices::select_wasapi_device;
 use super::wasapi_output::{decode_disconnect_reason, publish_disconnect};
 use super::{
     BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, CaptureCallback,
@@ -450,14 +451,8 @@ fn open_capture_input(
 ) -> Result<WasapiCaptureInput, WasapiStartError> {
     let enumerator = wasapi::DeviceEnumerator::new()
         .map_err(|source| backend_error(WasapiStartupStage::Enumerator, source))?;
-    let device = match &config.device_id {
-        Some(device_id) => enumerator
-            .get_device(device_id)
-            .map_err(|source| backend_error(WasapiStartupStage::Device, source))?,
-        None => enumerator
-            .get_default_device(&Direction::Capture)
-            .map_err(|source| backend_error(WasapiStartupStage::Device, source))?,
-    };
+    let device =
+        select_wasapi_device(&enumerator, Direction::Capture, config.device_id.as_deref())?;
     let mut client = device
         .get_iaudioclient()
         .map_err(|source| backend_error(WasapiStartupStage::Client, source))?;

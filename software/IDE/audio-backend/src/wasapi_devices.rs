@@ -1,8 +1,52 @@
+use crate::{WasapiStartError, WasapiStartupStage};
 use core::error::Error;
 use core::fmt;
 use std::collections::HashSet;
 use std::thread;
 use wasapi::{Direction, Role};
+
+// Resolve explicit IDs through the active collection. wasapi 0.22.0's
+// DeviceEnumerator::get_device constructs a PCWSTR from a temporary HSTRING,
+// so its pointer may be invalid by the time IMMDeviceEnumerator::GetDevice runs.
+fn find_active_wasapi_endpoint(
+    enumerator: &wasapi::DeviceEnumerator,
+    direction: Direction,
+    device_id: &str,
+) -> Result<Option<wasapi::Device>, wasapi::WasapiError> {
+    let collection = enumerator.get_device_collection(&direction)?;
+    for index in 0..collection.get_nbr_devices()? {
+        let device = collection.get_device_at_index(index)?;
+        if device.get_id()? == device_id {
+            return Ok(Some(device));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn select_wasapi_device(
+    enumerator: &wasapi::DeviceEnumerator,
+    direction: Direction,
+    device_id: Option<&str>,
+) -> Result<wasapi::Device, WasapiStartError> {
+    let device = match device_id {
+        Some(device_id) => find_active_wasapi_endpoint(enumerator, direction, device_id)
+            .map_err(|source| WasapiStartError::BackendSource {
+                stage: WasapiStartupStage::Device,
+                source: Box::new(source),
+            })?
+            .ok_or_else(|| WasapiStartError::Backend {
+                stage: WasapiStartupStage::Device,
+                detail: "selected audio endpoint is no longer active".to_owned(),
+            })?,
+        None => enumerator
+            .get_default_device(&direction)
+            .map_err(|source| WasapiStartError::BackendSource {
+                stage: WasapiStartupStage::Device,
+                source: Box::new(source),
+            })?,
+    };
+    Ok(device)
+}
 
 /// One active Windows audio endpoint available for explicit selection.
 #[derive(Clone, Debug, Eq, PartialEq)]

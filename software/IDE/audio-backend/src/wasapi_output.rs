@@ -1,3 +1,4 @@
+use super::wasapi_devices::select_wasapi_device;
 use super::{
     BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, CheckpointedOutputProcessor,
     InterleavedStereoProcessor, OutputCallback, OutputCallbackStatus, OutputStreamCounters,
@@ -701,14 +702,7 @@ fn open_render_output(
 ) -> Result<WasapiRenderOutput, WasapiStartError> {
     let enumerator = wasapi::DeviceEnumerator::new()
         .map_err(|source| backend_error(WasapiStartupStage::Enumerator, source))?;
-    let device = match &config.device_id {
-        Some(device_id) => enumerator
-            .get_device(device_id)
-            .map_err(|source| backend_error(WasapiStartupStage::Device, source))?,
-        None => enumerator
-            .get_default_device(&Direction::Render)
-            .map_err(|source| backend_error(WasapiStartupStage::Device, source))?,
-    };
+    let device = select_wasapi_device(&enumerator, Direction::Render, config.device_id.as_deref())?;
     let mut client = device
         .get_iaudioclient()
         .map_err(|source| backend_error(WasapiStartupStage::Client, source))?;
