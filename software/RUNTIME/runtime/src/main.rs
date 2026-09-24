@@ -8202,6 +8202,7 @@ fn apply_static_facts(ui: &OperatorWindow, facts: &RuntimeFacts) {
     ui.set_bundle_identity(facts.bundle_identity.clone().into());
     ui.set_output_route(facts.output_route.to_string().into());
     ui.set_input_route(facts.input_route.to_string().into());
+    ui.set_recording_limit(format_transport_time(MAX_AUDIO_FRAMES).into());
     ui.set_timeline_marker_navigation_state(
         operator_timeline_marker_navigation_state(&facts.timeline_markers, false).into(),
     );
@@ -14874,6 +14875,7 @@ mod tests {
         };
         apply_static_facts(&ui, &facts);
         assert_eq!(ui.get_output_route().as_str(), "Pinned: Studio Output");
+        assert_eq!(ui.get_recording_limit().as_str(), "00:15:00.000");
         let observation = apply_observations(
             &ui,
             &observers,

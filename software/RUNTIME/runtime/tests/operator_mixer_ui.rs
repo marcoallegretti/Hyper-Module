@@ -317,6 +317,7 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
 fn generated_recording_shortcut_uses_only_committed_authority() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = OperatorWindow::new().unwrap();
+    ui.set_recording_limit("00:15:00.000".into());
     let intents = Rc::new(RefCell::new(Vec::<Option<i32>>::new()));
     let start_intents = Rc::clone(&intents);
     ui.on_start_recording_requested(move |target| {
@@ -329,6 +330,21 @@ fn generated_recording_shortcut_uses_only_committed_authority() {
     ui.set_recording_target_names(ModelRc::from(Rc::new(VecModel::from(vec!["Audio".into()]))));
     ui.set_selected_recording_target_index(0);
     ui.show().unwrap();
+    assert!(
+        find_control(&ui, "Runtime audio recording maximum 00:15:00.000")
+            .size()
+            .width
+            > 0.0
+    );
+    assert!(
+        find_control(
+            &ui,
+            "Recording overruns retain a recovery journal and do not publish a WAV. Runtime never changes the verified project.",
+        )
+        .size()
+        .width
+            > 0.0
+    );
 
     dispatch_operator_key(&ui, "r".into(), false, false, false, false, false);
     ui.set_recording_start_enabled(true);

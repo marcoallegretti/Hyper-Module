@@ -694,6 +694,7 @@ export component OperatorWindow inherits Window {
     in property <[string]> recording-target-names;
     in-out property <int> selected-recording-target-index: -1;
     in property <string> recording-state: "Recording unavailable";
+    in property <string> recording-limit: "—";
     in property <bool> recording-start-enabled: false;
     in property <bool> recording-stop-enabled: false;
     in property <[string]> automation-target-names;
@@ -1113,8 +1114,16 @@ export component OperatorWindow inherits Window {
                 padding: 12px;
                 spacing: 7px;
                 HorizontalLayout {
+                    spacing: 8px;
                     Text { text: "RUNTIME AUDIO RECORDING · EXTERNAL HANDOFF"; color: #8d99ad; font-size: 11px; font-weight: 700; }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text {
+                        text: "MAX " + root.recording-limit;
+                        accessible-label: "Runtime audio recording maximum " + root.recording-limit;
+                        color: #d6b778;
+                        font-size: 10px;
+                        vertical-alignment: center;
+                    }
                     Text { text: root.recording-state; color: #8d99ad; font-size: 10px; overflow: elide; width: 300px; vertical-alignment: center; }
                 }
                 HorizontalLayout {
@@ -1128,7 +1137,8 @@ export component OperatorWindow inherits Window {
                         accessible-label: "Runtime audio recording target";
                     }
                     Text {
-                        text: "Records the selected monitored input to an external WAV. The verified project is never changed by Runtime.";
+                        text: "Overruns retain a recovery journal, not a WAV. Runtime never changes the verified project.";
+                        accessible-label: "Recording overruns retain a recovery journal and do not publish a WAV. Runtime never changes the verified project.";
                         color: #69778c;
                         font-size: 9px;
                         overflow: elide;
