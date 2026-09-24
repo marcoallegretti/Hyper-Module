@@ -3705,7 +3705,17 @@ fn failed_output_publication(
     output: DesktopOutputStream,
     source: DesktopPlaybackSessionStartError,
 ) -> DesktopPlaybackSessionStartError {
-    match output.stop().err().map(DesktopOutputStopError::from) {
+    settle_failed_output_publication(
+        || output.stop().map_err(DesktopOutputStopError::from),
+        source,
+    )
+}
+
+fn settle_failed_output_publication(
+    stop: impl FnOnce() -> Result<(), DesktopOutputStopError>,
+    source: DesktopPlaybackSessionStartError,
+) -> DesktopPlaybackSessionStartError {
+    match stop().err() {
         Some(cleanup) => DesktopPlaybackSessionStartError::OutputCleanup {
             source: Box::new(source),
             cleanup,
@@ -4690,6 +4700,63 @@ mod tests {
         assert!(matches!(
             pending.wait(Duration::from_secs(1)),
             DesktopPlaybackRecordingStartRecoveryWait::Settled(_)
+        ));
+    }
+
+    #[test]
+    fn failed_publication_stops_output_once_and_retains_pending_cleanup() {
+        for source in [
+            DesktopPlaybackSessionStartError::Build(
+                DesktopPlaybackSessionBuildError::AssetFactCapacityUnavailable,
+            ),
+            DesktopPlaybackSessionStartError::PublicationUnavailable,
+        ] {
+            let expected_build = matches!(&source, DesktopPlaybackSessionStartError::Build(_));
+            let (shutdown, release) = pending_shutdown_fixture();
+            let stop_calls = std::cell::Cell::new(0);
+            let error = settle_failed_output_publication(
+                || {
+                    stop_calls.set(stop_calls.get() + 1);
+                    Err(DesktopOutputStopError::ShutdownPending {
+                        shutdown: Box::new(shutdown),
+                    })
+                },
+                source,
+            );
+            assert_eq!(stop_calls.get(), 1);
+            let DesktopPlaybackSessionStartError::OutputCleanup {
+                source,
+                cleanup: DesktopOutputStopError::ShutdownPending { mut shutdown },
+            } = error
+            else {
+                panic!("failed publication must retain pending output cleanup");
+            };
+            assert_eq!(
+                matches!(*source, DesktopPlaybackSessionStartError::Build(_)),
+                expected_build
+            );
+            release.send(()).unwrap();
+            assert_eq!(
+                shutdown.wait(Duration::from_secs(1)),
+                PendingNativeShutdownWait::Completed
+            );
+        }
+    }
+
+    #[test]
+    fn failed_publication_preserves_the_start_error_after_clean_output_stop() {
+        let stop_calls = std::cell::Cell::new(0);
+        let error = settle_failed_output_publication(
+            || {
+                stop_calls.set(stop_calls.get() + 1);
+                Ok(())
+            },
+            DesktopPlaybackSessionStartError::PublicationUnavailable,
+        );
+        assert_eq!(stop_calls.get(), 1);
+        assert!(matches!(
+            error,
+            DesktopPlaybackSessionStartError::PublicationUnavailable
         ));
     }
 
