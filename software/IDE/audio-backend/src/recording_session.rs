@@ -174,12 +174,13 @@ impl fmt::Display for DesktopRecordingSessionStopError {
                 ..
             } => write!(
                 formatter,
-                "capture integrity failed; recording was not published and the last configured journal path was {}: callbacks={}, captured={}, dropped_frames={}, discontinuities={}, timestamp_errors={}, unavailable_buffers={}, malformed_buffers={}",
+                "capture integrity failed; recording was not published and the last configured journal path was {}: callbacks={}, captured={}, dropped_frames={}, discontinuities={}, first_discontinuity_at_frame={:?}, timestamp_errors={}, unavailable_buffers={}, malformed_buffers={}",
                 journal_path.display(),
                 capture.callback_count,
                 capture.captured_callback_count,
                 capture.dropped_frame_count,
                 capture.discontinuity_count,
+                capture.first_discontinuity_at_frame,
                 capture.timestamp_error_count,
                 capture.unavailable_buffer_count,
                 capture.malformed_buffer_count

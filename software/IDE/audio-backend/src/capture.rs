@@ -61,6 +61,8 @@ pub struct CaptureStreamSnapshot {
     pub unavailable_buffer_count: u64,
     pub malformed_buffer_count: u64,
     pub discontinuity_count: u64,
+    /// Accepted frames before the first native discontinuity packet, if any.
+    pub first_discontinuity_at_frame: Option<u64>,
     pub timestamp_error_count: u64,
     pub stream_error_count: u64,
     pub native_xruns: Option<NativeXrunSnapshot>,
@@ -79,6 +81,7 @@ struct CaptureStreamCounterState {
     unavailable_buffers: AtomicU64,
     malformed_buffers: AtomicU64,
     discontinuities: AtomicU64,
+    first_discontinuity_frame_plus_one: AtomicU64,
     timestamp_errors: AtomicU64,
     stream_errors: AtomicU64,
     native_xruns: Arc<NativeXrunCounterState>,
@@ -104,6 +107,11 @@ impl CaptureStreamCounters {
             unavailable_buffer_count: self.state.unavailable_buffers.load(Ordering::Relaxed),
             malformed_buffer_count: self.state.malformed_buffers.load(Ordering::Relaxed),
             discontinuity_count: self.state.discontinuities.load(Ordering::Relaxed),
+            first_discontinuity_at_frame: self
+                .state
+                .first_discontinuity_frame_plus_one
+                .load(Ordering::Relaxed)
+                .checked_sub(1),
             timestamp_error_count: self.state.timestamp_errors.load(Ordering::Relaxed),
             stream_error_count: self.state.stream_errors.load(Ordering::Relaxed),
             native_xruns: self.state.native_xruns.snapshot(),
@@ -134,6 +142,16 @@ impl CaptureStreamCounters {
 
     #[cfg(target_os = "windows")]
     pub(crate) fn record_discontinuity(&self) {
+        let prior_frames = self.state.captured_frames.load(Ordering::Relaxed);
+        let _ = self
+            .state
+            .first_discontinuity_frame_plus_one
+            .compare_exchange(
+                0,
+                prior_frames.saturating_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
         Self::add(&self.state.discontinuities, 1);
     }
 
@@ -368,6 +386,36 @@ mod tests {
                 maximum: MAXIMUM_BLOCK_FRAMES,
             }) if actual == MAXIMUM_BLOCK_FRAMES + 1
         ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn first_native_discontinuity_retains_its_accepted_frame_offset() {
+        let counters = CaptureStreamCounters::default();
+        assert_eq!(counters.snapshot().first_discontinuity_at_frame, None);
+        counters.record_discontinuity();
+        assert_eq!(counters.snapshot().first_discontinuity_at_frame, Some(0));
+
+        let mut callback = CaptureCallback::try_new_with_counters(
+            |_: &[f32]| Ok::<_, ()>(()),
+            4,
+            counters.clone(),
+        )
+        .unwrap();
+        assert_eq!(callback.process(&[0.0; 6]), CaptureCallbackStatus::Captured);
+        counters.record_discontinuity();
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.discontinuity_count, 2);
+        assert_eq!(snapshot.captured_frame_count, 3);
+        assert_eq!(snapshot.first_discontinuity_at_frame, Some(0));
+
+        let later = CaptureStreamCounters::default();
+        let mut callback =
+            CaptureCallback::try_new_with_counters(|_: &[f32]| Ok::<_, ()>(()), 4, later.clone())
+                .unwrap();
+        assert_eq!(callback.process(&[0.0; 4]), CaptureCallbackStatus::Captured);
+        later.record_discontinuity();
+        assert_eq!(later.snapshot().first_discontinuity_at_frame, Some(2));
     }
 
     #[cfg(all(target_os = "linux", target_endian = "little"))]
