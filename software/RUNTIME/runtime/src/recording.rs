@@ -137,6 +137,16 @@ impl RuntimeRecordingConfiguration {
         !self.targets.is_empty()
     }
 
+    pub(super) fn validate_target_index(
+        &self,
+        target_index: usize,
+    ) -> Result<(), RuntimeRecordingError> {
+        self.targets
+            .get(target_index)
+            .map(|_| ())
+            .ok_or(RuntimeRecordingError::TargetUnavailable)
+    }
+
     pub(super) fn prepare(
         &self,
         target_index: usize,
@@ -555,6 +565,15 @@ mod tests {
         assert_eq!(configuration.target_labels().unwrap(), ["Audio 1"]);
         assert!(configuration.has_targets());
         assert!(!configuration.output_configured());
+        assert!(configuration.validate_target_index(0).is_ok());
+        assert!(matches!(
+            configuration.validate_target_index(1),
+            Err(super::RuntimeRecordingError::TargetUnavailable)
+        ));
+        assert!(matches!(
+            configuration.validate_target_index(usize::MAX),
+            Err(super::RuntimeRecordingError::TargetUnavailable)
+        ));
         prepared.package().confirm_unchanged().unwrap();
     }
 

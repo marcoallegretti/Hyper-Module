@@ -246,6 +246,9 @@ impl RuntimePlaybackOwner {
         if !self.recording.has_targets() {
             return Err("the verified project has no audio-track recording target".to_owned());
         }
+        self.recording
+            .validate_target_index(target_index)
+            .map_err(|error| error.to_string())?;
         let state = self
             .state
             .take()
