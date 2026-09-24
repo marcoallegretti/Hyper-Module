@@ -30,8 +30,8 @@ use hyper_control_runtime::{
     UnboundReason,
 };
 use hyper_desktop_audio::{
-    CaptureStreamCounters, DesktopControlSinkError, DesktopMixerSendTap, DesktopMonitoringConfig,
-    DesktopMonitoringControl, DesktopNativeDevice, DesktopOutputStopError,
+    CaptureStreamCounters, CaptureStreamSnapshot, DesktopControlSinkError, DesktopMixerSendTap,
+    DesktopMonitoringConfig, DesktopMonitoringControl, DesktopNativeDevice, DesktopOutputStopError,
     DesktopPlaybackRecordingNativeSettlement, DesktopPlaybackRecordingSession,
     DesktopPlaybackRecordingStartRecovery, DesktopPlaybackRecordingStartRecoveryWait,
     DesktopPlaybackRecordingStartSettlement, DesktopPlaybackRecovery,
@@ -8292,6 +8292,8 @@ struct OperatorInputMonitorPresentation {
     callback_count: String,
     captured_frame_count: String,
     dropped_frame_count: String,
+    startup_telemetry: String,
+    integrity_telemetry: String,
     gain_percent: f32,
     muted: bool,
 }
@@ -8387,6 +8389,8 @@ fn operator_input_monitor_presentation(
             callback_count: "—".to_owned(),
             captured_frame_count: "—".to_owned(),
             dropped_frame_count: "—".to_owned(),
+            startup_telemetry: "—".to_owned(),
+            integrity_telemetry: "—".to_owned(),
             gain_percent: 0.0,
             muted: true,
         };
@@ -8397,12 +8401,15 @@ fn operator_input_monitor_presentation(
             callback_count: "—".to_owned(),
             captured_frame_count: "—".to_owned(),
             dropped_frame_count: "—".to_owned(),
+            startup_telemetry: "—".to_owned(),
+            integrity_telemetry: "—".to_owned(),
             gain_percent: 0.0,
             muted: true,
         };
     };
     let stream_state = status.state();
     let counters = counters.snapshot();
+    let (startup_telemetry, integrity_telemetry) = operator_input_capture_telemetry(counters);
     OperatorInputMonitorPresentation {
         authority: OperatorInputMonitorAuthority::Observed {
             stream_state,
@@ -8411,9 +8418,30 @@ fn operator_input_monitor_presentation(
         callback_count: counters.callback_count.to_string(),
         captured_frame_count: counters.captured_frame_count.to_string(),
         dropped_frame_count: counters.dropped_frame_count.to_string(),
+        startup_telemetry,
+        integrity_telemetry,
         gain_percent: control.gain_linear() * 100.0,
         muted: control.muted(),
     }
+}
+
+fn operator_input_capture_telemetry(counters: CaptureStreamSnapshot) -> (String, String) {
+    (
+        format!(
+            "STARTUP EXCLUDED {} FR · {} DISCONTINUITY · {} TIMESTAMP",
+            counters.startup_discarded_frame_count,
+            counters.startup_discontinuity_count,
+            counters.startup_timestamp_error_count,
+        ),
+        format!(
+            "CAPTURE STREAM {} DISCONTINUITY · {} TIMESTAMP · {} UNAVAILABLE · {} MALFORMED · {} ERROR",
+            counters.discontinuity_count,
+            counters.timestamp_error_count,
+            counters.unavailable_buffer_count,
+            counters.malformed_buffer_count,
+            counters.stream_error_count,
+        ),
+    )
 }
 
 const fn operator_input_stream_state_text(state: StreamState) -> &'static str {
@@ -8769,6 +8797,8 @@ fn apply_operator_input_monitor_observation(
     ui.set_input_callback_count(presentation.callback_count.into());
     ui.set_input_captured_frame_count(presentation.captured_frame_count.into());
     ui.set_input_dropped_frame_count(presentation.dropped_frame_count.into());
+    ui.set_input_startup_telemetry(presentation.startup_telemetry.into());
+    ui.set_input_integrity_telemetry(presentation.integrity_telemetry.into());
     ui.set_input_monitor_gain_percent(presentation.gain_percent);
     ui.set_input_monitor_muted(presentation.muted);
     ui.set_input_monitor_controls_enabled(presentation.authority.running());
@@ -9676,6 +9706,8 @@ mod tests {
         assert!(!disabled.authority.configured());
         assert_eq!(disabled.authority.state(), "DISABLED");
         assert!(!disabled.authority.running());
+        assert_eq!(disabled.startup_telemetry, "—");
+        assert_eq!(disabled.integrity_telemetry, "—");
 
         let unavailable = operator_input_monitor_presentation(true, None, None, None, false);
         assert_eq!(
@@ -9685,6 +9717,31 @@ mod tests {
         assert!(unavailable.authority.configured());
         assert_eq!(unavailable.authority.state(), "UNAVAILABLE");
         assert!(!unavailable.authority.running());
+        assert_eq!(unavailable.startup_telemetry, "—");
+        assert_eq!(unavailable.integrity_telemetry, "—");
+    }
+
+    #[test]
+    fn input_capture_telemetry_keeps_startup_exclusions_separate_from_later_faults() {
+        let (startup, integrity) = operator_input_capture_telemetry(CaptureStreamSnapshot {
+            startup_discarded_frame_count: 480,
+            startup_discontinuity_count: 1,
+            startup_timestamp_error_count: 2,
+            discontinuity_count: 3,
+            timestamp_error_count: 4,
+            unavailable_buffer_count: 5,
+            malformed_buffer_count: 6,
+            stream_error_count: 7,
+            ..CaptureStreamSnapshot::default()
+        });
+        assert_eq!(
+            startup,
+            "STARTUP EXCLUDED 480 FR · 1 DISCONTINUITY · 2 TIMESTAMP"
+        );
+        assert_eq!(
+            integrity,
+            "CAPTURE STREAM 3 DISCONTINUITY · 4 TIMESTAMP · 5 UNAVAILABLE · 6 MALFORMED · 7 ERROR"
+        );
     }
 
     #[test]

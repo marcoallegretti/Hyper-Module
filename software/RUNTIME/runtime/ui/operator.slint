@@ -645,6 +645,8 @@ export component OperatorWindow inherits Window {
     in property <string> input-callback-count: "—";
     in property <string> input-captured-frame-count: "—";
     in property <string> input-dropped-frame-count: "—";
+    in property <string> input-startup-telemetry: "—";
+    in property <string> input-integrity-telemetry: "—";
     in property <float> input-monitor-gain-percent: 0;
     in property <bool> input-monitor-muted: true;
     in property <bool> input-monitor-controls-enabled: false;
@@ -1210,7 +1212,7 @@ export component OperatorWindow inherits Window {
             border-color: #2c3445;
             border-width: 1px;
             border-radius: 8px;
-            min-height: root.input-monitor-configured ? 340px : 94px;
+            min-height: root.input-monitor-configured ? 378px : 94px;
             VerticalLayout {
                 padding: 12px;
                 spacing: 7px;
@@ -1276,6 +1278,8 @@ export component OperatorWindow inherits Window {
                         FactCard { label: "ACCEPTED FRAMES"; value: root.input-captured-frame-count; }
                         FactCard { label: "DROPPED FRAMES"; value: root.input-dropped-frame-count; }
                     }
+                    Text { text: root.input-startup-telemetry; color: #69778c; font-size: 10px; overflow: elide; }
+                    Text { text: root.input-integrity-telemetry; color: #69778c; font-size: 10px; overflow: elide; }
                     if root.input-meter-live : VerticalLayout {
                         spacing: 5px;
                         Text {
