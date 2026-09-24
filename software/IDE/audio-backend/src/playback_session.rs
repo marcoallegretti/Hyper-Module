@@ -430,6 +430,10 @@ impl Error for DesktopPlaybackSessionBuildError {
 pub enum DesktopPlaybackSessionStartError {
     Build(DesktopPlaybackSessionBuildError),
     Output(DesktopOutputStartError),
+    OutputCleanup {
+        source: Box<DesktopPlaybackSessionStartError>,
+        cleanup: DesktopOutputStopError,
+    },
     PublicationUnavailable,
     MonitoringCapacityUnavailable,
     MonitoringControl(DesktopMonitoringControlError),
@@ -445,6 +449,9 @@ impl fmt::Display for DesktopPlaybackSessionStartError {
         match self {
             Self::Build(source) => source.fmt(formatter),
             Self::Output(source) => source.fmt(formatter),
+            Self::OutputCleanup { source, cleanup } => {
+                write!(formatter, "{source}; output cleanup also failed: {cleanup}")
+            }
             Self::PublicationUnavailable => {
                 formatter.write_str("playback controls were unavailable after output startup")
             }
@@ -470,9 +477,11 @@ impl Error for DesktopPlaybackSessionStartError {
         match self {
             Self::Build(source) => Some(source),
             Self::Output(source) => Some(source),
+            Self::OutputCleanup { source, .. } | Self::Monitored { source, .. } => {
+                Some(source.as_ref())
+            }
             Self::MonitoringControl(source) => Some(source),
             Self::Input(source) => Some(source),
-            Self::Monitored { source, .. } => Some(source.as_ref()),
             Self::PublicationUnavailable | Self::MonitoringCapacityUnavailable => None,
         }
     }
@@ -1348,21 +1357,65 @@ impl DesktopPlaybackRecordingStartError {
         }
     }
 
-    /// Extracts the playback recovery authority after the caller has retained
-    /// or reported the transition error.
+    /// Retains the complete failed-start transaction until native threads and
+    /// the recording writer have settled. Playback cannot restart before then.
     #[must_use]
-    pub fn into_recovery(self) -> DesktopPlaybackRecovery {
-        match self {
-            Self::OutputNotPinned { recovery }
-            | Self::PlaybackUnavailable { recovery }
-            | Self::MonitoringUnavailable { recovery }
-            | Self::InputMismatch { recovery }
-            | Self::Monitoring { recovery, .. }
-            | Self::RecordingConfig { recovery, .. }
-            | Self::RecordingTransport { recovery, .. }
-            | Self::RecordingWriter { recovery, .. }
-            | Self::Input { recovery, .. }
-            | Self::Playback { recovery, .. } => *recovery,
+    pub fn into_recovery(self) -> DesktopPlaybackRecordingStartRecovery {
+        let input_failed = matches!(
+            &self,
+            Self::Playback {
+                input_cleanup: Some(DesktopInputStopError::RuntimeFailed),
+                ..
+            }
+        );
+        let input_panicked = matches!(
+            &self,
+            Self::Input {
+                source: DesktopInputStartError::ThreadPanicked,
+                ..
+            } | Self::Playback {
+                input_cleanup: Some(DesktopInputStopError::ThreadPanicked),
+                ..
+            }
+        );
+        let output_failed = matches!(
+            &self,
+            Self::Playback {
+                source,
+                ..
+            } if matches!(source.as_ref(), DesktopPlaybackSessionStartError::OutputCleanup {
+                cleanup: DesktopOutputStopError::RuntimeFailed, ..
+            })
+        );
+        let output_panicked = matches!(
+            &self,
+            Self::Playback {
+                source,
+                ..
+            } if matches!(source.as_ref(),
+                DesktopPlaybackSessionStartError::OutputCleanup {
+                    cleanup: DesktopOutputStopError::ThreadPanicked, ..
+                } | DesktopPlaybackSessionStartError::Output(
+                    DesktopOutputStartError::ThreadPanicked
+                )
+            )
+        );
+        DesktopPlaybackRecordingStartRecovery {
+            error: self,
+            input: if input_panicked {
+                DesktopPlaybackRecordingNativeSettlement::Panicked
+            } else if input_failed {
+                DesktopPlaybackRecordingNativeSettlement::Failed
+            } else {
+                DesktopPlaybackRecordingNativeSettlement::Clean
+            },
+            output: if output_panicked {
+                DesktopPlaybackRecordingNativeSettlement::Panicked
+            } else if output_failed {
+                DesktopPlaybackRecordingNativeSettlement::Failed
+            } else {
+                DesktopPlaybackRecordingNativeSettlement::Clean
+            },
         }
     }
 
@@ -1381,6 +1434,171 @@ impl DesktopPlaybackRecordingStartError {
             | Self::RecordingTransport { .. }
             | Self::RecordingWriter { .. } => None,
         }
+    }
+}
+
+/// Sole restart authority after a failed recording-capable playback start.
+/// Native teardown and writer settlement must both finish before it releases
+/// the stopped playback owner.
+#[derive(Debug)]
+pub struct DesktopPlaybackRecordingStartRecovery {
+    error: DesktopPlaybackRecordingStartError,
+    input: DesktopPlaybackRecordingNativeSettlement,
+    output: DesktopPlaybackRecordingNativeSettlement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesktopPlaybackRecordingNativeSettlement {
+    Clean,
+    Failed,
+    Panicked,
+}
+
+#[derive(Debug)]
+pub struct DesktopPlaybackRecordingStartSettlement {
+    pub recovery: DesktopPlaybackRecovery,
+    pub writer: Option<DesktopRecordingWriterSettlement>,
+    pub journal_path: Option<std::path::PathBuf>,
+    pub input: DesktopPlaybackRecordingNativeSettlement,
+    pub output: DesktopPlaybackRecordingNativeSettlement,
+}
+
+#[derive(Debug)]
+pub enum DesktopPlaybackRecordingStartRecoveryWait {
+    Settled(DesktopPlaybackRecordingStartSettlement),
+    TimedOut(DesktopPlaybackRecordingStartRecovery),
+}
+
+fn observe_recording_native_shutdown(
+    shutdown: &mut PendingNativeShutdown,
+    timeout: std::time::Duration,
+    settlement: &mut DesktopPlaybackRecordingNativeSettlement,
+) -> bool {
+    match shutdown.wait(timeout) {
+        PendingNativeShutdownWait::Completed => true,
+        PendingNativeShutdownWait::Failed => {
+            *settlement = DesktopPlaybackRecordingNativeSettlement::Failed;
+            true
+        }
+        PendingNativeShutdownWait::Panicked => {
+            *settlement = DesktopPlaybackRecordingNativeSettlement::Panicked;
+            true
+        }
+        PendingNativeShutdownWait::TimedOut => false,
+    }
+}
+
+impl DesktopPlaybackRecordingStartRecovery {
+    #[must_use]
+    pub fn journal_path(&self) -> Option<&std::path::Path> {
+        match &self.error {
+            DesktopPlaybackRecordingStartError::Input { journal_path, .. }
+            | DesktopPlaybackRecordingStartError::Playback { journal_path, .. } => {
+                Some(journal_path)
+            }
+            _ => None,
+        }
+    }
+
+    /// Waits within one shared deadline for the writer and every native owner.
+    /// Timeout returns this same exclusive restart authority for later polling.
+    #[must_use]
+    pub fn wait(
+        mut self,
+        timeout: std::time::Duration,
+    ) -> DesktopPlaybackRecordingStartRecoveryWait {
+        let started = std::time::Instant::now();
+        if let Some(writer) = (match &mut self.error {
+            DesktopPlaybackRecordingStartError::Input { writer, .. }
+            | DesktopPlaybackRecordingStartError::Playback { writer, .. } => Some(writer),
+            _ => None,
+        }) && let DesktopRecordingWriterSettlement::Pending(pending) = writer.as_mut()
+        {
+            match pending.wait(timeout.saturating_sub(started.elapsed())) {
+                Ok(completion) => {
+                    **writer = DesktopRecordingWriterSettlement::Completed(Box::new(completion));
+                }
+                Err(hyper_recording_worker::RecordingWorkerWaitError::TimedOut) => {
+                    return DesktopPlaybackRecordingStartRecoveryWait::TimedOut(self);
+                }
+                Err(error) => **writer = DesktopRecordingWriterSettlement::Failed(error),
+            }
+        }
+        let pending_input = match &mut self.error {
+            DesktopPlaybackRecordingStartError::Input {
+                source: DesktopInputStartError::CancellationPending { shutdown },
+                ..
+            }
+            | DesktopPlaybackRecordingStartError::Playback {
+                input_cleanup: Some(DesktopInputStopError::ShutdownPending { shutdown }),
+                ..
+            } => Some(shutdown.as_mut()),
+            _ => None,
+        };
+        if let Some(shutdown) = pending_input
+            && !observe_recording_native_shutdown(
+                shutdown,
+                timeout.saturating_sub(started.elapsed()),
+                &mut self.input,
+            )
+        {
+            return DesktopPlaybackRecordingStartRecoveryWait::TimedOut(self);
+        }
+        let pending_output = match &mut self.error {
+            DesktopPlaybackRecordingStartError::Playback { source, .. } => match source.as_mut() {
+                DesktopPlaybackSessionStartError::Output(
+                    DesktopOutputStartError::CancellationPending { shutdown },
+                )
+                | DesktopPlaybackSessionStartError::OutputCleanup {
+                    cleanup: DesktopOutputStopError::ShutdownPending { shutdown },
+                    ..
+                } => Some(shutdown.as_mut()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(shutdown) = pending_output
+            && !observe_recording_native_shutdown(
+                shutdown,
+                timeout.saturating_sub(started.elapsed()),
+                &mut self.output,
+            )
+        {
+            return DesktopPlaybackRecordingStartRecoveryWait::TimedOut(self);
+        }
+        let (recovery, writer, journal_path) = match self.error {
+            DesktopPlaybackRecordingStartError::OutputNotPinned { recovery }
+            | DesktopPlaybackRecordingStartError::PlaybackUnavailable { recovery }
+            | DesktopPlaybackRecordingStartError::MonitoringUnavailable { recovery }
+            | DesktopPlaybackRecordingStartError::InputMismatch { recovery }
+            | DesktopPlaybackRecordingStartError::Monitoring { recovery, .. }
+            | DesktopPlaybackRecordingStartError::RecordingConfig { recovery, .. }
+            | DesktopPlaybackRecordingStartError::RecordingTransport { recovery, .. }
+            | DesktopPlaybackRecordingStartError::RecordingWriter { recovery, .. } => {
+                (*recovery, None, None)
+            }
+            DesktopPlaybackRecordingStartError::Input {
+                recovery,
+                writer,
+                journal_path,
+                ..
+            }
+            | DesktopPlaybackRecordingStartError::Playback {
+                recovery,
+                writer,
+                journal_path,
+                ..
+            } => (*recovery, Some(*writer), Some(journal_path)),
+        };
+        DesktopPlaybackRecordingStartRecoveryWait::Settled(
+            DesktopPlaybackRecordingStartSettlement {
+                recovery,
+                writer,
+                journal_path,
+                input: self.input,
+                output: self.output,
+            },
+        )
     }
 }
 
@@ -1993,7 +2211,11 @@ impl DesktopPlaybackRecovery {
         error: DesktopPlaybackSessionStartError,
     ) -> DesktopPlaybackRecoveryStartError {
         match error {
-            DesktopPlaybackSessionStartError::Output(
+            DesktopPlaybackSessionStartError::OutputCleanup {
+                source: _,
+                cleanup: DesktopOutputStopError::ShutdownPending { shutdown },
+            }
+            | DesktopPlaybackSessionStartError::Output(
                 DesktopOutputStartError::CancellationPending { shutdown },
             ) => DesktopPlaybackRecoveryStartError::CancellationPending {
                 pending: Box::new(DesktopPlaybackRecoveryPendingStart {
@@ -2026,7 +2248,11 @@ impl DesktopPlaybackRecovery {
                 let output = match *nested {
                     DesktopPlaybackSessionStartError::Output(
                         DesktopOutputStartError::CancellationPending { shutdown },
-                    ) => Some(*shutdown),
+                    )
+                    | DesktopPlaybackSessionStartError::OutputCleanup {
+                        cleanup: DesktopOutputStopError::ShutdownPending { shutdown },
+                        ..
+                    } => Some(*shutdown),
                     nested => {
                         if input.is_none() {
                             self.source = Some(source);
@@ -2505,10 +2731,14 @@ impl DesktopPlaybackSession {
                     monitoring: None,
                     project_open_recovery: None,
                 }),
-                Ok(SessionPublication::Failed(source)) => {
-                    Err(DesktopPlaybackSessionStartError::Build(source))
-                }
-                Err(_) => Err(DesktopPlaybackSessionStartError::PublicationUnavailable),
+                Ok(SessionPublication::Failed(source)) => Err(failed_output_publication(
+                    output,
+                    DesktopPlaybackSessionStartError::Build(source),
+                )),
+                Err(_) => Err(failed_output_publication(
+                    output,
+                    DesktopPlaybackSessionStartError::PublicationUnavailable,
+                )),
             },
             Err(source) => Err(classify_output_start_failure(
                 source.into(),
@@ -3471,6 +3701,19 @@ fn classify_output_start_failure(
     }
 }
 
+fn failed_output_publication(
+    output: DesktopOutputStream,
+    source: DesktopPlaybackSessionStartError,
+) -> DesktopPlaybackSessionStartError {
+    match output.stop().err().map(DesktopOutputStopError::from) {
+        Some(cleanup) => DesktopPlaybackSessionStartError::OutputCleanup {
+            source: Box::new(source),
+            cleanup,
+        },
+        None => source,
+    }
+}
+
 struct SessionInitialization<'a> {
     input: &'a DesktopPlaybackSessionInput,
     recordings: &'a [hyper_recording_metadata::RecordingMetadataDocument],
@@ -4212,8 +4455,12 @@ mod tests {
         ));
         assert!(error.recovery().source.is_some());
         assert!(error.writer_settlement().is_none());
-        let recovered = error.into_recovery();
-        assert!(recovered.source.is_some());
+        let DesktopPlaybackRecordingStartRecoveryWait::Settled(settled) =
+            error.into_recovery().wait(Duration::ZERO)
+        else {
+            panic!("pre-native refusal cannot own a pending startup");
+        };
+        assert!(settled.recovery.source.is_some());
     }
 
     #[test]
@@ -4230,7 +4477,12 @@ mod tests {
             &error,
             DesktopPlaybackRecordingStartError::MonitoringUnavailable { .. }
         ));
-        assert!(error.into_recovery().source.is_some());
+        assert!(matches!(
+            error.into_recovery().wait(Duration::ZERO),
+            DesktopPlaybackRecordingStartRecoveryWait::Settled(
+                DesktopPlaybackRecordingStartSettlement { writer: None, .. }
+            )
+        ));
     }
 
     #[test]
@@ -4262,7 +4514,12 @@ mod tests {
             &error,
             DesktopPlaybackRecordingStartError::InputMismatch { .. }
         ));
-        assert!(error.into_recovery().source.is_some());
+        assert!(matches!(
+            error.into_recovery().wait(Duration::ZERO),
+            DesktopPlaybackRecordingStartRecoveryWait::Settled(
+                DesktopPlaybackRecordingStartSettlement { writer: None, .. }
+            )
+        ));
     }
 
     #[test]
@@ -4296,8 +4553,274 @@ mod tests {
                 ..
             }
         ));
-        assert!(error.into_recovery().source.is_some());
+        assert!(matches!(
+            error.into_recovery().wait(Duration::ZERO),
+            DesktopPlaybackRecordingStartRecoveryWait::Settled(
+                DesktopPlaybackRecordingStartSettlement { writer: None, .. }
+            )
+        ));
         assert!(fs::read_dir(&directory).unwrap().next().is_none());
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn recording_start_failure_keeps_input_shutdown_and_writer_before_recovery() {
+        let (shutdown, release) = pending_shutdown_fixture();
+        let journal_path = Path::new("unpublished-take.journal").to_path_buf();
+        let error = DesktopPlaybackRecordingStartError::Input {
+            journal_path: journal_path.clone(),
+            source: DesktopInputStartError::CancellationPending {
+                shutdown: Box::new(shutdown),
+            },
+            writer: Box::new(DesktopRecordingWriterSettlement::Completed(Box::new(
+                RecordingWorkerCompletion::Aborted {
+                    frames: 0,
+                    journal_path: journal_path.clone(),
+                },
+            ))),
+            recovery: Box::new(recording_recovery(
+                DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+                None,
+            )),
+        };
+        let DesktopPlaybackRecordingStartRecoveryWait::TimedOut(pending) =
+            error.into_recovery().wait(Duration::ZERO)
+        else {
+            panic!("pending input must retain the restart authority");
+        };
+        release.send(()).unwrap();
+        let DesktopPlaybackRecordingStartRecoveryWait::Settled(settled) =
+            pending.wait(Duration::from_secs(1))
+        else {
+            panic!("joined input must release the restart authority");
+        };
+        assert!(settled.recovery.source.is_some());
+        assert_eq!(
+            settled.journal_path.as_deref(),
+            Some(journal_path.as_path())
+        );
+        assert!(matches!(
+            settled.writer,
+            Some(DesktopRecordingWriterSettlement::Completed(completion))
+                if matches!(*completion, RecordingWorkerCompletion::Aborted { .. })
+        ));
+    }
+
+    #[test]
+    fn recording_start_failure_waits_for_input_and_output_and_remembers_native_failure() {
+        let status = OutputStreamStatus::default();
+        status.mark_failed();
+        let (input, release_input) = pending_shutdown_fixture_with_status(status);
+        let (output, release_output) = pending_shutdown_fixture();
+        let journal_path = Path::new("unpublished-take.journal").to_path_buf();
+        let error = DesktopPlaybackRecordingStartError::Playback {
+            journal_path: journal_path.clone(),
+            source: Box::new(DesktopPlaybackSessionStartError::Output(
+                DesktopOutputStartError::CancellationPending {
+                    shutdown: Box::new(output),
+                },
+            )),
+            input_cleanup: Some(DesktopInputStopError::ShutdownPending {
+                shutdown: Box::new(input),
+            }),
+            writer: Box::new(DesktopRecordingWriterSettlement::Completed(Box::new(
+                RecordingWorkerCompletion::Aborted {
+                    frames: 0,
+                    journal_path,
+                },
+            ))),
+            recovery: Box::new(recording_recovery(
+                DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+                None,
+            )),
+        };
+        release_input.send(()).unwrap();
+        let DesktopPlaybackRecordingStartRecoveryWait::TimedOut(pending) =
+            error.into_recovery().wait(Duration::from_millis(50))
+        else {
+            panic!("pending output must retain restart authority after input settles");
+        };
+        release_output.send(()).unwrap();
+        let DesktopPlaybackRecordingStartRecoveryWait::Settled(settled) =
+            pending.wait(Duration::from_secs(1))
+        else {
+            panic!("both native owners must settle");
+        };
+        assert_eq!(
+            settled.input,
+            DesktopPlaybackRecordingNativeSettlement::Failed
+        );
+        assert_eq!(
+            settled.output,
+            DesktopPlaybackRecordingNativeSettlement::Clean
+        );
+        assert!(settled.recovery.source.is_some());
+    }
+
+    #[test]
+    fn recording_start_failure_keeps_post_publication_output_cleanup() {
+        let (shutdown, release) = pending_shutdown_fixture();
+        let journal_path = Path::new("unpublished-take.journal").to_path_buf();
+        let error = DesktopPlaybackRecordingStartError::Playback {
+            journal_path: journal_path.clone(),
+            source: Box::new(DesktopPlaybackSessionStartError::OutputCleanup {
+                source: Box::new(DesktopPlaybackSessionStartError::PublicationUnavailable),
+                cleanup: DesktopOutputStopError::ShutdownPending {
+                    shutdown: Box::new(shutdown),
+                },
+            }),
+            input_cleanup: None,
+            writer: Box::new(DesktopRecordingWriterSettlement::Completed(Box::new(
+                RecordingWorkerCompletion::Aborted {
+                    frames: 0,
+                    journal_path,
+                },
+            ))),
+            recovery: Box::new(recording_recovery(
+                DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+                None,
+            )),
+        };
+        let DesktopPlaybackRecordingStartRecoveryWait::TimedOut(pending) =
+            error.into_recovery().wait(Duration::ZERO)
+        else {
+            panic!("post-publication output shutdown must gate recovery");
+        };
+        release.send(()).unwrap();
+        assert!(matches!(
+            pending.wait(Duration::from_secs(1)),
+            DesktopPlaybackRecordingStartRecoveryWait::Settled(_)
+        ));
+    }
+
+    #[test]
+    fn recording_start_failure_preserves_terminal_input_and_output_cleanup_evidence() {
+        let journal_path = Path::new("unpublished-take.journal").to_path_buf();
+        let error = DesktopPlaybackRecordingStartError::Playback {
+            journal_path: journal_path.clone(),
+            source: Box::new(DesktopPlaybackSessionStartError::OutputCleanup {
+                source: Box::new(DesktopPlaybackSessionStartError::PublicationUnavailable),
+                cleanup: DesktopOutputStopError::RuntimeFailed,
+            }),
+            input_cleanup: Some(DesktopInputStopError::ThreadPanicked),
+            writer: Box::new(DesktopRecordingWriterSettlement::Completed(Box::new(
+                RecordingWorkerCompletion::Aborted {
+                    frames: 0,
+                    journal_path,
+                },
+            ))),
+            recovery: Box::new(recording_recovery(
+                DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+                None,
+            )),
+        };
+        let DesktopPlaybackRecordingStartRecoveryWait::Settled(settled) =
+            error.into_recovery().wait(Duration::ZERO)
+        else {
+            panic!("terminal cleanup must not invent pending ownership");
+        };
+        assert_eq!(
+            settled.input,
+            DesktopPlaybackRecordingNativeSettlement::Panicked
+        );
+        assert_eq!(
+            settled.output,
+            DesktopPlaybackRecordingNativeSettlement::Failed
+        );
+    }
+
+    #[test]
+    fn recording_start_failure_retains_terminal_output_panic_while_input_is_pending() {
+        let (shutdown, release) = pending_shutdown_fixture();
+        let journal_path = Path::new("unpublished-take.journal").to_path_buf();
+        let error = DesktopPlaybackRecordingStartError::Playback {
+            journal_path: journal_path.clone(),
+            source: Box::new(DesktopPlaybackSessionStartError::OutputCleanup {
+                source: Box::new(DesktopPlaybackSessionStartError::PublicationUnavailable),
+                cleanup: DesktopOutputStopError::ThreadPanicked,
+            }),
+            input_cleanup: Some(DesktopInputStopError::ShutdownPending {
+                shutdown: Box::new(shutdown),
+            }),
+            writer: Box::new(DesktopRecordingWriterSettlement::Completed(Box::new(
+                RecordingWorkerCompletion::Aborted {
+                    frames: 0,
+                    journal_path,
+                },
+            ))),
+            recovery: Box::new(recording_recovery(
+                DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+                None,
+            )),
+        };
+        let DesktopPlaybackRecordingStartRecoveryWait::TimedOut(pending) =
+            error.into_recovery().wait(Duration::ZERO)
+        else {
+            panic!("input shutdown must remain pending");
+        };
+        release.send(()).unwrap();
+        let DesktopPlaybackRecordingStartRecoveryWait::Settled(settled) =
+            pending.wait(Duration::from_secs(1))
+        else {
+            panic!("input shutdown should complete");
+        };
+        assert_eq!(
+            settled.output,
+            DesktopPlaybackRecordingNativeSettlement::Panicked
+        );
+        assert_eq!(
+            settled.input,
+            DesktopPlaybackRecordingNativeSettlement::Clean
+        );
+    }
+
+    #[test]
+    fn recording_start_failure_retains_a_real_pending_writer_until_journal_settlement() {
+        let directory = std::env::temp_dir().join(format!(
+            "hyper-playback-pending-writer-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let mut recording = recording_config(recording_input("recording-input"), &directory);
+        recording.completion_timeout = Duration::from_millis(1);
+        let Ok((producer, core)) = start_recording_core(recording) else {
+            panic!("the pending-writer fixture must start a real journal worker");
+        };
+        let journal_path = core.journal_path().to_path_buf();
+        let writer = core.abort_and_settle();
+        assert!(matches!(
+            writer,
+            DesktopRecordingWriterSettlement::Pending(_)
+        ));
+
+        let error = DesktopPlaybackRecordingStartError::Input {
+            journal_path: journal_path.clone(),
+            source: DesktopInputStartError::ThreadTerminated,
+            writer: Box::new(writer),
+            recovery: Box::new(recording_recovery(
+                DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+                None,
+            )),
+        };
+        let DesktopPlaybackRecordingStartRecoveryWait::TimedOut(pending) =
+            error.into_recovery().wait(Duration::ZERO)
+        else {
+            panic!("an open producer must keep the abort writer pending");
+        };
+        drop(producer);
+        let DesktopPlaybackRecordingStartRecoveryWait::Settled(settled) =
+            pending.wait(Duration::from_secs(5))
+        else {
+            panic!("closing the producer must permit terminal writer settlement");
+        };
+        assert!(settled.recovery.source.is_some());
+        assert!(matches!(
+            settled.writer,
+            Some(DesktopRecordingWriterSettlement::Completed(completion))
+                if matches!(*completion, RecordingWorkerCompletion::Aborted { .. })
+        ));
+        fs::remove_file(journal_path).unwrap();
         fs::remove_dir(directory).unwrap();
     }
 

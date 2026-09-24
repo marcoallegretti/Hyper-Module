@@ -32,12 +32,15 @@ use hyper_control_runtime::{
 use hyper_desktop_audio::{
     CaptureStreamCounters, DesktopControlSinkError, DesktopMixerSendTap, DesktopMonitoringConfig,
     DesktopMonitoringControl, DesktopNativeDevice, DesktopOutputStopError,
-    DesktopPlaybackRecordingSession, DesktopPlaybackRecovery, DesktopPlaybackRecoveryPendingStart,
-    DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopFailure,
-    DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackRecoveryPendingWait,
-    DesktopPlaybackRecoveryStopError, DesktopPlaybackSession, DesktopSceneAvailability,
-    InputMeterReceiver, OutputStreamCounters, OutputStreamSnapshot, OutputStreamState,
-    OutputStreamStatus, StreamState, StreamStatus,
+    DesktopPlaybackRecordingNativeSettlement, DesktopPlaybackRecordingSession,
+    DesktopPlaybackRecordingStartRecovery, DesktopPlaybackRecordingStartRecoveryWait,
+    DesktopPlaybackRecordingStartSettlement, DesktopPlaybackRecovery,
+    DesktopPlaybackRecoveryPendingStart, DesktopPlaybackRecoveryPendingStop,
+    DesktopPlaybackRecoveryPendingStopFailure, DesktopPlaybackRecoveryPendingStopWait,
+    DesktopPlaybackRecoveryPendingWait, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
+    DesktopRecordingWriterSettlement, DesktopSceneAvailability, InputMeterReceiver,
+    OutputStreamCounters, OutputStreamSnapshot, OutputStreamState, OutputStreamStatus, StreamState,
+    StreamStatus,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
@@ -170,11 +173,13 @@ impl RuntimePlaybackOwner {
             RuntimePlaybackOwnerState::PendingStop { .. }
             | RuntimePlaybackOwnerState::Recovery { .. }
             | RuntimePlaybackOwnerState::PendingStart(_)
+            | RuntimePlaybackOwnerState::PendingRecordingStart(_)
             | RuntimePlaybackOwnerState::StopError { .. }
             | RuntimePlaybackOwnerState::ShutdownPlayback(_)
             | RuntimePlaybackOwnerState::ShutdownRecovery(_)
             | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
             | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
+            | RuntimePlaybackOwnerState::ShutdownPendingRecordingStart(_)
             | RuntimePlaybackOwnerState::ShutdownStopError(_) => None,
         }
     }
@@ -186,11 +191,13 @@ impl RuntimePlaybackOwner {
             RuntimePlaybackOwnerState::PendingStop { .. }
             | RuntimePlaybackOwnerState::Recovery { .. }
             | RuntimePlaybackOwnerState::PendingStart(_)
+            | RuntimePlaybackOwnerState::PendingRecordingStart(_)
             | RuntimePlaybackOwnerState::StopError { .. }
             | RuntimePlaybackOwnerState::ShutdownPlayback(_)
             | RuntimePlaybackOwnerState::ShutdownRecovery(_)
             | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
             | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
+            | RuntimePlaybackOwnerState::ShutdownPendingRecordingStart(_)
             | RuntimePlaybackOwnerState::ShutdownStopError(_) => None,
         }
     }
@@ -217,11 +224,13 @@ impl RuntimePlaybackOwner {
                 RuntimePlaybackOwnerState::PendingStop { .. }
                     | RuntimePlaybackOwnerState::Recovery { .. }
                     | RuntimePlaybackOwnerState::PendingStart(_)
+                    | RuntimePlaybackOwnerState::PendingRecordingStart(_)
                     | RuntimePlaybackOwnerState::StopError { .. }
                     | RuntimePlaybackOwnerState::ShutdownPlayback(_)
                     | RuntimePlaybackOwnerState::ShutdownRecovery(_)
                     | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
                     | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
+                    | RuntimePlaybackOwnerState::ShutdownPendingRecordingStart(_)
                     | RuntimePlaybackOwnerState::ShutdownStopError(_)
             )
         )
@@ -430,6 +439,10 @@ impl RuntimePlaybackOwner {
                 ))
             }
             (
+                RuntimePlaybackShutdownAction::RetainPendingStart,
+                RuntimePlaybackOwnerState::PendingRecordingStart(pending),
+            ) => self.settle_failed_recording_start_for_shutdown(*pending),
+            (
                 RuntimePlaybackShutdownAction::RetainStopError,
                 RuntimePlaybackOwnerState::StopError { error, .. },
             ) => {
@@ -444,6 +457,7 @@ impl RuntimePlaybackOwner {
                 | RuntimePlaybackOwnerState::ShutdownRecovery(_)
                 | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
                 | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
+                | RuntimePlaybackOwnerState::ShutdownPendingRecordingStart(_)
                 | RuntimePlaybackOwnerState::ShutdownStopError(_)),
             ) => {
                 self.state = Some(state);
@@ -453,6 +467,41 @@ impl RuntimePlaybackOwner {
         };
         self.refresh_recording_observation();
         result
+    }
+
+    fn settle_failed_recording_start_for_shutdown(
+        &mut self,
+        pending: DesktopPlaybackRecordingStartRecovery,
+    ) -> Result<Option<String>, String> {
+        match pending.wait(Duration::from_secs(1)) {
+            DesktopPlaybackRecordingStartRecoveryWait::Settled(settlement) => {
+                let failed = recording_start_settlement_failed(&settlement);
+                let message = format!(
+                    "Runtime shutdown settled failed recording startup: {}",
+                    describe_recording_start_settlement(&settlement)
+                );
+                self.state = Some(RuntimePlaybackOwnerState::ShutdownRecovery(Box::new(
+                    settlement.recovery,
+                )));
+                if failed {
+                    Err(message)
+                } else {
+                    Ok(Some(message))
+                }
+            }
+            DesktopPlaybackRecordingStartRecoveryWait::TimedOut(pending) => {
+                let journal = pending.journal_path().map_or_else(
+                    || "not created".to_owned(),
+                    |path| path.display().to_string(),
+                );
+                self.state = Some(RuntimePlaybackOwnerState::ShutdownPendingRecordingStart(
+                    Box::new(pending),
+                ));
+                Err(format!(
+                    "Runtime shutdown could not settle failed recording startup within one second; writer/native outcome unresolved; journal location (not proven recoverable): {journal}; no replacement owner started"
+                ))
+            }
+        }
     }
 
     fn abort_active_recording_for_shutdown(
@@ -556,6 +605,7 @@ impl RuntimePlaybackOwner {
             | RuntimePlaybackOwnerState::ShutdownRecovery(_)
             | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
             | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
+            | RuntimePlaybackOwnerState::ShutdownPendingRecordingStart(_)
             | RuntimePlaybackOwnerState::ShutdownStopError(_)) => {
                 self.retain_without_progress(state)
             }
@@ -587,6 +637,9 @@ impl RuntimePlaybackOwner {
                 }
             }
             RuntimePlaybackOwnerState::PendingStart(pending) => self.poll_pending_start(pending),
+            RuntimePlaybackOwnerState::PendingRecordingStart(pending) => {
+                self.poll_pending_recording_start(*pending)
+            }
             RuntimePlaybackOwnerState::StopError { error, action } => {
                 match (*error).into_recovery() {
                     Ok(recovery) => self.advance_recovery(recovery, action, None),
@@ -695,6 +748,68 @@ impl RuntimePlaybackOwner {
         }
     }
 
+    fn poll_pending_recording_start(
+        &mut self,
+        pending: DesktopPlaybackRecordingStartRecovery,
+    ) -> RuntimePlaybackOwnerPoll {
+        self.settle_recording_start(pending.wait(Duration::ZERO), None)
+    }
+
+    fn settle_recording_start(
+        &mut self,
+        outcome: DesktopPlaybackRecordingStartRecoveryWait,
+        prefix: Option<String>,
+    ) -> RuntimePlaybackOwnerPoll {
+        match outcome {
+            DesktopPlaybackRecordingStartRecoveryWait::TimedOut(pending) => {
+                self.state = Some(RuntimePlaybackOwnerState::PendingRecordingStart(Box::new(
+                    pending,
+                )));
+                RuntimePlaybackOwnerPoll {
+                    message: prefix.map(|prefix| format!(
+                        "{prefix}; waiting for failed recording startup to release native and writer ownership"
+                    )),
+                    playback_replaced: false,
+                    terminal_output_failure: false,
+                }
+            }
+            DesktopPlaybackRecordingStartRecoveryWait::Settled(settlement) => {
+                self.restart_settled_recording_start(settlement, prefix)
+            }
+        }
+    }
+
+    fn restart_settled_recording_start(
+        &mut self,
+        settlement: DesktopPlaybackRecordingStartSettlement,
+        prefix: Option<String>,
+    ) -> RuntimePlaybackOwnerPoll {
+        let output_failed = settlement.output != DesktopPlaybackRecordingNativeSettlement::Clean;
+        let message =
+            join_runtime_messages(prefix, describe_recording_start_settlement(&settlement));
+        match route_pending_stop_recovery(
+            settlement.recovery,
+            RuntimePlaybackRecoveryAction::RestoreFinalizedRecordingPlayback,
+            output_failed,
+        ) {
+            RuntimePendingStopRecoveryRoute::RetainForShutdown(recovery) => {
+                self.state = Some(RuntimePlaybackOwnerState::ShutdownRecovery(Box::new(
+                    recovery,
+                )));
+                RuntimePlaybackOwnerPoll {
+                    message: Some(format!(
+                        "{message}; terminal output failure prevented playback restart"
+                    )),
+                    playback_replaced: false,
+                    terminal_output_failure: true,
+                }
+            }
+            RuntimePendingStopRecoveryRoute::Continue { recovery, .. } => {
+                self.restart_playback(recovery, Some(message))
+            }
+        }
+    }
+
     fn advance_recovery(
         &mut self,
         recovery: DesktopPlaybackRecovery,
@@ -738,7 +853,10 @@ impl RuntimePlaybackOwner {
                             prefix,
                             format!("Runtime recording start failed: {error}"),
                         );
-                        self.restart_playback(error.into_recovery(), Some(message))
+                        self.settle_recording_start(
+                            error.into_recovery().wait(Duration::ZERO),
+                            Some(message),
+                        )
                     }
                 }
             }
@@ -949,6 +1067,12 @@ impl RuntimePlaybackOwner {
                 false,
                 false,
             ),
+            Some(RuntimePlaybackOwnerState::PendingRecordingStart(_)) => (
+                "Waiting for failed recording startup to settle native and writer ownership"
+                    .to_owned(),
+                false,
+                false,
+            ),
             Some(RuntimePlaybackOwnerState::StopError { .. }) => (
                 "Playback shutdown authority is retained; no replacement owner has started"
                     .to_owned(),
@@ -960,6 +1084,7 @@ impl RuntimePlaybackOwner {
                 | RuntimePlaybackOwnerState::ShutdownRecovery(_)
                 | RuntimePlaybackOwnerState::ShutdownPendingStop(_)
                 | RuntimePlaybackOwnerState::ShutdownPendingStart(_)
+                | RuntimePlaybackOwnerState::ShutdownPendingRecordingStart(_)
                 | RuntimePlaybackOwnerState::ShutdownStopError(_)),
             ) => (runtime_shutdown_recording_observation(state), false, false),
             None => (
@@ -998,6 +1123,13 @@ fn runtime_shutdown_recording_observation(state: &RuntimePlaybackOwnerState) -> 
             pending.input_status().map(|status| status.state()),
             pending.output_status().map(|status| status.state())
         ),
+        RuntimePlaybackOwnerState::ShutdownPendingRecordingStart(pending) => format!(
+            "Runtime shutdown retains failed recording startup and writer ownership; journal: {}",
+            pending.journal_path().map_or_else(
+                || "not created".to_owned(),
+                |path| path.display().to_string()
+            )
+        ),
         RuntimePlaybackOwnerState::ShutdownStopError(error) => {
             format!("Runtime shutdown retains playback stop evidence: {error}")
         }
@@ -1006,6 +1138,7 @@ fn runtime_shutdown_recording_observation(state: &RuntimePlaybackOwnerState) -> 
         | RuntimePlaybackOwnerState::PendingStop { .. }
         | RuntimePlaybackOwnerState::Recovery { .. }
         | RuntimePlaybackOwnerState::PendingStart(_)
+        | RuntimePlaybackOwnerState::PendingRecordingStart(_)
         | RuntimePlaybackOwnerState::StopError { .. } => {
             unreachable!("only shutdown-retained owners have shutdown observations")
         }
@@ -1025,6 +1158,75 @@ fn initial_runtime_recording_state(
     } else {
         "Waiting for committed Runtime playback recovery".to_owned()
     }
+}
+
+fn describe_recording_start_settlement(
+    settlement: &DesktopPlaybackRecordingStartSettlement,
+) -> String {
+    let writer = match settlement.writer.as_ref() {
+        Some(DesktopRecordingWriterSettlement::Completed(completion)) => {
+            match completion.as_ref() {
+                RecordingWorkerCompletion::Aborted {
+                    frames,
+                    journal_path,
+                } => format!(
+                    "recording writer aborted after {frames} frame(s); journal: {}",
+                    journal_path.display()
+                ),
+                RecordingWorkerCompletion::Failed {
+                    frames,
+                    journal_path,
+                    error,
+                } => format!(
+                    "recording writer failed after {frames} frame(s); journal: {}; {error}",
+                    journal_path.as_ref().map_or_else(
+                        || "unavailable".to_owned(),
+                        |path| path.display().to_string()
+                    )
+                ),
+                RecordingWorkerCompletion::Published(recording) => format!(
+                    "recording writer unexpectedly published {}",
+                    recording.final_wav_path().display()
+                ),
+            }
+        }
+        Some(DesktopRecordingWriterSettlement::Failed(error)) => format!(
+            "recording writer settlement failed for {}: {error}",
+            settlement.journal_path.as_ref().map_or_else(
+                || "unknown journal".to_owned(),
+                |path| path.display().to_string()
+            )
+        ),
+        Some(DesktopRecordingWriterSettlement::Pending(_)) => {
+            unreachable!("settled recording startup still owns a pending writer")
+        }
+        None => "recording writer was not started".to_owned(),
+    };
+    let input = match settlement.input {
+        DesktopPlaybackRecordingNativeSettlement::Clean => "input teardown settled",
+        DesktopPlaybackRecordingNativeSettlement::Failed => "input teardown failed",
+        DesktopPlaybackRecordingNativeSettlement::Panicked => "input teardown panicked",
+    };
+    let output = match settlement.output {
+        DesktopPlaybackRecordingNativeSettlement::Clean => "output teardown settled",
+        DesktopPlaybackRecordingNativeSettlement::Failed => "output teardown failed",
+        DesktopPlaybackRecordingNativeSettlement::Panicked => "output teardown panicked",
+    };
+    format!("{writer}; {input}; {output}")
+}
+
+fn recording_start_settlement_failed(settlement: &DesktopPlaybackRecordingStartSettlement) -> bool {
+    let writer_failed = match settlement.writer.as_ref() {
+        Some(DesktopRecordingWriterSettlement::Failed(_)) => true,
+        Some(DesktopRecordingWriterSettlement::Completed(completion)) => matches!(
+            completion.as_ref(),
+            RecordingWorkerCompletion::Failed { .. } | RecordingWorkerCompletion::Published(_)
+        ),
+        Some(DesktopRecordingWriterSettlement::Pending(_)) | None => false,
+    };
+    settlement.input != DesktopPlaybackRecordingNativeSettlement::Clean
+        || settlement.output != DesktopPlaybackRecordingNativeSettlement::Clean
+        || writer_failed
 }
 
 fn join_runtime_messages(prefix: Option<String>, message: String) -> String {
@@ -1166,6 +1368,7 @@ enum RuntimePlaybackOwnerState {
         retry_at: Instant,
     },
     PendingStart(Box<DesktopPlaybackRecoveryPendingStart>),
+    PendingRecordingStart(Box<DesktopPlaybackRecordingStartRecovery>),
     StopError {
         error: Box<DesktopPlaybackRecoveryStopError>,
         action: RuntimePlaybackRecoveryAction,
@@ -1174,6 +1377,7 @@ enum RuntimePlaybackOwnerState {
     ShutdownRecovery(Box<DesktopPlaybackRecovery>),
     ShutdownPendingStop(Box<DesktopPlaybackRecoveryPendingStop>),
     ShutdownPendingStart(Box<DesktopPlaybackRecoveryPendingStart>),
+    ShutdownPendingRecordingStart(Box<DesktopPlaybackRecordingStartRecovery>),
     ShutdownStopError(Box<DesktopPlaybackRecoveryStopError>),
 }
 
@@ -1184,12 +1388,15 @@ impl RuntimePlaybackOwnerState {
             Self::Recording { .. } => RuntimePlaybackOwnerPhase::Recording,
             Self::PendingStop { .. } => RuntimePlaybackOwnerPhase::PendingStop,
             Self::Recovery { .. } => RuntimePlaybackOwnerPhase::Recovery,
-            Self::PendingStart(_) => RuntimePlaybackOwnerPhase::PendingStart,
+            Self::PendingStart(_) | Self::PendingRecordingStart(_) => {
+                RuntimePlaybackOwnerPhase::PendingStart
+            }
             Self::StopError { .. } => RuntimePlaybackOwnerPhase::StopError,
             Self::ShutdownPlayback(_)
             | Self::ShutdownRecovery(_)
             | Self::ShutdownPendingStop(_)
             | Self::ShutdownPendingStart(_)
+            | Self::ShutdownPendingRecordingStart(_)
             | Self::ShutdownStopError(_) => RuntimePlaybackOwnerPhase::ShutdownRetained,
         }
     }
