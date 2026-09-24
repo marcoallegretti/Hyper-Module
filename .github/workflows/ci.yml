@@ -201,8 +201,8 @@ jobs:
             printf 'matrix_os=%s\n' "$MATRIX_OS"
             printf 'runner_os=%s\n' "$RUNNER_OS"
             printf 'runner_arch=%s\n' "$RUNNER_ARCH"
-            printf 'report.optimized-applications.log=cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-fs-authority -p hyper-audio-source\n'
-            printf 'report.application-inspection-smoke.log=optimized hyper-desktop-ui and hyper-runtime help/version commands\n'
+            printf 'report.optimized-applications.log=cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-recording-journal -p hyper-fs-authority -p hyper-audio-source\n'
+            printf 'report.application-inspection-smoke.log=optimized hyper-desktop-ui, hyper-runtime, and hyper-recording-recover help/version commands\n'
             printf 'report.package-deployment-smoke.log=extracted kit deployment\n'
             printf 'report.native-deployment-promotion.log=native Runtime promotion and offline render of extracted kit deployment\n'
           } > "$REPORT_DIR/manifest.txt"
@@ -218,7 +218,7 @@ jobs:
 
       - name: Build optimized applications and deployment helpers
         shell: bash
-        run: cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-fs-authority -p hyper-audio-source 2>&1 | tee "$REPORT_DIR/optimized-applications.log"
+        run: cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-recording-journal -p hyper-fs-authority -p hyper-audio-source 2>&1 | tee "$REPORT_DIR/optimized-applications.log"
 
       - name: Smoke-test optimized application inspection commands
         shell: bash
@@ -229,11 +229,14 @@ jobs:
           fi
           desktop_ide="./target/release/hyper-desktop-ui${suffix}"
           runtime="./target/release/hyper-runtime${suffix}"
+          recording_recover="./target/release/hyper-recording-recover${suffix}"
           {
             "$desktop_ide" --help &&
               "$desktop_ide" --version &&
               "$runtime" --help &&
-              "$runtime" --version
+              "$runtime" --version &&
+              "$recording_recover" --help &&
+              "$recording_recover" --version
           } 2>&1 | tee "$REPORT_DIR/application-inspection-smoke.log"
 
       - name: Install Node.js for local deployment kit
@@ -254,19 +257,21 @@ jobs:
           output="$RUNNER_TEMP/hyper-module-linux-x86_64"
           kit="$output/deployment-kit"
           mkdir -p "$kit/bin"
-          cp target/release/hyper-desktop-ui target/release/hyper-runtime README.md THIRD_PARTY_NOTICES.md "$output"
+          cp target/release/hyper-desktop-ui target/release/hyper-runtime target/release/hyper-recording-recover README.md THIRD_PARTY_NOTICES.md "$output"
           cp contracts/package.json contracts/package-lock.json contracts/THIRD_PARTY_NOTICES.md "$kit"
           cp contracts/fixtures/valid/deployment-storage-policy.json "$kit/storage-policy.example.json"
           cp -R contracts/lib contracts/scripts contracts/schemas contracts/node_modules "$kit"
           cp target/release/hyper-fs-authority "$kit/bin"
           cp target/release/hyper-audio-validate "$kit/bin"
           archive="$RUNNER_TEMP/hyper-module-linux-x86_64.tar.gz"
-          tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner --format=gnu -I 'gzip -n' -cf "$archive" -C "$output" hyper-desktop-ui hyper-runtime README.md THIRD_PARTY_NOTICES.md deployment-kit
+          tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner --format=gnu -I 'gzip -n' -cf "$archive" -C "$output" hyper-desktop-ui hyper-runtime hyper-recording-recover README.md THIRD_PARTY_NOTICES.md deployment-kit
           sha256sum "$archive" | sed "s|  $archive|  hyper-module-linux-x86_64.tar.gz|" > "$archive.sha256"
           extract="$RUNNER_TEMP/hyper-module-linux-extracted"
           smoke="$RUNNER_TEMP/hyper-module-linux-deployment-smoke"
           mkdir -p "$extract" "$smoke"
           tar -xzf "$archive" -C "$extract"
+          "$extract/hyper-recording-recover" --help >/dev/null
+          "$extract/hyper-recording-recover" --version
           runtime_version=$("$extract/hyper-runtime" --version | awk '{print $2}')
           node "$extract/deployment-kit/scripts/smoke-packaged-deployment.mjs" "$smoke" "$runtime_version" 2>&1 | tee "$REPORT_DIR/package-deployment-smoke.log"
           HYPER_CONTRACT_DEPLOYMENT_TARGET="$smoke/target" HYPER_CONTRACT_DEPLOYMENT_MODE=promote HYPER_CONTRACT_RUNTIME_VERSION="$runtime_version" HYPER_CONTRACT_EXPECT_MEDIA=one-active-audio-clip \
@@ -282,6 +287,7 @@ jobs:
           New-Item -ItemType Directory -Path $output -Force | Out-Null
           Copy-Item -LiteralPath "target/release/hyper-desktop-ui.exe" -Destination $output
           Copy-Item -LiteralPath "target/release/hyper-runtime.exe" -Destination $output
+          Copy-Item -LiteralPath "target/release/hyper-recording-recover.exe" -Destination $output
           Copy-Item -LiteralPath "README.md" -Destination $output
           Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" -Destination $output
           $kit = Join-Path $output "deployment-kit"
@@ -318,6 +324,10 @@ jobs:
           $smoke = Join-Path $env:RUNNER_TEMP "hyper-module-windows-deployment-smoke"
           New-Item -ItemType Directory -Path $smoke -Force | Out-Null
           Expand-Archive -LiteralPath $archive -DestinationPath $extract
+          & (Join-Path $extract "hyper-recording-recover.exe") --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "extracted recording recovery help failed" }
+          & (Join-Path $extract "hyper-recording-recover.exe") --version
+          if ($LASTEXITCODE -ne 0) { throw "extracted recording recovery version failed" }
           $runtimeVersion = (& (Join-Path $extract "hyper-runtime.exe") --version).Split(' ')[-1]
           $smokeScript = Join-Path $extract "deployment-kit/scripts/smoke-packaged-deployment.mjs"
           $smokeLog = Join-Path $env:REPORT_DIR "package-deployment-smoke.log"

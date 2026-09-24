@@ -56,17 +56,39 @@ operator, and external-update directories. Recording requires an explicitly
 pinned output, selected input, and external recording-update directory; Runtime
 does not edit the deployed project or automatically import handbacks.
 
+## Recovering an interrupted recording
+
+After the recording owner has stopped, the archive's `hyper-recording-recover`
+command can publish committed journal audio to a separate WAV path:
+
+```text
+hyper-recording-recover <JOURNAL> <OUTPUT_WAV>
+```
+
+Choose a new `.wav` destination in an existing directory. The command verifies
+the journal's committed chunks, may trim an incomplete trailing chunk from the
+journal, and retains the journal. It refuses a live journal and never replaces
+different existing output media; retrying the same publication is safe. A
+recovered WAV is salvage for audition and deliberate import, not proof of
+uninterrupted capture or a lossless take. Neither application automatically
+imports this WAV or changes a deployed project during recovery.
+
 ## Building and evidence
 
 The repository pins Rust 1.93.0 in `rust-toolchain.toml`. From the repository
-root, `cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime`
-builds both applications. The CI workflow is configured to run tests, strict
-Clippy, and platform-specific gates before producing commit-addressed archives
-and adjacent SHA-256 manifests. Verify an archive against its manifest before
-use.
-The CI archive contains the two applications, the local deployment kit, this
-guide, and third-party notices. It does not bundle Node.js, a project, or
-native audio-device configuration.
+root, run:
+
+```text
+cargo build --locked --release -p hyper-desktop-ui -p hyper-runtime -p hyper-recording-journal
+```
+
+This builds both applications and the recovery command. The CI workflow is
+configured to run tests, strict Clippy, and platform-specific gates before
+producing commit-addressed archives and adjacent SHA-256 manifests. Verify an
+archive against its manifest before use.
+The CI archive contains the two applications, the recording recovery command,
+the local deployment kit, this guide, and third-party notices. It does not
+bundle Node.js, a project, or native audio-device configuration.
 
 The present product limit is eight track documents and native execution of
 audio tracks, Groups, and Returns. MIDI/CV execution and third-party plug-in
