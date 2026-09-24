@@ -35,12 +35,12 @@ use hyper_desktop_audio::{
     DesktopPlaybackRecordingNativeSettlement, DesktopPlaybackRecordingSession,
     DesktopPlaybackRecordingStartRecovery, DesktopPlaybackRecordingStartRecoveryWait,
     DesktopPlaybackRecordingStartSettlement, DesktopPlaybackRecovery,
-    DesktopPlaybackRecoveryPendingStart, DesktopPlaybackRecoveryPendingStop,
-    DesktopPlaybackRecoveryPendingStopFailure, DesktopPlaybackRecoveryPendingStopWait,
-    DesktopPlaybackRecoveryPendingWait, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
-    DesktopRecordingWriterSettlement, DesktopSceneAvailability, InputMeterReceiver,
-    OutputStreamCounters, OutputStreamSnapshot, OutputStreamState, OutputStreamStatus, StreamState,
-    StreamStatus,
+    DesktopPlaybackRecoveryPendingStart, DesktopPlaybackRecoveryPendingStartFailure,
+    DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopFailure,
+    DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackRecoveryPendingWait,
+    DesktopPlaybackRecoveryStopError, DesktopPlaybackSession, DesktopRecordingWriterSettlement,
+    DesktopSceneAvailability, InputMeterReceiver, OutputStreamCounters, OutputStreamSnapshot,
+    OutputStreamState, OutputStreamStatus, StreamState, StreamStatus,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
@@ -737,14 +737,39 @@ impl RuntimePlaybackOwner {
             DesktopPlaybackRecoveryPendingWait::Completed(recovery) => {
                 self.restart_playback(recovery, None)
             }
-            DesktopPlaybackRecoveryPendingWait::Failed(recovery) => self.restart_playback(
+            DesktopPlaybackRecoveryPendingWait::Failed(failure) => self
+                .settle_pending_start_failure(
+                    failure,
+                    "cancelled playback restart ended with a native failure",
+                ),
+            DesktopPlaybackRecoveryPendingWait::Panicked(failure) => self
+                .settle_pending_start_failure(
+                    failure,
+                    "cancelled playback restart ended with a native panic",
+                ),
+        }
+    }
+
+    fn settle_pending_start_failure(
+        &mut self,
+        failure: DesktopPlaybackRecoveryPendingStartFailure,
+        message: &'static str,
+    ) -> RuntimePlaybackOwnerPoll {
+        let output_failed = failure.output_shutdown_failed();
+        let recovery = failure.into_recovery();
+        if output_failed {
+            self.state = Some(RuntimePlaybackOwnerState::ShutdownRecovery(Box::new(
                 recovery,
-                Some("cancelled playback restart ended with a native failure".to_owned()),
-            ),
-            DesktopPlaybackRecoveryPendingWait::Panicked(recovery) => self.restart_playback(
-                recovery,
-                Some("cancelled playback restart ended with a native panic".to_owned()),
-            ),
+            )));
+            RuntimePlaybackOwnerPoll {
+                message: Some(format!(
+                    "{message}; terminal output failure prevented playback restart"
+                )),
+                playback_replaced: false,
+                terminal_output_failure: true,
+            }
+        } else {
+            self.restart_playback(recovery, Some(message.to_owned()))
         }
     }
 
@@ -994,6 +1019,18 @@ impl RuntimePlaybackOwner {
                     prefix,
                     format!("Runtime playback restart failed: {error}"),
                 );
+                if error.terminal_output_failure() {
+                    self.state = Some(RuntimePlaybackOwnerState::ShutdownRecovery(Box::new(
+                        recovery,
+                    )));
+                    return RuntimePlaybackOwnerPoll {
+                        message: Some(format!(
+                            "{message}; terminal output failure prevented playback restart"
+                        )),
+                        playback_replaced: false,
+                        terminal_output_failure: true,
+                    };
+                }
                 if let Some(pending) = error.into_pending() {
                     self.state = Some(RuntimePlaybackOwnerState::PendingStart(Box::new(pending)));
                 } else {

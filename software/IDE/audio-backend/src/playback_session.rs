@@ -2025,7 +2025,33 @@ impl Error for DesktopPlaybackRecoveryStartError {
     }
 }
 
+fn playback_start_output_failure(
+    source: &DesktopPlaybackSessionStartError,
+) -> Option<NativeStopFailure> {
+    match source {
+        DesktopPlaybackSessionStartError::Output(DesktopOutputStartError::ThreadPanicked)
+        | DesktopPlaybackSessionStartError::OutputCleanup {
+            cleanup: DesktopOutputStopError::ThreadPanicked,
+            ..
+        } => Some(NativeStopFailure::ThreadPanicked),
+        DesktopPlaybackSessionStartError::OutputCleanup {
+            cleanup: DesktopOutputStopError::RuntimeFailed,
+            ..
+        } => Some(NativeStopFailure::RuntimeFailed),
+        DesktopPlaybackSessionStartError::Monitored { source, .. } => {
+            playback_start_output_failure(source)
+        }
+        _ => None,
+    }
+}
+
 impl DesktopPlaybackRecoveryStartError {
+    /// Whether a completed output startup or cleanup ended terminally.
+    #[must_use]
+    pub fn terminal_output_failure(&self) -> bool {
+        matches!(self, Self::Start(source) if playback_start_output_failure(source).is_some())
+    }
+
     /// Returns the sole pending restart authority when native cancellation has
     /// not yet completed.
     #[must_use]
@@ -2049,17 +2075,49 @@ impl DesktopPlaybackRecoveryStartError {
 pub struct DesktopPlaybackRecoveryPendingStart {
     input: Option<PendingNativeShutdown>,
     output: Option<PendingNativeShutdown>,
-    failed: bool,
-    panicked: bool,
+    input_failure: Option<NativeStopFailure>,
+    output_failure: Option<NativeStopFailure>,
     recovery: DesktopPlaybackRecovery,
+}
+
+/// Terminal native startup-cancellation evidence paired with the sole
+/// playback recovery. Input and output remain distinct for Runtime policy.
+#[derive(Debug)]
+pub struct DesktopPlaybackRecoveryPendingStartFailure {
+    input: Option<NativeStopFailure>,
+    output: Option<NativeStopFailure>,
+    recovery: DesktopPlaybackRecovery,
+}
+
+impl DesktopPlaybackRecoveryPendingStartFailure {
+    #[must_use]
+    pub const fn input_shutdown_failed(&self) -> bool {
+        self.input.is_some()
+    }
+
+    #[must_use]
+    pub const fn output_shutdown_failed(&self) -> bool {
+        self.output.is_some()
+    }
+
+    #[must_use]
+    pub const fn panicked(&self) -> bool {
+        matches!(self.input, Some(NativeStopFailure::ThreadPanicked))
+            || matches!(self.output, Some(NativeStopFailure::ThreadPanicked))
+    }
+
+    #[must_use]
+    pub fn into_recovery(self) -> DesktopPlaybackRecovery {
+        self.recovery
+    }
 }
 
 /// Result of waiting for a cancellation-pending playback restart.
 #[derive(Debug)]
 pub enum DesktopPlaybackRecoveryPendingWait {
     Completed(DesktopPlaybackRecovery),
-    Failed(DesktopPlaybackRecovery),
-    Panicked(DesktopPlaybackRecovery),
+    Failed(DesktopPlaybackRecoveryPendingStartFailure),
+    Panicked(DesktopPlaybackRecoveryPendingStartFailure),
     TimedOut(DesktopPlaybackRecoveryPendingStart),
 }
 
@@ -2091,13 +2149,11 @@ impl DesktopPlaybackRecoveryPendingStart {
 
     /// Waits for native teardown while retaining exactly one retry authority.
     ///
-    /// A timeout returns this pending value. Every terminal result returns the
-    /// recovery value that may create the next output.
+    /// A timeout returns this pending value. Terminal results keep stream-
+    /// specific failure evidence with the sole recovery authority.
     #[must_use]
     pub fn wait(mut self, timeout: std::time::Duration) -> DesktopPlaybackRecoveryPendingWait {
         let started = std::time::Instant::now();
-        let mut failed = self.failed;
-        let mut panicked = self.panicked;
         for input in [true, false] {
             let remaining = timeout.saturating_sub(started.elapsed());
             let result = if input {
@@ -2107,21 +2163,36 @@ impl DesktopPlaybackRecoveryPendingStart {
             };
             match result {
                 None | Some(PendingNativeShutdownWait::Completed) => {}
-                Some(PendingNativeShutdownWait::Failed) => failed = true,
-                Some(PendingNativeShutdownWait::Panicked) => panicked = true,
+                Some(PendingNativeShutdownWait::Failed) => {
+                    if input {
+                        self.input_failure = Some(NativeStopFailure::RuntimeFailed);
+                    } else {
+                        self.output_failure = Some(NativeStopFailure::RuntimeFailed);
+                    }
+                }
+                Some(PendingNativeShutdownWait::Panicked) => {
+                    if input {
+                        self.input_failure = Some(NativeStopFailure::ThreadPanicked);
+                    } else {
+                        self.output_failure = Some(NativeStopFailure::ThreadPanicked);
+                    }
+                }
                 Some(PendingNativeShutdownWait::TimedOut) => {
-                    self.failed = failed;
-                    self.panicked = panicked;
                     return DesktopPlaybackRecoveryPendingWait::TimedOut(self);
                 }
             }
         }
-        if panicked {
-            DesktopPlaybackRecoveryPendingWait::Panicked(self.recovery)
-        } else if failed {
-            DesktopPlaybackRecoveryPendingWait::Failed(self.recovery)
+        let failure = DesktopPlaybackRecoveryPendingStartFailure {
+            input: self.input_failure,
+            output: self.output_failure,
+            recovery: self.recovery,
+        };
+        if failure.panicked() {
+            DesktopPlaybackRecoveryPendingWait::Panicked(failure)
+        } else if failure.input_shutdown_failed() || failure.output_shutdown_failed() {
+            DesktopPlaybackRecoveryPendingWait::Failed(failure)
         } else {
-            DesktopPlaybackRecoveryPendingWait::Completed(self.recovery)
+            DesktopPlaybackRecoveryPendingWait::Completed(failure.into_recovery())
         }
     }
 }
@@ -2223,8 +2294,8 @@ impl DesktopPlaybackRecovery {
                 pending: Box::new(DesktopPlaybackRecoveryPendingStart {
                     input: None,
                     output: Some(*shutdown),
-                    failed: false,
-                    panicked: false,
+                    input_failure: None,
+                    output_failure: None,
                     recovery: DesktopPlaybackRecovery {
                         config,
                         monitoring,
@@ -2247,6 +2318,7 @@ impl DesktopPlaybackRecovery {
                     ) => (None, Some(source)),
                     None => (None, None),
                 };
+                let terminal_output_failure = playback_start_output_failure(&nested);
                 let output = match *nested {
                     DesktopPlaybackSessionStartError::Output(
                         DesktopOutputStartError::CancellationPending { shutdown },
@@ -2272,14 +2344,16 @@ impl DesktopPlaybackRecovery {
                     pending: Box::new(DesktopPlaybackRecoveryPendingStart {
                         input,
                         output,
-                        failed: matches!(
-                            terminal_input_cleanup,
-                            Some(DesktopInputStopError::RuntimeFailed)
-                        ),
-                        panicked: matches!(
-                            terminal_input_cleanup,
-                            Some(DesktopInputStopError::ThreadPanicked)
-                        ),
+                        input_failure: match terminal_input_cleanup {
+                            Some(DesktopInputStopError::RuntimeFailed) => {
+                                Some(NativeStopFailure::RuntimeFailed)
+                            }
+                            Some(DesktopInputStopError::ThreadPanicked) => {
+                                Some(NativeStopFailure::ThreadPanicked)
+                            }
+                            Some(DesktopInputStopError::ShutdownPending { .. }) | None => None,
+                        },
+                        output_failure: terminal_output_failure,
                         recovery: DesktopPlaybackRecovery {
                             config,
                             monitoring,
@@ -5855,10 +5929,13 @@ mod tests {
         assert!(pending.input_status().is_none());
         assert!(pending.output_status().is_some());
         release.send(()).unwrap();
-        assert!(matches!(
-            pending.wait(Duration::from_secs(1)),
-            DesktopPlaybackRecoveryPendingWait::Failed(_)
-        ));
+        let DesktopPlaybackRecoveryPendingWait::Failed(failure) =
+            pending.wait(Duration::from_secs(1))
+        else {
+            panic!("joined input failure must retain stream-specific evidence");
+        };
+        assert!(failure.input_shutdown_failed());
+        assert!(!failure.output_shutdown_failed());
     }
 
     #[test]
@@ -5923,10 +6000,100 @@ mod tests {
         };
 
         release_output.send(()).unwrap();
-        assert!(matches!(
-            pending.wait(Duration::from_secs(1)),
-            DesktopPlaybackRecoveryPendingWait::Failed(_)
-        ));
+        let DesktopPlaybackRecoveryPendingWait::Failed(failure) =
+            pending.wait(Duration::from_secs(1))
+        else {
+            panic!("joined input failure must survive the output timeout");
+        };
+        assert!(failure.input_shutdown_failed());
+        assert!(!failure.output_shutdown_failed());
+    }
+
+    #[test]
+    fn pending_restart_distinguishes_terminal_output_failure_and_panic() {
+        fn settle_output(
+            shutdown: PendingNativeShutdown,
+            release: &SyncSender<()>,
+            panicked: bool,
+        ) {
+            let pinned = DesktopOutputConfig::try_new(48_000, 256)
+                .unwrap()
+                .with_routing_id("opaque-route")
+                .unwrap();
+            let mut recovery = recording_recovery(pinned.clone(), None);
+            let source = recovery.source.take().unwrap();
+            let error = recovery.failed_restart(
+                pinned,
+                None,
+                source,
+                DesktopPlaybackSessionStartError::Output(
+                    DesktopOutputStartError::CancellationPending {
+                        shutdown: Box::new(shutdown),
+                    },
+                ),
+            );
+            let pending = error.into_pending().unwrap();
+            release.send(()).unwrap();
+            let failure = match pending.wait(Duration::from_secs(1)) {
+                DesktopPlaybackRecoveryPendingWait::Failed(failure) if !panicked => failure,
+                DesktopPlaybackRecoveryPendingWait::Panicked(failure) if panicked => failure,
+                other => panic!("unexpected output shutdown result: {other:?}"),
+            };
+            assert!(!failure.input_shutdown_failed());
+            assert!(failure.output_shutdown_failed());
+            assert_eq!(failure.panicked(), panicked);
+            assert!(failure.into_recovery().source.is_some());
+        }
+
+        let status = OutputStreamStatus::default();
+        status.mark_failed();
+        let (shutdown, release) = pending_shutdown_fixture_with_status(status);
+        settle_output(shutdown, &release, false);
+
+        let status = OutputStreamStatus::default();
+        status.mark_failed();
+        let (shutdown, release) = pending_shutdown_panic_fixture_with_status(status);
+        settle_output(shutdown, &release, true);
+    }
+
+    #[test]
+    fn monitored_restart_retains_output_panic_while_input_shutdown_is_pending() {
+        let pinned = DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_routing_id("opaque-route")
+            .unwrap();
+        let mut recovery = recording_recovery(pinned.clone(), None);
+        let source = recovery.source.take().unwrap();
+        let (shutdown, release) = pending_shutdown_fixture();
+        let error = recovery.failed_restart(
+            pinned,
+            None,
+            source,
+            DesktopPlaybackSessionStartError::Monitored {
+                source: Box::new(DesktopPlaybackSessionStartError::Output(
+                    DesktopOutputStartError::ThreadPanicked,
+                )),
+                input_cleanup: Some(DesktopInputStopError::ShutdownPending {
+                    shutdown: Box::new(shutdown),
+                }),
+            },
+        );
+        let pending = error.into_pending().unwrap();
+        assert!(pending.input_status().is_some());
+        assert!(pending.output_status().is_none());
+        let DesktopPlaybackRecoveryPendingWait::TimedOut(pending) = pending.wait(Duration::ZERO)
+        else {
+            panic!("input shutdown must retain the terminal output evidence");
+        };
+        release.send(()).unwrap();
+        let DesktopPlaybackRecoveryPendingWait::Panicked(failure) =
+            pending.wait(Duration::from_secs(1))
+        else {
+            panic!("joined input must release output-panic evidence");
+        };
+        assert!(!failure.input_shutdown_failed());
+        assert!(failure.output_shutdown_failed());
+        assert!(failure.panicked());
     }
 
     #[test]
@@ -5950,6 +6117,7 @@ mod tests {
             DesktopPlaybackSessionStartError::PublicationUnavailable,
         );
 
+        assert!(!error.terminal_output_failure());
         assert!(matches!(
             error,
             DesktopPlaybackRecoveryStartError::Start(
@@ -5957,6 +6125,33 @@ mod tests {
             )
         ));
         assert!(recovery.source.is_some());
+    }
+
+    #[test]
+    fn joined_restart_classifies_terminal_output_without_spending_recovery() {
+        for source_error in [
+            DesktopPlaybackSessionStartError::Output(DesktopOutputStartError::ThreadPanicked),
+            DesktopPlaybackSessionStartError::OutputCleanup {
+                source: Box::new(DesktopPlaybackSessionStartError::PublicationUnavailable),
+                cleanup: DesktopOutputStopError::RuntimeFailed,
+            },
+            DesktopPlaybackSessionStartError::Monitored {
+                source: Box::new(DesktopPlaybackSessionStartError::Output(
+                    DesktopOutputStartError::ThreadPanicked,
+                )),
+                input_cleanup: None,
+            },
+        ] {
+            let pinned = DesktopOutputConfig::try_new(48_000, 256)
+                .unwrap()
+                .with_routing_id("opaque-route")
+                .unwrap();
+            let mut recovery = recording_recovery(pinned.clone(), None);
+            let source = recovery.source.take().unwrap();
+            let error = recovery.failed_restart(pinned, None, source, source_error);
+            assert!(error.terminal_output_failure());
+            assert!(recovery.source.is_some());
+        }
     }
 
     #[test]
