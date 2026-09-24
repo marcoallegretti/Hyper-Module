@@ -13,11 +13,16 @@ use core::error::Error;
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io;
+#[cfg(windows)]
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::fs::{Dir, OpenOptions};
+use cap_std::fs::Dir;
+#[cfg(windows)]
+use cap_std::fs::OpenOptions;
 #[cfg(target_os = "linux")]
 use hyper_fs_authority::publish_bytes_no_replace;
 use hyper_fs_authority::{
