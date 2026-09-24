@@ -877,6 +877,8 @@ mod tests {
             callback_count: 2,
             captured_callback_count: 2,
             captured_frame_count: 512,
+            startup_discarded_frame_count: 480,
+            startup_discontinuity_count: 1,
             ..CaptureStreamSnapshot::default()
         }));
 

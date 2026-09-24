@@ -60,6 +60,10 @@ pub struct CaptureStreamSnapshot {
     pub non_finite_block_count: u64,
     pub unavailable_buffer_count: u64,
     pub malformed_buffer_count: u64,
+    /// Native frames discarded before the capture stream became recordable.
+    pub startup_discarded_frame_count: u64,
+    pub startup_discontinuity_count: u64,
+    pub startup_timestamp_error_count: u64,
     pub discontinuity_count: u64,
     /// Accepted frames before the first native discontinuity packet, if any.
     pub first_discontinuity_at_frame: Option<u64>,
@@ -80,6 +84,9 @@ struct CaptureStreamCounterState {
     non_finite_blocks: AtomicU64,
     unavailable_buffers: AtomicU64,
     malformed_buffers: AtomicU64,
+    startup_discarded_frames: AtomicU64,
+    startup_discontinuities: AtomicU64,
+    startup_timestamp_errors: AtomicU64,
     discontinuities: AtomicU64,
     first_discontinuity_frame_plus_one: AtomicU64,
     timestamp_errors: AtomicU64,
@@ -106,6 +113,15 @@ impl CaptureStreamCounters {
             non_finite_block_count: self.state.non_finite_blocks.load(Ordering::Relaxed),
             unavailable_buffer_count: self.state.unavailable_buffers.load(Ordering::Relaxed),
             malformed_buffer_count: self.state.malformed_buffers.load(Ordering::Relaxed),
+            startup_discarded_frame_count: self
+                .state
+                .startup_discarded_frames
+                .load(Ordering::Relaxed),
+            startup_discontinuity_count: self.state.startup_discontinuities.load(Ordering::Relaxed),
+            startup_timestamp_error_count: self
+                .state
+                .startup_timestamp_errors
+                .load(Ordering::Relaxed),
             discontinuity_count: self.state.discontinuities.load(Ordering::Relaxed),
             first_discontinuity_at_frame: self
                 .state
@@ -138,6 +154,22 @@ impl CaptureStreamCounters {
         Self::add(&self.state.callbacks, 1);
         Self::add(&self.state.malformed_buffers, 1);
         Self::add(&self.state.dropped_frames, frames);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn record_startup_discard(
+        &self,
+        frames: usize,
+        discontinuity: bool,
+        timestamp_error: bool,
+    ) {
+        Self::add(&self.state.startup_discarded_frames, frames);
+        if discontinuity {
+            Self::add(&self.state.startup_discontinuities, 1);
+        }
+        if timestamp_error {
+            Self::add(&self.state.startup_timestamp_errors, 1);
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -416,6 +448,21 @@ mod tests {
         assert_eq!(callback.process(&[0.0; 4]), CaptureCallbackStatus::Captured);
         later.record_discontinuity();
         assert_eq!(later.snapshot().first_discontinuity_at_frame, Some(2));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn startup_discard_is_separate_from_recorded_capture_integrity() {
+        let counters = CaptureStreamCounters::default();
+        counters.record_startup_discard(480, true, false);
+        counters.record_startup_discard(480, false, true);
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.startup_discarded_frame_count, 960);
+        assert_eq!(snapshot.startup_discontinuity_count, 1);
+        assert_eq!(snapshot.startup_timestamp_error_count, 1);
+        assert_eq!(snapshot.discontinuity_count, 0);
+        assert_eq!(snapshot.timestamp_error_count, 0);
+        assert_eq!(snapshot.callback_count, 0);
     }
 
     #[cfg(all(target_os = "linux", target_endian = "little"))]

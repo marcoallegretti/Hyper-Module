@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::Duration;
-use wasapi::{Direction, EventCallbacks, SampleType, ShareMode, StreamMode, WaveFormat};
+use wasapi::{
+    BufferInfo, Direction, EventCallbacks, SampleType, ShareMode, StreamMode, WaveFormat,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -393,8 +395,8 @@ where
             },
         });
     }
-    let _ = signals.startup.try_send(Ok(()));
-
+    let mut packet_sequence = CapturePacketSequence::default();
+    let mut startup_reported = false;
     let mut consecutive_event_timeouts = 0_u8;
     while !signals.stop_requested.load(Ordering::Acquire)
         && signals.status.state() != StreamState::Failed
@@ -404,22 +406,34 @@ where
             if consecutive_event_timeouts >= MAX_CONSECUTIVE_EVENT_TIMEOUTS {
                 signals.status.mark_failed();
                 signals.counters.record_stream_error();
+                if !startup_reported {
+                    return Err(WasapiStartError::Backend {
+                        stage: WasapiStartupStage::Start,
+                        detail: "capture did not deliver a clean startup packet".to_owned(),
+                    });
+                }
                 break;
             }
             continue;
         }
         consecutive_event_timeouts = 0;
-        if drain_capture_packets(
+        if let Err(source) = drain_capture_packets(
             &input.capture,
             &mut input.samples,
             &mut callback,
             signals.counters,
-        )
-        .is_err()
-        {
+            &mut packet_sequence,
+        ) {
             signals.status.mark_failed();
             signals.counters.record_stream_error();
+            if !startup_reported {
+                return Err(backend_error(WasapiStartupStage::Start, source));
+            }
             break;
+        }
+        if packet_sequence.primed && !startup_reported {
+            let _ = signals.startup.try_send(Ok(()));
+            startup_reported = true;
         }
     }
     Ok(())
@@ -549,6 +563,7 @@ fn drain_capture_packets<P>(
     samples: &mut [f32],
     callback: &mut CaptureCallback<P>,
     counters: &CaptureStreamCounters,
+    sequence: &mut CapturePacketSequence,
 ) -> Result<(), CapturePacketError<wasapi::WasapiError>>
 where
     P: InterleavedStereoCaptureProcessor,
@@ -580,7 +595,19 @@ where
             counters.record_malformed_buffer(frames_read);
             return Err(CapturePacketError::MalformedPacket);
         }
-        if info.flags.data_discontinuity {
+        let Some(disposition) = sequence.observe(&info, frames_read) else {
+            counters.record_malformed_buffer(frames_read);
+            return Err(CapturePacketError::MalformedPacket);
+        };
+        if disposition == CapturePacketDisposition::DiscardStartup {
+            counters.record_startup_discard(
+                frames_read,
+                info.flags.data_discontinuity,
+                info.flags.timestamp_error,
+            );
+            continue;
+        }
+        if disposition == CapturePacketDisposition::CaptureWithDiscontinuity {
             counters.record_discontinuity();
         }
         if info.flags.timestamp_error {
@@ -590,6 +617,40 @@ where
             packet.fill(0.0);
         }
         process_samples(packet, callback)?;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapturePacketDisposition {
+    DiscardStartup,
+    Capture,
+    CaptureWithDiscontinuity,
+}
+
+#[derive(Default)]
+struct CapturePacketSequence {
+    // Startup packets are outside the recordable stream. The first clean
+    // packet establishes its device-position origin; later gaps are failures.
+    primed: bool,
+    next_device_index: Option<u64>,
+}
+
+impl CapturePacketSequence {
+    fn observe(&mut self, info: &BufferInfo, frames: usize) -> Option<CapturePacketDisposition> {
+        if !self.primed && (info.flags.data_discontinuity || info.flags.timestamp_error) {
+            return Some(CapturePacketDisposition::DiscardStartup);
+        }
+        let next = info.index.checked_add(u64::try_from(frames).ok()?)?;
+        let gap = self
+            .next_device_index
+            .is_some_and(|expected| info.index != expected);
+        self.next_device_index = Some(next);
+        self.primed = true;
+        Some(if gap || info.flags.data_discontinuity {
+            CapturePacketDisposition::CaptureWithDiscontinuity
+        } else {
+            CapturePacketDisposition::Capture
+        })
     }
 }
 
@@ -721,6 +782,50 @@ mod tests {
 
         assert_eq!(captured, input);
         assert_eq!(counters.snapshot().captured_callback_count, 2);
+    }
+
+    #[test]
+    fn startup_packets_are_not_recorded_and_later_position_gaps_are_detected() {
+        let mut sequence = CapturePacketSequence::default();
+        let startup = BufferInfo::new(1, 480, 0);
+        assert_eq!(
+            sequence.observe(&startup, 480),
+            Some(CapturePacketDisposition::DiscardStartup)
+        );
+        assert!(!sequence.primed);
+        let first_clean = BufferInfo::new(0, 960, 0);
+        assert_eq!(
+            sequence.observe(&first_clean, 480),
+            Some(CapturePacketDisposition::Capture)
+        );
+        assert!(sequence.primed);
+        let contiguous = BufferInfo::new(0, 1440, 0);
+        assert_eq!(
+            sequence.observe(&contiguous, 480),
+            Some(CapturePacketDisposition::Capture)
+        );
+        let unflagged_gap = BufferInfo::new(0, 2400, 0);
+        assert_eq!(
+            sequence.observe(&unflagged_gap, 480),
+            Some(CapturePacketDisposition::CaptureWithDiscontinuity)
+        );
+    }
+
+    #[test]
+    fn timestamp_uncertain_startup_is_discarded_but_later_errors_remain_visible() {
+        let mut sequence = CapturePacketSequence::default();
+        assert_eq!(
+            sequence.observe(&BufferInfo::new(4, 0, 0), 480),
+            Some(CapturePacketDisposition::DiscardStartup)
+        );
+        assert_eq!(
+            sequence.observe(&BufferInfo::new(0, 480, 0), 480),
+            Some(CapturePacketDisposition::Capture)
+        );
+        assert_eq!(
+            sequence.observe(&BufferInfo::new(4, 960, 0), 480),
+            Some(CapturePacketDisposition::Capture)
+        );
     }
 
     #[test]
