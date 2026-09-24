@@ -31,7 +31,7 @@ use uuid::Uuid;
 const RECORDING_TRANSPORT_FRAMES: usize = super::MAXIMUM_BLOCK_FRAMES * 4;
 const RECORDING_DRAIN_FRAMES: usize = super::MAXIMUM_BLOCK_FRAMES;
 const RECORDING_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
-const RECORDING_MAXIMUM_FRAMES: u64 = 43_200_000;
+const RECORDING_MAXIMUM_FRAMES: u64 = super::MAX_AUDIO_FRAMES;
 const RECORDING_MAXIMUM_CHUNK_FRAMES: u32 = 4_096;
 
 struct RuntimeRecordingPaths {
@@ -420,8 +420,8 @@ fn try_owned(value: &str) -> Result<String, RuntimeRecordingError> {
 mod tests {
     use super::{
         RECORDING_COMPLETION_TIMEOUT, RECORDING_DRAIN_FRAMES, RECORDING_MAXIMUM_CHUNK_FRAMES,
-        RECORDING_MAXIMUM_FRAMES, RECORDING_TRANSPORT_FRAMES, RuntimeRecordingPaths,
-        RuntimeRecordingPublication, publication_outcome_is_uncertain, recording_session_config,
+        RECORDING_TRANSPORT_FRAMES, RuntimeRecordingPaths, RuntimeRecordingPublication,
+        publication_outcome_is_uncertain, recording_session_config,
     };
     use hyper_desktop_audio::DesktopInputConfig;
     use hyper_recording_journal::{JournalConfig, JournalWriter, publish_wav};
@@ -524,7 +524,7 @@ mod tests {
         );
         assert_eq!(
             session.writer.journal.max_total_frames,
-            RECORDING_MAXIMUM_FRAMES
+            super::super::MAX_AUDIO_FRAMES
         );
         assert_eq!(
             session.writer.journal.sample_rate,
