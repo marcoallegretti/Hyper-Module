@@ -578,6 +578,156 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[ignore = "requires a live PipeWire daemon with the hyper-ci-sink and hyper-ci-source virtual nodes"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear live owner transition keeps verified project, native graph, and publication evidence together"
+    )]
+    fn live_runtime_owner_records_publishes_and_restores_verified_playback() {
+        use hyper_desktop_audio::{
+            DesktopMonitoringConfig, DesktopOutputConfig, DesktopPlaybackSession,
+            discover_desktop_input_targets, discover_desktop_output_targets,
+        };
+        use hyper_runtime_recording_update::read_runtime_recording_update;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let temporary = TemporaryProjectParent::new();
+        let creation = create_project(
+            &temporary.path,
+            ProjectCreationRequest {
+                directory_name: "Runtime Capture",
+                project_name: "Runtime Capture",
+            },
+        )
+        .unwrap();
+        let prepared = hyper_project_loader::prepare_project_playback(
+            creation.project().root(),
+            super::super::limits().unwrap(),
+        )
+        .unwrap();
+        let manifest = prepared.package().manifest();
+        let project_id = manifest.project_id().to_owned();
+        let source = RuntimeRecordingUpdateSource::try_new(
+            project_id.clone(),
+            manifest.revision(),
+            sha256_hex(prepared.package().manifest_sha256()),
+            "a".repeat(64),
+            7,
+        )
+        .unwrap();
+        let output_path = temporary.path.join("recording-updates");
+        fs::create_dir(&output_path).unwrap();
+        let output = RuntimeRecordingUpdateDirectory::open(&output_path).unwrap();
+        let recording =
+            super::RuntimeRecordingConfiguration::try_new(source.clone(), &prepared, Some(output))
+                .unwrap();
+        let track_id = recording.targets[0].track_id.clone();
+
+        let outputs = discover_desktop_output_targets().unwrap();
+        let output_target = outputs
+            .targets()
+            .iter()
+            .find(|target| target.display_name() == "Hyper CI Sink")
+            .expect("CI null sink was not discovered");
+        let inputs = discover_desktop_input_targets().unwrap();
+        let input_target = inputs
+            .targets()
+            .iter()
+            .find(|target| target.display_name() == "Hyper CI Source")
+            .expect("CI virtual source was not discovered");
+        let output_config = DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_output_target(output_target)
+            .unwrap();
+        let input_config = DesktopInputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_input_target(input_target)
+            .unwrap();
+        let monitoring =
+            DesktopMonitoringConfig::try_new(input_config, output_config, 2_048, 256, 64).unwrap();
+        let playback = DesktopPlaybackSession::start_project_monitored_with_monitor_state(
+            monitoring, prepared, 1.0, true,
+        )
+        .unwrap();
+        let mut owner = super::super::RuntimePlaybackOwner::new(playback, recording, true);
+        assert!(owner.recording_observation().lock().unwrap().start_enabled);
+
+        let started = owner.start_recording(0).unwrap();
+        assert!(!started.terminal_output_failure, "{:?}", started.message);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !owner.is_recording() && Instant::now() < deadline {
+            let poll = owner.poll();
+            assert!(!poll.terminal_output_failure, "{:?}", poll.message);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            owner.is_recording(),
+            "Runtime did not acquire its recording owner"
+        );
+        assert!(owner.recording_observation().lock().unwrap().stop_enabled);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(
+            owner.state.as_ref(),
+            Some(super::super::RuntimePlaybackOwnerState::Recording { session, .. })
+                if session.recording_snapshot().accepted_frame_count == 0
+        ) && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let Some(super::super::RuntimePlaybackOwnerState::Recording { session, .. }) =
+            owner.state.as_ref()
+        else {
+            panic!("Runtime recording owner was lost before stop");
+        };
+        assert!(session.recording_snapshot().accepted_frame_count > 0);
+
+        let stopped = owner.stop_recording().unwrap();
+        assert!(!stopped.terminal_output_failure, "{:?}", stopped.message);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !matches!(
+            owner.state.as_ref(),
+            Some(super::super::RuntimePlaybackOwnerState::Playback(_))
+        ) && Instant::now() < deadline
+        {
+            let poll = owner.poll();
+            assert!(!poll.terminal_output_failure, "{:?}", poll.message);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(
+            owner.state.as_ref(),
+            Some(super::super::RuntimePlaybackOwnerState::Playback(_))
+        ));
+        assert!(owner.recording_observation().lock().unwrap().start_enabled);
+
+        let updates: Vec<_> = fs::read_dir(&output_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect();
+        assert_eq!(updates.len(), 1);
+        let update = read_runtime_recording_update(&updates[0]).unwrap();
+        assert_eq!(update.source(), &source);
+        assert_eq!(update.handoff().metadata().project_id(), project_id);
+        assert_eq!(update.handoff().metadata().track_id(), track_id);
+        assert!(
+            fs::metadata(update.handoff().recording_path())
+                .unwrap()
+                .len()
+                > 44
+        );
+        let Some(super::super::RuntimePlaybackOwnerState::Playback(playback)) = owner.state.take()
+        else {
+            panic!("restored playback owner was unavailable for clean native shutdown");
+        };
+        (*playback).stop().unwrap();
+    }
+
+    #[test]
     fn configuration_rejects_source_facts_from_another_project_revision() {
         let temporary = TemporaryProjectParent::new();
         let creation = create_project(

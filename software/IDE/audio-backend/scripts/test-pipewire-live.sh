@@ -26,3 +26,7 @@ cargo test -p hyper-desktop-audio \
 cargo test -p hyper-desktop-audio \
   playback_session::tests::live_recording_owner_publishes_and_restores_playback \
   -- --ignored --exact
+
+cargo test -p hyper-runtime --bin hyper-runtime --jobs 1 \
+  recording::tests::live_runtime_owner_records_publishes_and_restores_verified_playback \
+  -- --ignored --exact
