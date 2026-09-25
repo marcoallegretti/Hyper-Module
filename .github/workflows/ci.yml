@@ -426,6 +426,7 @@ jobs:
             printf 'matrix_os=%s\n' "$MATRIX_OS"
             printf 'runner_os=%s\n' "$RUNNER_OS"
             printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'report.dependency-audit.log=npm audit --audit-level=high\n'
             printf 'report.contract-tests.log=npm test\n'
           } > "$REPORT_DIR/manifest.txt"
 
@@ -439,6 +440,10 @@ jobs:
 
       - name: Install locked dependencies
         run: npm ci --ignore-scripts
+
+      - name: Audit shipped deployment dependencies
+        shell: bash
+        run: npm audit --audit-level=high 2>&1 | tee "$REPORT_DIR/dependency-audit.log"
 
       - name: Test contracts
         shell: bash
