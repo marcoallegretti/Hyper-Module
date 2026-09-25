@@ -86,13 +86,19 @@ This builds both applications and the recovery command. The CI workflow is
 configured to run tests, strict Clippy, and platform-specific gates before
 producing commit-addressed archives and adjacent SHA-256 manifests. Verify an
 archive against its manifest before use.
-The CI archive contains the two applications, the recording recovery command,
-the local deployment kit, this guide, and third-party notices. It does not
-bundle Node.js, a project, or native audio-device configuration.
+The Windows and x86-64 Ubuntu CI archives contain the two applications, the
+recording recovery command, the local deployment kit, this guide, and
+third-party notices. They do not bundle Node.js, a project, or native
+audio-device configuration.
 On x86-64 Ubuntu 24.04, the desktop UI's dual Wayland/X11 Slint build needs
 the system `libxkbcommon-x11-0` runtime package; the archive does not bundle
-it. Linux ARM64 IDE builds select Slint's Wayland-only backend, but no ARM64
-archive or on-device Wayland acceptance is available yet.
+it. The separate Ubuntu 24.04 ARM64 archive contains only the Wayland-only
+Desktop IDE, this guide, and third-party notices; it does not contain Runtime
+or the deployment kit. Use it in an Ubuntu Wayland desktop session with the
+system PipeWire, Fontconfig, graphics, and desktop-portal services available.
+The archive's extracted IDE passes help/version and dynamic-link inspection in
+CI only after the ARM64 job runs successfully; Pi window, input, dialog, and
+physical-audio acceptance remain separate gates.
 
 The present product limit is eight track documents and native execution of
 audio tracks, Groups, and Returns. MIDI/CV execution and third-party plug-in

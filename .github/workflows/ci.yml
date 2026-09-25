@@ -190,7 +190,7 @@ jobs:
           compression-level: 9
 
   arm64-ide:
-    name: ARM64 Wayland IDE compile
+    name: Ubuntu ARM64 Wayland IDE package
     runs-on: ubuntu-24.04-arm
     env:
       REPORT_DIR: ci-reports
@@ -215,7 +215,8 @@ jobs:
             printf 'job=%s\n' "$GITHUB_JOB"
             printf 'runner_os=%s\n' "$RUNNER_OS"
             printf 'runner_arch=%s\n' "$RUNNER_ARCH"
-            printf 'report.ide-check.log=cargo check --locked -p hyper-desktop-ui --all-targets\n'
+            printf 'report.ide-build.log=cargo build --locked --release -p hyper-desktop-ui --jobs 2\n'
+            printf 'report.ide-inspection-smoke.log=extracted ARM64 IDE help, version, and dynamic-link inspection\n'
           } > "$REPORT_DIR/manifest.txt"
 
       - name: Install pinned Rust toolchain
@@ -226,11 +227,46 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends libfontconfig-dev libpipewire-0.3-dev
 
-      - name: Check native ARM64 IDE compilation
+      - name: Build native ARM64 IDE
         shell: bash
         run: |
           test "$RUNNER_ARCH" = ARM64
-          cargo check --locked -p hyper-desktop-ui --all-targets 2>&1 | tee "$REPORT_DIR/ide-check.log"
+          cargo build --locked --release -p hyper-desktop-ui --jobs 2 2>&1 | tee "$REPORT_DIR/ide-build.log"
+
+      - name: Package and inspect extracted ARM64 IDE
+        shell: bash
+        run: |
+          output="$RUNNER_TEMP/hyper-module-ubuntu-24.04-arm64-ide"
+          mkdir -p "$output"
+          cp target/release/hyper-desktop-ui README.md THIRD_PARTY_NOTICES.md "$output"
+          archive="$RUNNER_TEMP/hyper-module-ubuntu-24.04-arm64-ide.tar.gz"
+          tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner --format=gnu -I 'gzip -n' -cf "$archive" -C "$output" hyper-desktop-ui README.md THIRD_PARTY_NOTICES.md
+          sha256sum "$archive" | sed "s|  $archive|  hyper-module-ubuntu-24.04-arm64-ide.tar.gz|" > "$archive.sha256"
+          (cd "$RUNNER_TEMP" && sha256sum -c "$(basename "$archive.sha256")")
+          extract="$RUNNER_TEMP/hyper-module-arm64-ide-extracted"
+          mkdir -p "$extract"
+          tar -xzf "$archive" -C "$extract"
+          cmp target/release/hyper-desktop-ui "$extract/hyper-desktop-ui"
+          {
+            "$extract/hyper-desktop-ui" --help &&
+              "$extract/hyper-desktop-ui" --version &&
+              ldd "$extract/hyper-desktop-ui"
+          } 2>&1 | tee "$REPORT_DIR/ide-inspection-smoke.log"
+          if grep -Fq 'not found' "$REPORT_DIR/ide-inspection-smoke.log"; then
+            echo 'ARM64 IDE has an unresolved dynamic library on the build runner' >&2
+            exit 1
+          fi
+
+      - name: Upload ARM64 IDE archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: hyper-module-ubuntu-24.04-arm64-ide-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/hyper-module-ubuntu-24.04-arm64-ide.tar.gz
+            ${{ runner.temp }}/hyper-module-ubuntu-24.04-arm64-ide.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
 
       - name: Upload ARM64 IDE report
         if: ${{ !cancelled() }}
