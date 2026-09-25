@@ -14,7 +14,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -653,19 +653,22 @@ try {
     temporaryRoot,
     "publication-collision-target",
   );
-  let collisionPath;
+  let collisionObserved = false;
   await assert.rejects(
     installBundle(bundle7, publicationCollisionTarget, {
       observer: async (boundary, { installedPath }) => {
         if (boundary !== "before-bundle-publication") return;
-        collisionPath = installedPath;
+        collisionObserved = true;
         await mkdir(installedPath);
       },
     }),
     /manifest\.json|runtime bundle root|ENOENT/,
   );
-  assert(collisionPath);
-  assert.deepEqual(await readdir(collisionPath), []);
+  assert(collisionObserved);
+  assert.deepEqual(
+    await readdir(join(publicationCollisionTarget, "bundles", identity7)),
+    [],
+  );
   assert.equal(await readDeploymentLock(publicationCollisionTarget), null);
 
   const growingSource = join(temporaryRoot, "growing-source.runtime");
@@ -755,9 +758,9 @@ try {
   );
   await assert.rejects(
     collectDeploymentGarbage(substitutedGarbageTarget, {
-      observer: async (boundary, { bundlePath }) => {
+      observer: async (boundary, { bundleSha256 }) => {
         if (boundary !== "before-garbage-candidate-open") return;
-        assert.equal(bundlePath, substitutedGarbagePath);
+        assert.equal(bundleSha256, substitutedGarbageIdentity);
         await rename(substitutedGarbagePath, displacedGarbagePath);
         await cp(displacedGarbagePath, substitutedGarbagePath, {
           recursive: true,
@@ -1001,7 +1004,7 @@ try {
     recoverDeploymentTarget(substitutedResidueTarget, {
       observer: async (boundary, detail) => {
         if (boundary !== "before-file-residue-quarantine") return;
-        assert.equal(detail.residuePath, substitutedResiduePath);
+        assert.equal(basename(detail.residuePath), substitutedResidueName);
         await rename(substitutedResiduePath, displacedResiduePath);
         await writeFile(substitutedResiduePath, "replacement");
         residueSubstituted = true;
@@ -1042,7 +1045,7 @@ try {
     recoverDeploymentTarget(substitutedDirectoryResidueTarget, {
       observer: async (boundary, { residuePath }) => {
         if (boundary !== "before-directory-residue-open") return;
-        assert.equal(residuePath, substitutedDirectoryResiduePath);
+        assert.equal(basename(residuePath), substitutedDirectoryResidueName);
         await rename(
           substitutedDirectoryResiduePath,
           displacedDirectoryResiduePath,
@@ -1092,7 +1095,7 @@ try {
     await recoverDeploymentTarget(quarantineSubstitutionTarget, {
       observer: async (boundary, { residuePath }) => {
         if (boundary !== "before-directory-residue-quarantine") return;
-        assert.equal(residuePath, quarantineSubstitutionPath);
+        assert.equal(basename(residuePath), quarantineSubstitutionName);
         await rename(quarantineSubstitutionPath, quarantineDisplacedPath);
         await mkdir(quarantineSubstitutionPath);
         await writeFile(
