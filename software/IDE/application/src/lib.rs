@@ -23546,7 +23546,7 @@ mod tests {
         assert_ne!(staged, awkward.to_path_buf());
 
         // A path with no file name has nowhere to stage.
-        assert!(export_journal_path(Path::new("C:/")).is_none());
+        assert!(export_journal_path(Path::new(std::path::MAIN_SEPARATOR_STR)).is_none());
     }
 
     #[test]

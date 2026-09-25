@@ -134,10 +134,7 @@ const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 const WORKER_SUPERVISOR_CAPACITY: usize = 16;
 #[cfg(test)]
 const WORKER_SUPERVISOR_CAPACITY: usize = 64;
-#[cfg(not(test))]
 const MIXER_SAVE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const MIXER_SAVE_COMMIT_TIMEOUT: Duration = Duration::from_millis(50);
 const MIXER_RECOVERY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 pub const MAX_IDE_WORKER_COMMANDS: usize = 64;
 pub const MAX_IDE_WORKER_EVENTS: usize = 64;
@@ -24146,8 +24143,9 @@ mod tests {
         worker
             .try_send(IdeWorkerCommand::OpenProject(project.clone()))
             .unwrap();
-        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
-            panic!("the project must open before importing a Runtime recording update");
+        let event = recv(&worker);
+        let IdeWorkerEvent::Running(opened) = event else {
+            panic!("the project must open before importing a Runtime recording update: {event:?}");
         };
         let track_id = opened
             .mixer_channels()
@@ -25319,13 +25317,17 @@ mod tests {
             recv_native_mutation(worker),
             IdeWorkerEvent::NativeFilterEditing { .. }
         ));
-        assert!(matches!(
-            recv_native_mutation(worker),
-            IdeWorkerEvent::UndoStateChanged {
-                undo_label: Some("native device"),
-                redo_label: None,
-            }
-        ));
+        let event = recv_native_mutation(worker);
+        assert!(
+            matches!(
+                event,
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: Some("native device"),
+                    redo_label: None,
+                }
+            ),
+            "native device edit must publish undo state: {event:?}"
+        );
         assert!(matches!(
             recv_native_mutation(worker),
             IdeWorkerEvent::Running(_)
