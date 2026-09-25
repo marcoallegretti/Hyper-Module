@@ -189,9 +189,62 @@ jobs:
           retention-days: 14
           compression-level: 9
 
+  arm64-ide:
+    name: ARM64 Wayland IDE compile
+    runs-on: ubuntu-24.04-arm
+    env:
+      REPORT_DIR: ci-reports
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Initialize ARM64 IDE report
+        shell: bash
+        run: |
+          mkdir -p "$REPORT_DIR"
+          {
+            printf 'schema=hyper-ci-test-report-v1\n'
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'workflow_commit=%s\n' "$GITHUB_WORKFLOW_SHA"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'job=%s\n' "$GITHUB_JOB"
+            printf 'runner_os=%s\n' "$RUNNER_OS"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'report.ide-check.log=cargo check --locked -p hyper-desktop-ui --all-targets\n'
+          } > "$REPORT_DIR/manifest.txt"
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93.0 --profile minimal
+
+      - name: Install Linux audio and UI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends libfontconfig-dev libpipewire-0.3-dev
+
+      - name: Check native ARM64 IDE compilation
+        shell: bash
+        run: |
+          test "$RUNNER_ARCH" = ARM64
+          cargo check --locked -p hyper-desktop-ui --all-targets 2>&1 | tee "$REPORT_DIR/ide-check.log"
+
+      - name: Upload ARM64 IDE report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: hyper-test-report-arm64-ide-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/ci-reports
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
+
   package:
     name: Package (${{ matrix.os }})
-    needs: [public-boundary, rust, contracts]
+    needs: [public-boundary, rust, arm64-ide, contracts]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
