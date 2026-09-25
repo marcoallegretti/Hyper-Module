@@ -19,6 +19,17 @@ i-slint-backend-testing = "=1.17.1"
 hyper-desktop-audio = { path = "../audio-backend" }
 hyper-desktop-ide = { path = "../application" }
 rfd = { version = "=0.17.2" }
+
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+slint = { version = "=1.17.1", default-features = false, features = [
+    "accessibility",
+    "backend-winit-wayland",
+    "compat-1-2",
+    "renderer-femtovg",
+    "std",
+] }
+
+[target.'cfg(not(all(target_os = "linux", target_arch = "aarch64")))'.dependencies]
 slint = { version = "=1.17.1", default-features = false, features = [
     "accessibility",
     "backend-winit",

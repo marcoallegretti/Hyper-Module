@@ -100,6 +100,8 @@ jobs:
             printf 'matrix_os=%s\n' "$MATRIX_OS"
             printf 'runner_os=%s\n' "$RUNNER_OS"
             printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'report.arm64-wayland-features.log=cargo tree -p hyper-desktop-ui --target aarch64-unknown-linux-gnu -e features -i winit\n'
+            printf 'condition.arm64-wayland-features.log=runner_os==Linux\n'
             printf 'report.workspace-tests.log=cargo test --workspace --exclude hyper-desktop-ide --all-targets --locked\n'
             printf 'report.ide-tests.log=cargo test -p hyper-desktop-ide --all-targets --locked -- --test-threads=1\n'
             printf 'report.vendored-pipewire-tests.log=cargo test --manifest-path third_party/pipewire/Cargo.toml\n'
@@ -120,6 +122,18 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Check ARM64 IDE Wayland backend
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo tree --locked -p hyper-desktop-ui --target aarch64-unknown-linux-gnu -e features -i winit | tee "$REPORT_DIR/arm64-wayland-features.log"
+          grep -Fq 'slint feature "backend-winit-wayland"' "$REPORT_DIR/arm64-wayland-features.log"
+          grep -Fq 'winit feature "wayland"' "$REPORT_DIR/arm64-wayland-features.log"
+          if grep -Fq 'winit feature "x11"' "$REPORT_DIR/arm64-wayland-features.log"; then
+            echo 'ARM64 IDE unexpectedly enables Winit X11' >&2
+            exit 1
+          fi
 
       - name: Lint all targets and features
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

@@ -89,8 +89,10 @@ archive against its manifest before use.
 The CI archive contains the two applications, the recording recovery command,
 the local deployment kit, this guide, and third-party notices. It does not
 bundle Node.js, a project, or native audio-device configuration.
-On Ubuntu 24.04, the desktop UI's X11 backend also needs the system
-`libxkbcommon-x11-0` runtime package; the archive does not bundle it.
+On x86-64 Ubuntu 24.04, the desktop UI's dual Wayland/X11 Slint build needs
+the system `libxkbcommon-x11-0` runtime package; the archive does not bundle
+it. Linux ARM64 IDE builds select Slint's Wayland-only backend, but no ARM64
+archive or on-device Wayland acceptance is available yet.
 
 The present product limit is eight track documents and native execution of
 audio tracks, Groups, and Returns. MIDI/CV execution and third-party plug-in
