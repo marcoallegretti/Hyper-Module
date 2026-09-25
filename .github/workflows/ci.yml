@@ -215,6 +215,7 @@ jobs:
             printf 'job=%s\n' "$GITHUB_JOB"
             printf 'runner_os=%s\n' "$RUNNER_OS"
             printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'report.ide-target-check.log=cargo check --locked -p hyper-desktop-ui --all-targets --jobs 2\n'
             printf 'report.ide-build.log=cargo build --locked --release -p hyper-desktop-ui --jobs 2\n'
             printf 'report.ide-inspection-smoke.log=extracted ARM64 IDE help, version, and dynamic-link inspection\n'
           } > "$REPORT_DIR/manifest.txt"
@@ -226,6 +227,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends libfontconfig-dev libpipewire-0.3-dev
+
+      - name: Check native ARM64 IDE test targets
+        shell: bash
+        run: cargo check --locked -p hyper-desktop-ui --all-targets --jobs 2 2>&1 | tee "$REPORT_DIR/ide-target-check.log"
 
       - name: Build native ARM64 IDE
         shell: bash
