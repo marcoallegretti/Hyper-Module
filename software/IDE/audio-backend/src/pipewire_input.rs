@@ -770,8 +770,8 @@ mod tests {
                 runner.status.mark_failed();
                 Ok(())
             },
-            Duration::from_millis(20),
-            Duration::from_millis(20),
+            STARTUP_TIMEOUT,
+            SHUTDOWN_TIMEOUT,
         )
         .unwrap();
 
@@ -791,8 +791,8 @@ mod tests {
                 let _ = runner.startup.try_send(Ok(()));
                 panic!("runtime panic");
             },
-            Duration::from_millis(20),
-            Duration::from_millis(20),
+            STARTUP_TIMEOUT,
+            SHUTDOWN_TIMEOUT,
         )
         .unwrap();
 
