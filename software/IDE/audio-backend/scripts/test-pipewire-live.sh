@@ -22,3 +22,7 @@ cargo test -p hyper-desktop-audio \
 cargo test -p hyper-desktop-audio \
   pipewire_input::tests::live_pipewire_source_captures_audio \
   -- --ignored --exact
+
+cargo test -p hyper-desktop-audio \
+  playback_session::tests::live_recording_owner_publishes_and_restores_playback \
+  -- --ignored --exact

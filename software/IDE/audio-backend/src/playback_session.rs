@@ -5713,6 +5713,73 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[ignore = "requires a live PipeWire daemon with the hyper-ci-sink and hyper-ci-source virtual nodes"]
+    fn live_recording_owner_publishes_and_restores_playback() {
+        let outputs = crate::discover_desktop_output_targets().unwrap();
+        let output = outputs
+            .targets()
+            .iter()
+            .find(|target| target.display_name() == "Hyper CI Sink")
+            .expect("CI null sink was not discovered");
+        let inputs = crate::discover_desktop_input_targets().unwrap();
+        let input = inputs
+            .targets()
+            .iter()
+            .find(|target| target.display_name() == "Hyper CI Source")
+            .expect("CI virtual source was not discovered");
+        let output = DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_output_target(output)
+            .unwrap();
+        let input = super::super::DesktopInputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_input_target(input)
+            .unwrap();
+        let monitoring =
+            DesktopMonitoringConfig::try_new(input.clone(), output, 4_096, 256, 64).unwrap();
+        let session = DesktopPlaybackSession::start_monitored_with_monitor_state(
+            monitoring,
+            live_session_input(),
+            1.0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            session.monitoring_input_status().unwrap().state(),
+            crate::StreamState::Running
+        );
+        let recovery = session.into_recovery().unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = recording_config(input, directory.path());
+        config.transport_capacity_frames = 4_096;
+        config.writer.journal.max_total_frames = 480_000;
+        config.completion_timeout = Duration::from_secs(5);
+        let recording = recovery.start_recording(&config).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while recording.recording_snapshot().accepted_frame_count == 0
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(recording.recording_snapshot().accepted_frame_count > 0);
+
+        let (publication, recovery) = recording.commit().unwrap().into_parts();
+        assert!(publication.frames() > 0);
+        assert_eq!(publication.sample_rate_hz(), 48_000);
+        assert_eq!(publication.channels(), 2);
+        assert!(fs::metadata(publication.final_wav_path()).unwrap().len() > 44);
+        let mut recovery = recovery.into_recovery().unwrap();
+        let replacement = recovery.restart().unwrap();
+        assert_eq!(
+            replacement.recovery_checkpoint().snapshot().state(),
+            PlaybackRecoveryTransportState::Stopped
+        );
+        replacement.stop().unwrap();
+    }
+
+    #[test]
     fn project_recovery_failure_precedes_loading_and_native_output_startup() {
         let not_a_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let config = DesktopOutputConfig::try_new(48_000, 256).unwrap();
