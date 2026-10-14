@@ -1162,6 +1162,7 @@ export component MainWindow inherits Window {
         && !root.scene-create-visible
         && !root.scene-rename-visible
         && !root.scene-duplicate-visible
+        && !root.scene-remove-visible
         && !root.scene-slots-visible;
 
     keyboard := FocusScope {
@@ -2868,7 +2869,7 @@ export component MainWindow inherits Window {
                         Rectangle { vertical-stretch: 1; background: transparent; }
                         HorizontalLayout {
                             spacing: 8px;
-                            Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.scene-remove-visible = false; root.scene-remove-id = ""; root.scene-remove-name = ""; } }
+                            Button { text: "Cancel"; accessible-label: "Cancel removal of scene " + root.scene-remove-name; enabled: root.app-mode == AppMode.running; clicked => { root.scene-remove-visible = false; root.scene-remove-id = ""; root.scene-remove-name = ""; } }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button { text: root.app-mode == AppMode.removing-scene ? "Removing scene..." : "Remove scene"; enabled: root.app-mode == AppMode.running && root.scene-remove-id != ""; clicked => { IdeActions.remove-scene(root.scene-remove-id); } }
                         }

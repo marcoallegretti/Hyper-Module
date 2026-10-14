@@ -20014,6 +20014,7 @@ mod tests {
         ui.set_scene_create_visible(false);
         ui.set_scene_rename_visible(false);
         ui.set_scene_duplicate_visible(false);
+        ui.set_scene_remove_visible(false);
         ui.set_scene_slots_visible(false);
         apply_transport_recovery_availability(ui, PlaybackRecoveryTransportState::Stopped);
         assert!(ui.get_transport_start_available());
@@ -20054,6 +20055,9 @@ mod tests {
         ui.set_timeline_map_visible(true);
         dispatch_ide_space(ui, false, false, false, false, false);
         ui.set_timeline_map_visible(false);
+        ui.set_scene_remove_visible(true);
+        dispatch_ide_space(ui, false, false, false, false, false);
+        ui.set_scene_remove_visible(false);
         ui.set_app_mode(AppMode::Previewing);
         dispatch_ide_space(ui, false, false, false, false, false);
         assert_eq!(starts.get(), 1);
@@ -20085,6 +20089,7 @@ mod tests {
         ui.set_scene_create_visible(false);
         ui.set_scene_rename_visible(false);
         ui.set_scene_duplicate_visible(false);
+        ui.set_scene_remove_visible(false);
         ui.set_scene_slots_visible(false);
         apply_transport_recovery_availability(ui, PlaybackRecoveryTransportState::Stopped);
         assert!(ui.get_transport_return_start_available());
@@ -20145,6 +20150,7 @@ mod tests {
         ui.set_scene_create_visible(false);
         ui.set_scene_rename_visible(false);
         ui.set_scene_duplicate_visible(false);
+        ui.set_scene_remove_visible(false);
         ui.set_scene_slots_visible(false);
         ui.set_transport_seek_available(true);
         apply_transport_recovery_availability(ui, PlaybackRecoveryTransportState::Stopped);
@@ -20653,6 +20659,7 @@ mod tests {
         ui.set_scene_create_visible(false);
         ui.set_scene_rename_visible(false);
         ui.set_scene_duplicate_visible(false);
+        ui.set_scene_remove_visible(false);
         ui.set_scene_slots_visible(false);
         ui.set_new_track_visible(false);
         let recording_routes = Rc::new(RefCell::new(Vec::new()));
@@ -22902,6 +22909,38 @@ mod tests {
                 .next()
                 .is_some(),
             "performance controls return after leaving the timeline map"
+        );
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn scene_removal_confirmation_replaces_performance_controls() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_scene_remove_visible(true);
+        ui.set_scene_remove_id("scene-a".into());
+        ui.set_scene_remove_name("Verse".into());
+        ui.show().unwrap();
+        assert!(
+            ElementHandle::find_by_accessible_label(&ui, "Return transport to start")
+                .next()
+                .is_none(),
+            "the hidden performance panel is not instantiated under the scene removal confirmation"
+        );
+
+        let cancel = ElementHandle::find_by_accessible_label(&ui, "Cancel removal of scene Verse")
+            .next()
+            .expect("the scene removal confirmation can be cancelled");
+        assert_eq!(cancel.accessible_enabled(), Some(true));
+        cancel.mock_single_click(PointerEventButton::Left);
+
+        assert!(!ui.get_scene_remove_visible());
+        assert!(
+            ElementHandle::find_by_accessible_label(&ui, "Return transport to start")
+                .next()
+                .is_some(),
+            "performance controls return after the scene removal is cancelled"
         );
         ui.hide().unwrap();
     }
