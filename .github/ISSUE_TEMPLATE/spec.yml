@@ -1,0 +1,48 @@
+name: Specification
+description: A change described so that it can be verified
+title: "A sentence stating what should be true"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The title states the defect or the truth that should hold, not a category.
+        A new crate, trait, format or ownership rule needs the `needs-design` label
+        and agreement before any code.
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed
+      description: What happens now, and where in the code (file and line).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What should be true instead, phrased so it can be checked.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: >
+        The test that fails before and passes after: file and assertion. If it
+        cannot be automated, say so and name the manual check.
+    validations:
+      required: true
+  - type: textarea
+    id: non-goals
+    attributes:
+      label: Non-goals
+      description: Neighbouring things this change deliberately does not do.
+  - type: textarea
+    id: where
+    attributes:
+      label: Where it lives
+      description: Files and functions involved.
+  - type: textarea
+    id: prior-art
+    attributes:
+      label: Prior art
+      description: Only for an unsettled design choice. The standard, and what comparable software chose, with links.
