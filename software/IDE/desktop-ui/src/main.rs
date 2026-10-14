@@ -18300,6 +18300,82 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_project_location_keeps_project_actions_below_it() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_project_name("Session".into());
+        ui.set_project_location(
+            "/home/composer/Music/Hyper Module/Projects/2026/Autumn Sessions/Session".into(),
+        );
+        ui.show().unwrap();
+
+        let location = ElementHandle::find_by_accessible_label(&ui, &ui.get_project_location())
+            .next()
+            .expect("the project location is rendered");
+        let add_track = ElementHandle::find_by_accessible_label(&ui, "Add audio track")
+            .next()
+            .expect("a running project offers track creation");
+        let save = ElementHandle::find_by_accessible_label(&ui, "Save project")
+            .next()
+            .expect("a running project offers saving");
+        assert!(location.size().height > 20.0, "the location wraps");
+        assert!(
+            add_track.absolute_position().y
+                - (location.absolute_position().y + location.size().height)
+                >= 7.5
+        );
+        assert!(
+            save.absolute_position().y
+                - (add_track.absolute_position().y + add_track.size().height)
+                >= 7.5
+        );
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn wrapped_project_form_notes_keep_form_actions_above_history() {
+        i_slint_backend_testing::init_no_event_loop();
+        for (open_form, note, confirm) in [
+            (
+                MainWindow::set_save_project_as_visible as fn(&MainWindow, bool),
+                "Preserves live mixer state in the source project, creates and verifies an independent package, then opens it.",
+                "Choose location & save copy",
+            ),
+            (
+                MainWindow::set_rename_project_visible,
+                "Updates only this verified package’s project name. Its folder, project ID, media, and resources stay unchanged.",
+                "Rename project",
+            ),
+        ] {
+            let ui = MainWindow::new().unwrap();
+            ui.set_app_mode(AppMode::Running);
+            open_form(&ui, true);
+            ui.show().unwrap();
+
+            let note = ElementHandle::find_by_accessible_label(&ui, note)
+                .next()
+                .expect("the project form explains its action");
+            let confirm = ElementHandle::find_by_accessible_label(&ui, confirm)
+                .next()
+                .expect("the project form offers its action");
+            let undo = ElementHandle::find_by_accessible_label(&ui, "Undo the last durable edit")
+                .next()
+                .expect("history controls stay below the project form");
+            assert!(note.size().height >= 18.0, "the note wraps");
+            assert!(
+                note.absolute_position().y + note.size().height <= confirm.absolute_position().y
+            );
+            assert!(
+                undo.absolute_position().y
+                    - (confirm.absolute_position().y + confirm.size().height)
+                    >= 7.5
+            );
+            ui.hide().unwrap();
+        }
+    }
+
+    #[test]
     fn recording_interruption_reports_each_native_failure_before_settlement() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();
