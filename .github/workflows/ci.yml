@@ -283,9 +283,52 @@ jobs:
           retention-days: 14
           compression-level: 9
 
+  change-hygiene:
+    name: Change hygiene
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Test the guards, commit-msg hook and added-line checks
+        run: bash .claude/hooks/guard.test.sh
+
+      - name: Check the pull request's lines, commits, title and branch
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          SAME_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          git fetch --no-tags origin "$BASE_REF"
+          base="$(git merge-base "origin/$BASE_REF" HEAD)"
+          bash .claude/scripts/lint-diff.sh "$base"
+          status=0
+          for commit in $(git rev-list --no-merges "$base..HEAD"); do
+            git log -1 --format=%B "$commit" > "$RUNNER_TEMP/message"
+            bash .claude/hooks/commit-msg.sh "$RUNNER_TEMP/message" || { echo "commit $commit"; status=1; }
+          done
+          printf '%s\n' "$PR_TITLE" > "$RUNNER_TEMP/message"
+          bash .claude/hooks/commit-msg.sh "$RUNNER_TEMP/message" || { echo "pull request title"; status=1; }
+          source .claude/hooks/lib.sh
+          problem="$(text_problem "$PR_BODY")"
+          if [[ -n "$problem" ]]; then echo "pull request body: $problem"; status=1; fi
+          if [[ "$SAME_REPOSITORY" == "true" ]]; then
+            problem="$(branch_problem "$HEAD_REF")"
+            if [[ -n "$problem" ]]; then echo "$problem"; status=1; fi
+          fi
+          exit "$status"
+
   package:
     name: Package (${{ matrix.os }})
-    needs: [public-boundary, rust, arm64-ide, contracts]
+    needs: [public-boundary, change-hygiene, rust, arm64-ide, contracts]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
