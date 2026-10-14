@@ -27506,6 +27506,7 @@ mod tests {
         reason = "the single generated-window regression preserves related reopen and warning authority ordering"
     )]
     fn committed_audio_clip_edit_warnings_preserve_reopen_authority() {
+        i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();
         configure_ui_contracts(&ui);
         assert_eq!(
