@@ -19992,6 +19992,15 @@ mod tests {
         assert!(!ui.get_metronome_available());
     }
 
+    const TRANSPORT_STRIP_WORKSPACES: [fn(&MainWindow, bool); 6] = [
+        MainWindow::set_mixer_visible,
+        MainWindow::set_takes_visible,
+        MainWindow::set_arrangement_visible,
+        MainWindow::set_clips_visible,
+        MainWindow::set_loudness_visible,
+        MainWindow::set_timeline_map_visible,
+    ];
+
     fn assert_transport_space_shortcut_contract(ui: &MainWindow) {
         let starts = Rc::new(Cell::new(0_usize));
         let starts_by_callback = Rc::clone(&starts);
@@ -20047,19 +20056,26 @@ mod tests {
         ui.set_new_track_visible(true);
         dispatch_ide_space(ui, false, false, false, false, false);
         ui.set_new_track_visible(false);
-        ui.set_clips_visible(true);
-        dispatch_ide_space(ui, false, false, false, false, false);
-        ui.set_clips_visible(false);
         ui.set_app_mode(AppMode::Previewing);
         dispatch_ide_space(ui, false, false, false, false, false);
         assert_eq!(starts.get(), 1);
         assert_eq!(
             stops.get(),
             1,
-            "modifiers, revoked authority, local forms, hidden performance controls, and non-running modes remain inert"
+            "modifiers, revoked authority, local forms, and non-running modes remain inert"
         );
 
         ui.set_app_mode(AppMode::Running);
+        for set_visible in TRANSPORT_STRIP_WORKSPACES {
+            set_visible(ui, true);
+            dispatch_ide_space(ui, false, false, false, false, false);
+            set_visible(ui, false);
+        }
+        assert_eq!(
+            starts.get(),
+            1 + TRANSPORT_STRIP_WORKSPACES.len(),
+            "the transport strip keeps Space in every workspace"
+        );
         ui.set_transport_start_available(false);
     }
 
@@ -20109,17 +20125,25 @@ mod tests {
         ui.set_new_track_visible(true);
         dispatch_ide_home(ui, false, false, false, false, false);
         ui.set_new_track_visible(false);
-        ui.set_clips_visible(true);
-        dispatch_ide_home(ui, false, false, false, false, false);
-        ui.set_clips_visible(false);
         ui.set_app_mode(AppMode::Previewing);
         dispatch_ide_home(ui, false, false, false, false, false);
         assert_eq!(
             returns.get(),
             2,
-            "modifiers, revoked authority, local forms, hidden performance controls, and non-running modes remain inert"
+            "modifiers, revoked authority, local forms, and non-running modes remain inert"
         );
 
+        ui.set_app_mode(AppMode::Running);
+        for set_visible in TRANSPORT_STRIP_WORKSPACES {
+            set_visible(ui, true);
+            dispatch_ide_home(ui, false, false, false, false, false);
+            set_visible(ui, false);
+        }
+        assert_eq!(
+            returns.get(),
+            2 + TRANSPORT_STRIP_WORKSPACES.len(),
+            "the transport strip keeps Home in every workspace"
+        );
         ui.set_transport_return_start_available(false);
     }
 
@@ -20163,18 +20187,80 @@ mod tests {
         ui.set_new_track_visible(true);
         dispatch_ide_end(ui, false, false, false, false, false);
         ui.set_new_track_visible(false);
-        ui.set_arrangement_visible(true);
-        dispatch_ide_end(ui, false, false, false, false, false);
-        ui.set_arrangement_visible(false);
         ui.set_app_mode(AppMode::OutputFailed);
         dispatch_ide_end(ui, false, false, false, false, false);
         assert_eq!(
             seeks.borrow().len(),
             2,
-            "modifiers, repeats, revoked seek, hidden performance controls, and non-running modes remain inert"
+            "modifiers, repeats, revoked seek, local forms, and non-running modes remain inert"
         );
 
+        ui.set_app_mode(AppMode::Running);
+        for set_visible in TRANSPORT_STRIP_WORKSPACES {
+            set_visible(ui, true);
+            dispatch_ide_end(ui, false, false, false, false, false);
+            set_visible(ui, false);
+        }
+        assert_eq!(
+            seeks.borrow().len(),
+            2 + TRANSPORT_STRIP_WORKSPACES.len(),
+            "the transport strip keeps End in every workspace"
+        );
         ui.set_transport_seek_available(false);
+    }
+
+    #[test]
+    fn transport_strip_stops_playback_from_every_workspace() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let stops = Rc::new(Cell::new(0_usize));
+        let stops_by_callback = Rc::clone(&stops);
+        ui.global::<IdeActions>().on_transport_stop(move || {
+            stops_by_callback.set(stops_by_callback.get() + 1);
+        });
+        ui.set_app_mode(AppMode::Running);
+        apply_transport_recovery_availability(&ui, PlaybackRecoveryTransportState::Rolling);
+        ui.show().unwrap();
+
+        for set_visible in TRANSPORT_STRIP_WORKSPACES {
+            set_visible(&ui, true);
+            let stop = ElementHandle::find_by_accessible_label(&ui, "■  Stop")
+                .next()
+                .expect("the transport strip stays above every workspace");
+            assert_eq!(stop.accessible_enabled(), Some(true));
+            stop.mock_single_click(PointerEventButton::Left);
+            set_visible(&ui, false);
+        }
+        assert_eq!(stops.get(), TRANSPORT_STRIP_WORKSPACES.len());
+
+        let seeks = Rc::new(RefCell::new(Vec::new()));
+        let seeks_by_callback = Rc::clone(&seeks);
+        ui.global::<IdeActions>().on_transport_seek(move |percent| {
+            seeks_by_callback.borrow_mut().push(percent.to_bits());
+        });
+        let end = || {
+            ElementHandle::find_by_accessible_label(&ui, "Seek exact playback end")
+                .next()
+                .expect("the transport strip offers the playback end")
+        };
+        ui.set_transport_seek_available(true);
+        for set_visible in TRANSPORT_STRIP_WORKSPACES {
+            set_visible(&ui, true);
+            assert_eq!(end().accessible_enabled(), Some(true));
+            end().mock_single_click(PointerEventButton::Left);
+            set_visible(&ui, false);
+        }
+        assert_eq!(
+            seeks.borrow().as_slice(),
+            [100.0_f32.to_bits(); TRANSPORT_STRIP_WORKSPACES.len()]
+        );
+        ui.set_transport_seek_available(false);
+        assert_eq!(
+            end().accessible_enabled(),
+            Some(false),
+            "End needs a finite playback range"
+        );
+        ui.hide().unwrap();
     }
 
     #[test]
