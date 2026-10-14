@@ -108,26 +108,33 @@ node contracts/scripts/check-public-boundary.mjs
    with an acceptance test. Read the code, not the description.
 2. `.claude/scripts/worktree.sh <kind>/<slug>` creates the branch in its own
    worktree.
-3. Failing test, then the change. Follow the pattern already in the file.
-4. `/simplify`: it edits the code, so everything below runs after it.
-5. Run the commands above for what you touched, and
+3. `debt-scout` over the area to be touched, before any code: each finding is
+   fix here, issue, or ignore.
+4. Failing test, then the change. Follow the pattern already in the file.
+5. `continuous-simplify`: it edits the code, so everything below runs after it.
+   A task that is itself a refactor uses `refactoring` on a `refactor/` branch
+   instead, never mixed with a feature or fix.
+6. Run the commands above for what you touched, and
    `.claude/scripts/lint-diff.sh` for stubs, markers and bare lint allows.
-6. Commit atomically, in build order: data and types, behaviour, then the API
+7. Commit atomically, in build order: data and types, behaviour, then the API
    or screen that exposes it.
-7. `reviewer` subagent over the commits, once, before the pull request exists.
+8. `reviewer` subagent over the commits, once, before the pull request exists.
    Zero blocking findings is the pass; notes are not cleared for their own
    sake. An architectural finding stops the work for the maintainer.
-8. Push the branch and open the pull request with the template filled in.
+9. Push the branch and open the pull request with the template filled in. If
+   code changed since step 5, run `continuous-simplify` again before pushing.
 
 `/implement <issue>` does all of it; `/harness` finds what a change leaves
-unwatched. Skills in `.claude/skills/` (`realtime`, `audio-io`, `contracts`,
-`ide`, `runtime`, `packaging`) load when the area is touched.
+unwatched. Skills in `.claude/skills/` (`debt-scout`, `continuous-simplify`,
+`refactoring`, `realtime`, `audio-io`, `contracts`, `ide`, `runtime`,
+`packaging`) load when the task or area calls for them.
 
 ## What watches the workflow
 
 `contracts/scripts/test-contributor-workflow.mjs` (part of `npm test`) fails
 when this file, the commands, skills or templates name a path or package that
-no longer exists, when branch kinds drift between here and the hooks, when a hook is missing or not executable, or when the steps
-fall out of order. `.claude/hooks/guard.test.sh` is the table for the guards,
+no longer exists, when branch kinds drift between here and the hooks, when a
+skill is not listed here, when a hook is missing or not executable, or when the
+steps fall out of order. `.claude/hooks/guard.test.sh` is the table for the guards,
 the commit-msg hook and `lint-diff.sh`; the `change-hygiene` CI job runs it,
 and checks every pull request's lines, commits, branch and title.

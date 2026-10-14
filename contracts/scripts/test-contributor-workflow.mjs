@@ -149,16 +149,18 @@ function inOrder(label, items, needles) {
 inOrder("AGENTS.md", numbered(read("AGENTS.md"), "## Working on a change"), [
   "/spec",
   "worktree.sh",
+  "debt-scout",
   "Failing test",
-  "/simplify",
+  "continuous-simplify",
   "commands above",
   "Commit atomically",
   "reviewer",
   "Push the branch",
 ]);
 inOrder("implement.md", numbered(read(".claude/commands/implement.md"), "Implement issue"), [
+  "debt-scout",
   "Failing test first",
-  "/simplify",
+  "continuous-simplify",
   "Checks",
   "Commit",
   "reviewer",
@@ -168,6 +170,11 @@ for (const document of ["AGENTS.md", ".claude/commands/implement.md"]) {
   if (!read(document).replace(/\s+/g, " ").includes("Zero blocking findings is the pass")) {
     fail(`${document}: lost the rule that zero blocking findings is the pass`);
   }
+}
+const agents = read("AGENTS.md");
+for (const path of modes.keys()) {
+  const skill = /^\.claude\/skills\/([^/]+)\/SKILL\.md$/.exec(path)?.[1];
+  if (skill && !agents.includes(`\`${skill}\``)) fail(`AGENTS.md does not list the ${skill} skill`);
 }
 for (const level of ["Blocks", "Worth answering", "Note"]) {
   if (!read(".claude/agents/reviewer.md").includes(`**${level}`)) fail(`reviewer.md: lost the '${level}' level`);
