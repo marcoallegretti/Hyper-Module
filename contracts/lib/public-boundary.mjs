@@ -1,6 +1,5 @@
 const PRIVATE_DIRECTORY_NAMES = new Set([
   ".agents",
-  ".claude",
   ".codex",
   ".cursor",
   ".gemini",
@@ -12,8 +11,6 @@ const PRIVATE_DIRECTORY_NAMES = new Set([
 ]);
 
 const PRIVATE_INSTRUCTION_FILES = new Set([
-  "agents.md",
-  "claude.md",
   "codex.md",
   "gemini.md",
 ]);
@@ -53,7 +50,14 @@ export function privatePathReason(path) {
     }
   }
 
+  if (names[0] === ".claude" && (names[1] === "settings.local.json" || names[1] === "projects")) {
+    return `private local assistant state '.claude/${names[1]}'`;
+  }
+
   const basename = names.at(-1);
+  if (basename === "claude.local.md") {
+    return "private local instruction file 'claude.local.md'";
+  }
   if (PRIVATE_INSTRUCTION_FILES.has(basename)) {
     return `private instruction file '${basename}'`;
   }

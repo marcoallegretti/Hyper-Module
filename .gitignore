@@ -1,12 +1,11 @@
 # Private design, agent, and model-assistance material
+/.claude/settings.local.json
 /int_docs/
 **/int_docs/
 /.agents/
 **/.agents/
 /.codex/
 **/.codex/
-/.claude/
-**/.claude/
 /.cursor/
 **/.cursor/
 /.gemini/
@@ -23,10 +22,6 @@
 /.github/copilot-instructions.md
 /.github/instructions/
 /.github/prompts/
-AGENTS.md
-**/AGENTS.md
-CLAUDE.md
-**/CLAUDE.md
 CODEX.md
 **/CODEX.md
 GEMINI.md

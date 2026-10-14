@@ -12,9 +12,10 @@ const rejected = [
   "LLM/prompt.md",
   ".OCR/session/final.md",
   ".Codex/settings.json",
+  ".claude/settings.local.json",
+  ".Claude/Projects/session.jsonl",
+  "nested/CLAUDE.local.md",
   "nested/.Agents/state.json",
-  "AGENTS.md",
-  "nested/Claude.MD",
   ".GITHUB/Commands/review.md",
   ".github/INSTRUCTIONS/policy.md",
   ".github/Prompts/review.md",
@@ -35,6 +36,9 @@ const accepted = [
   "tooling/public-build-script.mjs",
   "docs/user-guide.md",
   "agents.txt",
+  "AGENTS.md",
+  "CLAUDE.md",
+  ".claude/settings.json",
 ];
 
 for (const path of rejected) {
