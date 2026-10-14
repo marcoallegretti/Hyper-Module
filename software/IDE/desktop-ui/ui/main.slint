@@ -234,6 +234,8 @@ export struct ArrangementLaneRow {
 }
 
 export struct ArrangementBlockRow {
+    placement: int,
+    id: string,
     lane: int,
     start-seconds: float,
     end-seconds: float,
@@ -562,7 +564,9 @@ component ArrangementCanvas inherits Rectangle {
     in property <float> pixels-per-second: 48;
     in property <bool> zoom-in-available;
     in property <bool> zoom-out-available;
+    in property <string> selected-id;
     callback zoom-requested(bool);
+    callback placement-selected(int, string);
     property <length> ruler-height: 36px;
     property <length> lane-height: 30px;
     property <length> name-width: 96px;
@@ -676,10 +680,13 @@ component ArrangementCanvas inherits Rectangle {
             width: Math.max(2px, (block.end-seconds - block.start-seconds) * root.pixels-per-second * 1px);
             height: root.lane-height - 4px;
             background: block.active ? #245d78 : block.enabled ? #34404d : #4a3c34;
-            border-color: block.enabled ? #3d84a8 : #6b5547;
-            border-width: 1px;
+            border-color: block.id == root.selected-id ? #75d7b4 : block.enabled ? #3d84a8 : #6b5547;
+            border-width: block.id == root.selected-id ? 2px : 1px;
             border-radius: 3px;
             clip: true;
+            TouchArea {
+                clicked => { root.placement-selected(block.placement, block.id); }
+            }
             Text {
                 x: 5px;
                 width: parent.width - 8px;
@@ -1301,6 +1308,14 @@ export component MainWindow inherits Window {
     in property <float> arrangement-canvas-loop-end-seconds: 0;
     in property <float> playhead-seconds: 0;
     in-out property <float> arrangement-pixels-per-second: 48;
+    in-out property <string> arrangement-selected-placement-id: "";
+    private property <int> arrangement-focus-row: -1;
+    private property <int> arrangement-focus-serial: 0;
+    function select-arrangement-placement(row: int, id: string) {
+        root.arrangement-selected-placement-id = id;
+        root.arrangement-focus-row = row;
+        root.arrangement-focus-serial += 1;
+    }
     private property <float> arrangement-minimum-pixels-per-second: 6;
     private property <float> arrangement-maximum-pixels-per-second: 1536;
     function zoom-arrangement(zoom-in: bool) {
@@ -5788,17 +5803,26 @@ export component MainWindow inherits Window {
                             zoom-in-available: root.arrangement-pixels-per-second < root.arrangement-maximum-pixels-per-second;
                             zoom-out-available: root.arrangement-pixels-per-second > root.arrangement-minimum-pixels-per-second;
                             zoom-requested(zoom-in) => { root.zoom-arrangement(zoom-in); }
+                            selected-id: root.arrangement-selected-placement-id;
+                            placement-selected(row, id) => { root.select-arrangement-placement(row, id); }
                         }
 
                         if !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible && root.arrangement-placements.length > 0 : ListView {
                             vertical-stretch: 1;
+                            property <int> focus-serial: root.arrangement-focus-serial;
+                            changed focus-serial => {
+                                self.viewport-y = Math.min(0px, Math.max(self.visible-height - self.viewport-height, -root.arrangement-focus-row * 160px));
+                            }
                             for placement in root.arrangement-placements : Rectangle {
                                 height: 160px;
                                 width: parent.width;
                                 background: placement.enabled ? #0e141b : #11151a;
-                                border-color: placement.enabled ? #27313d : #3a3330;
-                                border-width: 1px;
+                                border-color: placement.id == root.arrangement-selected-placement-id ? #75d7b4 : placement.enabled ? #27313d : #3a3330;
+                                border-width: placement.id == root.arrangement-selected-placement-id ? 2px : 1px;
                                 border-radius: 6px;
+                                TouchArea {
+                                    clicked => { root.arrangement-selected-placement-id = placement.id; }
+                                }
                                 HorizontalLayout {
                                     padding: 9px;
                                     spacing: 6px;
