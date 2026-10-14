@@ -113,8 +113,8 @@ pub use hyper_native_device::{
 use hyper_playback_compiler::scene::LaunchQuantization;
 use hyper_playback_compiler::{FrameTimeline, FrameTimelineError};
 pub use hyper_playback_compiler::{
-    MeterEvent, MusicalPosition, MusicalPositionResolveError, TempoEvent, musical_position,
-    musical_position_at_frame, tick_at_musical_position,
+    MeterEvent, MusicalPosition, MusicalPositionResolveError, TempoEvent, Timeline,
+    musical_position, musical_position_at_frame, tick_at_musical_position,
 };
 pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_clip_gain_is_supported;
 #[cfg(test)]

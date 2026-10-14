@@ -46,11 +46,11 @@ use hyper_desktop_ide::{
     MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, MetronomeGain, MusicalPositionResolveError,
     NativeFilterMode, OfflineExportRange, OfflineExportReport, OfflineTrackStemExportFormat,
     PlaybackRecoveryTransportState, ProjectHistory, RecentProject, SceneAction, TempoEvent,
-    TimelineMapEdit, TransportAction, TransportCommand, TransportLoopRange, TriggerBehavior,
-    audio_import_file_extensions, bpm_for_microseconds_per_quarter, desktop_ide_application_config,
-    ide_audio_clip_gain_is_supported, meter_is_in_version_one_domain,
-    microseconds_per_quarter_for_bpm, musical_position, musical_position_at_frame,
-    tick_at_musical_position,
+    Timeline, TimelineMapEdit, TransportAction, TransportCommand, TransportLoopRange,
+    TriggerBehavior, audio_import_file_extensions, bpm_for_microseconds_per_quarter,
+    desktop_ide_application_config, ide_audio_clip_gain_is_supported,
+    meter_is_in_version_one_domain, microseconds_per_quarter_for_bpm, musical_position,
+    musical_position_at_frame, tick_at_musical_position,
 };
 #[cfg(test)]
 use hyper_desktop_ide::{
@@ -166,6 +166,7 @@ struct ProjectUiState {
     timeline: RefCell<ProjectTimeline>,
     sample_rate_hz: Cell<u32>,
     arrangement: RefCell<Option<ArrangementBinding>>,
+    arrangement_canvas: RefCell<Option<ArrangementCanvasKey>>,
     audio_clips: RefCell<Vec<IdeAudioClip>>,
     scenes: RefCell<Vec<IdeScene>>,
     scene_launch_evidence: RefCell<SceneLaunchEvidence>,
@@ -316,6 +317,24 @@ struct ArrangementBinding {
     owner: Arc<IdePlaybackArrangement>,
     sample_rate_hz: u32,
     scene_ids: Vec<String>,
+}
+
+struct ArrangementCanvasKey {
+    owner: Arc<IdePlaybackArrangement>,
+    lanes: Vec<(String, String)>,
+    clip_track_ids: Vec<String>,
+    sample_rate_hz: u32,
+    tempo_events: Vec<TempoEvent>,
+    meter_events: Vec<MeterEvent>,
+}
+
+struct ArrangementCanvasPlacement<'a> {
+    clip_name: &'a str,
+    track_id: &'a str,
+    start_frame: usize,
+    end_frame: usize,
+    enabled: bool,
+    active: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -10355,6 +10374,7 @@ fn apply_running_event(
     set_playback_extent(ui, project_state, observation);
     set_tempo_and_loop(ui, project_state, observation);
     set_arrangement(ui, project_state, observation);
+    set_arrangement_canvas(ui, project_state, observation);
     set_automation(ui, project_state, observation);
     set_control_mappings(ui, project_state, observation);
     let clips_changed = set_audio_clips(ui, project_state, observation.audio_clips());
@@ -11049,6 +11069,197 @@ fn set_arrangement(
         scene_ids,
     });
     ui.set_loop_export_available(current_persisted_loop_export_range(project_state).is_some());
+}
+
+const MIN_ARRANGEMENT_CANVAS_BARS: u64 = 16;
+const MAX_ARRANGEMENT_CANVAS_BARS: usize = 4096;
+
+fn set_arrangement_canvas(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    observation: &IdeRunningObservation,
+) {
+    let owner = observation.arrangement();
+    let lanes: Vec<(String, String)> = observation
+        .mixer_channels()
+        .iter()
+        .filter(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+        .map(|channel| (channel.id().to_owned(), channel.name().to_owned()))
+        .collect();
+    let clip_track_ids: Vec<String> = observation
+        .audio_clips()
+        .iter()
+        .map(|clip| clip.track_id().to_owned())
+        .collect();
+    let timeline = project_state.timeline.borrow();
+    let unchanged = project_state
+        .arrangement_canvas
+        .borrow()
+        .as_ref()
+        .is_some_and(|current| {
+            Arc::ptr_eq(&current.owner, owner)
+                && current.lanes == lanes
+                && current.clip_track_ids == clip_track_ids
+                && current.sample_rate_hz == timeline.sample_rate_hz
+                && current.tempo_events == timeline.tempo_events
+                && current.meter_events == timeline.meter_events
+        });
+    if unchanged {
+        return;
+    }
+    let lane_rows: Vec<ArrangementLaneRow> = lanes
+        .iter()
+        .map(|(id, name)| ArrangementLaneRow {
+            id: id.as_str().into(),
+            name: name.as_str().into(),
+        })
+        .collect();
+    let placements: Vec<ArrangementCanvasPlacement<'_>> = owner
+        .placements()
+        .iter()
+        .filter_map(|placement| {
+            Some(ArrangementCanvasPlacement {
+                clip_name: owner.clip_name(placement.clip_index())?,
+                track_id: clip_track_ids.get(placement.clip_index())?,
+                start_frame: placement.start_frame(),
+                end_frame: placement.end_frame(),
+                enabled: placement.enabled(),
+                active: placement.active(),
+            })
+        })
+        .collect();
+    let blocks = arrangement_block_rows(&placements, &lane_rows, timeline.sample_rate_hz);
+    let mut launch_frames = Vec::with_capacity(owner.scene_launches().len());
+    for launch in owner.scene_launches() {
+        launch_frames.push(launch.start_frame());
+    }
+    let extent_frame = arrangement_extent_frame(
+        owner.end_frame(),
+        *project_state.playback_end_frame.borrow(),
+        &launch_frames,
+    );
+    let bars = arrangement_bar_rows(&timeline, extent_frame);
+    let scene_markers: Vec<ArrangementCanvasMarkerRow> = owner
+        .scene_launches()
+        .iter()
+        .map(|launch| ArrangementCanvasMarkerRow {
+            seconds: frame_seconds(launch.start_frame(), timeline.sample_rate_hz),
+            label: owner
+                .scene_name(launch.scene_index())
+                .unwrap_or_default()
+                .into(),
+        })
+        .collect();
+    let extent_seconds = bars
+        .last()
+        .map_or(0.0, |bar| bar.seconds)
+        .max(frame_seconds(extent_frame, timeline.sample_rate_hz));
+    ui.set_arrangement_extent_seconds(extent_seconds);
+    ui.set_arrangement_lanes(ModelRc::from(Rc::new(VecModel::from(lane_rows))));
+    ui.set_arrangement_blocks(ModelRc::from(Rc::new(VecModel::from(blocks))));
+    ui.set_arrangement_bars(ModelRc::from(Rc::new(VecModel::from(bars))));
+    ui.set_arrangement_canvas_scene_markers(ModelRc::from(Rc::new(VecModel::from(scene_markers))));
+    *project_state.arrangement_canvas.borrow_mut() = Some(ArrangementCanvasKey {
+        owner: Arc::clone(owner),
+        lanes,
+        clip_track_ids,
+        sample_rate_hz: timeline.sample_rate_hz,
+        tempo_events: timeline.tempo_events.clone(),
+        meter_events: timeline.meter_events.clone(),
+    });
+}
+
+fn arrangement_extent_frame(
+    arrangement_end_frame: usize,
+    playback_end_frame: Option<usize>,
+    launch_frames: &[usize],
+) -> usize {
+    launch_frames
+        .iter()
+        .copied()
+        .chain(playback_end_frame)
+        .fold(arrangement_end_frame, usize::max)
+}
+
+fn arrangement_block_rows(
+    placements: &[ArrangementCanvasPlacement<'_>],
+    lanes: &[ArrangementLaneRow],
+    sample_rate_hz: u32,
+) -> Vec<ArrangementBlockRow> {
+    placements
+        .iter()
+        .filter_map(|placement| {
+            let lane = lanes
+                .iter()
+                .position(|lane| lane.id.as_str() == placement.track_id)?;
+            Some(ArrangementBlockRow {
+                lane: i32::try_from(lane).ok()?,
+                start_seconds: frame_seconds(placement.start_frame, sample_rate_hz),
+                end_seconds: frame_seconds(placement.end_frame, sample_rate_hz),
+                clip_name: placement.clip_name.into(),
+                enabled: placement.enabled,
+                active: placement.active,
+            })
+        })
+        .collect()
+}
+
+fn arrangement_bar_rows(timeline: &ProjectTimeline, end_frame: usize) -> Vec<ArrangementBarRow> {
+    let mut rows = Vec::new();
+    let Ok(frames) = Timeline::try_new(timeline.sample_rate_hz, &timeline.tempo_events) else {
+        return rows;
+    };
+    let meters = &timeline.meter_events;
+    let mut meter_index = 0;
+    let mut tick = 0_u64;
+    while rows.len() < MAX_ARRANGEMENT_CANVAS_BARS {
+        while meters
+            .get(meter_index + 1)
+            .is_some_and(|next| next.tick <= tick)
+        {
+            meter_index += 1;
+        }
+        let Some(meter) = meters.get(meter_index) else {
+            break;
+        };
+        let (Ok(frame), Ok(position)) =
+            (frames.tick_to_frame(tick), musical_position(meters, tick))
+        else {
+            break;
+        };
+        let Ok(bar) = i32::try_from(position.bar()) else {
+            break;
+        };
+        rows.push(ArrangementBarRow {
+            bar,
+            seconds: frame_seconds(frame, timeline.sample_rate_hz),
+        });
+        if frame >= end_frame && position.bar() > MIN_ARRANGEMENT_CANVAS_BARS {
+            break;
+        }
+        let Some(mut next) = tick.checked_add(meter.ticks_per_bar()) else {
+            break;
+        };
+        if let Some(change) = meters.get(meter_index + 1)
+            && change.tick < next
+        {
+            next = change.tick;
+        }
+        tick = next;
+    }
+    rows
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "canvas coordinates need display precision only"
+)]
+fn frame_seconds(frame: usize, sample_rate_hz: u32) -> f32 {
+    if sample_rate_hz == 0 {
+        return 0.0;
+    }
+    (frame as f64 / f64::from(sample_rate_hz)) as f32
 }
 
 fn set_audio_clips(
@@ -12158,6 +12369,7 @@ fn reset_project(
     ui.set_preview_clip_id(SharedString::default());
     *project_state.playback_end_frame.borrow_mut() = None;
     *project_state.arrangement.borrow_mut() = None;
+    *project_state.arrangement_canvas.borrow_mut() = None;
     project_state.audio_clips.borrow_mut().clear();
     project_state.unused_sample_cleanup.set(None);
     ui.set_unused_sample_assets(0);
@@ -12235,6 +12447,15 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     reset_arrangement_placement_addition_form(ui);
     ui.set_arrangement_placements(ModelRc::default());
     ui.set_arrangement_scene_launches(ModelRc::default());
+    ui.set_arrangement_lanes(ModelRc::default());
+    ui.set_arrangement_blocks(ModelRc::default());
+    ui.set_arrangement_bars(ModelRc::default());
+    ui.set_arrangement_canvas_scene_markers(ModelRc::default());
+    ui.set_arrangement_extent_seconds(0.0);
+    ui.set_arrangement_canvas_loop_available(false);
+    ui.set_arrangement_canvas_loop_enabled(false);
+    ui.set_arrangement_pixels_per_second(48.0);
+    ui.set_playhead_seconds(0.0);
     ui.set_automation_takes(ModelRc::default());
     ui.set_automation_target_names(ModelRc::default());
     ui.set_automation_target_boolean(ModelRc::default());
@@ -16582,6 +16803,21 @@ fn refresh_loop_controls(ui: &MainWindow, state: &ProjectUiStateCell, sample_rat
     } else {
         ui.set_loop_engaged(state.loop_engaged.get());
     }
+    if let Some(range) = marks.range() {
+        ui.set_arrangement_canvas_loop_available(true);
+        ui.set_arrangement_canvas_loop_enabled(state.loop_engaged.get());
+        ui.set_arrangement_canvas_loop_start_seconds(frame_seconds(
+            range.start_frame(),
+            sample_rate_hz,
+        ));
+        ui.set_arrangement_canvas_loop_end_seconds(frame_seconds(
+            range.end_frame(),
+            sample_rate_hz,
+        ));
+    } else {
+        ui.set_arrangement_canvas_loop_available(false);
+        ui.set_arrangement_canvas_loop_enabled(false);
+    }
 }
 
 /// The tempo a stored value represents. Shown to at most two decimals because
@@ -16595,6 +16831,10 @@ fn refresh_loop_controls(ui: &MainWindow, state: &ProjectUiStateCell, sample_rat
 fn set_playhead(ui: &MainWindow, project_state: &ProjectUiStateCell, position_frame: usize) {
     ui.set_frame_position(position_frame.to_string().into());
     project_state.playhead_frame.set(position_frame);
+    ui.set_playhead_seconds(frame_seconds(
+        position_frame,
+        project_state.sample_rate_hz.get(),
+    ));
     ui.set_musical_position(
         format_musical_position(&project_state.timeline.borrow(), position_frame).into(),
     );
@@ -22596,6 +22836,318 @@ mod tests {
             tempo_command("abc").unwrap_err(),
             "\"abc\" is not a tempo",
             "and the message names what was typed"
+        );
+    }
+
+    fn arrangement_test_timeline(meter_events: Vec<MeterEvent>) -> ProjectTimeline {
+        ProjectTimeline {
+            sample_rate_hz: 48_000,
+            tempo_events: vec![TempoEvent {
+                tick: 0,
+                microseconds_per_quarter: 500_000,
+            }],
+            meter_events,
+            ..ProjectTimeline::default()
+        }
+    }
+
+    #[test]
+    fn arrangement_loop_band_follows_the_session_loop_marks() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let state = Rc::new(ProjectUiState::default());
+        ui.set_app_mode(AppMode::Running);
+        state.loop_marks.set(LoopMarks {
+            start: Some(48_000),
+            end: Some(144_000),
+        });
+        state.loop_engaged.set(true);
+        refresh_loop_controls(&ui, &state, 48_000);
+        assert!(ui.get_arrangement_canvas_loop_available());
+        assert!(ui.get_arrangement_canvas_loop_enabled());
+        assert_eq!(
+            (
+                ui.get_arrangement_canvas_loop_start_seconds().to_bits(),
+                ui.get_arrangement_canvas_loop_end_seconds().to_bits()
+            ),
+            (1.0_f32.to_bits(), 3.0_f32.to_bits())
+        );
+
+        state.loop_engaged.set(false);
+        refresh_loop_controls(&ui, &state, 48_000);
+        assert!(!ui.get_arrangement_canvas_loop_enabled());
+
+        state.loop_marks.set(LoopMarks {
+            start: Some(48_000),
+            end: None,
+        });
+        refresh_loop_controls(&ui, &state, 48_000);
+        assert!(!ui.get_arrangement_canvas_loop_available());
+    }
+
+    #[test]
+    fn arrangement_zoom_buttons_belong_to_the_drawn_canvas() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_arrangement_visible(true);
+        ui.set_arrangement_extent_seconds(32.0);
+        ui.show().unwrap();
+        let zoom = |label: &str| ElementHandle::find_by_accessible_label(&ui, label).next();
+        assert!(
+            zoom("Zoom arrangement in").is_none(),
+            "no audio lane means no canvas to zoom"
+        );
+
+        ui.set_arrangement_lanes(ModelRc::from(Rc::new(VecModel::from(vec![
+            ArrangementLaneRow {
+                id: "track-a".into(),
+                name: "Audio 1".into(),
+            },
+        ]))));
+        let zoom_in = zoom("Zoom arrangement in").expect("the canvas offers zoom");
+        zoom_in.mock_single_click(PointerEventButton::Left);
+        assert_eq!(
+            ui.get_arrangement_pixels_per_second().to_bits(),
+            96.0_f32.to_bits()
+        );
+        for _ in 0..8 {
+            zoom_in.mock_single_click(PointerEventButton::Left);
+        }
+        assert_eq!(
+            ui.get_arrangement_pixels_per_second().to_bits(),
+            1_536.0_f32.to_bits()
+        );
+        assert_eq!(zoom_in.accessible_enabled(), Some(false));
+        let zoom_out = zoom("Zoom arrangement out").expect("the canvas offers zoom");
+        assert_eq!(zoom_out.accessible_enabled(), Some(true));
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn arrangement_canvas_zooms_with_control_wheel_around_the_pointer() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_arrangement_visible(true);
+        ui.set_arrangement_lanes(ModelRc::from(Rc::new(VecModel::from(vec![
+            ArrangementLaneRow {
+                id: "track-a".into(),
+                name: "Audio 1".into(),
+            },
+        ]))));
+        ui.set_arrangement_blocks(ModelRc::from(Rc::new(VecModel::from(vec![
+            ArrangementBlockRow {
+                lane: 0,
+                start_seconds: 6.0,
+                end_seconds: 8.0,
+                clip_name: "Kick".into(),
+                enabled: true,
+                active: true,
+            },
+        ]))));
+        ui.set_arrangement_extent_seconds(40.0);
+        ui.show().unwrap();
+        let kick_x = || {
+            ElementHandle::find_by_accessible_label(&ui, "Kick")
+                .next()
+                .expect("the placement block is drawn")
+                .absolute_position()
+        };
+        let before = kick_x();
+        let pointer = LogicalPosition::new(before.x + 2.0, before.y + 4.0);
+        let scroll = || {
+            ui.window().dispatch_event(WindowEvent::PointerScrolled {
+                position: pointer,
+                delta_x: 0.0,
+                delta_y: 60.0,
+            });
+        };
+
+        scroll();
+        assert_eq!(
+            ui.get_arrangement_pixels_per_second().to_bits(),
+            48.0_f32.to_bits()
+        );
+        ui.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Control.into(),
+        });
+        scroll();
+        ui.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Control.into(),
+        });
+        assert_eq!(
+            ui.get_arrangement_pixels_per_second().to_bits(),
+            96.0_f32.to_bits()
+        );
+        let after = kick_x();
+        let label_inset = 5.0;
+        let anchored_start = pointer.x - 2.0 * (pointer.x - (before.x - label_inset));
+        assert!(
+            (after.x - label_inset - anchored_start).abs() < 1.0,
+            "the time under the pointer stays under the pointer: {before:?} -> {after:?}"
+        );
+        ui.hide().unwrap();
+    }
+
+    #[test]
+    fn arrangement_bars_follow_meter_changes_past_the_end() {
+        let timeline = arrangement_test_timeline(vec![
+            MeterEvent {
+                tick: 0,
+                numerator: 4,
+                denominator: 4,
+            },
+            MeterEvent {
+                tick: 2 * 4 * 1_920,
+                numerator: 3,
+                denominator: 4,
+            },
+        ]);
+        let bars = arrangement_bar_rows(&timeline, 48_000 * 40);
+        let starts: Vec<(i32, f32)> = bars.iter().map(|bar| (bar.bar, bar.seconds)).collect();
+        assert_eq!(starts[..4], [(1, 0.0), (2, 2.0), (3, 4.0), (4, 5.5)]);
+        assert_bars_start_where_the_readout_says_beat_one(&timeline, &bars);
+        let last = bars.last().unwrap();
+        assert!(last.seconds >= 40.0);
+        assert!(bars[bars.len() - 2].seconds < 40.0);
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bar lines in these tests sit on small positive whole frames"
+    )]
+    fn assert_bars_start_where_the_readout_says_beat_one(
+        timeline: &ProjectTimeline,
+        bars: &[ArrangementBarRow],
+    ) {
+        for bar in bars {
+            let frame = (f64::from(bar.seconds) * f64::from(timeline.sample_rate_hz)).round();
+            let readout = format_musical_position(timeline, frame as usize);
+            assert_eq!(
+                readout,
+                format!("{}|1|000", bar.bar),
+                "bar line at {}s",
+                bar.seconds
+            );
+        }
+    }
+
+    #[test]
+    fn arrangement_bars_follow_tempo_changes_and_mid_bar_meter_changes() {
+        let mut timeline = arrangement_test_timeline(vec![
+            MeterEvent {
+                tick: 0,
+                numerator: 4,
+                denominator: 4,
+            },
+            MeterEvent {
+                tick: 6 * 1_920,
+                numerator: 3,
+                denominator: 4,
+            },
+        ]);
+        timeline.tempo_events.push(TempoEvent {
+            tick: 4 * 1_920,
+            microseconds_per_quarter: 250_000,
+        });
+        let bars = arrangement_bar_rows(&timeline, 48_000 * 6);
+        let starts: Vec<(i32, f32)> = bars.iter().map(|bar| (bar.bar, bar.seconds)).collect();
+        assert_eq!(starts[..4], [(1, 0.0), (2, 2.0), (2, 2.5), (3, 3.25)]);
+        assert_bars_start_where_the_readout_says_beat_one(&timeline, &bars);
+    }
+
+    #[test]
+    fn arrangement_extent_reaches_launches_and_playback_past_the_last_placement() {
+        assert_eq!(
+            arrangement_extent_frame(96_000, None, &[48_000, 1_920_000]),
+            1_920_000
+        );
+        assert_eq!(
+            arrangement_extent_frame(96_000, Some(2_400_000), &[1_920_000]),
+            2_400_000
+        );
+        assert_eq!(arrangement_extent_frame(96_000, None, &[]), 96_000);
+    }
+
+    #[test]
+    fn arrangement_bars_cover_an_extent_past_the_sixteen_bar_minimum() {
+        let timeline = arrangement_test_timeline(vec![MeterEvent {
+            tick: 0,
+            numerator: 4,
+            denominator: 4,
+        }]);
+        let bars = arrangement_bar_rows(&timeline, 1_920_000);
+        assert!(bars.last().unwrap().seconds >= 40.0);
+    }
+
+    #[test]
+    fn arrangement_bars_span_sixteen_bars_for_an_empty_project() {
+        let timeline = arrangement_test_timeline(vec![MeterEvent {
+            tick: 0,
+            numerator: 4,
+            denominator: 4,
+        }]);
+        let bars = arrangement_bar_rows(&timeline, 0);
+        assert_eq!(bars.len(), 17);
+        assert_eq!((bars[16].bar, bars[16].seconds), (17, 32.0));
+    }
+
+    #[test]
+    fn arrangement_blocks_take_the_structural_lane_of_their_clip_track() {
+        let lanes = [
+            ArrangementLaneRow {
+                id: "track-b".into(),
+                name: "B".into(),
+            },
+            ArrangementLaneRow {
+                id: "track-a".into(),
+                name: "A".into(),
+            },
+        ];
+        let placements = [
+            ArrangementCanvasPlacement {
+                clip_name: "Kick",
+                track_id: "track-a",
+                start_frame: 48_000,
+                end_frame: 96_000,
+                enabled: true,
+                active: false,
+            },
+            ArrangementCanvasPlacement {
+                clip_name: "Orphan",
+                track_id: "track-x",
+                start_frame: 0,
+                end_frame: 48_000,
+                enabled: true,
+                active: false,
+            },
+            ArrangementCanvasPlacement {
+                clip_name: "Pad",
+                track_id: "track-b",
+                start_frame: 0,
+                end_frame: 24_000,
+                enabled: false,
+                active: false,
+            },
+        ];
+        let blocks = arrangement_block_rows(&placements, &lanes, 48_000);
+        let mapped: Vec<(i32, f32, f32, &str, bool)> = blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.lane,
+                    block.start_seconds,
+                    block.end_seconds,
+                    block.clip_name.as_str(),
+                    block.enabled,
+                )
+            })
+            .collect();
+        assert_eq!(
+            mapped,
+            [(1, 1.0, 2.0, "Kick", true), (0, 0.0, 0.5, "Pad", false)]
         );
     }
 

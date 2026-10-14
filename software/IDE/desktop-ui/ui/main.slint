@@ -228,6 +228,30 @@ export struct TakeRow {
     discardable: bool,
 }
 
+export struct ArrangementLaneRow {
+    id: string,
+    name: string,
+}
+
+export struct ArrangementBlockRow {
+    lane: int,
+    start-seconds: float,
+    end-seconds: float,
+    clip-name: string,
+    enabled: bool,
+    active: bool,
+}
+
+export struct ArrangementBarRow {
+    bar: int,
+    seconds: float,
+}
+
+export struct ArrangementCanvasMarkerRow {
+    seconds: float,
+    label: string,
+}
+
 export struct ArrangementRow {
     index: int,
     id: string,
@@ -522,6 +546,180 @@ component Panel inherits Rectangle {
     border-color: #27313d;
     border-width: 1px;
     border-radius: 8px;
+}
+
+component ArrangementCanvas inherits Rectangle {
+    in property <[ArrangementLaneRow]> lanes;
+    in property <[ArrangementBlockRow]> blocks;
+    in property <[ArrangementBarRow]> bars;
+    in property <[ArrangementCanvasMarkerRow]> scene-markers;
+    in property <float> extent-seconds;
+    in property <float> playhead-seconds;
+    in property <bool> loop-available;
+    in property <bool> loop-enabled;
+    in property <float> loop-start-seconds;
+    in property <float> loop-end-seconds;
+    in property <float> pixels-per-second: 48;
+    in property <bool> zoom-in-available;
+    in property <bool> zoom-out-available;
+    callback zoom-requested(bool);
+    property <length> ruler-height: 36px;
+    property <length> lane-height: 30px;
+    property <length> name-width: 96px;
+    property <length> content-width: Math.max(timeline.width, Math.max(root.extent-seconds, root.playhead-seconds, root.loop-available ? root.loop-end-seconds : 0) * root.pixels-per-second * 1px + 64px);
+    property <int> bar-label-step: root.bars.length < 2 ? 1
+        : Math.max(1, Math.pow(2, Math.ceil(Math.log(Math.max(1, 56 / Math.max(0.001, (root.bars[root.bars.length - 1].seconds - root.bars[0].seconds) * root.pixels-per-second / (root.bars.length - 1))), 2))));
+    height: root.ruler-height + Math.max(1, root.lanes.length) * root.lane-height + 16px;
+    background: #0b1016;
+    border-color: #27313d;
+    border-width: 1px;
+    border-radius: 6px;
+    clip: true;
+
+    function zoom-at(zoom-in: bool, content-x: length) {
+        let seconds = content-x / (root.pixels-per-second * 1px);
+        let view-x = content-x + timeline.viewport-x;
+        root.zoom-requested(zoom-in);
+        timeline.viewport-x = Math.max(timeline.visible-width - root.content-width, Math.min(0px, view-x - seconds * root.pixels-per-second * 1px));
+    }
+
+    HorizontalLayout {
+        x: 4px;
+        y: 2px;
+        width: root.name-width - 6px;
+        height: root.ruler-height - 4px;
+        spacing: 4px;
+        Button {
+            text: "−";
+            accessible-label: "Zoom arrangement out";
+            enabled: root.zoom-out-available;
+            clicked => { root.zoom-at(false, timeline.visible-width / 2 - timeline.viewport-x); }
+        }
+        Button {
+            text: "+";
+            accessible-label: "Zoom arrangement in";
+            enabled: root.zoom-in-available;
+            clicked => { root.zoom-at(true, timeline.visible-width / 2 - timeline.viewport-x); }
+        }
+    }
+
+    for lane[lane-index] in root.lanes : Rectangle {
+        x: 1px;
+        y: root.ruler-height + lane-index * root.lane-height;
+        width: root.name-width;
+        height: root.lane-height;
+        background: Math.mod(lane-index, 2) == 0 ? #111821 : #0e141b;
+        Text {
+            x: 8px;
+            width: parent.width - 12px;
+            text: lane.name;
+            color: #aebccc;
+            font-size: 10px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    timeline := ScrollView {
+        x: root.name-width + 1px;
+        y: 1px;
+        width: root.width - root.name-width - 2px;
+        height: root.height - 2px;
+        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+        viewport-width: root.content-width;
+        viewport-height: root.ruler-height + Math.max(1, root.lanes.length) * root.lane-height;
+
+        TouchArea {
+            width: root.content-width;
+            height: root.ruler-height + Math.max(1, root.lanes.length) * root.lane-height;
+            scroll-event(event) => {
+                if event.modifiers.control && event.delta-y != 0 {
+                    root.zoom-at(event.delta-y > 0, self.mouse-x);
+                    return accept;
+                }
+                reject
+            }
+        }
+
+        for lane[lane-index] in root.lanes : Rectangle {
+            y: root.ruler-height + lane-index * root.lane-height - 1px;
+            width: root.content-width;
+            height: root.lane-height;
+            background: Math.mod(lane-index, 2) == 0 ? #111821 : #0e141b;
+        }
+
+        if root.loop-available : Rectangle {
+            x: root.loop-start-seconds * root.pixels-per-second * 1px;
+            width: Math.max(1px, (root.loop-end-seconds - root.loop-start-seconds) * root.pixels-per-second * 1px);
+            height: root.ruler-height + Math.max(1, root.lanes.length) * root.lane-height;
+            background: root.loop-enabled ? #1d3b2f66 : #2a313966;
+        }
+
+        for bar[bar-index] in root.bars : Rectangle {
+            x: bar.seconds * root.pixels-per-second * 1px;
+            width: 1px;
+            height: root.ruler-height + Math.max(1, root.lanes.length) * root.lane-height;
+            visible: Math.mod(bar-index, root.bar-label-step) == 0;
+            background: #2b3643;
+            Text {
+                x: 3px;
+                y: 3px;
+                text: bar.bar;
+                color: #8290a2;
+                font-size: 9px;
+            }
+        }
+
+        for block in root.blocks : Rectangle {
+            x: block.start-seconds * root.pixels-per-second * 1px;
+            y: root.ruler-height + block.lane * root.lane-height + 2px;
+            width: Math.max(2px, (block.end-seconds - block.start-seconds) * root.pixels-per-second * 1px);
+            height: root.lane-height - 4px;
+            background: block.active ? #245d78 : block.enabled ? #34404d : #4a3c34;
+            border-color: block.enabled ? #3d84a8 : #6b5547;
+            border-width: 1px;
+            border-radius: 3px;
+            clip: true;
+            Text {
+                x: 5px;
+                width: parent.width - 8px;
+                text: block.clip-name;
+                color: block.enabled ? #edf2f8 : #8c929a;
+                font-size: 10px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        for marker in root.scene-markers : Rectangle {
+            x: marker.seconds * root.pixels-per-second * 1px;
+            width: 2px;
+            height: root.ruler-height + Math.max(1, root.lanes.length) * root.lane-height;
+            background: #d7a75f;
+            Text {
+                x: 4px;
+                y: 18px;
+                text: marker.label;
+                color: #d7a75f;
+                font-size: 9px;
+            }
+        }
+
+        Rectangle {
+            x: root.playhead-seconds * root.pixels-per-second * 1px;
+            width: 1px;
+            height: root.ruler-height + Math.max(1, root.lanes.length) * root.lane-height;
+            background: #75d7b4;
+        }
+    }
+
+    Rectangle {
+        x: 1px;
+        y: root.ruler-height;
+        width: root.width - 2px;
+        height: 1px;
+        background: #27313d;
+    }
 }
 
 component Meter inherits Rectangle {
@@ -1092,6 +1290,24 @@ export component MainWindow inherits Window {
     in property <string> recording-drop-count: "0";
     in property <[TakeRow]> recording-takes: [];
     in property <[ArrangementRow]> arrangement-placements: [];
+    in property <[ArrangementLaneRow]> arrangement-lanes: [];
+    in property <[ArrangementBlockRow]> arrangement-blocks: [];
+    in property <[ArrangementBarRow]> arrangement-bars: [];
+    in property <[ArrangementCanvasMarkerRow]> arrangement-canvas-scene-markers: [];
+    in property <float> arrangement-extent-seconds: 0;
+    in property <bool> arrangement-canvas-loop-available: false;
+    in property <bool> arrangement-canvas-loop-enabled: false;
+    in property <float> arrangement-canvas-loop-start-seconds: 0;
+    in property <float> arrangement-canvas-loop-end-seconds: 0;
+    in property <float> playhead-seconds: 0;
+    in-out property <float> arrangement-pixels-per-second: 48;
+    private property <float> arrangement-minimum-pixels-per-second: 6;
+    private property <float> arrangement-maximum-pixels-per-second: 1536;
+    function zoom-arrangement(zoom-in: bool) {
+        root.arrangement-pixels-per-second = zoom-in
+            ? Math.min(root.arrangement-maximum-pixels-per-second, root.arrangement-pixels-per-second * 2)
+            : Math.max(root.arrangement-minimum-pixels-per-second, root.arrangement-pixels-per-second / 2);
+    }
     in property <[ArrangementSceneLaunchRow]> arrangement-scene-launches: [];
     in property <[TimelineTempoMarkerRow]> timeline-tempo-markers: [];
     in property <[TimelineMeterMarkerRow]> timeline-meter-markers: [];
@@ -5555,6 +5771,23 @@ export component MainWindow inherits Window {
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
+                        }
+
+                        if !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible && root.arrangement-lanes.length > 0 : ArrangementCanvas {
+                            lanes: root.arrangement-lanes;
+                            blocks: root.arrangement-blocks;
+                            bars: root.arrangement-bars;
+                            scene-markers: root.arrangement-canvas-scene-markers;
+                            extent-seconds: root.arrangement-extent-seconds;
+                            playhead-seconds: root.playhead-seconds;
+                            loop-available: root.arrangement-canvas-loop-available;
+                            loop-enabled: root.arrangement-canvas-loop-enabled;
+                            loop-start-seconds: root.arrangement-canvas-loop-start-seconds;
+                            loop-end-seconds: root.arrangement-canvas-loop-end-seconds;
+                            pixels-per-second: root.arrangement-pixels-per-second;
+                            zoom-in-available: root.arrangement-pixels-per-second < root.arrangement-maximum-pixels-per-second;
+                            zoom-out-available: root.arrangement-pixels-per-second > root.arrangement-minimum-pixels-per-second;
+                            zoom-requested(zoom-in) => { root.zoom-arrangement(zoom-in); }
                         }
 
                         if !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible && root.arrangement-placements.length > 0 : ListView {
