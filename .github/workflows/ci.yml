@@ -382,11 +382,11 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.93.0 --profile minimal
 
-      - name: Install PipeWire development files
+      - name: Install Linux audio and UI build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends libpipewire-0.3-dev pipewire pipewire-bin wireplumber
+          sudo apt-get install --no-install-recommends libfontconfig-dev libpipewire-0.3-dev pipewire pipewire-bin wireplumber
 
       - name: Build optimized applications and deployment helpers
         shell: bash
