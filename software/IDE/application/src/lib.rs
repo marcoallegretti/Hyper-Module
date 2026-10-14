@@ -110,12 +110,12 @@ pub use hyper_native_device::{
     MIN_COMPRESSOR_RELEASE_MICROSECONDS, MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
     MIN_FILTER_CUTOFF_MILLIHERTZ, MIN_FILTER_RESONANCE_MILLIONTHS, NativeFilterMode,
 };
+use hyper_playback_compiler::FrameTimelineError;
 use hyper_playback_compiler::scene::LaunchQuantization;
 pub use hyper_playback_compiler::{
-    ClipTimebase, MeterEvent, MusicalPosition, MusicalPositionResolveError, TempoEvent, Timeline,
-    musical_position, musical_position_at_frame, tick_at_musical_position,
+    ClipTimebase, FrameTimeline, MeterEvent, MusicalPosition, MusicalPositionResolveError,
+    TempoEvent, Timeline, musical_position, musical_position_at_frame, tick_at_musical_position,
 };
-use hyper_playback_compiler::{FrameTimeline, FrameTimelineError};
 pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_clip_gain_is_supported;
 #[cfg(test)]
 use hyper_playback_json::serialize_arrangement_scene_launch_addition;
