@@ -118,7 +118,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends dbus-daemon libpipewire-0.3-dev libxkbcommon-x11-0 pipewire pipewire-bin wireplumber
+          sudo apt-get install --no-install-recommends dbus-daemon libfontconfig-dev libpipewire-0.3-dev libxkbcommon-x11-0 pipewire pipewire-bin wireplumber
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -283,9 +283,58 @@ jobs:
           retention-days: 14
           compression-level: 9
 
+  change-hygiene:
+    name: Change hygiene
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Test the guards, commit-msg hook and added-line checks
+        run: bash .claude/hooks/guard.test.sh
+
+      - name: Check the pull request's lines, commits, title and branch
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SAME_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          git fetch --no-tags origin "$BASE_REF"
+          base="$(git merge-base "origin/$BASE_REF" HEAD)"
+          bash .claude/scripts/lint-diff.sh "$base"
+          status=0
+          for commit in $(git rev-list --no-merges "$base..HEAD"); do
+            git log -1 --format=%B "$commit" > "$RUNNER_TEMP/message"
+            bash .claude/hooks/commit-msg.sh "$RUNNER_TEMP/message" || { echo "commit $commit"; status=1; }
+          done
+          pull_request="$(gh pr view "$PR_NUMBER" --json title,body)"
+          PR_BODY="$(jq -r .body <<< "$pull_request")"
+          jq -r .title <<< "$pull_request" > "$RUNNER_TEMP/message"
+          bash .claude/hooks/commit-msg.sh "$RUNNER_TEMP/message" || { echo "pull request title"; status=1; }
+          source .claude/hooks/lib.sh
+          problem="$(text_problem "$PR_BODY")"
+          if [[ -n "$problem" ]]; then echo "pull request body: $problem"; status=1; fi
+          if [[ "$SAME_REPOSITORY" == "true" ]]; then
+            problem="$(branch_problem "$HEAD_REF")"
+            if [[ -n "$problem" ]]; then echo "$problem"; status=1; fi
+          fi
+          exit "$status"
+
   package:
     name: Package (${{ matrix.os }})
-    needs: [public-boundary, rust, arm64-ide, contracts]
+    needs: [public-boundary, change-hygiene, rust, arm64-ide, contracts]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -545,6 +594,13 @@ jobs:
           cache: npm
           cache-dependency-path: contracts/package-lock.json
           package-manager-cache: false
+
+      - name: Install Linux audio dependencies for native tools
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends libpipewire-0.3-dev pipewire pipewire-bin wireplumber
 
       - name: Install locked dependencies
         run: npm ci --ignore-scripts
