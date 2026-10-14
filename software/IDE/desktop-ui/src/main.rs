@@ -639,10 +639,7 @@ fn run(startup_project: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let project_state = Rc::new(ProjectUiState::default());
 
     bind_callbacks(&ui, &worker, &routes, &project_state);
-    let timer = start_event_pump(&ui, &worker, &routes, &project_state);
-    if let Some(path) = startup_project {
-        begin_project_open(&ui, &worker, path);
-    }
+    let timer = start_event_pump(&ui, &worker, &routes, &project_state, startup_project);
     let run_result = ui.run();
     timer.stop();
 
@@ -6818,10 +6815,11 @@ fn start_event_pump(
     worker: &WorkerCell,
     routes: &UiRoutes,
     project_state: &ProjectUiStateCell,
+    mut startup_project: Option<PathBuf>,
 ) -> Timer {
     let timer = Timer::default();
     let weak = ui.as_weak();
-    let worker = Rc::clone(worker);
+    let worker_cell = Rc::clone(worker);
     let routes = routes.clone();
     let project_state = Rc::clone(project_state);
     let mut observation_pending = false;
@@ -6829,26 +6827,35 @@ fn start_event_pump(
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        let mut worker_ref = worker.borrow_mut();
-        let Some(worker) = worker_ref.as_mut() else {
-            return;
-        };
-        loop {
-            match worker.try_recv() {
-                Ok(Some(event)) => {
-                    if completes_observation(&event) {
-                        observation_pending = false;
+        {
+            let mut worker_ref = worker_cell.borrow_mut();
+            let Some(worker) = worker_ref.as_mut() else {
+                return;
+            };
+            loop {
+                match worker.try_recv() {
+                    Ok(Some(event)) => {
+                        if completes_observation(&event) {
+                            observation_pending = false;
+                        }
+                        apply_event(&ui, &routes, &project_state, event);
                     }
-                    apply_event(&ui, &routes, &project_state, event);
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    ui.set_app_mode(AppMode::Unavailable);
-                    ui.set_error_text(error.to_string().into());
-                    return;
+                    Ok(None) => break,
+                    Err(error) => {
+                        ui.set_app_mode(AppMode::Unavailable);
+                        ui.set_error_text(error.to_string().into());
+                        return;
+                    }
                 }
             }
         }
+        if open_discovered_startup_project(&ui, &worker_cell, &mut startup_project) {
+            return;
+        }
+        let mut worker_ref = worker_cell.borrow_mut();
+        let Some(worker) = worker_ref.as_mut() else {
+            return;
+        };
         if !matches!(
             ui.get_app_mode(),
             AppMode::Running
@@ -6873,6 +6880,21 @@ fn start_event_pump(
         }
     });
     timer
+}
+
+fn open_discovered_startup_project(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    startup_project: &mut Option<PathBuf>,
+) -> bool {
+    if ui.get_app_mode() == AppMode::Closed
+        && let Some(path) = startup_project.take()
+    {
+        begin_project_open(ui, worker, path);
+        true
+    } else {
+        false
+    }
 }
 
 fn completes_observation(event: &IdeWorkerEvent) -> bool {
@@ -18219,6 +18241,49 @@ mod tests {
                 "{arguments:?} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn startup_project_waits_for_published_audio_discovery() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        let project = PathBuf::from("projects/Session α");
+        let mut startup_project = Some(project.clone());
+
+        for mode in [AppMode::Discovering, AppMode::Unavailable] {
+            ui.set_app_mode(mode);
+            assert!(!open_discovered_startup_project(
+                &ui,
+                &worker,
+                &mut startup_project
+            ));
+            assert_eq!(ui.get_app_mode(), mode);
+            assert_eq!(startup_project.as_ref(), Some(&project));
+        }
+
+        ui.set_app_mode(AppMode::Closed);
+        assert!(open_discovered_startup_project(
+            &ui,
+            &worker,
+            &mut startup_project
+        ));
+        assert_eq!(startup_project, None);
+        assert_eq!(
+            ui.get_project_location(),
+            SharedString::from(project.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            ui.get_app_mode(),
+            AppMode::Unavailable,
+            "the open reaches the worker submission path"
+        );
+        ui.set_app_mode(AppMode::Closed);
+        assert!(!open_discovered_startup_project(
+            &ui,
+            &worker,
+            &mut startup_project
+        ));
     }
 
     #[test]
