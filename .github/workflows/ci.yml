@@ -120,6 +120,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends dbus-daemon libfontconfig-dev libpipewire-0.3-dev libxkbcommon-x11-0 pipewire pipewire-bin wireplumber
 
+      - name: Install virtual WASAPI render endpoint
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: software/IDE/audio-backend/scripts/wasapi-virtual-endpoint.ps1
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
