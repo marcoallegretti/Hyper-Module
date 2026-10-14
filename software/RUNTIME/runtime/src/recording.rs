@@ -68,6 +68,7 @@ struct RuntimeRecordingTarget {
 pub(super) struct RuntimeRecordingConfiguration {
     source: RuntimeRecordingUpdateSource,
     targets: Vec<RuntimeRecordingTarget>,
+    available_inputs: u8,
     timeline: FrameTimeline,
     output_directory: Option<RuntimeRecordingUpdateDirectory>,
 }
@@ -113,6 +114,7 @@ impl RuntimeRecordingConfiguration {
         Ok(Self {
             source,
             targets,
+            available_inputs: manifest.required_capabilities().audio_inputs(),
             timeline,
             output_directory,
         })
@@ -137,6 +139,20 @@ impl RuntimeRecordingConfiguration {
         !self.targets.is_empty()
     }
 
+    pub(super) const fn stereo_input_available(&self) -> bool {
+        self.available_inputs >= 2
+    }
+
+    pub(super) fn validate_source_inputs(&self) -> Result<(), RuntimeRecordingError> {
+        if self.stereo_input_available() {
+            Ok(())
+        } else {
+            Err(RuntimeRecordingError::SourceInputUnavailable {
+                available_inputs: self.available_inputs,
+            })
+        }
+    }
+
     pub(super) fn validate_target_index(
         &self,
         target_index: usize,
@@ -157,6 +173,7 @@ impl RuntimeRecordingConfiguration {
             .output_directory
             .as_ref()
             .ok_or(RuntimeRecordingError::OutputDirectoryNotConfigured)?;
+        self.validate_source_inputs()?;
         let target = self
             .targets
             .get(target_index)
@@ -336,6 +353,7 @@ impl ActiveRuntimeRecording {
 pub(super) enum RuntimeRecordingError {
     OutputDirectoryNotConfigured,
     InputUnavailable,
+    SourceInputUnavailable { available_inputs: u8 },
     TargetUnavailable,
     ProjectSnapshotUnavailable,
     ProjectCatalogUnavailable,
@@ -358,6 +376,10 @@ impl fmt::Display for RuntimeRecordingError {
             Self::InputUnavailable => {
                 formatter.write_str("recording requires an explicitly selected monitored input")
             }
+            Self::SourceInputUnavailable { available_inputs } => write!(
+                formatter,
+                "stereo recording requires two declared project audio inputs; project declares {available_inputs}"
+            ),
             Self::TargetUnavailable => {
                 formatter.write_str("the selected Runtime recording target is unavailable")
             }
@@ -396,6 +418,7 @@ impl Error for RuntimeRecordingError {
             Self::Update(source) => Some(source),
             Self::OutputDirectoryNotConfigured
             | Self::InputUnavailable
+            | Self::SourceInputUnavailable { .. }
             | Self::TargetUnavailable
             | Self::ProjectSnapshotUnavailable
             | Self::ProjectCatalogUnavailable
@@ -564,6 +587,8 @@ mod tests {
 
         assert_eq!(configuration.target_labels().unwrap(), ["Audio 1"]);
         assert!(configuration.has_targets());
+        assert!(configuration.stereo_input_available());
+        assert!(configuration.validate_source_inputs().is_ok());
         assert!(!configuration.output_configured());
         assert!(configuration.validate_target_index(0).is_ok());
         assert!(matches!(
@@ -575,6 +600,67 @@ mod tests {
             Err(super::RuntimeRecordingError::TargetUnavailable)
         ));
         prepared.package().confirm_unchanged().unwrap();
+    }
+
+    #[test]
+    fn stereo_recording_refuses_projects_with_fewer_than_two_declared_inputs() {
+        for available_inputs in [0_u8, 1] {
+            let temporary = TemporaryProjectParent::new();
+            let creation = create_project(
+                &temporary.path,
+                ProjectCreationRequest {
+                    directory_name: "Runtime Capture",
+                    project_name: "Runtime Capture",
+                },
+            )
+            .unwrap();
+            let project_root = creation.project().root().to_path_buf();
+            drop(creation);
+            let manifest_path = project_root.join("project.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            manifest["required_capabilities"]["audio_inputs"] = serde_json::json!(available_inputs);
+            fs::write(
+                &manifest_path,
+                serde_json_canonicalizer::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let prepared = hyper_project_loader::prepare_project_playback(
+                &project_root,
+                super::super::limits().unwrap(),
+            )
+            .unwrap();
+            let manifest = prepared.package().manifest();
+            let source = RuntimeRecordingUpdateSource::try_new(
+                manifest.project_id().to_owned(),
+                manifest.revision(),
+                sha256_hex(prepared.package().manifest_sha256()),
+                "a".repeat(64),
+                7,
+            )
+            .unwrap();
+            let output_path = temporary.path.join("recording-updates");
+            fs::create_dir(&output_path).unwrap();
+            let output = RuntimeRecordingUpdateDirectory::open(&output_path).unwrap();
+            let configuration =
+                super::RuntimeRecordingConfiguration::try_new(source, &prepared, Some(output))
+                    .unwrap();
+
+            assert!(configuration.has_targets());
+            assert!(configuration.output_configured());
+            assert!(!configuration.stereo_input_available());
+            assert!(matches!(
+                configuration.validate_source_inputs(),
+                Err(super::RuntimeRecordingError::SourceInputUnavailable {
+                    available_inputs: declared
+                }) if declared == available_inputs
+            ));
+            assert!(
+                super::super::initial_runtime_recording_state(&configuration, true)
+                    .contains("stereo recording requires two declared project audio inputs")
+            );
+            prepared.package().confirm_unchanged().unwrap();
+        }
     }
 
     #[test]

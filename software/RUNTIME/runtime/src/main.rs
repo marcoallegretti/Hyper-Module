@@ -247,6 +247,9 @@ impl RuntimePlaybackOwner {
             return Err("the verified project has no audio-track recording target".to_owned());
         }
         self.recording
+            .validate_source_inputs()
+            .map_err(|error| error.to_string())?;
+        self.recording
             .validate_target_index(target_index)
             .map_err(|error| error.to_string())?;
         let state = self
@@ -1061,6 +1064,7 @@ impl RuntimePlaybackOwner {
                 let ready = self.output_pinned
                     && self.recording.output_configured()
                     && self.recording.has_targets()
+                    && self.recording.stereo_input_available()
                     && input_running
                     && checkpoint.state() == PlaybackRecoveryTransportState::Stopped
                     && !checkpoint.loop_enabled();
@@ -1072,6 +1076,8 @@ impl RuntimePlaybackOwner {
                     "Recording unavailable: audio output is not explicitly pinned".to_owned()
                 } else if !self.recording.has_targets() {
                     "Recording unavailable: project has no audio track".to_owned()
+                } else if let Err(error) = self.recording.validate_source_inputs() {
+                    format!("Recording unavailable: {error}")
                 } else if !input_running {
                     "Recording unavailable: monitored input is not running".to_owned()
                 } else if checkpoint.loop_enabled() {
@@ -1195,6 +1201,8 @@ fn initial_runtime_recording_state(
         "Recording unavailable: audio output is not explicitly pinned".to_owned()
     } else if !recording.has_targets() {
         "Recording unavailable: project has no audio track".to_owned()
+    } else if let Err(error) = recording.validate_source_inputs() {
+        format!("Recording unavailable: {error}")
     } else {
         "Waiting for committed Runtime playback recovery".to_owned()
     }
