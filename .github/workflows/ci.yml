@@ -286,6 +286,9 @@ jobs:
   change-hygiene:
     name: Change hygiene
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -303,8 +306,9 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           SAME_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           git fetch --no-tags origin "$BASE_REF"
@@ -315,7 +319,9 @@ jobs:
             git log -1 --format=%B "$commit" > "$RUNNER_TEMP/message"
             bash .claude/hooks/commit-msg.sh "$RUNNER_TEMP/message" || { echo "commit $commit"; status=1; }
           done
-          printf '%s\n' "$PR_TITLE" > "$RUNNER_TEMP/message"
+          pull_request="$(gh pr view "$PR_NUMBER" --json title,body)"
+          PR_BODY="$(jq -r .body <<< "$pull_request")"
+          jq -r .title <<< "$pull_request" > "$RUNNER_TEMP/message"
           bash .claude/hooks/commit-msg.sh "$RUNNER_TEMP/message" || { echo "pull request title"; status=1; }
           source .claude/hooks/lib.sh
           problem="$(text_problem "$PR_BODY")"
