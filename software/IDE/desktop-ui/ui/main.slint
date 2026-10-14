@@ -235,6 +235,7 @@ export struct ArrangementLaneRow {
 
 export struct ArrangementBlockRow {
     placement: int,
+    start-tick: int,
     id: string,
     lane: int,
     start-seconds: float,
@@ -410,6 +411,9 @@ export global IdeActions {
     callback locate-placement(int);
     callback set-arrangement-placement-active(int, bool);
     callback move-arrangement-placement(string, string);
+    pure callback arrangement-drag-tick(int, float, int) -> int;
+    pure callback arrangement-tick-seconds(int) -> float;
+    callback drop-arrangement-placement(string, int);
     callback set-arrangement-placement-duration(string, string);
     callback set-arrangement-placement-gain(string, string);
     callback set-arrangement-placement-fades(string, string, string);
@@ -565,8 +569,20 @@ component ArrangementCanvas inherits Rectangle {
     in property <bool> zoom-in-available;
     in property <bool> zoom-out-available;
     in property <string> selected-id;
+    in property <bool> move-available;
+    in property <int> grid;
+    property <string> drag-id;
+    property <bool> drag-pressed;
+    property <int> drag-lane;
+    property <int> drag-tick: -1;
+    property <float> drag-duration-seconds;
     callback zoom-requested(bool);
     callback placement-selected(int, string);
+
+    changed blocks => {
+        root.drag-id = "";
+        root.drag-pressed = false;
+    }
     property <length> ruler-height: 36px;
     property <length> lane-height: 30px;
     property <length> name-width: 96px;
@@ -685,7 +701,33 @@ component ArrangementCanvas inherits Rectangle {
             border-radius: 3px;
             clip: true;
             TouchArea {
+                mouse-cursor: root.move-available ? MouseCursor.move : MouseCursor.default;
                 clicked => { root.placement-selected(block.placement, block.id); }
+                moved => {
+                    if root.move-available && root.drag-pressed && block.start-tick >= 0 && (root.drag-id == block.id || Math.abs(self.mouse-x - self.pressed-x) >= 4px) {
+                        root.drag-id = block.id;
+                        root.drag-lane = block.lane;
+                        root.drag-duration-seconds = block.end-seconds - block.start-seconds;
+                        root.drag-tick = IdeActions.arrangement-drag-tick(
+                            block.start-tick,
+                            (self.mouse-x - self.pressed-x) / (root.pixels-per-second * 1px),
+                            root.grid);
+                    }
+                }
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.down {
+                        root.drag-pressed = event.button == PointerEventButton.left;
+                    } else if event.kind == PointerEventKind.cancel {
+                        root.drag-id = "";
+                        root.drag-pressed = false;
+                    } else if event.kind == PointerEventKind.up {
+                        if root.drag-id == block.id && root.move-available && root.drag-tick >= 0 && root.drag-tick != block.start-tick {
+                            IdeActions.drop-arrangement-placement(block.id, root.drag-tick);
+                        }
+                        root.drag-id = "";
+                        root.drag-pressed = false;
+                    }
+                }
             }
             Text {
                 x: 5px;
@@ -710,6 +752,19 @@ component ArrangementCanvas inherits Rectangle {
                 color: #d7a75f;
                 font-size: 9px;
             }
+        }
+
+        if root.drag-id != "" && root.drag-tick >= 0 : Rectangle {
+            x: IdeActions.arrangement-tick-seconds(root.drag-tick) * root.pixels-per-second * 1px;
+            y: root.ruler-height + root.drag-lane * root.lane-height + 2px;
+            width: Math.max(2px, root.drag-duration-seconds * root.pixels-per-second * 1px);
+            height: root.lane-height - 4px;
+            accessible-role: text;
+            accessible-label: "Drop position at tick " + root.drag-tick;
+            background: #75d7b433;
+            border-color: #75d7b4;
+            border-width: 1px;
+            border-radius: 3px;
         }
 
         Rectangle {
@@ -1309,6 +1364,7 @@ export component MainWindow inherits Window {
     in property <float> playhead-seconds: 0;
     in-out property <float> arrangement-pixels-per-second: 48;
     in-out property <string> arrangement-selected-placement-id: "";
+    in-out property <int> arrangement-grid-index: 0;
     private property <int> arrangement-focus-row: -1;
     private property <int> arrangement-focus-serial: 0;
     function select-arrangement-placement(row: int, id: string) {
@@ -5419,6 +5475,12 @@ export component MainWindow inherits Window {
                                 Text { text: root.arrangement-placements.length + " placements · " + root.arrangement-scene-launches.length + " scene markers · span " + root.arrangement-span-clock; color: #aebccc; font-size: 12px; }
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
+                            if root.arrangement-lanes.length > 0 && !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible : ComboBox {
+                                width: 120px;
+                                model: ["Grid: Bar", "Grid: Beat", "Grid: Off"];
+                                current-index <=> root.arrangement-grid-index;
+                                accessible-label: "Arrangement drag grid";
+                            }
                             Button {
                                 text: "Import Runtime loop…";
                                 accessible-label: "Select one Runtime loop update and import its provenance-checked arrangement loop";
@@ -5782,7 +5844,7 @@ export component MainWindow inherits Window {
 
                         if !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible : Text {
                             height: 36px;
-                            text: "Placement and scene-marker forms accept exact raw ticks or uniquely resolvable bar|beat|tick positions. Grid-scene capture, non-ripple placement edits, and bounded linear crossfades are durable. Arrangement drag, snap, direct waveform editing, and arbitrary live timing are unavailable.";
+                            text: "Placement and scene-marker forms accept exact raw ticks or uniquely resolvable bar|beat|tick positions. Grid-scene capture, non-ripple placement edits, and bounded linear crossfades are durable. Dragging a block moves its placement to the chosen grid as one non-ripple edit; trimming on the canvas, direct waveform editing, and arbitrary live timing are unavailable.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
@@ -5804,6 +5866,8 @@ export component MainWindow inherits Window {
                             zoom-out-available: root.arrangement-pixels-per-second > root.arrangement-minimum-pixels-per-second;
                             zoom-requested(zoom-in) => { root.zoom-arrangement(zoom-in); }
                             selected-id: root.arrangement-selected-placement-id;
+                            move-available: root.app-mode == AppMode.running;
+                            grid: root.arrangement-grid-index;
                             placement-selected(row, id) => { root.select-arrangement-placement(row, id); }
                         }
 

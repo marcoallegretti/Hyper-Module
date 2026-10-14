@@ -16,7 +16,7 @@ use hyper_desktop_ide::{
     AUDIO_IMPORT_FILE_FILTER_LABEL, AutomationChannelParameter, AutomationInterpolation,
     AutomationMainParameter, AutomationPoint, AutomationSendParameter, AutomationTarget,
     AutomationValue, ControlScope, ControlSource, ControlTarget, ControlTransform,
-    DesktopAudioPreviewState, DesktopIdeWorker, Edge, IDE_AUDIO_CLIP_WAVEFORM_BINS,
+    DesktopAudioPreviewState, DesktopIdeWorker, Edge, FrameTimeline, IDE_AUDIO_CLIP_WAVEFORM_BINS,
     IdeApplicationConfig, IdeAudioClip, IdeAudioClipSourceRange, IdeAudioClipWaveform,
     IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
     IdeAutomationLaneAddRequest, IdeAutomationLaneEditRequest, IdeAutomationTakeRequest,
@@ -330,6 +330,7 @@ struct ArrangementCanvasKey {
 
 struct ArrangementCanvasPlacement<'a> {
     row: usize,
+    start_tick: u64,
     id: &'a str,
     clip_name: &'a str,
     track_id: &'a str,
@@ -4413,6 +4414,7 @@ fn bind_arrangement_callback(
     });
 
     bind_arrangement_move_callback(ui, worker, project_state);
+    bind_arrangement_drag_callbacks(ui, project_state);
     bind_arrangement_duplication_callback(ui, worker, project_state);
     bind_arrangement_split_callback(ui, worker, project_state);
     bind_arrangement_duration_callback(ui, worker, project_state);
@@ -5077,6 +5079,122 @@ fn arrangement_removal_confirmation_is_current(
         && visible
         && !confirmed_placement_id.is_empty()
         && confirmed_placement_id == requested_placement_id
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArrangementGrid {
+    Bar,
+    Beat,
+    Off,
+}
+
+impl ArrangementGrid {
+    const fn from_index(index: i32) -> Self {
+        match index {
+            0 => Self::Bar,
+            1 => Self::Beat,
+            _ => Self::Off,
+        }
+    }
+}
+
+fn snap_arrangement_tick(meter_events: &[MeterEvent], tick: u64, grid: ArrangementGrid) -> u64 {
+    let Some(index) = meter_events.iter().rposition(|meter| meter.tick <= tick) else {
+        return tick;
+    };
+    let meter = meter_events[index];
+    let unit = match grid {
+        ArrangementGrid::Bar => meter.ticks_per_bar(),
+        ArrangementGrid::Beat => meter.ticks_per_beat(),
+        ArrangementGrid::Off => return tick,
+    };
+    let lower = meter.tick + (tick - meter.tick) / unit * unit;
+    let mut upper = lower.saturating_add(unit);
+    if let Some(next) = meter_events.get(index + 1)
+        && next.tick < upper
+    {
+        upper = next.tick;
+    }
+    if tick - lower < upper - tick {
+        lower
+    } else {
+        upper
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a canvas drag spans far fewer frames than i64 holds"
+)]
+fn arrangement_drag_tick(
+    timeline: &ProjectTimeline,
+    start_tick: u64,
+    delta_seconds: f32,
+    grid: ArrangementGrid,
+) -> Option<u64> {
+    let delta_frames =
+        (f64::from(delta_seconds) * f64::from(timeline.sample_rate_hz)).round() as i64;
+    if delta_frames == 0 {
+        return Some(start_tick);
+    }
+    let start_frame = Timeline::try_new(timeline.sample_rate_hz, &timeline.tempo_events)
+        .ok()?
+        .tick_to_frame(start_tick)
+        .ok()?;
+    let target_frame = i64::try_from(start_frame)
+        .ok()?
+        .saturating_add(delta_frames)
+        .max(0);
+    let tick = FrameTimeline::try_new(timeline.sample_rate_hz, &timeline.tempo_events)
+        .ok()?
+        .position_at_frame(usize::try_from(target_frame).ok()?)
+        .ok()?
+        .whole_tick();
+    Some(snap_arrangement_tick(&timeline.meter_events, tick, grid))
+}
+
+fn arrangement_tick_seconds(timeline: &ProjectTimeline, tick: u64) -> Option<f32> {
+    let frame = Timeline::try_new(timeline.sample_rate_hz, &timeline.tempo_events)
+        .ok()?
+        .tick_to_frame(tick)
+        .ok()?;
+    Some(frame_seconds(frame, timeline.sample_rate_hz))
+}
+
+fn bind_arrangement_drag_callbacks(ui: &MainWindow, project_state: &ProjectUiStateCell) {
+    let actions = ui.global::<IdeActions>();
+    let state_for_drag = Rc::clone(project_state);
+    actions.on_arrangement_drag_tick(move |start_tick, delta_seconds, grid| {
+        u64::try_from(start_tick)
+            .ok()
+            .and_then(|start_tick| {
+                arrangement_drag_tick(
+                    &state_for_drag.timeline.borrow(),
+                    start_tick,
+                    delta_seconds,
+                    ArrangementGrid::from_index(grid),
+                )
+            })
+            .and_then(|tick| i32::try_from(tick).ok())
+            .unwrap_or(-1)
+    });
+    let state_for_seconds = Rc::clone(project_state);
+    actions.on_arrangement_tick_seconds(move |tick| {
+        u64::try_from(tick)
+            .ok()
+            .and_then(|tick| arrangement_tick_seconds(&state_for_seconds.timeline.borrow(), tick))
+            .unwrap_or(0.0)
+    });
+    let weak = ui.as_weak();
+    actions.on_drop_arrangement_placement(move |placement_id, tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if tick >= 0 {
+            ui.global::<IdeActions>()
+                .invoke_move_arrangement_placement(placement_id, tick.to_string().into());
+        }
+    });
 }
 
 fn bind_arrangement_move_callback(
@@ -11122,6 +11240,7 @@ fn set_arrangement_canvas(
         .filter_map(|(row, placement)| {
             Some(ArrangementCanvasPlacement {
                 row,
+                start_tick: placement.start_tick(),
                 id: placement.id(),
                 clip_name: owner.clip_name(placement.clip_index())?,
                 track_id: clip_track_ids.get(placement.clip_index())?,
@@ -11198,6 +11317,7 @@ fn arrangement_block_rows(
                 .position(|lane| lane.id.as_str() == placement.track_id)?;
             Some(ArrangementBlockRow {
                 placement: i32::try_from(placement.row).ok()?,
+                start_tick: i32::try_from(placement.start_tick).unwrap_or(-1),
                 id: placement.id.into(),
                 lane: i32::try_from(lane).ok()?,
                 start_seconds: frame_seconds(placement.start_frame, sample_rate_hz),
@@ -22968,6 +23088,7 @@ mod tests {
         let blocks: Vec<ArrangementBlockRow> = (0..12_u8)
             .map(|row| ArrangementBlockRow {
                 placement: i32::from(row),
+                start_tick: 0,
                 id: format!("placement-{row}").into(),
                 lane: 0,
                 start_seconds: f32::from(row) * 0.75,
@@ -23006,6 +23127,225 @@ mod tests {
             ui.get_arrangement_selected_placement_id(),
             "placement-11",
             "selecting a card selects its placement"
+        );
+        ui.hide().unwrap();
+    }
+
+    fn four_four_meter() -> Vec<MeterEvent> {
+        vec![MeterEvent {
+            tick: 0,
+            numerator: 4,
+            denominator: 4,
+        }]
+    }
+
+    #[test]
+    fn arrangement_ticks_snap_to_the_nearest_bar_or_beat_of_the_meter_map() {
+        let mut meters = four_four_meter();
+        assert_eq!(
+            snap_arrangement_tick(&meters, 7_000, ArrangementGrid::Bar),
+            7_680
+        );
+        assert_eq!(
+            snap_arrangement_tick(&meters, 3_000, ArrangementGrid::Bar),
+            0
+        );
+        assert_eq!(
+            snap_arrangement_tick(&meters, 2_500, ArrangementGrid::Beat),
+            1_920
+        );
+        assert_eq!(
+            snap_arrangement_tick(&meters, 2_500, ArrangementGrid::Off),
+            2_500
+        );
+        assert_eq!(
+            snap_arrangement_tick(&meters, 3_840, ArrangementGrid::Bar),
+            7_680,
+            "a tie rounds half up, as Ardour's grid does"
+        );
+        meters.push(MeterEvent {
+            tick: 9_600,
+            numerator: 3,
+            denominator: 4,
+        });
+        assert_eq!(
+            snap_arrangement_tick(&meters, 9_000, ArrangementGrid::Bar),
+            9_600,
+            "a meter change inside a bar is itself a bar start"
+        );
+        assert_eq!(
+            snap_arrangement_tick(&meters, 14_600, ArrangementGrid::Bar),
+            15_360,
+            "bars after a change are counted from the change"
+        );
+    }
+
+    #[test]
+    fn arrangement_drags_move_by_frames_through_the_tempo_map() {
+        let mut timeline = arrangement_test_timeline(four_four_meter());
+        timeline.tempo_events.push(TempoEvent {
+            tick: 7_680,
+            microseconds_per_quarter: 250_000,
+        });
+        assert_eq!(
+            arrangement_drag_tick(&timeline, 0, 2.3, ArrangementGrid::Off),
+            Some(9_984)
+        );
+        assert_eq!(
+            arrangement_drag_tick(&timeline, 0, 2.3, ArrangementGrid::Beat),
+            Some(9_600)
+        );
+        assert_eq!(
+            arrangement_drag_tick(&timeline, 9_600, 0.25, ArrangementGrid::Off),
+            Some(11_520),
+            "a start after the tempo change converts through the faster tempo"
+        );
+        assert_eq!(
+            arrangement_drag_tick(&timeline, 1_001, 0.0, ArrangementGrid::Bar),
+            Some(1_001),
+            "an unmoved block keeps its exact tick on any grid"
+        );
+        assert_eq!(
+            arrangement_drag_tick(&timeline, 3_840, -5.0, ArrangementGrid::Off),
+            Some(0)
+        );
+        assert_eq!(
+            arrangement_tick_seconds(&timeline, 9_600).map(f32::to_bits),
+            Some(2.25_f32.to_bits())
+        );
+    }
+
+    fn drag_arrangement_block_with_button(
+        ui: &MainWindow,
+        label: &str,
+        dx: f32,
+        button: PointerEventButton,
+    ) {
+        let block = ElementHandle::find_by_accessible_label(ui, label)
+            .next()
+            .expect("the block is drawn");
+        let start = block.absolute_position();
+        let from = LogicalPosition::new(start.x + 4.0, start.y + 4.0);
+        let to = LogicalPosition::new(from.x + dx, from.y);
+        ui.window().dispatch_event(WindowEvent::PointerPressed {
+            position: from,
+            button,
+        });
+        ui.window()
+            .dispatch_event(WindowEvent::PointerMoved { position: to });
+        ui.window().dispatch_event(WindowEvent::PointerReleased {
+            position: to,
+            button,
+        });
+    }
+
+    fn drag_arrangement_block(ui: &MainWindow, label: &str, dx: f32) {
+        drag_arrangement_block_with(ui, label, dx, || {});
+    }
+
+    fn drag_arrangement_block_with(
+        ui: &MainWindow,
+        label: &str,
+        dx: f32,
+        before_release: impl FnOnce(),
+    ) {
+        let block = ElementHandle::find_by_accessible_label(ui, label)
+            .next()
+            .expect("the block is drawn");
+        let start = block.absolute_position();
+        let from = LogicalPosition::new(start.x + 4.0, start.y + 4.0);
+        let to = LogicalPosition::new(from.x + dx, from.y);
+        ui.window().dispatch_event(WindowEvent::PointerPressed {
+            position: from,
+            button: PointerEventButton::Left,
+        });
+        ui.window()
+            .dispatch_event(WindowEvent::PointerMoved { position: to });
+        before_release();
+        ui.window().dispatch_event(WindowEvent::PointerReleased {
+            position: to,
+            button: PointerEventButton::Left,
+        });
+    }
+
+    #[test]
+    fn dragging_a_block_moves_its_placement_to_the_chosen_grid() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let state = Rc::new(ProjectUiState::default());
+        *state.timeline.borrow_mut() = arrangement_test_timeline(four_four_meter());
+        bind_arrangement_drag_callbacks(&ui, &state);
+        let moves = Rc::new(RefCell::new(Vec::new()));
+        let moves_by_callback = Rc::clone(&moves);
+        ui.global::<IdeActions>()
+            .on_move_arrangement_placement(move |id, tick| {
+                moves_by_callback
+                    .borrow_mut()
+                    .push((id.to_string(), tick.to_string()));
+            });
+        ui.set_app_mode(AppMode::Running);
+        ui.set_arrangement_visible(true);
+        ui.set_arrangement_extent_seconds(32.0);
+        ui.set_arrangement_lanes(ModelRc::from(Rc::new(VecModel::from(vec![
+            ArrangementLaneRow {
+                id: "track-a".into(),
+                name: "Audio 1".into(),
+            },
+        ]))));
+        ui.set_arrangement_blocks(ModelRc::from(Rc::new(VecModel::from(vec![
+            ArrangementBlockRow {
+                placement: 0,
+                start_tick: 23_040,
+                id: "placement-0".into(),
+                lane: 0,
+                start_seconds: 6.0,
+                end_seconds: 8.0,
+                clip_name: "Kick".into(),
+                enabled: true,
+                active: true,
+            },
+        ]))));
+        ui.show().unwrap();
+
+        drag_arrangement_block(&ui, "Kick", 130.0);
+        ui.set_arrangement_grid_index(1);
+        drag_arrangement_block(&ui, "Kick", 130.0);
+        ui.set_arrangement_grid_index(2);
+        drag_arrangement_block(&ui, "Kick", 130.0);
+        drag_arrangement_block(&ui, "Kick", 2.0);
+        drag_arrangement_block_with(&ui, "Kick", 130.0, || ui.set_app_mode(AppMode::Saving));
+        drag_arrangement_block(&ui, "Kick", 130.0);
+        drag_arrangement_block_with(&ui, "Kick", 130.0, || ui.set_app_mode(AppMode::Running));
+        drag_arrangement_block_with_button(&ui, "Kick", 130.0, PointerEventButton::Right);
+        let ghost =
+            || ElementHandle::find_by_accessible_label(&ui, "Drop position at tick 33440").next();
+        drag_arrangement_block_with(&ui, "Kick", 130.0, || {
+            assert!(ghost().is_some(), "the drop position follows the drag");
+            ui.window().dispatch_event(WindowEvent::PointerExited);
+        });
+        assert!(
+            ghost().is_none(),
+            "a cancelled drag leaves no drop position"
+        );
+        drag_arrangement_block(&ui, "Kick", 0.0);
+        let blocks = ui.get_arrangement_blocks();
+        drag_arrangement_block_with(&ui, "Kick", 130.0, || {
+            let rows: Vec<ArrangementBlockRow> = blocks.iter().collect();
+            ui.set_arrangement_blocks(ModelRc::from(Rc::new(VecModel::from(rows))));
+        });
+        assert!(
+            ghost().is_none(),
+            "a rebuilt canvas drops the drag in progress"
+        );
+        drag_arrangement_block(&ui, "Kick", 0.0);
+        assert_eq!(
+            moves.borrow().as_slice(),
+            [
+                ("placement-0".to_owned(), "30720".to_owned()),
+                ("placement-0".to_owned(), "32640".to_owned()),
+                ("placement-0".to_owned(), "33440".to_owned()),
+            ],
+            "bar, beat and free drops; nothing for a nudge, a release outside Running, a drag begun outside Running, a right-button drag, or a click after a cancelled drag"
         );
         ui.hide().unwrap();
     }
@@ -23064,6 +23404,7 @@ mod tests {
         ui.set_arrangement_blocks(ModelRc::from(Rc::new(VecModel::from(vec![
             ArrangementBlockRow {
                 placement: 0,
+                start_tick: 0,
                 id: "placement-kick".into(),
                 lane: 0,
                 start_seconds: 6.0,
@@ -23236,6 +23577,7 @@ mod tests {
         let placements = [
             ArrangementCanvasPlacement {
                 row: 0,
+                start_tick: 0,
                 id: "placement-kick",
                 clip_name: "Kick",
                 track_id: "track-a",
@@ -23246,6 +23588,7 @@ mod tests {
             },
             ArrangementCanvasPlacement {
                 row: 1,
+                start_tick: 0,
                 id: "placement-orphan",
                 clip_name: "Orphan",
                 track_id: "track-x",
@@ -23256,6 +23599,7 @@ mod tests {
             },
             ArrangementCanvasPlacement {
                 row: 2,
+                start_tick: 0,
                 id: "placement-pad",
                 clip_name: "Pad",
                 track_id: "track-b",
