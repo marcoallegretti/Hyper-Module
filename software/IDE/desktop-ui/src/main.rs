@@ -15,7 +15,7 @@ use hyper_desktop_audio::StreamState;
 use hyper_desktop_ide::{
     AUDIO_IMPORT_FILE_FILTER_LABEL, AutomationChannelParameter, AutomationInterpolation,
     AutomationMainParameter, AutomationPoint, AutomationSendParameter, AutomationTarget,
-    AutomationValue, ControlScope, ControlSource, ControlTarget, ControlTransform,
+    AutomationValue, ClipTimebase, ControlScope, ControlSource, ControlTarget, ControlTransform,
     DesktopAudioPreviewState, DesktopIdeWorker, Edge, IDE_AUDIO_CLIP_WAVEFORM_BINS,
     IdeApplicationConfig, IdeAudioClip, IdeAudioClipSourceRange, IdeAudioClipWaveform,
     IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
@@ -66,7 +66,10 @@ use hyper_desktop_ide::{
 #[cfg(test)]
 use hyper_mixer_runtime::PlaybackRecoverySnapshot;
 #[cfg(test)]
-use hyper_playback_session::{PlaybackAutomation, PlaybackAutomationLane, PlaybackAutomationTake};
+use hyper_playback_session::{
+    PlaybackArrangementPlacement, PlaybackAutomation, PlaybackAutomationLane,
+    PlaybackAutomationTake,
+};
 use slint::platform::PlatformError;
 use slint::{
     CloseRequestResponse, ComponentHandle, Model, ModelRc, ModelTracker, SharedString, Timer,
@@ -10885,6 +10888,12 @@ fn set_playback_extent(
     }
 }
 
+fn plays_whole_clip(arrangement: &IdePlaybackArrangement, clip_index: usize) -> bool {
+    arrangement
+        .clip_timebase(clip_index)
+        .is_some_and(ClipTimebase::requires_whole_clip_placement)
+}
+
 struct ArrangementListModel {
     owner: Arc<IdePlaybackArrangement>,
     sample_rate_hz: u32,
@@ -10900,7 +10909,7 @@ fn arrangement_crossfade_target(
     outgoing_index: usize,
 ) -> Option<(usize, u64)> {
     let outgoing = arrangement.placements().get(outgoing_index)?;
-    if !outgoing.active() {
+    if !outgoing.active() || plays_whole_clip(arrangement, outgoing.clip_index()) {
         return None;
     }
     let outgoing_end_tick = outgoing
@@ -10914,6 +10923,7 @@ fn arrangement_crossfade_target(
     for (incoming_index, incoming) in arrangement.placements().iter().enumerate() {
         if incoming_index == outgoing_index
             || !incoming.active()
+            || plays_whole_clip(arrangement, incoming.clip_index())
             || incoming.track_index() != outgoing.track_index()
             || outgoing.start_tick() >= incoming.start_tick()
             || incoming.start_tick() >= outgoing_end_tick
@@ -11017,6 +11027,7 @@ impl Model for ArrangementListModel {
             width_percent: (end_percent - start_percent).max(0.0),
             enabled: placement.enabled(),
             active: placement.active(),
+            whole_clip: plays_whole_clip(self.owner.as_ref(), placement.clip_index()),
         })
     }
 
@@ -18845,6 +18856,7 @@ mod tests {
                 width_percent: 100.0,
                 enabled: true,
                 active: true,
+                whole_clip: false,
             },
         ]))));
         let submitted = Rc::new(RefCell::new(Vec::new()));
@@ -18933,6 +18945,7 @@ mod tests {
                 width_percent: 100.0,
                 enabled: true,
                 active: true,
+                whole_clip: false,
             },
         ]))));
         let submitted = Rc::new(RefCell::new(Vec::new()));
@@ -18974,6 +18987,148 @@ mod tests {
         ui.hide().unwrap();
     }
 
+    fn two_overlapping_placements(lead: ClipTimebase, pad: ClipTimebase) -> IdePlaybackArrangement {
+        IdePlaybackArrangement::for_test_with_placements(
+            vec!["Audio".to_owned()],
+            vec![("Pad".to_owned(), pad), ("Lead".to_owned(), lead)],
+            vec![
+                PlaybackArrangementPlacement::for_test("lead", 0, 1, 0, 960),
+                PlaybackArrangementPlacement::for_test("pad", 0, 0, 480, 960),
+            ],
+        )
+    }
+
+    #[test]
+    fn whole_clip_placements_are_marked_and_never_crossfaded() {
+        let musical = two_overlapping_placements(ClipTimebase::Musical, ClipTimebase::Musical);
+        assert_eq!(arrangement_crossfade_target(&musical, 0), Some((1, 480)));
+        assert_eq!(
+            arrangement_crossfade_target(
+                &two_overlapping_placements(ClipTimebase::SampleLocked, ClipTimebase::Musical),
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            arrangement_crossfade_target(
+                &two_overlapping_placements(ClipTimebase::Musical, ClipTimebase::SampleLocked),
+                0
+            ),
+            None
+        );
+
+        let rows = ArrangementListModel {
+            owner: Arc::new(two_overlapping_placements(
+                ClipTimebase::SampleLocked,
+                ClipTimebase::Musical,
+            )),
+            sample_rate_hz: 48_000,
+        };
+        assert!(rows.row_data(0).unwrap().whole_clip);
+        assert!(!rows.row_data(1).unwrap().whole_clip);
+
+        let with_whole_clip_neighbour = IdePlaybackArrangement::for_test_with_placements(
+            vec!["Audio".to_owned()],
+            vec![
+                ("Lead".to_owned(), ClipTimebase::Musical),
+                ("Pad".to_owned(), ClipTimebase::Musical),
+                ("Hit".to_owned(), ClipTimebase::SampleLocked),
+            ],
+            vec![
+                PlaybackArrangementPlacement::for_test("lead", 0, 0, 0, 960),
+                PlaybackArrangementPlacement::for_test("pad", 0, 1, 480, 960),
+                PlaybackArrangementPlacement::for_test("hit", 0, 2, 600, 960),
+            ],
+        );
+        assert_eq!(
+            arrangement_crossfade_target(&with_whole_clip_neighbour, 0),
+            Some((1, 480)),
+            "a whole-clip neighbour that can never be crossfaded does not hide the one real pair"
+        );
+    }
+
+    #[test]
+    fn whole_clip_placement_cards_disable_window_edits_with_the_reason() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_arrangement_visible(true);
+        let row = |clip_name: &str, whole_clip: bool| ArrangementRow {
+            index: 0,
+            id: format!("placement-{clip_name}").into(),
+            track_name: "Audio".into(),
+            clip_name: clip_name.into(),
+            start_tick: "0".into(),
+            clip_start_tick: if whole_clip { "0" } else { "240" }.into(),
+            duration_ticks: "960".into(),
+            gain_edit: "0".into(),
+            fade_in_edit: "0".into(),
+            fade_out_edit: "0".into(),
+            enabled: true,
+            active: true,
+            whole_clip,
+            ..ArrangementRow::default()
+        };
+        ui.set_arrangement_placements(ModelRc::from(Rc::new(VecModel::from(vec![
+            row("Lead", false),
+            row("Pad", true),
+        ]))));
+        ui.show().unwrap();
+        let find = |label: String| {
+            ElementHandle::find_by_accessible_label(&ui, &label)
+                .next()
+                .unwrap_or_else(|| panic!("{label} is drawn"))
+        };
+        for clip in ["Lead", "Pad"] {
+            find(format!(
+                "Start project tick or bar beat tick for {clip} on Audio"
+            ))
+            .set_accessible_value("480");
+            find(format!("Duration ticks for {clip} on Audio")).set_accessible_value("480");
+            find(format!(
+                "Placement fade-in duration in ticks for {clip} on Audio"
+            ))
+            .set_accessible_value("10");
+        }
+        let window_edits = |clip: &str| {
+            [
+                format!("Trim the left edge of {clip} on Audio to entered project position while preserving its right edge"),
+                format!("Split {clip} on Audio at the entered project position without ripple"),
+                format!("Set the right edge of {clip} on Audio from its entered duration"),
+                format!("Duration ticks for {clip} on Audio"),
+                format!("Placement fade-in duration in ticks for {clip} on Audio"),
+                format!("Placement fade-out duration in ticks for {clip} on Audio"),
+                format!("Apply the entered local placement fades to {clip} on Audio"),
+            ]
+            .map(|label| find(label).accessible_enabled())
+        };
+        assert_eq!(
+            find("Duration ticks for Pad on Audio".to_owned()).accessible_value(),
+            Some("480".into()),
+            "the disabled field still carries an edited value, so its button guard is exercised"
+        );
+        assert_eq!(window_edits("Lead"), [Some(true); 7]);
+        assert_eq!(window_edits("Pad"), [Some(false); 7]);
+        let count = |label: &str| ElementHandle::find_by_accessible_label(&ui, label).count();
+        assert_eq!(count("WHOLE CLIP · SAMPLE-LOCKED"), 1);
+        assert_eq!(count("SOURCE +240 TICKS"), 1);
+        assert_eq!(count("SOURCE +0 TICKS"), 0);
+        find("Placement gain offset in dB for Pad on Audio".to_owned()).set_accessible_value("-3");
+        assert_eq!(
+            [
+                "Move Pad on Audio to entered project position",
+                "Copy the exact source view of Pad on Audio to the entered project position without ripple",
+                "Apply the entered local placement gain offset to Pad on Audio",
+                "Disable Pad on Audio",
+                "Review removal of Pad from Audio",
+            ]
+            .map(|label| find(label.to_owned()).accessible_enabled()),
+            [Some(true); 5],
+            "a whole clip still moves, copies, takes gain, toggles and is removable"
+        );
+        ui.hide().unwrap();
+    }
+
     #[test]
     fn generated_arrangement_crossfade_control_submits_only_the_current_pair() {
         i_slint_backend_testing::init_no_event_loop();
@@ -19001,6 +19156,7 @@ mod tests {
                 width_percent: 100.0,
                 enabled: true,
                 active: true,
+                whole_clip: false,
             },
         ]))));
         let submitted = Rc::new(RefCell::new(Vec::new()));
