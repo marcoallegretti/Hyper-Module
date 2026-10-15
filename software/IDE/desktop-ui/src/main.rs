@@ -329,6 +329,8 @@ struct ArrangementCanvasKey {
 }
 
 struct ArrangementCanvasPlacement<'a> {
+    row: usize,
+    id: &'a str,
     clip_name: &'a str,
     track_id: &'a str,
     start_frame: usize,
@@ -11116,8 +11118,11 @@ fn set_arrangement_canvas(
     let placements: Vec<ArrangementCanvasPlacement<'_>> = owner
         .placements()
         .iter()
-        .filter_map(|placement| {
+        .enumerate()
+        .filter_map(|(row, placement)| {
             Some(ArrangementCanvasPlacement {
+                row,
+                id: placement.id(),
                 clip_name: owner.clip_name(placement.clip_index())?,
                 track_id: clip_track_ids.get(placement.clip_index())?,
                 start_frame: placement.start_frame(),
@@ -11192,6 +11197,8 @@ fn arrangement_block_rows(
                 .iter()
                 .position(|lane| lane.id.as_str() == placement.track_id)?;
             Some(ArrangementBlockRow {
+                placement: i32::try_from(placement.row).ok()?,
+                id: placement.id.into(),
                 lane: i32::try_from(lane).ok()?,
                 start_seconds: frame_seconds(placement.start_frame, sample_rate_hz),
                 end_seconds: frame_seconds(placement.end_frame, sample_rate_hz),
@@ -12454,6 +12461,7 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_arrangement_canvas_loop_available(false);
     ui.set_arrangement_canvas_loop_enabled(false);
     ui.set_arrangement_pixels_per_second(48.0);
+    ui.set_arrangement_selected_placement_id(SharedString::default());
     ui.set_playhead_seconds(0.0);
     ui.set_automation_takes(ModelRc::default());
     ui.set_automation_target_names(ModelRc::default());
@@ -22935,6 +22943,74 @@ mod tests {
     }
 
     #[test]
+    fn arrangement_selection_follows_blocks_and_placement_cards() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_arrangement_visible(true);
+        ui.set_arrangement_extent_seconds(32.0);
+        ui.set_arrangement_lanes(ModelRc::from(Rc::new(VecModel::from(vec![
+            ArrangementLaneRow {
+                id: "track-a".into(),
+                name: "Audio 1".into(),
+            },
+        ]))));
+        let rows: Vec<ArrangementRow> = (0..12)
+            .map(|row| ArrangementRow {
+                index: row,
+                id: format!("placement-{row}").into(),
+                clip_name: format!("Clip {row}").into(),
+                track_name: "Audio 1".into(),
+                enabled: true,
+                ..ArrangementRow::default()
+            })
+            .collect();
+        let blocks: Vec<ArrangementBlockRow> = (0..12_u8)
+            .map(|row| ArrangementBlockRow {
+                placement: i32::from(row),
+                id: format!("placement-{row}").into(),
+                lane: 0,
+                start_seconds: f32::from(row) * 0.75,
+                end_seconds: f32::from(row) * 0.75 + 0.5,
+                clip_name: format!("B{row}").into(),
+                enabled: true,
+                active: false,
+            })
+            .collect();
+        ui.set_arrangement_placements(ModelRc::from(Rc::new(VecModel::from(rows))));
+        ui.set_arrangement_blocks(ModelRc::from(Rc::new(VecModel::from(blocks))));
+        ui.show().unwrap();
+        let find = |label: &str| ElementHandle::find_by_accessible_label(&ui, label).next();
+        assert!(
+            find("Clip 11").is_none(),
+            "the last card starts out of view"
+        );
+
+        find("B11")
+            .expect("the block is drawn")
+            .mock_single_click(PointerEventButton::Left);
+        assert_eq!(ui.get_arrangement_selected_placement_id(), "placement-11");
+        assert!(
+            find("Clip 11").is_some(),
+            "selecting a block brings its placement card into view"
+        );
+
+        find("B10")
+            .expect("the block is drawn")
+            .mock_single_click(PointerEventButton::Left);
+        assert_eq!(ui.get_arrangement_selected_placement_id(), "placement-10");
+        find("Clip 11")
+            .expect("the card stays in view")
+            .mock_single_click(PointerEventButton::Left);
+        assert_eq!(
+            ui.get_arrangement_selected_placement_id(),
+            "placement-11",
+            "selecting a card selects its placement"
+        );
+        ui.hide().unwrap();
+    }
+
+    #[test]
     fn arrangement_zoom_buttons_belong_to_the_drawn_canvas() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();
@@ -22987,6 +23063,8 @@ mod tests {
         ]))));
         ui.set_arrangement_blocks(ModelRc::from(Rc::new(VecModel::from(vec![
             ArrangementBlockRow {
+                placement: 0,
+                id: "placement-kick".into(),
                 lane: 0,
                 start_seconds: 6.0,
                 end_seconds: 8.0,
@@ -23157,6 +23235,8 @@ mod tests {
         ];
         let placements = [
             ArrangementCanvasPlacement {
+                row: 0,
+                id: "placement-kick",
                 clip_name: "Kick",
                 track_id: "track-a",
                 start_frame: 48_000,
@@ -23165,6 +23245,8 @@ mod tests {
                 active: false,
             },
             ArrangementCanvasPlacement {
+                row: 1,
+                id: "placement-orphan",
                 clip_name: "Orphan",
                 track_id: "track-x",
                 start_frame: 0,
@@ -23173,6 +23255,8 @@ mod tests {
                 active: false,
             },
             ArrangementCanvasPlacement {
+                row: 2,
+                id: "placement-pad",
                 clip_name: "Pad",
                 track_id: "track-b",
                 start_frame: 0,
@@ -23182,10 +23266,11 @@ mod tests {
             },
         ];
         let blocks = arrangement_block_rows(&placements, &lanes, 48_000);
-        let mapped: Vec<(i32, f32, f32, &str, bool)> = blocks
+        let mapped: Vec<(i32, i32, f32, f32, &str, bool)> = blocks
             .iter()
             .map(|block| {
                 (
+                    block.placement,
                     block.lane,
                     block.start_seconds,
                     block.end_seconds,
@@ -23196,7 +23281,10 @@ mod tests {
             .collect();
         assert_eq!(
             mapped,
-            [(1, 1.0, 2.0, "Kick", true), (0, 0.0, 0.5, "Pad", false)]
+            [
+                (0, 1, 1.0, 2.0, "Kick", true),
+                (2, 0, 0.0, 0.5, "Pad", false)
+            ]
         );
     }
 
@@ -23260,9 +23348,16 @@ mod tests {
         ui.set_project_location("C:\\projects\\a".into());
         set_playhead(&ui, &state, 96_000);
         assert_eq!(ui.get_musical_position(), "2|1|000");
+        ui.set_arrangement_selected_placement_id("placement-a".into());
+        ui.set_arrangement_pixels_per_second(192.0);
 
         reset_project(&ui, &recording_routes, &take_routes, &state);
 
+        assert!(ui.get_arrangement_selected_placement_id().is_empty());
+        assert_eq!(
+            ui.get_arrangement_pixels_per_second().to_bits(),
+            48.0_f32.to_bits()
+        );
         assert_eq!(ui.get_project_name(), "No project open");
         assert_eq!(ui.get_project_location(), "No project selected");
         assert_eq!(ui.get_frame_position(), "0");
