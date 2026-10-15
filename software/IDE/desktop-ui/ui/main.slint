@@ -1374,6 +1374,7 @@ export component MainWindow inherits Window {
         && !root.arrangement-visible
         && !root.clips-visible
         && !root.loudness-visible
+        && !root.timeline-map-visible
         && !root.scene-create-visible
         && !root.scene-rename-visible
         && !root.scene-duplicate-visible
@@ -5225,6 +5226,11 @@ export component MainWindow inherits Window {
                                 text: "Add marker";
                                 enabled: root.app-mode == AppMode.running;
                                 clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-edit-visible = false; root.timeline-tempo-move-visible = false; root.timeline-meter-add-visible = false; root.timeline-meter-edit-visible = false; root.timeline-meter-move-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = ""; root.timeline-marker-id = ""; root.timeline-marker-source-tick = ""; root.timeline-marker-tick = ""; root.timeline-marker-name = ""; root.timeline-marker-add-visible = true; }
+                            }
+                            Button {
+                                text: "Performance";
+                                accessible-label: "Return from timeline map to performance";
+                                clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-edit-visible = false; root.timeline-tempo-move-visible = false; root.timeline-meter-add-visible = false; root.timeline-meter-edit-visible = false; root.timeline-meter-move-visible = false; root.timeline-marker-add-visible = false; root.timeline-marker-rename-visible = false; root.timeline-marker-move-visible = false; root.timeline-marker-remove-confirming-id = ""; root.timeline-map-visible = false; }
                             }
                         }
                         Rectangle { height: 1px; background: #27313d; }

@@ -20364,6 +20364,7 @@ mod tests {
         ui.set_arrangement_visible(false);
         ui.set_clips_visible(false);
         ui.set_loudness_visible(false);
+        ui.set_timeline_map_visible(false);
         ui.set_scene_create_visible(false);
         ui.set_scene_rename_visible(false);
         ui.set_scene_duplicate_visible(false);
@@ -20404,6 +20405,9 @@ mod tests {
         ui.set_clips_visible(true);
         dispatch_ide_space(ui, false, false, false, false, false);
         ui.set_clips_visible(false);
+        ui.set_timeline_map_visible(true);
+        dispatch_ide_space(ui, false, false, false, false, false);
+        ui.set_timeline_map_visible(false);
         ui.set_app_mode(AppMode::Previewing);
         dispatch_ide_space(ui, false, false, false, false, false);
         assert_eq!(starts.get(), 1);
@@ -20431,6 +20435,7 @@ mod tests {
         ui.set_arrangement_visible(false);
         ui.set_clips_visible(false);
         ui.set_loudness_visible(false);
+        ui.set_timeline_map_visible(false);
         ui.set_scene_create_visible(false);
         ui.set_scene_rename_visible(false);
         ui.set_scene_duplicate_visible(false);
@@ -20490,6 +20495,7 @@ mod tests {
         ui.set_arrangement_visible(false);
         ui.set_clips_visible(false);
         ui.set_loudness_visible(false);
+        ui.set_timeline_map_visible(false);
         ui.set_scene_create_visible(false);
         ui.set_scene_rename_visible(false);
         ui.set_scene_duplicate_visible(false);
@@ -20997,6 +21003,7 @@ mod tests {
         ui.set_arrangement_visible(false);
         ui.set_clips_visible(false);
         ui.set_loudness_visible(false);
+        ui.set_timeline_map_visible(false);
         ui.set_scene_create_visible(false);
         ui.set_scene_rename_visible(false);
         ui.set_scene_duplicate_visible(false);
@@ -23512,6 +23519,63 @@ mod tests {
         assert!(ui.get_timeline_marker_remove_confirming_id().is_empty());
         assert!(ui.get_status_text().is_empty());
         assert!(ui.get_error_text().contains("navigation marker was saved"));
+    }
+
+    #[test]
+    fn timeline_map_returns_to_performance_and_closes_its_forms() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Saving);
+        ui.set_timeline_map_visible(true);
+        ui.set_timeline_tempo_add_visible(true);
+        ui.set_timeline_tempo_edit_visible(true);
+        ui.set_timeline_tempo_move_visible(true);
+        ui.set_timeline_meter_add_visible(true);
+        ui.set_timeline_meter_edit_visible(true);
+        ui.set_timeline_meter_move_visible(true);
+        ui.set_timeline_marker_add_visible(true);
+        ui.set_timeline_marker_rename_visible(true);
+        ui.set_timeline_marker_move_visible(true);
+        ui.set_timeline_marker_remove_confirming_id("marker-a".into());
+        ui.show().unwrap();
+        assert!(
+            ElementHandle::find_by_accessible_label(
+                &ui,
+                "Locate within finite compiled playback range"
+            )
+            .next()
+            .is_none(),
+            "the hidden performance panel is not instantiated under the timeline map"
+        );
+
+        let performance =
+            ElementHandle::find_by_accessible_label(&ui, "Return from timeline map to performance")
+                .next()
+                .expect("the timeline map exposes a way back to performance");
+        assert_eq!(performance.accessible_enabled(), Some(true));
+        performance.mock_single_click(PointerEventButton::Left);
+
+        assert!(!ui.get_timeline_map_visible());
+        assert!(!ui.get_timeline_tempo_add_visible());
+        assert!(!ui.get_timeline_tempo_edit_visible());
+        assert!(!ui.get_timeline_tempo_move_visible());
+        assert!(!ui.get_timeline_meter_add_visible());
+        assert!(!ui.get_timeline_meter_edit_visible());
+        assert!(!ui.get_timeline_meter_move_visible());
+        assert!(!ui.get_timeline_marker_add_visible());
+        assert!(!ui.get_timeline_marker_rename_visible());
+        assert!(!ui.get_timeline_marker_move_visible());
+        assert!(ui.get_timeline_marker_remove_confirming_id().is_empty());
+        assert!(
+            ElementHandle::find_by_accessible_label(
+                &ui,
+                "Locate within finite compiled playback range"
+            )
+            .next()
+            .is_some(),
+            "performance controls return after leaving the timeline map"
+        );
+        ui.hide().unwrap();
     }
 
     #[test]
