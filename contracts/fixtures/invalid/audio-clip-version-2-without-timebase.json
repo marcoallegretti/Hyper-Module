@@ -1,0 +1,45 @@
+{
+  "format": "hyper-audio-clip",
+  "format_version": 2,
+  "id": "018f47a2-6b2d-7c11-8a44-001122334460",
+  "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+  "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+  "name": "Kick Loop",
+  "enabled": true,
+  "duration_ticks": 7680,
+  "source": {
+    "asset_id": "018f47a2-6b2d-7c11-8a44-001122334457",
+    "start_frame": 2400,
+    "frame_count": 96000
+  },
+  "loop": {
+    "enabled": true,
+    "start_tick": 0,
+    "end_tick": 7680
+  },
+  "playback": {
+    "gain_decibels": -3,
+    "reverse": false,
+    "transpose_cents": 0
+  },
+  "fades": {
+    "curve": "linear-amplitude",
+    "in_ticks": 10,
+    "out_ticks": 10
+  },
+  "warp_markers": [
+    {
+      "tick": 0,
+      "source_frame_offset": 0
+    },
+    {
+      "tick": 3840,
+      "source_frame_offset": 48000
+    },
+    {
+      "tick": 7680,
+      "source_frame_offset": 96000
+    }
+  ],
+  "extensions": {}
+}
