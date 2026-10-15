@@ -177,12 +177,15 @@ mod windows_rename {
 
         impl TemporaryDirectory {
             fn new() -> Self {
+                static SEQUENCE: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let nonce = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("system clock must follow the Unix epoch")
                     .as_nanos();
                 let path = std::env::temp_dir().join(format!(
-                    "hyper-fs-authority-rename-{}-{nonce}",
+                    "hyper-fs-authority-rename-{}-{nonce}-{sequence}",
                     std::process::id()
                 ));
                 fs::create_dir(&path).expect("temporary authority root must be unique");
@@ -1400,12 +1403,14 @@ mod stable_file_tests {
 
     impl TemporaryDirectory {
         fn new() -> Self {
+            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock must follow the Unix epoch")
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "hyper-fs-stable-file-{}-{nonce}",
+                "hyper-fs-stable-file-{}-{nonce}-{sequence}",
                 std::process::id()
             ));
             fs::create_dir(&path).expect("temporary authority root must be unique");
@@ -1539,16 +1544,17 @@ mod directory_entry_tests {
 
     impl TemporaryDirectory {
         fn new() -> Self {
+            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "hyper-fs-authority-entry-{}-{nonce}",
+                "hyper-fs-authority-entry-{}-{nonce}-{sequence}",
                 std::process::id(),
             ));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir(&path).unwrap();
+            fs::create_dir(&path).expect("temporary authority root must be unique");
             Self(path)
         }
 
