@@ -7450,10 +7450,9 @@ fn apply_event(
             routes.audio_imports.borrow_mut().clear();
             ui.set_audio_import_track_names(ModelRc::default());
             ui.set_selected_audio_import_track_index(-1);
-            reset_project(ui, &routes.recordings, &routes.takes, project_state);
+            let mode = settle_closed_project(ui, &routes.recordings, &routes.takes, project_state);
             ui.set_output_test_confirming(false);
             ui.set_mixer_recovery_available(false);
-            let mode = mode_after_closed_event(ui.get_app_mode());
             ui.set_app_mode(mode);
             if mode == AppMode::Closed {
                 ui.set_status_text("Ready to open a verified project".into());
@@ -17909,11 +17908,30 @@ fn mixer_sends_unchanged(sends: &ModelRc<MixerSendRow>, channels: &[IdeMixerChan
 }
 
 fn mode_after_closed_event(current: AppMode) -> AppMode {
-    if current == AppMode::Selecting {
-        AppMode::Selecting
+    if matches!(
+        current,
+        AppMode::Selecting | AppMode::Opening | AppMode::Creating
+    ) {
+        current
     } else {
         AppMode::Closed
     }
+}
+
+fn settle_closed_project(
+    ui: &MainWindow,
+    recording_routes: &RecordingRoutes,
+    take_routes: &TakeRoutes,
+    project_state: &ProjectUiStateCell,
+) -> AppMode {
+    let mode = mode_after_closed_event(ui.get_app_mode());
+    let pending_location =
+        matches!(mode, AppMode::Opening | AppMode::Creating).then(|| ui.get_project_location());
+    reset_project(ui, recording_routes, take_routes, project_state);
+    if let Some(location) = pending_location {
+        ui.set_project_location(location);
+    }
+    mode
 }
 
 fn apply_idle_running_event(ui: &MainWindow) {
@@ -18248,6 +18266,37 @@ mod tests {
             panic!("startup must submit exactly one open-project command");
         };
         assert_eq!(actual, project);
+    }
+
+    #[test]
+    fn worker_closure_keeps_a_pending_project_and_its_location() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let recording_routes = Rc::new(RefCell::new(Vec::new()));
+        let take_routes = Rc::new(RefCell::new(Vec::new()));
+        let project_state = Rc::new(ProjectUiState::default());
+        let location = "projects/Session α";
+
+        for (pending, expected) in [
+            (AppMode::Opening, AppMode::Opening),
+            (AppMode::Creating, AppMode::Creating),
+            (AppMode::Running, AppMode::Closed),
+            (AppMode::Selecting, AppMode::Selecting),
+        ] {
+            ui.set_app_mode(pending);
+            ui.set_project_name("Session".into());
+            ui.set_project_location(location.into());
+
+            let mode = settle_closed_project(&ui, &recording_routes, &take_routes, &project_state);
+
+            assert_eq!(mode, expected);
+            assert_eq!(ui.get_project_name(), "No project open");
+            if matches!(pending, AppMode::Opening | AppMode::Creating) {
+                assert_eq!(ui.get_project_location(), location);
+            } else {
+                assert_eq!(ui.get_project_location(), "No project selected");
+            }
+        }
     }
 
     #[test]
@@ -30113,12 +30162,16 @@ mod tests {
     }
 
     #[test]
-    fn closed_worker_event_does_not_complete_an_active_project_dialog() {
+    fn closed_worker_event_does_not_complete_a_pending_project_dialog_open_or_creation() {
         assert_eq!(
             mode_after_closed_event(AppMode::Selecting),
             AppMode::Selecting
         );
-        assert_eq!(mode_after_closed_event(AppMode::Opening), AppMode::Closed);
+        assert_eq!(mode_after_closed_event(AppMode::Opening), AppMode::Opening);
+        assert_eq!(
+            mode_after_closed_event(AppMode::Creating),
+            AppMode::Creating
+        );
         assert_eq!(mode_after_closed_event(AppMode::Running), AppMode::Closed);
     }
 
