@@ -1208,7 +1208,7 @@ export component MainWindow inherits Window {
                     && !event.modifiers.alt
                     && !event.modifiers.meta
                     && root.app-mode == AppMode.running
-                    && root.performance-visible {
+                    && !root.local-edit-form-visible {
                     if root.transport-start-available {
                         IdeActions.transport-start();
                     } else if root.transport-stop-available {
@@ -1224,7 +1224,7 @@ export component MainWindow inherits Window {
                     && !event.modifiers.alt
                     && !event.modifiers.meta
                     && root.app-mode == AppMode.running
-                    && root.performance-visible
+                    && !root.local-edit-form-visible
                     && root.transport-return-start-available {
                     IdeActions.transport-return-start();
                 }
@@ -1237,7 +1237,7 @@ export component MainWindow inherits Window {
                     && !event.modifiers.alt
                     && !event.modifiers.meta
                     && root.app-mode == AppMode.running
-                    && root.performance-visible
+                    && !root.local-edit-form-visible
                     && root.transport-seek-available {
                     IdeActions.transport-seek(100);
                 }
@@ -2181,8 +2181,58 @@ export component MainWindow inherits Window {
                 }
             }
 
-            right-pane := Rectangle {
+            VerticalLayout {
                 horizontal-stretch: 1;
+                vertical-stretch: 1;
+                spacing: 10px;
+
+                Panel {
+                    height: 56px;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            width: 150px;
+                            Text { text: "TRANSPORT"; color: #6f8197; font-size: 9px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: root.transport-state; color: #edf2f8; font-size: 15px; font-weight: 650; overflow: elide; }
+                        }
+                        Button {
+                            text: "▶  Start";
+                            enabled: root.app-mode == AppMode.running && root.transport-start-available;
+                            clicked => { IdeActions.transport-start(); }
+                        }
+                        Button {
+                            text: "■  Stop";
+                            enabled: root.app-mode == AppMode.running && root.transport-stop-available;
+                            clicked => { IdeActions.transport-stop(); }
+                        }
+                        Button {
+                            text: "|◀  Return";
+                            accessible-label: "Return transport to start";
+                            enabled: root.app-mode == AppMode.running && root.transport-return-start-available;
+                            clicked => { IdeActions.transport-return-start(); }
+                        }
+                        Button {
+                            text: "▶|  End";
+                            accessible-label: "Seek exact playback end";
+                            enabled: root.app-mode == AppMode.running && root.transport-seek-available;
+                            clicked => { IdeActions.transport-seek(100); }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text { text: root.transport-clock; color: #dce5ef; font-size: 18px; font-weight: 600; vertical-alignment: center; }
+                        VerticalLayout {
+                            alignment: center;
+                            Text { text: root.musical-position; color: #7fd6a2; font-size: 12px; font-weight: 600; horizontal-alignment: right; }
+                            Text { text: "Frame  " + root.frame-position; color: #8fa0b4; font-size: 11px; horizontal-alignment: right; }
+                        }
+                    }
+                }
+
+            right-pane := Rectangle {
                 vertical-stretch: 1;
                 background: transparent;
 
@@ -2199,7 +2249,6 @@ export component MainWindow inherits Window {
                         height: 62px;
                         VerticalLayout {
                             Text { text: "PERFORMANCE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                            Text { text: root.transport-state; color: #edf2f8; font-size: 24px; font-weight: 650; }
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         Button {
@@ -2247,22 +2296,6 @@ export component MainWindow inherits Window {
                             HorizontalLayout {
                                 alignment: center;
                                 spacing: 10px;
-                                Button {
-                                    text: "▶  Start";
-                                    enabled: root.app-mode == AppMode.running && root.transport-start-available;
-                                    clicked => { IdeActions.transport-start(); }
-                                }
-                                Button {
-                                    text: "■  Stop";
-                                    enabled: root.app-mode == AppMode.running && root.transport-stop-available;
-                                    clicked => { IdeActions.transport-stop(); }
-                                }
-                                Button {
-                                    text: "|◀  Return";
-                                    accessible-label: "Return transport to start";
-                                    enabled: root.app-mode == AppMode.running && root.transport-return-start-available;
-                                    clicked => { IdeActions.transport-return-start(); }
-                                }
                                 if root.app-mode != AppMode.capturing-scene-performance : Button {
                                     text: "●  Capture scenes";
                                     accessible-label: "Start transport and capture committed grid-quantized scene launches as one arrangement edit";
@@ -2299,9 +2332,6 @@ export component MainWindow inherits Window {
                                     overflow: elide;
                                 }
                             }
-                            Text { text: root.transport-clock; color: #dce5ef; font-size: 18px; font-weight: 600; horizontal-alignment: center; }
-                            Text { text: root.musical-position; color: #7fd6a2; font-size: 12px; font-weight: 600; horizontal-alignment: center; }
-                            Text { text: "Frame  " + root.frame-position; color: #8fa0b4; font-size: 11px; horizontal-alignment: center; }
                             VerticalLayout {
                                 spacing: 2px;
                                 Slider {
@@ -6920,6 +6950,7 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
+            }
             }
         }
 
