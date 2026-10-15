@@ -742,7 +742,7 @@ fn bind_callbacks(
 }
 
 fn bind_audio_import_callback(ui: &MainWindow, worker: &WorkerCell, routes: &AudioImportRoutes) {
-    bind_audio_import_callback_with(ui, worker, routes, |weak, worker, track_id| {
+    bind_audio_import_callback_with(ui, worker, routes, |weak, worker, track_id, token| {
         let weak_for_dialog = weak.clone();
         let spawn_result = slint::spawn_local(async move {
             let extensions = audio_import_file_extensions().collect::<Vec<_>>();
@@ -754,9 +754,6 @@ fn bind_audio_import_callback(ui: &MainWindow, worker: &WorkerCell, routes: &Aud
             let Some(ui) = weak_for_dialog.upgrade() else {
                 return;
             };
-            if ui.get_app_mode() != AppMode::ImportingAudio {
-                return;
-            }
             let choice = selection.map_or(AudioImportChoice::Cancelled, |selection| {
                 AudioImportChoice::Selected(
                     selection
@@ -765,11 +762,12 @@ fn bind_audio_import_callback(ui: &MainWindow, worker: &WorkerCell, routes: &Aud
                         .collect(),
                 )
             });
-            complete_audio_import_choice(&ui, &worker, track_id, choice);
+            complete_audio_import_choice(&ui, &worker, token, track_id, choice);
         });
         if spawn_result.is_err()
             && let Some(ui) = weak.upgrade()
         {
+            end_file_dialog(&ui);
             ui.set_app_mode(AppMode::Running);
             ui.set_status_text("Audio file selection is unavailable".into());
         }
@@ -779,20 +777,25 @@ fn bind_audio_import_callback(ui: &MainWindow, worker: &WorkerCell, routes: &Aud
 fn complete_audio_import_choice(
     ui: &MainWindow,
     worker: &WorkerCell,
+    token: i32,
     track_id: String,
     choice: AudioImportChoice,
 ) {
-    complete_audio_import_choice_with(ui, track_id, choice, |command| {
+    complete_audio_import_choice_with(ui, token, track_id, choice, |command| {
         submit_to_ui(ui, worker, command);
     });
 }
 
 fn complete_audio_import_choice_with(
     ui: &MainWindow,
+    token: i32,
     track_id: String,
     choice: AudioImportChoice,
     submit: impl FnOnce(IdeWorkerCommand),
 ) {
+    if !finish_file_dialog(ui, token, AppMode::ImportingAudio) {
+        return;
+    }
     match choice {
         AudioImportChoice::Selected(paths) => {
             submit(IdeWorkerCommand::ImportAudio { paths, track_id });
@@ -808,7 +811,7 @@ fn bind_audio_import_callback_with(
     ui: &MainWindow,
     worker: &WorkerCell,
     routes: &AudioImportRoutes,
-    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, String) + 'static,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, String, i32) + 'static,
 ) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -831,7 +834,8 @@ fn bind_audio_import_callback_with(
         ui.set_app_mode(AppMode::ImportingAudio);
         ui.set_status_text("Waiting for audio files…".into());
         ui.set_error_text(SharedString::default());
-        choose(weak.clone(), Rc::clone(&worker), track_id);
+        let token = begin_file_dialog(&ui);
+        choose(weak.clone(), Rc::clone(&worker), track_id, token);
     });
 }
 
@@ -1591,7 +1595,7 @@ fn bind_scene_performance_capture_callbacks(ui: &MainWindow, worker: &WorkerCell
 }
 
 fn bind_runtime_scene_performance_import_callback(ui: &MainWindow, worker: &WorkerCell) {
-    bind_runtime_scene_performance_import_callback_with(ui, worker, |weak, worker| {
+    bind_runtime_scene_performance_import_callback_with(ui, worker, |weak, worker, token| {
         let weak_for_dialog = weak.clone();
         let spawn_result = slint::spawn_local(async move {
             let selection = rfd::AsyncFileDialog::new()
@@ -1602,20 +1606,18 @@ fn bind_runtime_scene_performance_import_callback(ui: &MainWindow, worker: &Work
             let Some(ui) = weak_for_dialog.upgrade() else {
                 return;
             };
-            if ui.get_app_mode() != AppMode::ImportingRuntimeScenePerformance {
-                return;
-            }
             let choice = selection.map_or(
                 RuntimeScenePerformanceImportChoice::Cancelled,
                 |selection| {
                     RuntimeScenePerformanceImportChoice::Selected(selection.path().to_path_buf())
                 },
             );
-            complete_runtime_scene_performance_import_choice(&ui, &worker, choice);
+            complete_runtime_scene_performance_import_choice(&ui, &worker, token, choice);
         });
         if spawn_result.is_err()
             && let Some(ui) = weak.upgrade()
         {
+            end_file_dialog(&ui);
             ui.set_app_mode(AppMode::Running);
             ui.set_status_text("Runtime scene-performance selection is unavailable".into());
         }
@@ -1625,18 +1627,23 @@ fn bind_runtime_scene_performance_import_callback(ui: &MainWindow, worker: &Work
 fn complete_runtime_scene_performance_import_choice(
     ui: &MainWindow,
     worker: &WorkerCell,
+    token: i32,
     choice: RuntimeScenePerformanceImportChoice,
 ) {
-    complete_runtime_scene_performance_import_choice_with(ui, choice, |command| {
+    complete_runtime_scene_performance_import_choice_with(ui, token, choice, |command| {
         submit_to_ui(ui, worker, command);
     });
 }
 
 fn complete_runtime_scene_performance_import_choice_with(
     ui: &MainWindow,
+    token: i32,
     choice: RuntimeScenePerformanceImportChoice,
     submit: impl FnOnce(IdeWorkerCommand),
 ) {
+    if !finish_file_dialog(ui, token, AppMode::ImportingRuntimeScenePerformance) {
+        return;
+    }
     match choice {
         RuntimeScenePerformanceImportChoice::Selected(path) => {
             submit(IdeWorkerCommand::ImportRuntimeScenePerformance { path });
@@ -1651,7 +1658,7 @@ fn complete_runtime_scene_performance_import_choice_with(
 fn bind_runtime_scene_performance_import_callback_with(
     ui: &MainWindow,
     worker: &WorkerCell,
-    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell) + 'static,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, i32) + 'static,
 ) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -1666,12 +1673,13 @@ fn bind_runtime_scene_performance_import_callback_with(
         ui.set_app_mode(AppMode::ImportingRuntimeScenePerformance);
         ui.set_status_text("Waiting for a Runtime scene-performance update…".into());
         ui.set_error_text(SharedString::default());
-        choose(weak.clone(), Rc::clone(&worker));
+        let token = begin_file_dialog(&ui);
+        choose(weak.clone(), Rc::clone(&worker), token);
     });
 }
 
 fn bind_runtime_mixer_update_import_callback(ui: &MainWindow, worker: &WorkerCell) {
-    bind_runtime_mixer_update_import_callback_with(ui, worker, |weak, worker| {
+    bind_runtime_mixer_update_import_callback_with(ui, worker, |weak, worker, token| {
         let weak_for_dialog = weak.clone();
         let spawn_result = slint::spawn_local(async move {
             let selection = rfd::AsyncFileDialog::new()
@@ -1682,17 +1690,15 @@ fn bind_runtime_mixer_update_import_callback(ui: &MainWindow, worker: &WorkerCel
             let Some(ui) = weak_for_dialog.upgrade() else {
                 return;
             };
-            if ui.get_app_mode() != AppMode::ImportingRuntimeMixerUpdate {
-                return;
-            }
             let choice = selection.map_or(RuntimeMixerUpdateImportChoice::Cancelled, |selection| {
                 RuntimeMixerUpdateImportChoice::Selected(selection.path().to_path_buf())
             });
-            complete_runtime_mixer_update_import_choice(&ui, &worker, choice);
+            complete_runtime_mixer_update_import_choice(&ui, &worker, token, choice);
         });
         if spawn_result.is_err()
             && let Some(ui) = weak.upgrade()
         {
+            end_file_dialog(&ui);
             ui.set_app_mode(AppMode::Running);
             ui.set_status_text("Runtime mixer-update selection is unavailable".into());
         }
@@ -1702,18 +1708,23 @@ fn bind_runtime_mixer_update_import_callback(ui: &MainWindow, worker: &WorkerCel
 fn complete_runtime_mixer_update_import_choice(
     ui: &MainWindow,
     worker: &WorkerCell,
+    token: i32,
     choice: RuntimeMixerUpdateImportChoice,
 ) {
-    complete_runtime_mixer_update_import_choice_with(ui, choice, |command| {
+    complete_runtime_mixer_update_import_choice_with(ui, token, choice, |command| {
         submit_to_ui(ui, worker, command);
     });
 }
 
 fn complete_runtime_mixer_update_import_choice_with(
     ui: &MainWindow,
+    token: i32,
     choice: RuntimeMixerUpdateImportChoice,
     submit: impl FnOnce(IdeWorkerCommand),
 ) {
+    if !finish_file_dialog(ui, token, AppMode::ImportingRuntimeMixerUpdate) {
+        return;
+    }
     match choice {
         RuntimeMixerUpdateImportChoice::Selected(path) => {
             submit(IdeWorkerCommand::ImportRuntimeMixerUpdate { path });
@@ -1728,7 +1739,7 @@ fn complete_runtime_mixer_update_import_choice_with(
 fn bind_runtime_mixer_update_import_callback_with(
     ui: &MainWindow,
     worker: &WorkerCell,
-    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell) + 'static,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, i32) + 'static,
 ) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -1743,12 +1754,13 @@ fn bind_runtime_mixer_update_import_callback_with(
         ui.set_app_mode(AppMode::ImportingRuntimeMixerUpdate);
         ui.set_status_text("Waiting for a Runtime mixer update…".into());
         ui.set_error_text(SharedString::default());
-        choose(weak.clone(), Rc::clone(&worker));
+        let token = begin_file_dialog(&ui);
+        choose(weak.clone(), Rc::clone(&worker), token);
     });
 }
 
 fn bind_runtime_native_device_update_import_callback(ui: &MainWindow, worker: &WorkerCell) {
-    bind_runtime_native_device_update_import_callback_with(ui, worker, |weak, worker| {
+    bind_runtime_native_device_update_import_callback_with(ui, worker, |weak, worker, token| {
         let weak_for_dialog = weak.clone();
         let spawn_result = slint::spawn_local(async move {
             let selection = rfd::AsyncFileDialog::new()
@@ -1759,20 +1771,18 @@ fn bind_runtime_native_device_update_import_callback(ui: &MainWindow, worker: &W
             let Some(ui) = weak_for_dialog.upgrade() else {
                 return;
             };
-            if ui.get_app_mode() != AppMode::ImportingRuntimeNativeDeviceUpdate {
-                return;
-            }
             let choice = selection.map_or(
                 RuntimeNativeDeviceUpdateImportChoice::Cancelled,
                 |selection| {
                     RuntimeNativeDeviceUpdateImportChoice::Selected(selection.path().to_path_buf())
                 },
             );
-            complete_runtime_native_device_update_import_choice(&ui, &worker, choice);
+            complete_runtime_native_device_update_import_choice(&ui, &worker, token, choice);
         });
         if spawn_result.is_err()
             && let Some(ui) = weak.upgrade()
         {
+            end_file_dialog(&ui);
             ui.set_app_mode(AppMode::Running);
             ui.set_status_text("Runtime native-device update selection is unavailable".into());
         }
@@ -1782,18 +1792,23 @@ fn bind_runtime_native_device_update_import_callback(ui: &MainWindow, worker: &W
 fn complete_runtime_native_device_update_import_choice(
     ui: &MainWindow,
     worker: &WorkerCell,
+    token: i32,
     choice: RuntimeNativeDeviceUpdateImportChoice,
 ) {
-    complete_runtime_native_device_update_import_choice_with(ui, choice, |command| {
+    complete_runtime_native_device_update_import_choice_with(ui, token, choice, |command| {
         submit_to_ui(ui, worker, command);
     });
 }
 
 fn complete_runtime_native_device_update_import_choice_with(
     ui: &MainWindow,
+    token: i32,
     choice: RuntimeNativeDeviceUpdateImportChoice,
     submit: impl FnOnce(IdeWorkerCommand),
 ) {
+    if !finish_file_dialog(ui, token, AppMode::ImportingRuntimeNativeDeviceUpdate) {
+        return;
+    }
     match choice {
         RuntimeNativeDeviceUpdateImportChoice::Selected(path) => {
             submit(IdeWorkerCommand::ImportRuntimeNativeDeviceUpdate { path });
@@ -1808,7 +1823,7 @@ fn complete_runtime_native_device_update_import_choice_with(
 fn bind_runtime_native_device_update_import_callback_with(
     ui: &MainWindow,
     worker: &WorkerCell,
-    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell) + 'static,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, i32) + 'static,
 ) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -1823,12 +1838,13 @@ fn bind_runtime_native_device_update_import_callback_with(
         ui.set_app_mode(AppMode::ImportingRuntimeNativeDeviceUpdate);
         ui.set_status_text("Waiting for a Runtime native-device update…".into());
         ui.set_error_text(SharedString::default());
-        choose(weak.clone(), Rc::clone(&worker));
+        let token = begin_file_dialog(&ui);
+        choose(weak.clone(), Rc::clone(&worker), token);
     });
 }
 
 fn bind_runtime_recording_update_import_callback(ui: &MainWindow, worker: &WorkerCell) {
-    bind_runtime_recording_update_import_callback_with(ui, worker, |weak, worker| {
+    bind_runtime_recording_update_import_callback_with(ui, worker, |weak, worker, token| {
         let weak_for_dialog = weak.clone();
         let spawn_result = slint::spawn_local(async move {
             let selection = rfd::AsyncFileDialog::new()
@@ -1839,18 +1855,16 @@ fn bind_runtime_recording_update_import_callback(ui: &MainWindow, worker: &Worke
             let Some(ui) = weak_for_dialog.upgrade() else {
                 return;
             };
-            if ui.get_app_mode() != AppMode::ImportingRuntimeRecordingUpdate {
-                return;
-            }
             let choice =
                 selection.map_or(RuntimeRecordingUpdateImportChoice::Cancelled, |selection| {
                     RuntimeRecordingUpdateImportChoice::Selected(selection.path().to_path_buf())
                 });
-            complete_runtime_recording_update_import_choice(&ui, &worker, choice);
+            complete_runtime_recording_update_import_choice(&ui, &worker, token, choice);
         });
         if spawn_result.is_err()
             && let Some(ui) = weak.upgrade()
         {
+            end_file_dialog(&ui);
             ui.set_app_mode(AppMode::Running);
             ui.set_status_text("Runtime recording update selection is unavailable".into());
         }
@@ -1860,18 +1874,23 @@ fn bind_runtime_recording_update_import_callback(ui: &MainWindow, worker: &Worke
 fn complete_runtime_recording_update_import_choice(
     ui: &MainWindow,
     worker: &WorkerCell,
+    token: i32,
     choice: RuntimeRecordingUpdateImportChoice,
 ) {
-    complete_runtime_recording_update_import_choice_with(ui, choice, |command| {
+    complete_runtime_recording_update_import_choice_with(ui, token, choice, |command| {
         submit_to_ui(ui, worker, command);
     });
 }
 
 fn complete_runtime_recording_update_import_choice_with(
     ui: &MainWindow,
+    token: i32,
     choice: RuntimeRecordingUpdateImportChoice,
     submit: impl FnOnce(IdeWorkerCommand),
 ) {
+    if !finish_file_dialog(ui, token, AppMode::ImportingRuntimeRecordingUpdate) {
+        return;
+    }
     match choice {
         RuntimeRecordingUpdateImportChoice::Selected(path) => {
             submit(IdeWorkerCommand::ImportRuntimeRecordingUpdate { path });
@@ -1886,7 +1905,7 @@ fn complete_runtime_recording_update_import_choice_with(
 fn bind_runtime_recording_update_import_callback_with(
     ui: &MainWindow,
     worker: &WorkerCell,
-    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell) + 'static,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, i32) + 'static,
 ) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -1901,12 +1920,13 @@ fn bind_runtime_recording_update_import_callback_with(
         ui.set_app_mode(AppMode::ImportingRuntimeRecordingUpdate);
         ui.set_status_text("Waiting for a Runtime recording update…".into());
         ui.set_error_text(SharedString::default());
-        choose(weak.clone(), Rc::clone(&worker));
+        let token = begin_file_dialog(&ui);
+        choose(weak.clone(), Rc::clone(&worker), token);
     });
 }
 
 fn bind_runtime_automation_update_import_callback(ui: &MainWindow, worker: &WorkerCell) {
-    bind_runtime_automation_update_import_callback_with(ui, worker, |weak, worker| {
+    bind_runtime_automation_update_import_callback_with(ui, worker, |weak, worker, token| {
         let weak_for_dialog = weak.clone();
         let spawn_result = slint::spawn_local(async move {
             let selection = rfd::AsyncFileDialog::new()
@@ -1917,20 +1937,18 @@ fn bind_runtime_automation_update_import_callback(ui: &MainWindow, worker: &Work
             let Some(ui) = weak_for_dialog.upgrade() else {
                 return;
             };
-            if ui.get_app_mode() != AppMode::ImportingRuntimeAutomationUpdate {
-                return;
-            }
             let choice = selection.map_or(
                 RuntimeAutomationUpdateImportChoice::Cancelled,
                 |selection| {
                     RuntimeAutomationUpdateImportChoice::Selected(selection.path().to_path_buf())
                 },
             );
-            complete_runtime_automation_update_import_choice(&ui, &worker, choice);
+            complete_runtime_automation_update_import_choice(&ui, &worker, token, choice);
         });
         if spawn_result.is_err()
             && let Some(ui) = weak.upgrade()
         {
+            end_file_dialog(&ui);
             ui.set_app_mode(AppMode::Running);
             ui.set_status_text("Runtime automation update selection is unavailable".into());
         }
@@ -1940,18 +1958,23 @@ fn bind_runtime_automation_update_import_callback(ui: &MainWindow, worker: &Work
 fn complete_runtime_automation_update_import_choice(
     ui: &MainWindow,
     worker: &WorkerCell,
+    token: i32,
     choice: RuntimeAutomationUpdateImportChoice,
 ) {
-    complete_runtime_automation_update_import_choice_with(ui, choice, |command| {
+    complete_runtime_automation_update_import_choice_with(ui, token, choice, |command| {
         submit_to_ui(ui, worker, command);
     });
 }
 
 fn complete_runtime_automation_update_import_choice_with(
     ui: &MainWindow,
+    token: i32,
     choice: RuntimeAutomationUpdateImportChoice,
     submit: impl FnOnce(IdeWorkerCommand),
 ) {
+    if !finish_file_dialog(ui, token, AppMode::ImportingRuntimeAutomationUpdate) {
+        return;
+    }
     match choice {
         RuntimeAutomationUpdateImportChoice::Selected(path) => {
             submit(IdeWorkerCommand::ImportRuntimeAutomationUpdate { path });
@@ -1966,7 +1989,7 @@ fn complete_runtime_automation_update_import_choice_with(
 fn bind_runtime_automation_update_import_callback_with(
     ui: &MainWindow,
     worker: &WorkerCell,
-    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell) + 'static,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, i32) + 'static,
 ) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -1981,7 +2004,8 @@ fn bind_runtime_automation_update_import_callback_with(
         ui.set_app_mode(AppMode::ImportingRuntimeAutomationUpdate);
         ui.set_status_text("Waiting for a Runtime automation update…".into());
         ui.set_error_text(SharedString::default());
-        choose(weak.clone(), Rc::clone(&worker));
+        let token = begin_file_dialog(&ui);
+        choose(weak.clone(), Rc::clone(&worker), token);
     });
 }
 
@@ -1995,7 +2019,7 @@ fn bind_runtime_loop_update_import_callback(
         ui,
         worker,
         move || runtime_loop_update_import_availability(&project_state_for_availability),
-        |weak, worker| {
+        |weak, worker, token| {
             let weak_for_dialog = weak.clone();
             let spawn_result = slint::spawn_local(async move {
                 let selection = rfd::AsyncFileDialog::new()
@@ -2006,18 +2030,16 @@ fn bind_runtime_loop_update_import_callback(
                 let Some(ui) = weak_for_dialog.upgrade() else {
                     return;
                 };
-                if ui.get_app_mode() != AppMode::ImportingRuntimeLoopUpdate {
-                    return;
-                }
                 let choice =
                     selection.map_or(RuntimeLoopUpdateImportChoice::Cancelled, |selection| {
                         RuntimeLoopUpdateImportChoice::Selected(selection.path().to_path_buf())
                     });
-                complete_runtime_loop_update_import_choice(&ui, &worker, choice);
+                complete_runtime_loop_update_import_choice(&ui, &worker, token, choice);
             });
             if spawn_result.is_err()
                 && let Some(ui) = weak.upgrade()
             {
+                end_file_dialog(&ui);
                 ui.set_app_mode(AppMode::Running);
                 ui.set_status_text("Runtime loop-update selection is unavailable".into());
             }
@@ -2028,18 +2050,23 @@ fn bind_runtime_loop_update_import_callback(
 fn complete_runtime_loop_update_import_choice(
     ui: &MainWindow,
     worker: &WorkerCell,
+    token: i32,
     choice: RuntimeLoopUpdateImportChoice,
 ) {
-    complete_runtime_loop_update_import_choice_with(ui, choice, |command| {
+    complete_runtime_loop_update_import_choice_with(ui, token, choice, |command| {
         submit_to_ui(ui, worker, command);
     });
 }
 
 fn complete_runtime_loop_update_import_choice_with(
     ui: &MainWindow,
+    token: i32,
     choice: RuntimeLoopUpdateImportChoice,
     submit: impl FnOnce(IdeWorkerCommand),
 ) {
+    if !finish_file_dialog(ui, token, AppMode::ImportingRuntimeLoopUpdate) {
+        return;
+    }
     match choice {
         RuntimeLoopUpdateImportChoice::Selected(path) => {
             submit(IdeWorkerCommand::ImportRuntimeLoopUpdate { path });
@@ -2055,7 +2082,7 @@ fn bind_runtime_loop_update_import_callback_with(
     ui: &MainWindow,
     worker: &WorkerCell,
     availability: impl Fn() -> Result<(), &'static str> + 'static,
-    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell) + 'static,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, i32) + 'static,
 ) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -2074,7 +2101,8 @@ fn bind_runtime_loop_update_import_callback_with(
         ui.set_app_mode(AppMode::ImportingRuntimeLoopUpdate);
         ui.set_status_text("Waiting for a Runtime loop update…".into());
         ui.set_error_text(SharedString::default());
-        choose(weak.clone(), Rc::clone(&worker));
+        let token = begin_file_dialog(&ui);
+        choose(weak.clone(), Rc::clone(&worker), token);
     });
 }
 
@@ -2592,36 +2620,41 @@ fn bind_project_save_callback_with(
 }
 
 fn bind_project_copy_callback(ui: &MainWindow, worker: &WorkerCell) {
-    bind_project_copy_callback_with(ui, worker, |weak, worker, project_name, switch_to| {
-        let weak_for_dialog = weak.clone();
-        let spawn_result = slint::spawn_local(async move {
-            let selection = rfd::AsyncFileDialog::new()
-                .set_title("Choose parent folder for the independent Hyper Module project")
-                .pick_folder()
-                .await;
-            let Some(ui) = weak_for_dialog.upgrade() else {
-                return;
-            };
-            if ui.get_app_mode() != AppMode::Saving || !ui.get_save_project_as_visible() {
-                return;
+    bind_project_copy_callback_with(
+        ui,
+        worker,
+        |weak, worker, project_name, switch_to, token| {
+            let weak_for_dialog = weak.clone();
+            let spawn_result = slint::spawn_local(async move {
+                let selection = rfd::AsyncFileDialog::new()
+                    .set_title("Choose parent folder for the independent Hyper Module project")
+                    .pick_folder()
+                    .await;
+                let Some(ui) = weak_for_dialog.upgrade() else {
+                    return;
+                };
+                complete_project_copy_choice(
+                    &ui,
+                    &worker,
+                    token,
+                    project_name,
+                    switch_to,
+                    selection.map_or(ProjectCopyChoice::Cancelled, |selection| {
+                        ProjectCopyChoice::Selected(selection.path().to_path_buf())
+                    }),
+                );
+            });
+            if let Err(error) = spawn_result
+                && let Some(ui) = weak.upgrade()
+            {
+                end_file_dialog(&ui);
+                ui.set_app_mode(AppMode::Running);
+                ui.set_error_text(
+                    format!("Save As location dialog could not start: {error}").into(),
+                );
             }
-            complete_project_copy_choice(
-                &ui,
-                &worker,
-                project_name,
-                switch_to,
-                selection.map_or(ProjectCopyChoice::Cancelled, |selection| {
-                    ProjectCopyChoice::Selected(selection.path().to_path_buf())
-                }),
-            );
-        });
-        if let Err(error) = spawn_result
-            && let Some(ui) = weak.upgrade()
-        {
-            ui.set_app_mode(AppMode::Running);
-            ui.set_error_text(format!("Save As location dialog could not start: {error}").into());
-        }
-    });
+        },
+    );
 }
 
 #[derive(Debug)]
@@ -2633,22 +2666,32 @@ enum ProjectCopyChoice {
 fn complete_project_copy_choice(
     ui: &MainWindow,
     worker: &WorkerCell,
+    token: i32,
     project_name: String,
     switch_to: bool,
     choice: ProjectCopyChoice,
 ) {
-    complete_project_copy_choice_with(ui, project_name, switch_to, choice, |command| {
+    complete_project_copy_choice_with(ui, token, project_name, switch_to, choice, |command| {
         submit_to_ui(ui, worker, command);
     });
 }
 
 fn complete_project_copy_choice_with(
     ui: &MainWindow,
+    token: i32,
     project_name: String,
     switch_to: bool,
     choice: ProjectCopyChoice,
     submit: impl FnOnce(IdeWorkerCommand),
 ) {
+    if !finish_file_dialog(ui, token, AppMode::Saving) {
+        return;
+    }
+    let choice = if ui.get_save_project_as_visible() {
+        choice
+    } else {
+        ProjectCopyChoice::Cancelled
+    };
     match choice {
         ProjectCopyChoice::Selected(parent) => submit(IdeWorkerCommand::SaveProjectAs {
             parent,
@@ -2666,7 +2709,7 @@ fn complete_project_copy_choice_with(
 fn bind_project_copy_callback_with(
     ui: &MainWindow,
     worker: &WorkerCell,
-    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, String, bool) + 'static,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, String, bool, i32) + 'static,
 ) {
     let weak = ui.as_weak();
     let worker = Rc::clone(worker);
@@ -2686,7 +2729,14 @@ fn bind_project_copy_callback_with(
             ui.set_app_mode(AppMode::Saving);
             ui.set_error_text(SharedString::default());
             ui.set_status_text("Waiting for the independent project destination…".into());
-            choose(weak.clone(), Rc::clone(&worker), project_name, switch_to);
+            let token = begin_file_dialog(&ui);
+            choose(
+                weak.clone(),
+                Rc::clone(&worker),
+                project_name,
+                switch_to,
+                token,
+            );
         });
 }
 
@@ -7593,6 +7643,7 @@ fn apply_event(
             project_path,
             opened,
         } => {
+            ui.set_save_project_as_visible(false);
             ui.set_status_text(
                 if opened {
                     format!(
@@ -7614,6 +7665,7 @@ fn apply_event(
             opened,
             warning,
         } => {
+            ui.set_save_project_as_visible(false);
             ui.set_status_text(
                 if opened {
                     format!("Independent project opened at {} with a durability warning", project_path.display())
@@ -10351,9 +10403,11 @@ fn apply_running_event(
     observation: &IdeRunningObservation,
 ) {
     ui.set_mixer_recovery_available(false);
-    ui.set_new_project_visible(false);
-    ui.set_save_project_as_visible(false);
-    ui.set_rename_project_visible(false);
+    if matches!(ui.get_app_mode(), AppMode::Opening | AppMode::Creating) {
+        ui.set_new_project_visible(false);
+        ui.set_save_project_as_visible(false);
+        ui.set_rename_project_visible(false);
+    }
     ui.set_project_name(observation.project_name().into());
     ui.set_project_id(observation.project_id().into());
     ui.set_sample_rate(format!("{} Hz", observation.sample_rate_hz()).into());
@@ -10445,13 +10499,21 @@ fn apply_running_event(
         apply_output_failure_observation(ui);
         return;
     }
-    match observation.preview().state() {
+    apply_preview_settlement(
+        ui,
+        observation.preview().state(),
+        observation.preview().clip_id().is_some(),
+    );
+}
+
+fn apply_preview_settlement(ui: &MainWindow, state: DesktopAudioPreviewState, clip_preview: bool) {
+    match state {
         DesktopAudioPreviewState::Starting
         | DesktopAudioPreviewState::Playing
         | DesktopAudioPreviewState::Stopping => {
             ui.set_app_mode(AppMode::Previewing);
             ui.set_status_text(
-                if observation.preview().clip_id().is_some() {
+                if clip_preview {
                     "Dry clip-source audition · input cue temporarily suppressed"
                 } else {
                     "Dry take audition · input cue temporarily suppressed"
@@ -10460,10 +10522,10 @@ fn apply_running_event(
             );
             ui.set_error_text(SharedString::default());
         }
-        DesktopAudioPreviewState::Complete => {
+        DesktopAudioPreviewState::Complete if observation_may_settle_mode(ui) => {
             ui.set_app_mode(AppMode::Running);
             ui.set_status_text(
-                if observation.preview().clip_id().is_some() {
+                if clip_preview {
                     "Clip-source audition complete"
                 } else {
                     "Take audition complete"
@@ -10472,11 +10534,11 @@ fn apply_running_event(
             );
             ui.set_error_text(SharedString::default());
         }
-        DesktopAudioPreviewState::Failed => {
+        DesktopAudioPreviewState::Failed if observation_may_settle_mode(ui) => {
             ui.set_app_mode(AppMode::Running);
             ui.set_status_text("Audio audition stopped".into());
             ui.set_error_text(
-                if observation.preview().clip_id().is_some() {
+                if clip_preview {
                     "The audio callback could not render this clip source view"
                 } else {
                     "The audio callback could not render this recorded take"
@@ -10487,6 +10549,7 @@ fn apply_running_event(
         DesktopAudioPreviewState::Idle => {
             apply_idle_running_event(ui);
         }
+        DesktopAudioPreviewState::Complete | DesktopAudioPreviewState::Failed => {}
     }
 }
 
@@ -12269,8 +12332,10 @@ fn reset_project(
     take_routes: &TakeRoutes,
     project_state: &ProjectUiStateCell,
 ) {
+    end_file_dialog(ui);
     ui.set_rename_project_visible(false);
     ui.set_rename_project_name(SharedString::default());
+    ui.set_save_project_as_visible(false);
     ui.set_project_name("No project open".into());
     ui.set_project_location("No project selected".into());
     ui.set_project_id("—".into());
@@ -12414,7 +12479,10 @@ fn apply_transport_recovery_availability(ui: &MainWindow, state: PlaybackRecover
 }
 
 fn apply_output_failure_observation(ui: &MainWindow) {
+    end_file_dialog(ui);
     ui.set_new_track_visible(false);
+    ui.set_save_project_as_visible(false);
+    ui.set_rename_project_visible(false);
     ui.set_stream_state("Failed".into());
     ui.set_transport_start_available(false);
     ui.set_transport_stop_available(false);
@@ -12544,6 +12612,8 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
         IdeWorkerCommandKind::CloseProject if current == AppMode::Saving => AppMode::OutputFailed,
         IdeWorkerCommandKind::SaveProject
+        | IdeWorkerCommandKind::SaveProjectAs
+        | IdeWorkerCommandKind::RenameProject
         | IdeWorkerCommandKind::DiscardRecordingTake
         | IdeWorkerCommandKind::RenameRecordingTake
         | IdeWorkerCommandKind::ReorderMixerStrips
@@ -18174,8 +18244,34 @@ fn settle_closed_project(
     mode
 }
 
+fn begin_file_dialog(ui: &MainWindow) -> i32 {
+    let token = ui.get_file_dialog_token().wrapping_add(1);
+    ui.set_file_dialog_token(token);
+    ui.set_file_dialog_mode(ui.get_app_mode());
+    ui.set_file_dialog_open(true);
+    token
+}
+
+fn end_file_dialog(ui: &MainWindow) {
+    ui.set_file_dialog_open(false);
+}
+
+fn finish_file_dialog(ui: &MainWindow, token: i32, pending: AppMode) -> bool {
+    let owned = ui.get_file_dialog_open() && ui.get_file_dialog_token() == token;
+    if owned {
+        end_file_dialog(ui);
+    }
+    owned && ui.get_app_mode() == pending
+}
+
+fn observation_may_settle_mode(ui: &MainWindow) -> bool {
+    let mode = ui.get_app_mode();
+    mode != AppMode::PreparingRuntime
+        && !(ui.get_file_dialog_open() && ui.get_file_dialog_mode() == mode)
+}
+
 fn apply_idle_running_event(ui: &MainWindow) {
-    if ui.get_app_mode() != AppMode::PreparingRuntime {
+    if observation_may_settle_mode(ui) {
         ui.set_app_mode(AppMode::Running);
         ui.set_status_text("Runtime evidence updated".into());
         ui.set_error_text(SharedString::default());
@@ -19451,16 +19547,21 @@ mod tests {
 
     fn assert_project_copy_callback_contract(ui: &MainWindow) {
         let worker: WorkerCell = Rc::new(RefCell::new(None));
-        bind_project_copy_callback_with(ui, &worker, move |weak, _, project_name, switch_to| {
-            let ui = weak.upgrade().unwrap();
-            complete_project_copy_choice_with(
-                &ui,
-                project_name,
-                switch_to,
-                ProjectCopyChoice::Cancelled,
-                |_| panic!("a cancelled Save As chooser must not submit a command"),
-            );
-        });
+        bind_project_copy_callback_with(
+            ui,
+            &worker,
+            move |weak, _, project_name, switch_to, token| {
+                let ui = weak.upgrade().unwrap();
+                complete_project_copy_choice_with(
+                    &ui,
+                    token,
+                    project_name,
+                    switch_to,
+                    ProjectCopyChoice::Cancelled,
+                    |_| panic!("a cancelled Save As chooser must not submit a command"),
+                );
+            },
+        );
         ui.set_app_mode(AppMode::Running);
         ui.set_save_project_as_visible(true);
         ui.global::<IdeActions>()
@@ -19470,8 +19571,11 @@ mod tests {
 
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_choice = Rc::clone(&submitted);
+        ui.set_app_mode(AppMode::Saving);
+        let token = begin_file_dialog(ui);
         complete_project_copy_choice_with(
             ui,
+            token,
             "Independent".to_owned(),
             true,
             ProjectCopyChoice::Selected(PathBuf::from("parent")),
@@ -19493,11 +19597,12 @@ mod tests {
         bind_project_copy_callback_with(
             ui,
             &worker,
-            move |weak, worker, project_name, switch_to| {
+            move |weak, worker, project_name, switch_to, token| {
                 let ui = weak.upgrade().unwrap();
                 complete_project_copy_choice(
                     &ui,
                     &worker,
+                    token,
                     project_name,
                     switch_to,
                     ProjectCopyChoice::Selected(PathBuf::from("parent")),
@@ -21757,16 +21862,21 @@ mod tests {
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_choice = Rc::clone(&submitted);
         let worker: WorkerCell = Rc::new(RefCell::new(None));
-        bind_project_copy_callback_with(&ui, &worker, move |weak, _, project_name, switch_to| {
-            let ui = weak.upgrade().unwrap();
-            complete_project_copy_choice_with(
-                &ui,
-                project_name,
-                switch_to,
-                ProjectCopyChoice::Selected(PathBuf::from("parent")),
-                |command| submitted_by_choice.borrow_mut().push(command),
-            );
-        });
+        bind_project_copy_callback_with(
+            &ui,
+            &worker,
+            move |weak, _, project_name, switch_to, token| {
+                let ui = weak.upgrade().unwrap();
+                complete_project_copy_choice_with(
+                    &ui,
+                    token,
+                    project_name,
+                    switch_to,
+                    ProjectCopyChoice::Selected(PathBuf::from("parent")),
+                    |command| submitted_by_choice.borrow_mut().push(command),
+                );
+            },
+        );
         let mut restored_entries =
             ElementHandle::find_by_element_id(&ui, "MainWindow::save-project-as-entry");
         let restored_entry = restored_entries
@@ -24663,6 +24773,544 @@ mod tests {
             ),
             AppMode::OutputTesting
         );
+    }
+
+    #[test]
+    fn running_observations_close_project_forms_only_after_an_open() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let observe = |ui: &MainWindow| {
+            apply_event(
+                ui,
+                &UiRoutes::default(),
+                &Rc::new(ProjectUiState::default()),
+                IdeWorkerEvent::Running(IdeRunningObservation::for_ui_test(
+                    PlaybackRecoverySnapshot::for_test(PlaybackRecoveryTransportState::Stopped, 0),
+                )),
+            );
+        };
+        for pending in [AppMode::Running, AppMode::Saving, AppMode::Previewing] {
+            ui.set_app_mode(pending);
+            ui.set_save_project_as_visible(true);
+            ui.set_rename_project_visible(true);
+
+            observe(&ui);
+
+            assert_eq!(ui.get_app_mode(), AppMode::Running);
+            assert!(ui.get_save_project_as_visible());
+            assert!(ui.get_rename_project_visible());
+        }
+
+        for pending in [AppMode::Opening, AppMode::Creating] {
+            ui.set_app_mode(pending);
+            ui.set_new_project_visible(true);
+            ui.set_save_project_as_visible(true);
+            ui.set_rename_project_visible(true);
+
+            observe(&ui);
+
+            assert!(!ui.get_new_project_visible());
+            assert!(!ui.get_save_project_as_visible());
+            assert!(!ui.get_rename_project_visible());
+        }
+    }
+
+    #[test]
+    fn project_forms_close_when_their_project_can_no_longer_use_them() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_save_project_as_visible(true);
+        ui.set_rename_project_visible(true);
+        apply_output_failure_observation(&ui);
+        assert!(!ui.get_save_project_as_visible());
+        assert!(!ui.get_rename_project_visible());
+
+        ui.set_save_project_as_visible(true);
+        reset_project(
+            &ui,
+            &Rc::new(RefCell::new(Vec::new())),
+            &Rc::new(RefCell::new(Vec::new())),
+            &Rc::new(ProjectUiState::default()),
+        );
+        assert!(!ui.get_save_project_as_visible());
+
+        for event in [
+            IdeWorkerEvent::ProjectCopied {
+                project_path: PathBuf::from("projects/Copy"),
+                opened: false,
+            },
+            IdeWorkerEvent::ProjectCopyCommittedWithWarning {
+                project_path: PathBuf::from("projects/Copy"),
+                opened: true,
+                warning: Box::new(hyper_desktop_ide::IdeProjectCopyError::Save(
+                    hyper_desktop_ide::IdeProjectSaveError::ProjectSnapshotUnavailable,
+                )),
+            },
+        ] {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_save_project_as_visible(true);
+            apply_event(
+                &ui,
+                &UiRoutes::default(),
+                &Rc::new(ProjectUiState::default()),
+                event,
+            );
+            assert!(!ui.get_save_project_as_visible());
+        }
+    }
+
+    #[test]
+    fn rejected_project_copy_or_rename_returns_from_saving() {
+        for command in [
+            IdeWorkerCommandKind::SaveProjectAs,
+            IdeWorkerCommandKind::RenameProject,
+        ] {
+            assert_eq!(
+                mode_after_failure(AppMode::Saving, command),
+                AppMode::Running
+            );
+        }
+    }
+
+    #[test]
+    fn running_observations_leave_an_open_file_dialog_pending() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        for pending in [
+            AppMode::ImportingAudio,
+            AppMode::ImportingRuntimeMixerUpdate,
+            AppMode::Saving,
+        ] {
+            ui.set_app_mode(pending);
+            ui.set_save_project_as_visible(true);
+            ui.set_status_text("Waiting for a file".into());
+            let token = begin_file_dialog(&ui);
+
+            apply_event(
+                &ui,
+                &UiRoutes::default(),
+                &Rc::new(ProjectUiState::default()),
+                IdeWorkerEvent::Running(IdeRunningObservation::for_ui_test(
+                    PlaybackRecoverySnapshot::for_test(PlaybackRecoveryTransportState::Stopped, 0),
+                )),
+            );
+            for finished in [
+                DesktopAudioPreviewState::Complete,
+                DesktopAudioPreviewState::Failed,
+            ] {
+                apply_preview_settlement(&ui, finished, true);
+            }
+
+            assert_eq!(ui.get_app_mode(), pending);
+            assert!(ui.get_save_project_as_visible());
+            assert_eq!(ui.get_status_text(), "Waiting for a file");
+            assert!(finish_file_dialog(&ui, token, pending));
+            assert!(!ui.get_file_dialog_open());
+        }
+
+        ui.set_app_mode(AppMode::ImportingAudio);
+        let token = begin_file_dialog(&ui);
+        ui.set_app_mode(AppMode::Saving);
+        apply_idle_running_event(&ui);
+        assert_eq!(
+            ui.get_app_mode(),
+            AppMode::Running,
+            "a dialog holds only the mode it was opened in"
+        );
+        assert!(!finish_file_dialog(&ui, token, AppMode::ImportingAudio));
+        apply_preview_settlement(&ui, DesktopAudioPreviewState::Complete, false);
+        assert_eq!(ui.get_status_text(), "Take audition complete");
+    }
+
+    fn file_dialog_recorder(
+        opened: &Rc<RefCell<Vec<(bool, AppMode)>>>,
+    ) -> impl Fn(&slint::Weak<MainWindow>) -> MainWindow + 'static {
+        let opened = Rc::clone(opened);
+        move |weak| {
+            let ui = weak.upgrade().unwrap();
+            opened
+                .borrow_mut()
+                .push((ui.get_file_dialog_open(), ui.get_file_dialog_mode()));
+            ui
+        }
+    }
+
+    fn bind_cancelling_recording_automation_loop_fakes(
+        ui: &MainWindow,
+        worker: &WorkerCell,
+        opened: &Rc<RefCell<Vec<(bool, AppMode)>>>,
+    ) {
+        let recorder = file_dialog_recorder(opened);
+        bind_runtime_recording_update_import_callback_with(ui, worker, move |weak, _, token| {
+            let ui = recorder(&weak);
+            complete_runtime_recording_update_import_choice_with(
+                &ui,
+                token,
+                RuntimeRecordingUpdateImportChoice::Cancelled,
+                |_| {},
+            );
+        });
+        let recorder = file_dialog_recorder(opened);
+        bind_runtime_automation_update_import_callback_with(ui, worker, move |weak, _, token| {
+            let ui = recorder(&weak);
+            complete_runtime_automation_update_import_choice_with(
+                &ui,
+                token,
+                RuntimeAutomationUpdateImportChoice::Cancelled,
+                |_| {},
+            );
+        });
+        let recorder = file_dialog_recorder(opened);
+        bind_runtime_loop_update_import_callback_with(
+            ui,
+            worker,
+            || Ok(()),
+            move |weak, _, token| {
+                let ui = recorder(&weak);
+                complete_runtime_loop_update_import_choice_with(
+                    &ui,
+                    token,
+                    RuntimeLoopUpdateImportChoice::Cancelled,
+                    |_| {},
+                );
+            },
+        );
+    }
+
+    fn bind_cancelling_file_dialog_fakes(
+        ui: &MainWindow,
+        opened: &Rc<RefCell<Vec<(bool, AppMode)>>>,
+    ) {
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        let routes: AudioImportRoutes = Rc::new(RefCell::new(vec!["track-a".to_owned()]));
+        let recorder = file_dialog_recorder(opened);
+        bind_audio_import_callback_with(ui, &worker, &routes, move |weak, _, track_id, token| {
+            let ui = recorder(&weak);
+            complete_audio_import_choice_with(
+                &ui,
+                token,
+                track_id,
+                AudioImportChoice::Cancelled,
+                |_| {},
+            );
+        });
+        let recorder = file_dialog_recorder(opened);
+        bind_runtime_scene_performance_import_callback_with(ui, &worker, move |weak, _, token| {
+            let ui = recorder(&weak);
+            complete_runtime_scene_performance_import_choice_with(
+                &ui,
+                token,
+                RuntimeScenePerformanceImportChoice::Cancelled,
+                |_| {},
+            );
+        });
+        let recorder = file_dialog_recorder(opened);
+        bind_runtime_mixer_update_import_callback_with(ui, &worker, move |weak, _, token| {
+            let ui = recorder(&weak);
+            complete_runtime_mixer_update_import_choice_with(
+                &ui,
+                token,
+                RuntimeMixerUpdateImportChoice::Cancelled,
+                |_| {},
+            );
+        });
+        let recorder = file_dialog_recorder(opened);
+        bind_runtime_native_device_update_import_callback_with(
+            ui,
+            &worker,
+            move |weak, _, token| {
+                let ui = recorder(&weak);
+                complete_runtime_native_device_update_import_choice_with(
+                    &ui,
+                    token,
+                    RuntimeNativeDeviceUpdateImportChoice::Cancelled,
+                    |_| {},
+                );
+            },
+        );
+        bind_cancelling_recording_automation_loop_fakes(ui, &worker, opened);
+        let recorder = file_dialog_recorder(opened);
+        bind_project_copy_callback_with(
+            ui,
+            &worker,
+            move |weak, _, project_name, switch_to, token| {
+                let ui = recorder(&weak);
+                complete_project_copy_choice_with(
+                    &ui,
+                    token,
+                    project_name,
+                    switch_to,
+                    ProjectCopyChoice::Cancelled,
+                    |_| {},
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn file_dialog_actions_open_and_finish_their_dialog_in_the_pending_mode() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        bind_cancelling_file_dialog_fakes(&ui, &opened);
+
+        let actions = ui.global::<IdeActions>();
+        let invocations: [(Box<dyn Fn()>, AppMode); 8] = [
+            (
+                Box::new(|| actions.invoke_choose_audio_import(0)),
+                AppMode::ImportingAudio,
+            ),
+            (
+                Box::new(|| actions.invoke_import_runtime_scene_performance()),
+                AppMode::ImportingRuntimeScenePerformance,
+            ),
+            (
+                Box::new(|| actions.invoke_import_runtime_mixer_update()),
+                AppMode::ImportingRuntimeMixerUpdate,
+            ),
+            (
+                Box::new(|| actions.invoke_import_runtime_native_device_update()),
+                AppMode::ImportingRuntimeNativeDeviceUpdate,
+            ),
+            (
+                Box::new(|| actions.invoke_import_runtime_recording_update()),
+                AppMode::ImportingRuntimeRecordingUpdate,
+            ),
+            (
+                Box::new(|| actions.invoke_import_runtime_automation_update()),
+                AppMode::ImportingRuntimeAutomationUpdate,
+            ),
+            (
+                Box::new(|| actions.invoke_import_runtime_loop_update()),
+                AppMode::ImportingRuntimeLoopUpdate,
+            ),
+            (
+                Box::new(|| actions.invoke_save_project_as("Copy".into(), true)),
+                AppMode::Saving,
+            ),
+        ];
+        for (index, (invoke, pending)) in invocations.iter().enumerate() {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_save_project_as_visible(true);
+            invoke();
+            assert_eq!(opened.borrow().len(), index + 1);
+            assert_eq!(opened.borrow()[index], (true, *pending));
+            assert!(!ui.get_file_dialog_open());
+            assert_eq!(ui.get_app_mode(), AppMode::Running);
+        }
+    }
+
+    #[test]
+    fn save_as_choice_for_a_closed_form_is_cancelled() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_save_project_as_visible(false);
+        ui.set_app_mode(AppMode::Saving);
+        let token = begin_file_dialog(&ui);
+        let submitted = RefCell::new(Vec::new());
+        complete_project_copy_choice_with(
+            &ui,
+            token,
+            "Copy".to_owned(),
+            true,
+            ProjectCopyChoice::Selected(PathBuf::from("projects")),
+            |command| submitted.borrow_mut().push(command),
+        );
+        assert!(submitted.borrow().is_empty());
+        assert_eq!(
+            ui.get_app_mode(),
+            AppMode::Running,
+            "a Save As choice for a closed form leaves Saving"
+        );
+    }
+
+    type StaleChoice = (
+        AppMode,
+        fn(&MainWindow, i32, &RefCell<Vec<IdeWorkerCommand>>),
+    );
+
+    fn stale_file_dialog_choices() -> [StaleChoice; 8] {
+        [
+            (AppMode::ImportingAudio, |ui, token, submitted| {
+                complete_audio_import_choice_with(
+                    ui,
+                    token,
+                    "track-a".to_owned(),
+                    AudioImportChoice::Selected(vec![PathBuf::from("choice")]),
+                    |command| submitted.borrow_mut().push(command),
+                );
+            }),
+            (
+                AppMode::ImportingRuntimeScenePerformance,
+                |ui, token, submitted| {
+                    complete_runtime_scene_performance_import_choice_with(
+                        ui,
+                        token,
+                        RuntimeScenePerformanceImportChoice::Selected(PathBuf::from("choice")),
+                        |command| submitted.borrow_mut().push(command),
+                    );
+                },
+            ),
+            (
+                AppMode::ImportingRuntimeMixerUpdate,
+                |ui, token, submitted| {
+                    complete_runtime_mixer_update_import_choice_with(
+                        ui,
+                        token,
+                        RuntimeMixerUpdateImportChoice::Selected(PathBuf::from("choice")),
+                        |command| submitted.borrow_mut().push(command),
+                    );
+                },
+            ),
+            (
+                AppMode::ImportingRuntimeNativeDeviceUpdate,
+                |ui, token, submitted| {
+                    complete_runtime_native_device_update_import_choice_with(
+                        ui,
+                        token,
+                        RuntimeNativeDeviceUpdateImportChoice::Selected(PathBuf::from("choice")),
+                        |command| submitted.borrow_mut().push(command),
+                    );
+                },
+            ),
+            (
+                AppMode::ImportingRuntimeRecordingUpdate,
+                |ui, token, submitted| {
+                    complete_runtime_recording_update_import_choice_with(
+                        ui,
+                        token,
+                        RuntimeRecordingUpdateImportChoice::Selected(PathBuf::from("choice")),
+                        |command| submitted.borrow_mut().push(command),
+                    );
+                },
+            ),
+            (
+                AppMode::ImportingRuntimeAutomationUpdate,
+                |ui, token, submitted| {
+                    complete_runtime_automation_update_import_choice_with(
+                        ui,
+                        token,
+                        RuntimeAutomationUpdateImportChoice::Selected(PathBuf::from("choice")),
+                        |command| submitted.borrow_mut().push(command),
+                    );
+                },
+            ),
+            (
+                AppMode::ImportingRuntimeLoopUpdate,
+                |ui, token, submitted| {
+                    complete_runtime_loop_update_import_choice_with(
+                        ui,
+                        token,
+                        RuntimeLoopUpdateImportChoice::Selected(PathBuf::from("choice")),
+                        |command| submitted.borrow_mut().push(command),
+                    );
+                },
+            ),
+            (AppMode::Saving, |ui, token, submitted| {
+                complete_project_copy_choice_with(
+                    ui,
+                    token,
+                    "Copy".to_owned(),
+                    true,
+                    ProjectCopyChoice::Selected(PathBuf::from("choice")),
+                    |command| submitted.borrow_mut().push(command),
+                );
+            }),
+        ]
+    }
+
+    #[test]
+    fn file_dialog_choices_submit_only_from_their_open_dialog_and_mode() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_save_project_as_visible(true);
+        for (pending, complete) in stale_file_dialog_choices() {
+            let submitted = RefCell::new(Vec::new());
+
+            ui.set_app_mode(pending);
+            let token = begin_file_dialog(&ui);
+            ui.set_app_mode(AppMode::Running);
+            complete(&ui, token, &submitted);
+            assert!(
+                submitted.borrow().is_empty(),
+                "{pending:?} after the mode moved on"
+            );
+            assert_eq!(ui.get_app_mode(), AppMode::Running);
+            assert!(!ui.get_file_dialog_open());
+
+            ui.set_app_mode(pending);
+            complete(&ui, token, &submitted);
+            assert!(
+                submitted.borrow().is_empty(),
+                "{pending:?} without an open dialog"
+            );
+            assert_eq!(ui.get_app_mode(), pending);
+
+            let token = begin_file_dialog(&ui);
+            complete(&ui, token, &submitted);
+            assert_eq!(
+                submitted.borrow().len(),
+                1,
+                "{pending:?} from its open dialog"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_file_dialog_leaves_a_newer_dialog_pending() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_save_project_as_visible(true);
+        let choices = stale_file_dialog_choices();
+        for (index, (pending, complete)) in choices.iter().enumerate() {
+            for (stale_pending, complete_stale) in
+                [choices[index], choices[(index + 1) % choices.len()]]
+            {
+                let submitted = RefCell::new(Vec::new());
+                ui.set_app_mode(stale_pending);
+                let stale = begin_file_dialog(&ui);
+                end_file_dialog(&ui);
+                ui.set_app_mode(*pending);
+                let token = begin_file_dialog(&ui);
+
+                complete_stale(&ui, stale, &submitted);
+                assert!(
+                    submitted.borrow().is_empty(),
+                    "{stale_pending:?} from before {pending:?}"
+                );
+                assert!(ui.get_file_dialog_open());
+                assert_eq!(ui.get_app_mode(), *pending);
+
+                complete(&ui, token, &submitted);
+                assert_eq!(
+                    submitted.borrow().len(),
+                    1,
+                    "{pending:?} after {stale_pending:?}"
+                );
+                assert!(!ui.get_file_dialog_open());
+            }
+        }
+    }
+
+    #[test]
+    fn output_failure_and_project_reset_close_the_open_file_dialog() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Saving);
+        begin_file_dialog(&ui);
+        apply_output_failure_observation(&ui);
+        assert!(!ui.get_file_dialog_open());
+
+        ui.set_app_mode(AppMode::Saving);
+        begin_file_dialog(&ui);
+        reset_project(
+            &ui,
+            &RecordingRoutes::default(),
+            &TakeRoutes::default(),
+            &Rc::new(ProjectUiState::default()),
+        );
+        assert!(!ui.get_file_dialog_open());
     }
 
     #[test]
@@ -28396,10 +29044,11 @@ mod tests {
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
         let worker: WorkerCell = Rc::new(RefCell::new(None));
-        bind_runtime_scene_performance_import_callback_with(ui, &worker, move |weak, _| {
+        bind_runtime_scene_performance_import_callback_with(ui, &worker, move |weak, _, token| {
             let ui = weak.upgrade().unwrap();
             complete_runtime_scene_performance_import_choice_with(
                 &ui,
+                token,
                 RuntimeScenePerformanceImportChoice::Selected(PathBuf::from(
                     "performance.hyper-scene-performance.json",
                 )),
@@ -28427,10 +29076,11 @@ mod tests {
             "Closed mode owns no import action"
         );
 
-        bind_runtime_scene_performance_import_callback_with(ui, &worker, move |weak, _| {
+        bind_runtime_scene_performance_import_callback_with(ui, &worker, move |weak, _, token| {
             let ui = weak.upgrade().unwrap();
             complete_runtime_scene_performance_import_choice_with(
                 &ui,
+                token,
                 RuntimeScenePerformanceImportChoice::Cancelled,
                 |_| panic!("a cancelled chooser must not submit a command"),
             );
@@ -28444,16 +29094,21 @@ mod tests {
             "Runtime scene-performance import cancelled"
         );
 
-        bind_runtime_scene_performance_import_callback_with(ui, &worker, move |weak, worker| {
-            let ui = weak.upgrade().unwrap();
-            complete_runtime_scene_performance_import_choice(
-                &ui,
-                &worker,
-                RuntimeScenePerformanceImportChoice::Selected(PathBuf::from(
-                    "performance.hyper-scene-performance.json",
-                )),
-            );
-        });
+        bind_runtime_scene_performance_import_callback_with(
+            ui,
+            &worker,
+            move |weak, worker, token| {
+                let ui = weak.upgrade().unwrap();
+                complete_runtime_scene_performance_import_choice(
+                    &ui,
+                    &worker,
+                    token,
+                    RuntimeScenePerformanceImportChoice::Selected(PathBuf::from(
+                        "performance.hyper-scene-performance.json",
+                    )),
+                );
+            },
+        );
         ui.set_app_mode(AppMode::Running);
         ui.global::<IdeActions>()
             .invoke_import_runtime_scene_performance();
@@ -28528,10 +29183,11 @@ mod tests {
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
         let worker: WorkerCell = Rc::new(RefCell::new(None));
-        bind_runtime_mixer_update_import_callback_with(ui, &worker, move |weak, _| {
+        bind_runtime_mixer_update_import_callback_with(ui, &worker, move |weak, _, token| {
             let ui = weak.upgrade().unwrap();
             complete_runtime_mixer_update_import_choice_with(
                 &ui,
+                token,
                 RuntimeMixerUpdateImportChoice::Selected(PathBuf::from(
                     "mixer.hyper-mixer-update.json",
                 )),
@@ -28559,10 +29215,11 @@ mod tests {
             "Closed mode owns no Runtime mixer-update import action"
         );
 
-        bind_runtime_mixer_update_import_callback_with(ui, &worker, move |weak, _| {
+        bind_runtime_mixer_update_import_callback_with(ui, &worker, move |weak, _, token| {
             let ui = weak.upgrade().unwrap();
             complete_runtime_mixer_update_import_choice_with(
                 &ui,
+                token,
                 RuntimeMixerUpdateImportChoice::Cancelled,
                 |_| panic!("a cancelled chooser must not submit a command"),
             );
@@ -28576,11 +29233,12 @@ mod tests {
             "Runtime mixer update import cancelled"
         );
 
-        bind_runtime_mixer_update_import_callback_with(ui, &worker, move |weak, worker| {
+        bind_runtime_mixer_update_import_callback_with(ui, &worker, move |weak, worker, token| {
             let ui = weak.upgrade().unwrap();
             complete_runtime_mixer_update_import_choice(
                 &ui,
                 &worker,
+                token,
                 RuntimeMixerUpdateImportChoice::Selected(PathBuf::from(
                     "mixer.hyper-mixer-update.json",
                 )),
@@ -28678,16 +29336,21 @@ mod tests {
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
         let worker: WorkerCell = Rc::new(RefCell::new(None));
-        bind_runtime_native_device_update_import_callback_with(ui, &worker, move |weak, _| {
-            let ui = weak.upgrade().unwrap();
-            complete_runtime_native_device_update_import_choice_with(
-                &ui,
-                RuntimeNativeDeviceUpdateImportChoice::Selected(PathBuf::from(
-                    "devices.hyper-native-device-update.json",
-                )),
-                |command| submitted_by_callback.borrow_mut().push(command),
-            );
-        });
+        bind_runtime_native_device_update_import_callback_with(
+            ui,
+            &worker,
+            move |weak, _, token| {
+                let ui = weak.upgrade().unwrap();
+                complete_runtime_native_device_update_import_choice_with(
+                    &ui,
+                    token,
+                    RuntimeNativeDeviceUpdateImportChoice::Selected(PathBuf::from(
+                        "devices.hyper-native-device-update.json",
+                    )),
+                    |command| submitted_by_callback.borrow_mut().push(command),
+                );
+            },
+        );
         ui.set_app_mode(AppMode::Running);
         ui.set_error_text("stale error".into());
         ui.global::<IdeActions>()
@@ -28712,14 +29375,19 @@ mod tests {
             "Closed mode owns no Runtime native-device update import action"
         );
 
-        bind_runtime_native_device_update_import_callback_with(ui, &worker, move |weak, _| {
-            let ui = weak.upgrade().unwrap();
-            complete_runtime_native_device_update_import_choice_with(
-                &ui,
-                RuntimeNativeDeviceUpdateImportChoice::Cancelled,
-                |_| panic!("a cancelled chooser must not submit a command"),
-            );
-        });
+        bind_runtime_native_device_update_import_callback_with(
+            ui,
+            &worker,
+            move |weak, _, token| {
+                let ui = weak.upgrade().unwrap();
+                complete_runtime_native_device_update_import_choice_with(
+                    &ui,
+                    token,
+                    RuntimeNativeDeviceUpdateImportChoice::Cancelled,
+                    |_| panic!("a cancelled chooser must not submit a command"),
+                );
+            },
+        );
         ui.set_app_mode(AppMode::Running);
         ui.global::<IdeActions>()
             .invoke_import_runtime_native_device_update();
@@ -28729,16 +29397,21 @@ mod tests {
             "Runtime native-device update import cancelled"
         );
 
-        bind_runtime_native_device_update_import_callback_with(ui, &worker, move |weak, worker| {
-            let ui = weak.upgrade().unwrap();
-            complete_runtime_native_device_update_import_choice(
-                &ui,
-                &worker,
-                RuntimeNativeDeviceUpdateImportChoice::Selected(PathBuf::from(
-                    "devices.hyper-native-device-update.json",
-                )),
-            );
-        });
+        bind_runtime_native_device_update_import_callback_with(
+            ui,
+            &worker,
+            move |weak, worker, token| {
+                let ui = weak.upgrade().unwrap();
+                complete_runtime_native_device_update_import_choice(
+                    &ui,
+                    &worker,
+                    token,
+                    RuntimeNativeDeviceUpdateImportChoice::Selected(PathBuf::from(
+                        "devices.hyper-native-device-update.json",
+                    )),
+                );
+            },
+        );
         ui.set_app_mode(AppMode::Running);
         ui.global::<IdeActions>()
             .invoke_import_runtime_native_device_update();
@@ -28873,10 +29546,11 @@ mod tests {
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
         let worker: WorkerCell = Rc::new(RefCell::new(None));
-        bind_runtime_recording_update_import_callback_with(ui, &worker, move |weak, _| {
+        bind_runtime_recording_update_import_callback_with(ui, &worker, move |weak, _, token| {
             let ui = weak.upgrade().unwrap();
             complete_runtime_recording_update_import_choice_with(
                 &ui,
+                token,
                 RuntimeRecordingUpdateImportChoice::Selected(PathBuf::from(
                     "take.hyper-recording-update.json",
                 )),
@@ -28904,10 +29578,11 @@ mod tests {
             "Closed mode owns no Runtime recording-update import action"
         );
 
-        bind_runtime_recording_update_import_callback_with(ui, &worker, move |weak, _| {
+        bind_runtime_recording_update_import_callback_with(ui, &worker, move |weak, _, token| {
             let ui = weak.upgrade().unwrap();
             complete_runtime_recording_update_import_choice_with(
                 &ui,
+                token,
                 RuntimeRecordingUpdateImportChoice::Cancelled,
                 |_| panic!("a cancelled chooser must not submit a command"),
             );
@@ -28921,16 +29596,21 @@ mod tests {
             "Runtime recording update import cancelled"
         );
 
-        bind_runtime_recording_update_import_callback_with(ui, &worker, move |weak, worker| {
-            let ui = weak.upgrade().unwrap();
-            complete_runtime_recording_update_import_choice(
-                &ui,
-                &worker,
-                RuntimeRecordingUpdateImportChoice::Selected(PathBuf::from(
-                    "take.hyper-recording-update.json",
-                )),
-            );
-        });
+        bind_runtime_recording_update_import_callback_with(
+            ui,
+            &worker,
+            move |weak, worker, token| {
+                let ui = weak.upgrade().unwrap();
+                complete_runtime_recording_update_import_choice(
+                    &ui,
+                    &worker,
+                    token,
+                    RuntimeRecordingUpdateImportChoice::Selected(PathBuf::from(
+                        "take.hyper-recording-update.json",
+                    )),
+                );
+            },
+        );
         ui.set_app_mode(AppMode::Running);
         ui.global::<IdeActions>()
             .invoke_import_runtime_recording_update();
@@ -29044,10 +29724,11 @@ mod tests {
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
         let worker: WorkerCell = Rc::new(RefCell::new(None));
-        bind_runtime_automation_update_import_callback_with(ui, &worker, move |weak, _| {
+        bind_runtime_automation_update_import_callback_with(ui, &worker, move |weak, _, token| {
             let ui = weak.upgrade().unwrap();
             complete_runtime_automation_update_import_choice_with(
                 &ui,
+                token,
                 RuntimeAutomationUpdateImportChoice::Selected(PathBuf::from(
                     "take.hyper-automation-update.json",
                 )),
@@ -29075,10 +29756,11 @@ mod tests {
             "Closed mode owns no Runtime automation-update import action"
         );
 
-        bind_runtime_automation_update_import_callback_with(ui, &worker, move |weak, _| {
+        bind_runtime_automation_update_import_callback_with(ui, &worker, move |weak, _, token| {
             let ui = weak.upgrade().unwrap();
             complete_runtime_automation_update_import_choice_with(
                 &ui,
+                token,
                 RuntimeAutomationUpdateImportChoice::Cancelled,
                 |_| panic!("a cancelled chooser must not submit a command"),
             );
@@ -29092,16 +29774,21 @@ mod tests {
             "Runtime automation update import cancelled"
         );
 
-        bind_runtime_automation_update_import_callback_with(ui, &worker, move |weak, worker| {
-            let ui = weak.upgrade().unwrap();
-            complete_runtime_automation_update_import_choice(
-                &ui,
-                &worker,
-                RuntimeAutomationUpdateImportChoice::Selected(PathBuf::from(
-                    "take.hyper-automation-update.json",
-                )),
-            );
-        });
+        bind_runtime_automation_update_import_callback_with(
+            ui,
+            &worker,
+            move |weak, worker, token| {
+                let ui = weak.upgrade().unwrap();
+                complete_runtime_automation_update_import_choice(
+                    &ui,
+                    &worker,
+                    token,
+                    RuntimeAutomationUpdateImportChoice::Selected(PathBuf::from(
+                        "take.hyper-automation-update.json",
+                    )),
+                );
+            },
+        );
         ui.set_app_mode(AppMode::Running);
         ui.global::<IdeActions>()
             .invoke_import_runtime_automation_update();
@@ -29255,10 +29942,11 @@ mod tests {
             ui,
             worker,
             move || runtime_loop_update_import_availability(&project_state_for_availability),
-            move |weak, _| {
+            move |weak, _, token| {
                 let ui = weak.upgrade().unwrap();
                 complete_runtime_loop_update_import_choice_with(
                     &ui,
+                    token,
                     RuntimeLoopUpdateImportChoice::Selected(PathBuf::from(
                         "loop.hyper-loop-update.json",
                     )),
@@ -29298,10 +29986,11 @@ mod tests {
             ui,
             worker,
             move || runtime_loop_update_import_availability(&project_state_for_availability),
-            move |weak, _| {
+            move |weak, _, token| {
                 let ui = weak.upgrade().unwrap();
                 complete_runtime_loop_update_import_choice_with(
                     &ui,
+                    token,
                     RuntimeLoopUpdateImportChoice::Cancelled,
                     |_| panic!("a cancelled chooser must not submit a command"),
                 );
@@ -29324,11 +30013,12 @@ mod tests {
             ui,
             worker,
             move || runtime_loop_update_import_availability(&project_state_for_availability),
-            move |weak, worker| {
+            move |weak, worker, token| {
                 let ui = weak.upgrade().unwrap();
                 complete_runtime_loop_update_import_choice(
                     &ui,
                     &worker,
+                    token,
                     RuntimeLoopUpdateImportChoice::Selected(PathBuf::from(
                         "loop.hyper-loop-update.json",
                     )),
@@ -29357,7 +30047,7 @@ mod tests {
             ui,
             worker,
             move || runtime_loop_update_import_availability(&project_state_for_availability),
-            |_, _| panic!("a local-loop conflict must not open the Runtime loop-update chooser"),
+            |_, _, _| panic!("a local-loop conflict must not open the Runtime loop-update chooser"),
         );
         ui.set_app_mode(AppMode::Running);
         ui.set_error_text(SharedString::default());
@@ -30083,10 +30773,11 @@ mod tests {
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
         let worker: WorkerCell = Rc::new(RefCell::new(None));
-        bind_audio_import_callback_with(ui, &worker, routes, move |weak, _, track_id| {
+        bind_audio_import_callback_with(ui, &worker, routes, move |weak, _, track_id, token| {
             let ui = weak.upgrade().unwrap();
             complete_audio_import_choice_with(
                 &ui,
+                token,
                 track_id,
                 AudioImportChoice::Selected(vec![
                     PathBuf::from("kick.wav"),
@@ -30142,26 +30833,36 @@ mod tests {
         );
         assert_eq!(ui.get_selected_audio_import_track_index(), 0);
 
-        bind_audio_import_callback_with(ui, &worker, routes, move |weak, _, track_id| {
+        bind_audio_import_callback_with(ui, &worker, routes, move |weak, _, track_id, token| {
             let ui = weak.upgrade().unwrap();
-            complete_audio_import_choice_with(&ui, track_id, AudioImportChoice::Cancelled, |_| {
-                panic!("a cancelled chooser must not submit a command")
-            });
+            complete_audio_import_choice_with(
+                &ui,
+                token,
+                track_id,
+                AudioImportChoice::Cancelled,
+                |_| panic!("a cancelled chooser must not submit a command"),
+            );
         });
         ui.set_app_mode(AppMode::Running);
         ui.global::<IdeActions>().invoke_choose_audio_import(0);
         assert_eq!(ui.get_app_mode(), AppMode::Running);
         assert_eq!(ui.get_status_text(), "Audio import cancelled");
 
-        bind_audio_import_callback_with(ui, &worker, routes, move |weak, worker, track_id| {
-            let ui = weak.upgrade().unwrap();
-            complete_audio_import_choice(
-                &ui,
-                &worker,
-                track_id,
-                AudioImportChoice::Selected(vec![PathBuf::from("kick.wav")]),
-            );
-        });
+        bind_audio_import_callback_with(
+            ui,
+            &worker,
+            routes,
+            move |weak, worker, track_id, token| {
+                let ui = weak.upgrade().unwrap();
+                complete_audio_import_choice(
+                    &ui,
+                    &worker,
+                    token,
+                    track_id,
+                    AudioImportChoice::Selected(vec![PathBuf::from("kick.wav")]),
+                );
+            },
+        );
         ui.set_app_mode(AppMode::Running);
         ui.global::<IdeActions>().invoke_choose_audio_import(0);
         assert_eq!(ui.get_app_mode(), AppMode::Unavailable);

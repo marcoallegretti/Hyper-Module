@@ -874,6 +874,9 @@ export component MainWindow inherits Window {
     in-out property <bool> save-project-as-visible: false;
     in-out property <string> save-project-as-name: "";
     in-out property <bool> save-project-as-switch-to: true;
+    in-out property <bool> file-dialog-open: false;
+    in-out property <AppMode> file-dialog-mode;
+    in-out property <int> file-dialog-token: 0;
     in-out property <bool> rename-project-visible: false;
     in-out property <string> rename-project-name: "";
     in property <string> project-id: "—";
