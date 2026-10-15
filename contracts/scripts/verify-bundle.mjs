@@ -188,6 +188,7 @@ export async function verifyDescribedFile(
       try {
         inspection = await inspect(stream, {
           byteLength: descriptor.byte_length,
+          handle,
           mediaType: descriptor.media_type,
           path: descriptor.path,
         });

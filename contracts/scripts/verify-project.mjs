@@ -132,6 +132,37 @@ function isLocalOnlyPath(path) {
   return path.startsWith("cache/") || path.startsWith("backups/");
 }
 
+const waveSubformatGuidTail = Buffer.from("00001000800000aa00389b71", "hex");
+
+async function readWaveExtensibleCodec(fileInfo) {
+  const chunkHeader = Buffer.alloc(8);
+  const fmt = Buffer.alloc(40);
+  let offset = 12;
+  while (offset + chunkHeader.byteLength <= fileInfo.byteLength) {
+    await fileInfo.handle.read(chunkHeader, 0, chunkHeader.byteLength, offset);
+    const chunkBytes = chunkHeader.readUInt32LE(4);
+    if (chunkHeader.toString("ascii", 0, 4) === "fmt ") {
+      if (
+        chunkBytes < fmt.byteLength ||
+        offset + 8 + fmt.byteLength > fileInfo.byteLength
+      ) {
+        return undefined;
+      }
+      await fileInfo.handle.read(fmt, 0, fmt.byteLength, offset + 8);
+      if (
+        fmt.readUInt16LE(0) !== 0xfffe ||
+        fmt.readUInt16LE(16) < 22 ||
+        !fmt.subarray(28, 40).equals(waveSubformatGuidTail)
+      ) {
+        return undefined;
+      }
+      return { 1: "PCM", 3: "IEEE_FLOAT" }[fmt.readUInt32LE(24)];
+    }
+    offset += 8 + chunkBytes + (chunkBytes % 2);
+  }
+  return undefined;
+}
+
 async function readAudioAssetFormat(stream, asset, fileInfo) {
   let metadata;
   try {
@@ -163,7 +194,11 @@ async function readAudioAssetFormat(stream, asset, fileInfo) {
     `${asset.path}: audio container does not match declared media type`,
   );
   if (asset.media_type === "audio/wav") {
-    const codec = metadata.format.codec;
+    const reportedCodec = metadata.format.codec;
+    const codec =
+      reportedCodec === "PCM" || reportedCodec === "IEEE_FLOAT"
+        ? reportedCodec
+        : await readWaveExtensibleCodec(fileInfo);
     assert(
       codec === "PCM" || codec === "IEEE_FLOAT",
       `${asset.path}: WAV codec is unsupported`,

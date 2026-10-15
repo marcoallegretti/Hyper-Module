@@ -139,6 +139,57 @@ function float32Wave(samples, channels = 1, sampleRate = 48000) {
   return buffer;
 }
 
+const waveSubformatGuidTail = "00001000800000aa00389b71";
+
+function extensibleWave(
+  formatCode,
+  bitsPerSample,
+  frameCount,
+  {
+    channels = 1,
+    extensionBytes = 22,
+    guidTail = waveSubformatGuidTail,
+    leadingChunkBytes = undefined,
+  } = {},
+) {
+  const sampleRate = 48000;
+  const blockAlign = channels * (bitsPerSample / 8);
+  const dataBytes = frameCount * blockAlign;
+  const leading =
+    leadingChunkBytes === undefined
+      ? Buffer.alloc(0)
+      : Buffer.alloc(8 + leadingChunkBytes + (leadingChunkBytes % 2));
+  if (leadingChunkBytes !== undefined) {
+    leading.write("JUNK", 0, "ascii");
+    leading.writeUInt32LE(leadingChunkBytes, 4);
+  }
+  const fmt = Buffer.alloc(48);
+  fmt.write("fmt ", 0, "ascii");
+  fmt.writeUInt32LE(40, 4);
+  fmt.writeUInt16LE(0xfffe, 8);
+  fmt.writeUInt16LE(channels, 10);
+  fmt.writeUInt32LE(sampleRate, 12);
+  fmt.writeUInt32LE(sampleRate * blockAlign, 16);
+  fmt.writeUInt16LE(blockAlign, 20);
+  fmt.writeUInt16LE(bitsPerSample, 22);
+  fmt.writeUInt16LE(extensionBytes, 24);
+  fmt.writeUInt16LE(bitsPerSample, 26);
+  fmt.writeUInt32LE(channels === 1 ? 0x1 : 0x3, 28);
+  fmt.writeUInt32LE(formatCode, 32);
+  Buffer.from(guidTail, "hex").copy(fmt, 36);
+  const data = Buffer.alloc(8 + dataBytes);
+  data.write("data", 0, "ascii");
+  data.writeUInt32LE(dataBytes, 4);
+  const header = Buffer.alloc(12);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(
+    4 + leading.byteLength + fmt.byteLength + data.byteLength,
+    4,
+  );
+  header.write("WAVE", 8, "ascii");
+  return Buffer.concat([header, leading, fmt, data]);
+}
+
 async function createValidProject(parent, name, audioFixture) {
   const fixture = audioFixture ?? {
     bytes: pcm16Wave(128),
@@ -826,6 +877,43 @@ try {
     verifyProject(unsupportedWave),
     /WAV codec is unsupported/,
   );
+
+  for (const [name, formatCode, bitsPerSample, options] of [
+    ["extensible-float-wave", 3, 32, {}],
+    ["extensible-pcm-wave", 1, 24, {}],
+    ["extensible-stereo-float-wave", 3, 32, { channels: 2 }],
+    ["extensible-after-odd-chunk", 3, 32, { leadingChunkBytes: 5 }],
+    ["extensible-after-large-chunk", 3, 32, { leadingChunkBytes: 8191 }],
+  ]) {
+    const extensibleProject = await createValidProject(temporaryRoot, name, {
+      bytes: extensibleWave(formatCode, bitsPerSample, 128, options),
+      frameCount: 128,
+      mediaType: "audio/wav",
+      path: `assets/samples/${name}.wav`,
+    });
+    await verifyProject(extensibleProject);
+  }
+
+  for (const [name, formatCode, options] of [
+    ["extensible-adpcm-wave", 2, {}],
+    [
+      "extensible-foreign-guid-wave",
+      1,
+      { guidTail: "2107d3118644c8c1ca000000" },
+    ],
+    ["extensible-short-extension-wave", 1, { extensionBytes: 0 }],
+  ]) {
+    const refusedProject = await createValidProject(temporaryRoot, name, {
+      bytes: extensibleWave(formatCode, 16, 128, options),
+      frameCount: 128,
+      mediaType: "audio/wav",
+      path: `assets/samples/${name}.wav`,
+    });
+    await assert.rejects(
+      verifyProject(refusedProject),
+      /WAV codec is unsupported/,
+    );
+  }
 
   const nonFiniteWave = await createValidProject(
     temporaryRoot,
