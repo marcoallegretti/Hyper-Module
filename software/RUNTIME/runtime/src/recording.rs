@@ -771,6 +771,13 @@ mod tests {
 
         let stopped = owner.stop_recording().unwrap();
         assert!(!stopped.terminal_output_failure, "{:?}", stopped.message);
+        assert!(
+            stopped.message.as_deref().is_some_and(
+                |message| message.starts_with("Runtime recording for Audio 1 published to ")
+            ),
+            "{:?}",
+            stopped.message
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while !matches!(
             owner.state.as_ref(),
@@ -795,7 +802,7 @@ mod tests {
                     .is_some_and(|extension| extension == "json")
             })
             .collect();
-        assert_eq!(updates.len(), 1);
+        assert_eq!(updates.len(), 1, "{:?}", stopped.message);
         let update = read_runtime_recording_update(&updates[0]).unwrap();
         assert_eq!(update.source(), &source);
         assert_eq!(update.handoff().metadata().project_id(), project_id);

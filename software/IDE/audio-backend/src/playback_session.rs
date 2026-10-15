@@ -3726,8 +3726,7 @@ impl DesktopPlaybackRecordingSession {
             .as_ref()
             .expect("recording-capable playback owns its capture input")
             .input
-            .counters()
-            .snapshot();
+            .counters();
         let recovery = match playback.into_recovery() {
             Ok(recovery) => DesktopPlaybackRecordingRecovery::Ready(recovery),
             Err(source) if source.input.is_some() => {
@@ -3738,7 +3737,7 @@ impl DesktopPlaybackRecordingSession {
             }
             Err(source) => DesktopPlaybackRecordingRecovery::NativeShutdown(Box::new(source)),
         };
-        let completion = match recording.finish(capture, commit) {
+        let completion = match recording.finish(capture.snapshot(), commit) {
             Ok(completion) => completion,
             Err(source) => {
                 return Err(DesktopPlaybackRecordingStopError::Recording {
