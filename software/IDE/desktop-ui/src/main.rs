@@ -79,6 +79,8 @@ const WORKER_COMMAND_CAPACITY: usize = 16;
 const EXPORT_BLOCK_FRAMES: usize = 1_024;
 const WORKER_EVENT_CAPACITY: usize = 16;
 const UI_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const RUNNING_STATUS: &str = "Runtime evidence updated";
+const MIXER_RECOVERY_UNAVAILABLE: &str = "Live mixer recovery is unavailable";
 const INITIAL_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const FINAL_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 const MAX_VISIBLE_SCENE_NAME_CHARS: usize = 20;
@@ -7525,9 +7527,10 @@ fn apply_event(
         }
         IdeWorkerEvent::MixerRecoverySnapshotSaved => {
             ui.set_status_text("Live mixer recovery snapshot updated".into());
+            retract_error(ui, MIXER_RECOVERY_UNAVAILABLE);
         }
         IdeWorkerEvent::MixerRecoverySnapshotWarning(reason) => {
-            ui.set_error_text(format!("Live mixer recovery is unavailable: {reason}").into());
+            ui.set_error_text(format!("{MIXER_RECOVERY_UNAVAILABLE}: {reason}").into());
         }
         IdeWorkerEvent::CloseDiscardRequired => {
             apply_close_discard_required(ui);
@@ -8155,6 +8158,12 @@ fn apply_event(
                     ui.set_close_unsaved_mixer_confirming(true);
                 }
                 ui.set_app_mode(mode_after_failure(ui.get_app_mode(), command));
+                if ui.get_app_mode() == AppMode::Running && command != IdeWorkerCommandKind::Observe
+                {
+                    ui.set_status_text(RUNNING_STATUS.into());
+                } else if ui.get_status_text() == command_status(command) {
+                    ui.set_status_text(SharedString::default());
+                }
             }
             ui.set_error_text(format!("{}: {reason}", command_status(command)).into());
         }
@@ -10249,10 +10258,10 @@ fn apply_audio_preview_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_status_text("Waiting for a committed stopped transport cycle…".into());
         }
         IdeWorkerEvent::AudioPreviewStopRequested => {
-            ui.set_status_text("Ramping take audition to silence…".into());
+            ui.set_status_text("Ramping audition to silence…".into());
         }
         IdeWorkerEvent::AudioPreviewControlApplied(_) => {
-            ui.set_status_text("Take audition control applied".into());
+            ui.set_status_text("Audition control applied".into());
         }
         _ => unreachable!("only audio-preview events are routed to this handler"),
     }
@@ -10426,13 +10435,24 @@ fn apply_running_event(
         apply_output_failure_observation(ui);
         return;
     }
-    match observation.preview().state() {
+    retract_observe_failure(ui);
+    apply_preview_settlement(
+        ui,
+        observation.preview().state(),
+        observation.preview().clip_id().is_some(),
+    );
+}
+
+fn apply_preview_settlement(ui: &MainWindow, state: DesktopAudioPreviewState, clip_preview: bool) {
+    match state {
         DesktopAudioPreviewState::Starting
         | DesktopAudioPreviewState::Playing
-        | DesktopAudioPreviewState::Stopping => {
+        | DesktopAudioPreviewState::Stopping
+            if ui.get_app_mode() != AppMode::Previewing =>
+        {
             ui.set_app_mode(AppMode::Previewing);
             ui.set_status_text(
-                if observation.preview().clip_id().is_some() {
+                if clip_preview {
                     "Dry clip-source audition · input cue temporarily suppressed"
                 } else {
                     "Dry take audition · input cue temporarily suppressed"
@@ -10441,10 +10461,10 @@ fn apply_running_event(
             );
             ui.set_error_text(SharedString::default());
         }
-        DesktopAudioPreviewState::Complete => {
+        DesktopAudioPreviewState::Complete if observation_may_settle_mode(ui) => {
             ui.set_app_mode(AppMode::Running);
             ui.set_status_text(
-                if observation.preview().clip_id().is_some() {
+                if clip_preview {
                     "Clip-source audition complete"
                 } else {
                     "Take audition complete"
@@ -10453,11 +10473,11 @@ fn apply_running_event(
             );
             ui.set_error_text(SharedString::default());
         }
-        DesktopAudioPreviewState::Failed => {
+        DesktopAudioPreviewState::Failed if observation_may_settle_mode(ui) => {
             ui.set_app_mode(AppMode::Running);
             ui.set_status_text("Audio audition stopped".into());
             ui.set_error_text(
-                if observation.preview().clip_id().is_some() {
+                if clip_preview {
                     "The audio callback could not render this clip source view"
                 } else {
                     "The audio callback could not render this recorded take"
@@ -10468,6 +10488,11 @@ fn apply_running_event(
         DesktopAudioPreviewState::Idle => {
             apply_idle_running_event(ui);
         }
+        DesktopAudioPreviewState::Starting
+        | DesktopAudioPreviewState::Playing
+        | DesktopAudioPreviewState::Stopping
+        | DesktopAudioPreviewState::Complete
+        | DesktopAudioPreviewState::Failed => {}
     }
 }
 
@@ -17916,12 +17941,35 @@ fn mode_after_closed_event(current: AppMode) -> AppMode {
     }
 }
 
+fn observation_may_settle_mode(ui: &MainWindow) -> bool {
+    !matches!(
+        ui.get_app_mode(),
+        AppMode::Running | AppMode::PreparingRuntime
+    )
+}
+
 fn apply_idle_running_event(ui: &MainWindow) {
-    if ui.get_app_mode() != AppMode::PreparingRuntime {
+    if observation_may_settle_mode(ui) {
         ui.set_app_mode(AppMode::Running);
-        ui.set_status_text("Runtime evidence updated".into());
+        ui.set_status_text(RUNNING_STATUS.into());
         ui.set_error_text(SharedString::default());
     }
+}
+
+fn retract_observe_failure(ui: &MainWindow) {
+    if retract_error(ui, command_status(IdeWorkerCommandKind::Observe))
+        && ui.get_app_mode() == AppMode::Running
+    {
+        ui.set_status_text(RUNNING_STATUS.into());
+    }
+}
+
+fn retract_error(ui: &MainWindow, prefix: &str) -> bool {
+    let retracted = ui.get_error_text().starts_with(prefix);
+    if retracted {
+        ui.set_error_text(SharedString::default());
+    }
+    retracted
 }
 
 fn mode_after_submission_failure(
@@ -24475,6 +24523,230 @@ mod tests {
         assert!(parse_arrangement_duration_ticks("18446744073709551616").is_err());
     }
 
+    fn observe_running(ui: &MainWindow, routes: &UiRoutes, project_state: &ProjectUiStateCell) {
+        apply_event(
+            ui,
+            routes,
+            project_state,
+            IdeWorkerEvent::Running(IdeRunningObservation::for_ui_test(
+                PlaybackRecoverySnapshot::for_test(PlaybackRecoveryTransportState::Stopped, 0),
+            )),
+        );
+    }
+
+    #[test]
+    fn running_observations_keep_the_messages_shown_while_running() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let routes = UiRoutes::default();
+        let project_state = Rc::new(ProjectUiState::default());
+        ui.set_app_mode(AppMode::TrimmingArrangementPlacement);
+        ui.set_status_text(
+            command_status(IdeWorkerCommandKind::SetArrangementPlacementDuration).into(),
+        );
+        apply_event(
+            &ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetArrangementPlacementDuration,
+                reason: IdeWorkerCommandFailure::ArrangementPlacementDuration(Box::new(
+                    IdeArrangementPlacementEditError::InvalidPlacementIdentity,
+                )),
+            },
+        );
+        assert_eq!(
+            ui.get_status_text(),
+            RUNNING_STATUS,
+            "a failed command leaves no progress claim behind its error"
+        );
+        let failure = ui.get_error_text();
+        assert!(!failure.is_empty());
+        observe_running(&ui, &routes, &project_state);
+        observe_running(&ui, &routes, &project_state);
+        assert_eq!(ui.get_error_text(), failure);
+
+        ui.set_status_text("Arrangement placement already has that duration".into());
+        observe_running(&ui, &routes, &project_state);
+        apply_preview_settlement(&ui, DesktopAudioPreviewState::Complete, true);
+        apply_preview_settlement(&ui, DesktopAudioPreviewState::Failed, false);
+        assert_eq!(
+            ui.get_status_text(),
+            "Arrangement placement already has that duration",
+            "a finished audition is reported once, not on every observation"
+        );
+        assert_eq!(ui.get_error_text(), failure);
+
+        ui.set_app_mode(AppMode::Previewing);
+        observe_running(&ui, &routes, &project_state);
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(ui.get_status_text(), RUNNING_STATUS);
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::Previewing);
+        apply_preview_settlement(&ui, DesktopAudioPreviewState::Complete, true);
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(ui.get_status_text(), "Clip-source audition complete");
+
+        ui.set_app_mode(AppMode::Previewing);
+        apply_preview_settlement(&ui, DesktopAudioPreviewState::Failed, false);
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(ui.get_status_text(), "Audio audition stopped");
+        assert_eq!(
+            ui.get_error_text(),
+            "The audio callback could not render this recorded take"
+        );
+    }
+
+    #[test]
+    fn audition_observations_keep_a_failed_audition_control_reported() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let routes = UiRoutes::default();
+        let project_state = Rc::new(ProjectUiState::default());
+        ui.set_app_mode(AppMode::Running);
+        apply_preview_settlement(&ui, DesktopAudioPreviewState::Playing, false);
+        assert_eq!(ui.get_app_mode(), AppMode::Previewing);
+        assert_eq!(
+            ui.get_status_text(),
+            "Dry take audition · input cue temporarily suppressed"
+        );
+
+        ui.set_app_mode(AppMode::PreparingPreview);
+        ui.set_error_text("stale".into());
+        apply_preview_settlement(&ui, DesktopAudioPreviewState::Playing, true);
+        assert_eq!(ui.get_app_mode(), AppMode::Previewing);
+        assert_eq!(
+            ui.get_status_text(),
+            "Dry clip-source audition · input cue temporarily suppressed"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_status_text(command_status(IdeWorkerCommandKind::StopAudioPreview).into());
+        apply_event(
+            &ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::StopAudioPreview,
+                reason: IdeWorkerCommandFailure::InvalidState,
+            },
+        );
+        let failure = ui.get_error_text();
+        assert!(!failure.is_empty());
+        assert!(
+            ui.get_status_text().is_empty(),
+            "a failed stop no longer claims the audition is stopping"
+        );
+        apply_preview_settlement(&ui, DesktopAudioPreviewState::Playing, true);
+        apply_preview_settlement(&ui, DesktopAudioPreviewState::Stopping, true);
+        assert_eq!(ui.get_app_mode(), AppMode::Previewing);
+        assert_eq!(ui.get_error_text(), failure);
+
+        ui.set_status_text("Audition control applied".into());
+        ui.set_error_text(
+            format!("{}: busy", command_status(IdeWorkerCommandKind::Observe)).into(),
+        );
+        retract_observe_failure(&ui);
+        assert!(ui.get_error_text().is_empty());
+        assert_eq!(ui.get_status_text(), "Audition control applied");
+    }
+
+    #[test]
+    fn resolved_warnings_retract_their_own_errors_only() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let routes = UiRoutes::default();
+        let project_state = Rc::new(ProjectUiState::default());
+        ui.set_app_mode(AppMode::Running);
+        ui.set_status_text("Start queued for the audio runtime".into());
+        apply_event(
+            &ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::InvalidState,
+            },
+        );
+        assert!(!ui.get_error_text().is_empty());
+        assert_eq!(
+            ui.get_status_text(),
+            "Start queued for the audio runtime",
+            "a failed observation does not claim evidence was updated"
+        );
+        observe_running(&ui, &routes, &project_state);
+        assert!(
+            ui.get_error_text().is_empty(),
+            "a good observation retracts a failed one"
+        );
+        assert_eq!(ui.get_status_text(), RUNNING_STATUS);
+
+        ui.set_app_mode(AppMode::Opening);
+        ui.set_status_text("Recovering and verifying project…".into());
+        apply_event(
+            &ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::InvalidState,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        observe_running(&ui, &routes, &project_state);
+        assert_eq!(
+            ui.get_status_text(),
+            RUNNING_STATUS,
+            "an open that recovers from a failed observation stops claiming progress"
+        );
+
+        apply_event(
+            &ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::MixerRecoverySnapshotWarning(
+                hyper_desktop_ide::IdeProjectSaveError::MixerCommitTimeout,
+            ),
+        );
+        observe_running(&ui, &routes, &project_state);
+        assert!(ui.get_error_text().starts_with(MIXER_RECOVERY_UNAVAILABLE));
+        apply_event(
+            &ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::MixerRecoverySnapshotSaved,
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_error_text("clip placement is invalid".into());
+        apply_event(
+            &ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::MixerRecoverySnapshotSaved,
+        );
+        observe_running(&ui, &routes, &project_state);
+        assert_eq!(ui.get_error_text(), "clip placement is invalid");
+
+        ui.set_app_mode(AppMode::Opening);
+        ui.set_status_text(command_status(IdeWorkerCommandKind::OpenProject).into());
+        apply_event(
+            &ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::OpenProject,
+                reason: IdeWorkerCommandFailure::InvalidState,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Closed);
+        assert!(
+            ui.get_status_text().is_empty(),
+            "a failed open no longer claims it is opening"
+        );
+    }
+
     #[test]
     fn arrangement_duration_failure_restores_running_mode() {
         assert_eq!(
@@ -27539,9 +27811,10 @@ mod tests {
         assert_eq!(ui.get_status_text(), "Choose a Runtime destination");
         assert_eq!(ui.get_error_text(), "retained message");
 
-        ui.set_app_mode(AppMode::Running);
+        ui.set_app_mode(AppMode::TrimmingArrangementPlacement);
         apply_idle_running_event(&ui);
-        assert_eq!(ui.get_status_text(), "Runtime evidence updated");
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(ui.get_status_text(), RUNNING_STATUS);
         assert!(ui.get_error_text().is_empty());
 
         ui.set_app_mode(AppMode::Running);
