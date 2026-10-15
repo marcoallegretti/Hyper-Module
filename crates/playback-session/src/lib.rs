@@ -11,7 +11,7 @@ use hyper_media_cache::{
     CacheBuildError, CacheLimits, DecodedMediaCache, DecodedMediaCacheBuilder, PreparePlaybackError,
 };
 use hyper_playback_compiler::scene::{RecordedSceneExtent, SceneLimits};
-use hyper_playback_compiler::{FrameTimelineError, graph::GraphLimits};
+use hyper_playback_compiler::{ClipTimebase, FrameTimelineError, graph::GraphLimits};
 use hyper_playback_json::{
     AdapterCompileError, AutomationCompileError, AutomationInterpolation, AutomationPoint,
     AutomationTarget, CompiledAutomation, CompiledMixerGraph, CompiledMixerTap,
@@ -299,6 +299,45 @@ impl PlaybackArrangementSceneLaunch {
 }
 
 impl PlaybackArrangementPlacement {
+    /// Builds one enabled, active, fade-free placement for consumer tests,
+    /// with one frame per tick.
+    ///
+    /// Production placements remain owned by verified playback-session assembly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the placement end tick overflows `u64` or does not fit in `usize`.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn for_test(
+        id: &str,
+        track_index: usize,
+        clip_index: usize,
+        start_tick: u64,
+        duration_ticks: u64,
+    ) -> Self {
+        let frame = |tick: u64| usize::try_from(tick).expect("test ticks fit in usize");
+        Self {
+            id: id.to_owned(),
+            track_index,
+            clip_index,
+            start_tick,
+            clip_start_tick: 0,
+            duration_ticks,
+            gain_decibels: 0.0,
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
+            start_frame: frame(start_tick),
+            end_frame: frame(
+                start_tick
+                    .checked_add(duration_ticks)
+                    .expect("test ticks fit in u64"),
+            ),
+            enabled: true,
+            active: true,
+        }
+    }
+
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
@@ -555,6 +594,7 @@ fn retain_automation(
 pub struct PlaybackArrangement {
     track_names: Vec<String>,
     clip_names: Vec<String>,
+    clip_timebases: Vec<ClipTimebase>,
     scene_names: Vec<String>,
     placements: Vec<PlaybackArrangementPlacement>,
     scene_launches: Vec<PlaybackArrangementSceneLaunch>,
@@ -607,6 +647,7 @@ impl PlaybackArrangement {
         Self {
             track_names: Vec::new(),
             clip_names: Vec::new(),
+            clip_timebases: Vec::new(),
             scene_names: Vec::new(),
             placements: Vec::new(),
             scene_launches: Vec::new(),
@@ -644,6 +685,7 @@ impl PlaybackArrangement {
         Self {
             track_names: Vec::new(),
             clip_names: Vec::new(),
+            clip_timebases: Vec::new(),
             scene_names: Vec::new(),
             placements: Vec::new(),
             scene_launches: Vec::new(),
@@ -658,6 +700,45 @@ impl PlaybackArrangement {
         }
     }
 
+    /// Builds an immutable arrangement of the supplied placements for consumer tests.
+    ///
+    /// Production views remain owned by verified playback-session assembly.
+    /// `clips` pairs each clip name with its timebase in canonical clip order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a placement names a track or clip index outside the supplied lists.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn for_test_with_placements(
+        track_names: Vec<String>,
+        clips: Vec<(String, ClipTimebase)>,
+        placements: Vec<PlaybackArrangementPlacement>,
+    ) -> Self {
+        assert!(
+            placements.iter().all(|placement| {
+                placement.track_index < track_names.len() && placement.clip_index < clips.len()
+            }),
+            "test placements must name supplied tracks and clips"
+        );
+        let end_frame = placements
+            .iter()
+            .map(|placement| placement.end_frame)
+            .max()
+            .unwrap_or(0);
+        let (clip_names, clip_timebases) = clips.into_iter().unzip();
+        Self {
+            track_names,
+            clip_names,
+            clip_timebases,
+            scene_names: Vec::new(),
+            placements,
+            scene_launches: Vec::new(),
+            loop_range: None,
+            end_frame,
+        }
+    }
+
     #[must_use]
     pub fn track_name(&self, index: usize) -> Option<&str> {
         self.track_names.get(index).map(String::as_str)
@@ -666,6 +747,12 @@ impl PlaybackArrangement {
     #[must_use]
     pub fn clip_name(&self, index: usize) -> Option<&str> {
         self.clip_names.get(index).map(String::as_str)
+    }
+
+    /// Returns how the clip at `index` maps project ticks to source frames.
+    #[must_use]
+    pub fn clip_timebase(&self, index: usize) -> Option<ClipTimebase> {
+        self.clip_timebases.get(index).copied()
     }
 
     #[must_use]
@@ -1150,7 +1237,11 @@ fn build_playback_arrangement(
     }
 
     let mut clip_names = Vec::new();
+    let mut clip_timebases = Vec::new();
     clip_names
+        .try_reserve_exact(project.clip_count())
+        .map_err(|_| PlaybackSessionAssemblyError::ArrangementCapacityUnavailable)?;
+    clip_timebases
         .try_reserve_exact(project.clip_count())
         .map_err(|_| PlaybackSessionAssemblyError::ArrangementCapacityUnavailable)?;
     for clip_index in 0..project.clip_count() {
@@ -1158,6 +1249,11 @@ fn build_playback_arrangement(
             .clip_name_at(clip_index)
             .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?;
         clip_names.push(try_arrangement_owned(name)?);
+        clip_timebases.push(
+            project
+                .clip_timebase_at(clip_index)
+                .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?,
+        );
     }
 
     let mut scene_names = Vec::new();
@@ -1224,6 +1320,7 @@ fn build_playback_arrangement(
     Ok(PlaybackArrangement {
         track_names,
         clip_names,
+        clip_timebases,
         scene_names,
         placements,
         scene_launches,
@@ -1587,6 +1684,8 @@ mod tests {
         let arrangement = session.arrangement();
         assert_eq!(arrangement.track_name(0), Some("Audio"));
         assert_eq!(arrangement.clip_name(0), Some("Clip"));
+        assert_eq!(arrangement.clip_timebase(0), Some(ClipTimebase::Musical));
+        assert_eq!(arrangement.clip_timebase(1), None);
         assert_eq!(arrangement.end_frame(), 100);
         assert_eq!(arrangement.placements().len(), 1);
         assert_eq!(
