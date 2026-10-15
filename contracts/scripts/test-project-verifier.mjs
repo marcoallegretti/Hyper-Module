@@ -493,6 +493,20 @@ async function mutateArrangement(root, mutate) {
   await writeFile(projectPath, canonicalize(project));
 }
 
+async function mutateClip(root, mutate) {
+  const projectPath = join(root, "project.json");
+  const project = JSON.parse(await readFile(projectPath, "utf8"));
+  const clipRecord = project.resources.find((record) => record.role === "clip");
+  const clipPath = join(root, ...clipRecord.path.split("/"));
+  const clip = JSON.parse(await readFile(clipPath, "utf8"));
+  mutate(clip);
+  const bytes = Buffer.from(canonicalize(clip), "utf8");
+  await writeFile(clipPath, bytes);
+  clipRecord.byte_length = bytes.length;
+  clipRecord.sha256 = createHash("sha256").update(bytes).digest("hex");
+  await writeFile(projectPath, canonicalize(project));
+}
+
 async function addSecondAudioTrack(root) {
   const projectPath = join(root, "project.json");
   const project = JSON.parse(await readFile(projectPath, "utf8"));
@@ -1795,6 +1809,36 @@ try {
     verifyProject(overlappingPlacements),
     /exceed the 2-voice/,
   );
+
+  for (const [name, placementChange, expected] of [
+    ["sample-locked-whole-placement", {}, undefined],
+    [
+      "sample-locked-partial-placement",
+      { clip_start_tick: 960, duration_ticks: 6720 },
+      /sample-locked placement must cover its whole clip/,
+    ],
+    [
+      "sample-locked-placement-fades",
+      { fade_in_ticks: 10 },
+      /sample-locked placement cannot fade/,
+    ],
+  ]) {
+    const sampleLockedPlacement = join(temporaryRoot, name);
+    await cp(valid, sampleLockedPlacement, { recursive: true });
+    await mutateClip(sampleLockedPlacement, (clip) => {
+      clip.format_version = 2;
+      clip.timebase = "sample-locked";
+      clip.loop.enabled = false;
+    });
+    await mutateArrangement(sampleLockedPlacement, (arrangement) => {
+      Object.assign(arrangement.placements[0], placementChange);
+    });
+    if (expected === undefined) {
+      await verifyProject(sampleLockedPlacement);
+    } else {
+      await assert.rejects(verifyProject(sampleLockedPlacement), expected);
+    }
+  }
 
   const invalidPlacementStart = join(temporaryRoot, "invalid-placement-start");
   await cp(valid, invalidPlacementStart, { recursive: true });

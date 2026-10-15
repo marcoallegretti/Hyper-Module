@@ -797,6 +797,18 @@ async function verifyProjectManifest(
           `${arrangement.name}: placement exceeds non-looping clip duration`,
         );
       }
+      if (clip.timebase === "sample-locked") {
+        assert(
+          placement.clip_start_tick === 0 &&
+            placement.duration_ticks === clip.duration_ticks,
+          `${arrangement.name}: sample-locked placement must cover its whole clip`,
+        );
+        assert(
+          (placement.fade_in_ticks ?? 0) === 0 &&
+            (placement.fade_out_ticks ?? 0) === 0,
+          `${arrangement.name}: sample-locked placement cannot fade`,
+        );
+      }
     }
 
     const sceneDrivenTrackIds = new Set();
