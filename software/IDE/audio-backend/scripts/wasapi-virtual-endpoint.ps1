@@ -46,31 +46,43 @@ if ($audio.Status -ne 'Running') {
     Start-Service -Name Audiosrv
 }
 
-$deadline = (Get-Date).AddSeconds(60)
-do {
-    $active = @(Get-ChildItem $renderKey -ErrorAction SilentlyContinue | Where-Object {
-        (Get-ItemPropertyValue $_.PSPath -Name DeviceState -ErrorAction SilentlyContinue) -eq 1
-    })
-    if ($active.Count -gt 0) { break }
-    Start-Sleep -Seconds 1
-} while ((Get-Date) -lt $deadline)
-if ($active.Count -eq 0) {
-    throw 'no active WASAPI render endpoint appeared'
+function Get-RegistryValue([string] $path, [string] $name) {
+    # Get-ItemPropertyValue throws on a missing value even with SilentlyContinue.
+    $item = Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return $null }
+    $property = $item.PSObject.Properties[$name]
+    if ($null -eq $property) { return $null }
+    return , $property.Value
 }
 
+# Windows publishes an endpoint as active before it writes the endpoint's default format.
+$deadline = (Get-Date).AddSeconds(60)
 $ready = $false
-foreach ($endpoint in $active) {
-    $properties = Join-Path $endpoint.PSPath 'Properties'
-    $name = Get-ItemPropertyValue $properties -Name $friendlyNameValue -ErrorAction SilentlyContinue
-    $format = [byte[]](Get-ItemPropertyValue $properties -Name $deviceFormatValue -ErrorAction SilentlyContinue)
-    if ($null -eq $format -or $format.Length -lt 16) {
-        Write-Host "Render endpoint '$name' reports no default format"
-        continue
+$seen = @{}
+$polls = 0
+do {
+    $polls += 1
+    foreach ($endpoint in @(Get-ChildItem $renderKey -ErrorAction SilentlyContinue)) {
+        if ((Get-RegistryValue $endpoint.PSPath 'DeviceState') -ne 1) { continue }
+        $properties = Join-Path $endpoint.PSPath 'Properties'
+        $name = Get-RegistryValue $properties $friendlyNameValue
+        $format = Get-RegistryValue $properties $deviceFormatValue
+        if ($null -eq $format -or $format.Length -lt 16) {
+            $seen[$endpoint.PSChildName] = "Render endpoint '$name' reports no default format"
+            continue
+        }
+        $channels = [BitConverter]::ToUInt16([byte[]] $format, 10)
+        $rate = [BitConverter]::ToUInt32([byte[]] $format, 12)
+        $seen[$endpoint.PSChildName] = "Render endpoint '$name': $channels channels at $rate Hz"
+        if ($channels -eq 2 -and $rate -eq 48000) { $ready = $true }
     }
-    $channels = [BitConverter]::ToUInt16($format, 10)
-    $rate = [BitConverter]::ToUInt32($format, 12)
-    Write-Host "Render endpoint '$name': $channels channels at $rate Hz"
-    if ($channels -eq 2 -and $rate -eq 48000) { $ready = $true }
+    if ($ready) { break }
+    Start-Sleep -Seconds 1
+} while ((Get-Date) -lt $deadline)
+$seen.Values | ForEach-Object { Write-Host $_ }
+Write-Host "Render endpoints polled $polls times"
+if ($seen.Count -eq 0) {
+    throw 'no active WASAPI render endpoint appeared'
 }
 if (-not $ready) {
     throw 'no active render endpoint has a 48 kHz stereo default format'
