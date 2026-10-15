@@ -89,6 +89,15 @@
         },
         "enabled": {
           "type": "boolean"
+        },
+        "gain_decibels": {
+          "type": "number"
+        },
+        "fade_in_ticks": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "fade_out_ticks": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
         }
       },
       "additionalProperties": false

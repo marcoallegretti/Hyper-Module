@@ -213,6 +213,12 @@ const cases = [
     invariants: assertArrangementInvariants,
   },
   {
+    path: "fixtures/valid/arrangement-placement-gain-fades.json",
+    schema: schemas[9].$id,
+    valid: true,
+    invariants: assertArrangementInvariants,
+  },
+  {
     path: "fixtures/valid/mixer.json",
     schema: schemas[10].$id,
     valid: true,
@@ -391,6 +397,24 @@ const cases = [
   },
   {
     path: "fixtures/invalid/arrangement-overlapping-placement.json",
+    schema: schemas[9].$id,
+    valid: false,
+    invariants: assertArrangementInvariants,
+  },
+  {
+    path: "fixtures/invalid/arrangement-placement-gain-not-number.json",
+    schema: schemas[9].$id,
+    valid: false,
+    invariants: assertArrangementInvariants,
+  },
+  {
+    path: "fixtures/invalid/arrangement-placement-negative-fade.json",
+    schema: schemas[9].$id,
+    valid: false,
+    invariants: assertArrangementInvariants,
+  },
+  {
+    path: "fixtures/invalid/arrangement-placement-fades-exceed-duration.json",
     schema: schemas[9].$id,
     valid: false,
     invariants: assertArrangementInvariants,

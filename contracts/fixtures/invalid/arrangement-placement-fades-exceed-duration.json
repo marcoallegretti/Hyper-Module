@@ -1,0 +1,24 @@
+{
+  "format": "hyper-arrangement",
+  "format_version": 1,
+  "id": "018f47a2-6b2d-7c11-8a44-001122334463",
+  "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+  "name": "Main",
+  "enabled": true,
+  "placements": [
+    {
+      "id": "018f47a2-6b2d-7c11-8a44-001122334464",
+      "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+      "clip_id": "018f47a2-6b2d-7c11-8a44-001122334460",
+      "start_tick": 0,
+      "clip_start_tick": 0,
+      "duration_ticks": 7680,
+      "enabled": true,
+      "gain_decibels": 0,
+      "fade_in_ticks": 7680,
+      "fade_out_ticks": 1
+    }
+  ],
+  "scene_launches": [],
+  "extensions": {}
+}
