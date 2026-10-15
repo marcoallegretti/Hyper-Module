@@ -189,6 +189,18 @@ const cases = [
     invariants: assertAudioClipInvariants,
   },
   {
+    path: "fixtures/valid/audio-clip-sample-locked.json",
+    schema: schemas[7].$id,
+    valid: true,
+    invariants: assertAudioClipInvariants,
+  },
+  {
+    path: "fixtures/valid/audio-clip-musical-version-2.json",
+    schema: schemas[7].$id,
+    valid: true,
+    invariants: assertAudioClipInvariants,
+  },
+  {
     path: "fixtures/valid/scene.json",
     schema: schemas[8].$id,
     valid: true,
@@ -196,6 +208,12 @@ const cases = [
   },
   {
     path: "fixtures/valid/arrangement.json",
+    schema: schemas[9].$id,
+    valid: true,
+    invariants: assertArrangementInvariants,
+  },
+  {
+    path: "fixtures/valid/arrangement-placement-gain-fades.json",
     schema: schemas[9].$id,
     valid: true,
     invariants: assertArrangementInvariants,
@@ -337,6 +355,36 @@ const cases = [
     invariants: assertAudioClipInvariants,
   },
   {
+    path: "fixtures/invalid/audio-clip-version-1-timebase.json",
+    schema: schemas[7].$id,
+    valid: false,
+    invariants: assertAudioClipInvariants,
+  },
+  {
+    path: "fixtures/invalid/audio-clip-version-2-without-timebase.json",
+    schema: schemas[7].$id,
+    valid: false,
+    invariants: assertAudioClipInvariants,
+  },
+  {
+    path: "fixtures/invalid/audio-clip-sample-locked-loop.json",
+    schema: schemas[7].$id,
+    valid: false,
+    invariants: assertAudioClipInvariants,
+  },
+  {
+    path: "fixtures/invalid/audio-clip-sample-locked-fades.json",
+    schema: schemas[7].$id,
+    valid: false,
+    invariants: assertAudioClipInvariants,
+  },
+  {
+    path: "fixtures/invalid/audio-clip-sample-locked-warp.json",
+    schema: schemas[7].$id,
+    valid: false,
+    invariants: assertAudioClipInvariants,
+  },
+  {
     path: "fixtures/invalid/scene-duplicate-track.json",
     schema: schemas[8].$id,
     valid: false,
@@ -349,6 +397,24 @@ const cases = [
   },
   {
     path: "fixtures/invalid/arrangement-overlapping-placement.json",
+    schema: schemas[9].$id,
+    valid: false,
+    invariants: assertArrangementInvariants,
+  },
+  {
+    path: "fixtures/invalid/arrangement-placement-gain-not-number.json",
+    schema: schemas[9].$id,
+    valid: false,
+    invariants: assertArrangementInvariants,
+  },
+  {
+    path: "fixtures/invalid/arrangement-placement-negative-fade.json",
+    schema: schemas[9].$id,
+    valid: false,
+    invariants: assertArrangementInvariants,
+  },
+  {
+    path: "fixtures/invalid/arrangement-placement-fades-exceed-duration.json",
     schema: schemas[9].$id,
     valid: false,
     invariants: assertArrangementInvariants,
