@@ -489,6 +489,12 @@ if (invokedPath === import.meta.url) {
     3,
     "usage: node scripts/verify-bundle.mjs <bundle-directory>",
   );
-  await verifyBundle(process.argv[2]);
-  console.log("Runtime bundle verification passed");
+  // A top-level await here would deadlock: verify-project.mjs imports this module.
+  verifyBundle(process.argv[2]).then(
+    () => console.log("Runtime bundle verification passed"),
+    (error) => {
+      console.error(error);
+      process.exitCode = 1;
+    },
+  );
 }
