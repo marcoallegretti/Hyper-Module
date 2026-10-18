@@ -10,15 +10,24 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 import canonicalize from "canonicalize";
 
 import { collectRegularFiles } from "../lib/filesystem-tree.mjs";
+import { runNativeProcess } from "../lib/native-process.mjs";
 import { buildProjectBundle } from "./build-project-bundle.mjs";
 import { createMinimalProject } from "./test-project-fixture.mjs";
 import { verifyBundle, verifyBundleArtifact } from "./verify-bundle.mjs";
+
+function runVerifierCommand(bundlePath) {
+  return runNativeProcess(
+    process.execPath,
+    [resolve(import.meta.dirname, "verify-bundle.mjs"), bundlePath],
+    { stdio: ["ignore", "pipe", "pipe"], timeoutMs: 60_000 },
+  );
+}
 
 async function createValidBundle(parent, name) {
   const fixture = await createMinimalProject(parent, `${name}-source`);
@@ -33,6 +42,10 @@ const temporaryRoot = await mkdtemp(
 try {
   const valid = await createValidBundle(temporaryRoot, "valid");
   await verifyBundle(valid);
+  assert.equal(
+    (await runVerifierCommand(valid)).toString("utf8"),
+    "Runtime bundle verification passed\n",
+  );
   const verifiedArtifact = await verifyBundleArtifact(valid);
   assert(Object.isFrozen(verifiedArtifact));
   assert(Object.isFrozen(verifiedArtifact.manifest));
@@ -84,6 +97,7 @@ try {
     Buffer.alloc(originalTimeline.length, 0x78),
   );
   await assert.rejects(verifyBundle(modified), /SHA-256 mismatch/);
+  await assert.rejects(runVerifierCommand(modified), /SHA-256 mismatch/);
 
   const wrongSourceIdentity = join(temporaryRoot, "wrong-source-identity");
   await cp(valid, wrongSourceIdentity, { recursive: true });
