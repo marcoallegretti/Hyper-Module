@@ -24360,4 +24360,88 @@ mod tests {
             LoadErrorKind::InvalidVersionOneDomain
         );
     }
+
+    #[test]
+    fn shared_contract_fixtures_agree_with_the_clip_and_arrangement_loaders() {
+        let limits = LoaderLimits::VERSION_1;
+        let clip = |bytes: &[u8]| {
+            load_clip(
+                bytes,
+                0,
+                PROJECT_ID,
+                limits.max_document_bytes,
+                limits.max_warp_markers,
+            )
+        };
+        for (bytes, timebase) in [
+            (
+                include_bytes!("../../../contracts/fixtures/valid/audio-clip.json").as_slice(),
+                ClipTimebase::Musical,
+            ),
+            (
+                include_bytes!(
+                    "../../../contracts/fixtures/valid/audio-clip-musical-version-2.json"
+                )
+                .as_slice(),
+                ClipTimebase::Musical,
+            ),
+            (
+                include_bytes!("../../../contracts/fixtures/valid/audio-clip-sample-locked.json")
+                    .as_slice(),
+                ClipTimebase::SampleLocked,
+            ),
+        ] {
+            assert_eq!(clip(bytes).unwrap().timebase, timebase);
+        }
+        for bytes in [
+            include_bytes!(
+                "../../../contracts/fixtures/invalid/audio-clip-version-1-timebase.json"
+            )
+            .as_slice(),
+            include_bytes!(
+                "../../../contracts/fixtures/invalid/audio-clip-version-2-without-timebase.json"
+            )
+            .as_slice(),
+            include_bytes!(
+                "../../../contracts/fixtures/invalid/audio-clip-sample-locked-loop.json"
+            )
+            .as_slice(),
+            include_bytes!(
+                "../../../contracts/fixtures/invalid/audio-clip-sample-locked-fades.json"
+            )
+            .as_slice(),
+            include_bytes!(
+                "../../../contracts/fixtures/invalid/audio-clip-sample-locked-warp.json"
+            )
+            .as_slice(),
+        ] {
+            assert!(clip(bytes).is_err());
+        }
+
+        let arrangement = |bytes: &[u8]| {
+            load_arrangement(
+                bytes,
+                PROJECT_ID,
+                limits.max_document_bytes,
+                limits.max_placements,
+                limits.max_scene_launches,
+            )
+        };
+        for bytes in [
+            include_bytes!("../../../contracts/fixtures/valid/arrangement.json").as_slice(),
+            include_bytes!(
+                "../../../contracts/fixtures/valid/arrangement-placement-gain-fades.json"
+            )
+            .as_slice(),
+        ] {
+            arrangement(bytes).unwrap();
+        }
+        for bytes in [
+            include_bytes!("../../../contracts/fixtures/invalid/arrangement-placement-gain-not-number.json").as_slice(),
+            include_bytes!("../../../contracts/fixtures/invalid/arrangement-placement-negative-fade.json").as_slice(),
+            include_bytes!("../../../contracts/fixtures/invalid/arrangement-placement-fades-exceed-duration.json").as_slice(),
+        ] {
+            assert!(arrangement(bytes).is_err());
+        }
+    }
 }
