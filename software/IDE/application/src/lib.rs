@@ -111,11 +111,11 @@ pub use hyper_native_device::{
     MIN_FILTER_CUTOFF_MILLIHERTZ, MIN_FILTER_RESONANCE_MILLIONTHS, NativeFilterMode,
 };
 use hyper_playback_compiler::scene::LaunchQuantization;
-use hyper_playback_compiler::{FrameTimeline, FrameTimelineError};
 pub use hyper_playback_compiler::{
-    MeterEvent, MusicalPosition, MusicalPositionResolveError, TempoEvent, Timeline,
+    ClipTimebase, MeterEvent, MusicalPosition, MusicalPositionResolveError, TempoEvent, Timeline,
     musical_position, musical_position_at_frame, tick_at_musical_position,
 };
+use hyper_playback_compiler::{FrameTimeline, FrameTimelineError};
 pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_clip_gain_is_supported;
 #[cfg(test)]
 use hyper_playback_json::serialize_arrangement_scene_launch_addition;
@@ -21384,6 +21384,10 @@ mod tests {
         assert_eq!(placement.clip_start_tick(), 0);
         assert_eq!(placement.duration_ticks(), 6);
         assert_eq!(placement.clip_index(), 0);
+        assert_eq!(
+            reopened.session().arrangement().clip_timebase(0),
+            Some(ClipTimebase::SampleLocked)
+        );
         assert_eq!(
             reopened.package().read_resource(&mixer_id).unwrap(),
             source_mixer

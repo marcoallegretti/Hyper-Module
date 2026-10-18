@@ -273,6 +273,7 @@ export struct ArrangementRow {
     width-percent: float,
     enabled: bool,
     active: bool,
+    whole-clip: bool,
 }
 
 export struct ControlBindingRow {
@@ -5842,7 +5843,7 @@ export component MainWindow inherits Window {
                                         spacing: 2px;
                                         Text { text: placement.clip-name; color: placement.enabled ? #edf2f8 : #8c929a; font-size: 13px; font-weight: 600; overflow: elide; }
                                         Text { text: placement.track-name; color: #8290a2; font-size: 9px; overflow: elide; }
-                                        Text { text: "SOURCE +" + placement.clip-start-tick + " TICKS"; color: #65758a; font-size: 8px; overflow: elide; }
+                                        Text { text: placement.whole-clip ? "WHOLE CLIP · SAMPLE-LOCKED" : "SOURCE +" + placement.clip-start-tick + " TICKS"; color: #65758a; font-size: 8px; wrap: word-wrap; }
                                     }
                                     VerticalLayout {
                                         horizontal-stretch: 1;
@@ -5924,14 +5925,14 @@ export component MainWindow inherits Window {
                                                 width: 50px;
                                                 text: "Left";
                                                 accessible-label: "Trim the left edge of " + placement.clip-name + " on " + placement.track-name + " to entered project position while preserving its right edge";
-                                                enabled: root.app-mode == AppMode.running && start-tick-input.text != placement.start-tick;
+                                                enabled: root.app-mode == AppMode.running && !placement.whole-clip && start-tick-input.text != placement.start-tick;
                                                 clicked => { IdeActions.trim-arrangement-placement-front(placement.id, start-tick-input.text); }
                                             }
                                             Button {
                                                 width: 50px;
                                                 text: "Split";
                                                 accessible-label: "Split " + placement.clip-name + " on " + placement.track-name + " at the entered project position without ripple";
-                                                enabled: root.app-mode == AppMode.running && start-tick-input.text != placement.start-tick;
+                                                enabled: root.app-mode == AppMode.running && !placement.whole-clip && start-tick-input.text != placement.start-tick;
                                                 clicked => { IdeActions.split-arrangement-placement(placement.id, start-tick-input.text); }
                                             }
                                         }
@@ -5950,6 +5951,7 @@ export component MainWindow inherits Window {
                                                     width: 82px;
                                                     horizontal-stretch: 0;
                                                     text: placement.duration-ticks;
+                                                    enabled: !placement.whole-clip;
                                                     accessible-label: "Duration ticks for " + placement.clip-name + " on " + placement.track-name;
                                                     accepted => { IdeActions.set-arrangement-placement-duration(placement.id, self.text); }
                                                 }
@@ -5958,7 +5960,7 @@ export component MainWindow inherits Window {
                                                 width: 50px;
                                                 text: "Trim";
                                                 accessible-label: "Set the right edge of " + placement.clip-name + " on " + placement.track-name + " from its entered duration";
-                                                enabled: root.app-mode == AppMode.running && duration-tick-input.text != placement.duration-ticks;
+                                                enabled: root.app-mode == AppMode.running && !placement.whole-clip && duration-tick-input.text != placement.duration-ticks;
                                                 clicked => { IdeActions.set-arrangement-placement-duration(placement.id, duration-tick-input.text); }
                                             }
                                             VerticalLayout {
@@ -6000,6 +6002,7 @@ export component MainWindow inherits Window {
                                                     width: 86px;
                                                     horizontal-stretch: 0;
                                                     text: placement.fade-in-edit;
+                                                    enabled: !placement.whole-clip;
                                                     accessible-label: "Placement fade-in duration in ticks for " + placement.clip-name + " on " + placement.track-name;
                                                     accepted => { IdeActions.set-arrangement-placement-fades(placement.id, self.text, placement-fade-out-input.text); }
                                                 }
@@ -6016,6 +6019,7 @@ export component MainWindow inherits Window {
                                                     width: 86px;
                                                     horizontal-stretch: 0;
                                                     text: placement.fade-out-edit;
+                                                    enabled: !placement.whole-clip;
                                                     accessible-label: "Placement fade-out duration in ticks for " + placement.clip-name + " on " + placement.track-name;
                                                     accepted => { IdeActions.set-arrangement-placement-fades(placement.id, placement-fade-in-input.text, self.text); }
                                                 }
@@ -6024,7 +6028,7 @@ export component MainWindow inherits Window {
                                                 width: 50px;
                                                 text: "Apply";
                                                 accessible-label: "Apply the entered local placement fades to " + placement.clip-name + " on " + placement.track-name;
-                                                enabled: root.app-mode == AppMode.running && placement-fade-in-input.text != "" && placement-fade-out-input.text != "" && (placement-fade-in-input.text != placement.fade-in-edit || placement-fade-out-input.text != placement.fade-out-edit);
+                                                enabled: root.app-mode == AppMode.running && !placement.whole-clip && placement-fade-in-input.text != "" && placement-fade-out-input.text != "" && (placement-fade-in-input.text != placement.fade-in-edit || placement-fade-out-input.text != placement.fade-out-edit);
                                                 clicked => { IdeActions.set-arrangement-placement-fades(placement.id, placement-fade-in-input.text, placement-fade-out-input.text); }
                                             }
                                         }

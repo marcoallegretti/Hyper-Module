@@ -764,6 +764,15 @@ pub enum ClipTimebase {
     SampleLocked,
 }
 
+impl ClipTimebase {
+    /// Returns whether every placement of a clip with this timebase must play
+    /// the whole clip from its first tick, with no placement fades.
+    #[must_use]
+    pub const fn requires_whole_clip_placement(self) -> bool {
+        matches!(self, Self::SampleLocked)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ClipCompileSpec<'a> {
     pub enabled: bool,
@@ -1374,12 +1383,12 @@ fn validate_placement(
     if !clip.loop_enabled && clip_requested_end > clip.duration_ticks {
         return Err(CompileError::InvalidPlacement);
     }
-    if clip.timebase == ClipTimebase::SampleLocked
+    if clip.timebase.requires_whole_clip_placement()
         && (placement.clip_start_tick != 0 || placement.duration_ticks != clip.duration_ticks)
     {
         return Err(CompileError::InvalidPlacement);
     }
-    if clip.timebase == ClipTimebase::SampleLocked
+    if clip.timebase.requires_whole_clip_placement()
         && (placement.fade_in_ticks != 0 || placement.fade_out_ticks != 0)
     {
         return Err(CompileError::InvalidPlacementFades);

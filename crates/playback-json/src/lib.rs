@@ -9972,6 +9972,12 @@ impl LoadedPlaybackProject {
         self.clips.get(clip_index).map(|clip| clip.duration_ticks)
     }
 
+    /// Returns how one validated audio clip maps project ticks to source frames.
+    #[must_use]
+    pub fn clip_timebase_at(&self, clip_index: usize) -> Option<ClipTimebase> {
+        self.clips.get(clip_index).map(|clip| clip.timebase)
+    }
+
     /// Returns the persisted global activation state for one audio clip.
     #[must_use]
     pub fn clip_active_at(&self, clip_index: usize) -> Option<bool> {
@@ -13265,6 +13271,11 @@ mod tests {
             LoaderLimits::VERSION_1,
         )
         .unwrap();
+        assert_eq!(
+            reopened.clip_timebase_at(0),
+            Some(ClipTimebase::SampleLocked)
+        );
+        assert_eq!(reopened.clip_timebase_at(1), None);
         let schedule = reopened.compile(&assets, GraphLimits::VERSION_1).unwrap();
         assert_eq!(schedule.entries()[0].compiled.arrangement_end_frame(), 63);
     }
