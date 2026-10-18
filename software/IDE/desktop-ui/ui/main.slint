@@ -2075,7 +2075,7 @@ export component MainWindow inherits Window {
                             if !root.new-track-visible && !root.routing-bus-create-visible : VerticalLayout {
                                 spacing: 8px;
                             Text { text: root.project-name; color: #edf2f8; font-size: 18px; font-weight: 600; overflow: elide; }
-                            Text { text: root.project-location; color: #8290a2; font-size: 11px; wrap: word-wrap; vertical-stretch: 1; }
+                            Text { text: root.project-location; color: #8290a2; font-size: 11px; wrap: word-wrap; height: self.preferred-height; }
                             if root.app-mode == AppMode.closed && root.recent-project-names.length > 0 : VerticalLayout {
                                 spacing: 4px;
                                 Text { text: "RECENT PROJECTS"; color: #65758a; font-size: 9px; font-weight: 700; letter-spacing: 0.6px; }
@@ -2167,6 +2167,7 @@ export component MainWindow inherits Window {
                                 color: #728196;
                                 font-size: 9px;
                                 wrap: word-wrap;
+                                height: self.preferred-height;
                             }
                             HorizontalLayout {
                                 spacing: 8px;
@@ -2188,7 +2189,7 @@ export component MainWindow inherits Window {
                                 enabled: root.app-mode == AppMode.running;
                                 accessible-label: "Project name";
                             }
-                            Text { text: "Updates only this verified package’s project name. Its folder, project ID, media, and resources stay unchanged."; color: #728196; font-size: 9px; wrap: word-wrap; }
+                            Text { text: "Updates only this verified package’s project name. Its folder, project ID, media, and resources stay unchanged."; color: #728196; font-size: 9px; wrap: word-wrap; height: self.preferred-height; }
                             HorizontalLayout {
                                 spacing: 8px;
                                 rename-project-cancel := Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.rename-project-visible = false; } }
