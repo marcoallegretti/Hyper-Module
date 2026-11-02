@@ -66,6 +66,9 @@ jobs:
     continue-on-error: ${{ matrix.experimental }}
     env:
       REPORT_DIR: ci-reports
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     strategy:
       fail-fast: false
       matrix:
@@ -100,6 +103,9 @@ jobs:
             printf 'matrix_os=%s\n' "$MATRIX_OS"
             printf 'runner_os=%s\n' "$RUNNER_OS"
             printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'cargo_incremental=%s\n' "$CARGO_INCREMENTAL"
+            printf 'cargo_profile_dev_debug=%s\n' "$CARGO_PROFILE_DEV_DEBUG"
+            printf 'cargo_profile_test_debug=%s\n' "$CARGO_PROFILE_TEST_DEBUG"
             printf 'report.arm64-wayland-features.log=cargo tree -p hyper-desktop-ui --target aarch64-unknown-linux-gnu -e features -i winit\n'
             printf 'condition.arm64-wayland-features.log=runner_os==Linux\n'
             printf 'report.workspace-tests.log=cargo test --workspace --exclude hyper-desktop-ide --all-targets --locked\n'
