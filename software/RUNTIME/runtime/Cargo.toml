@@ -62,3 +62,6 @@ hyper-mixer-runtime = { path = "../../../crates/mixer-runtime", features = ["tes
 i-slint-backend-testing = "=1.17.1"
 serde_json = "=1.0.151"
 serde_json_canonicalizer = "=0.3.2"
+
+[target.'cfg(all(target_os = "linux", target_endian = "little"))'.dev-dependencies]
+hyper-desktop-ide = { path = "../../IDE/application" }

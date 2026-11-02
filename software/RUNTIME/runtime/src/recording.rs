@@ -668,12 +668,17 @@ mod tests {
     #[ignore = "requires a live PipeWire daemon with the hyper-ci-sink and hyper-ci-source virtual nodes"]
     #[allow(
         clippy::too_many_lines,
-        reason = "one linear live owner transition keeps verified project, native graph, and publication evidence together"
+        reason = "one linear native recording-to-IDE handoff keeps project and owner authority visible"
     )]
-    fn live_runtime_owner_records_publishes_and_restores_verified_playback() {
+    fn live_runtime_recording_round_trips_through_ide() {
         use hyper_desktop_audio::{
             DesktopMonitoringConfig, DesktopOutputConfig, DesktopPlaybackSession,
             discover_desktop_input_targets, discover_desktop_output_targets,
+        };
+        use hyper_desktop_ide::{
+            DesktopIdeWorker, IdeApplicationConfig, IdeOutputSelection,
+            IdeRuntimeRecordingUpdateImportError, IdeWorkerCommand, IdeWorkerCommandFailure,
+            IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerShutdownOutcome,
         };
         use hyper_runtime_recording_update::read_runtime_recording_update;
         use std::thread;
@@ -818,6 +823,135 @@ mod tests {
             panic!("restored playback owner was unavailable for clean native shutdown");
         };
         (*playback).stop().unwrap();
+
+        let worker = DesktopIdeWorker::start(
+            IdeApplicationConfig::try_new(256, super::super::limits().unwrap()).unwrap(),
+            2,
+            8,
+        )
+        .unwrap();
+        let next_event = |expected: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(event) = worker.try_recv().unwrap() {
+                    return event;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "IDE worker timed out waiting for {expected}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert!(matches!(
+            next_event("initial discovery"),
+            IdeWorkerEvent::Closed {
+                native_failure: None,
+                ..
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::SelectOutput(
+                output_target.routing_id().to_owned(),
+            ))
+            .unwrap();
+        let IdeWorkerEvent::Closed {
+            snapshot,
+            native_failure: None,
+            ..
+        } = next_event("output selection")
+        else {
+            panic!("IDE output selection must settle before project open");
+        };
+        assert_eq!(
+            snapshot.output_selection(),
+            &IdeOutputSelection::Routed(output_target.routing_id().to_owned())
+        );
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(
+                creation.project().root().to_path_buf(),
+            ))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = next_event("project open") else {
+            panic!("IDE must open the project before importing a Runtime take");
+        };
+        assert!(opened.recording_takes().is_empty());
+        let recording_bytes = fs::read(update.handoff().recording_path()).unwrap();
+        let update_bytes = fs::read(&updates[0]).unwrap();
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeRecordingUpdate {
+                path: updates[0].clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            next_event("recording import start"),
+            IdeWorkerEvent::RuntimeRecordingUpdateImporting
+        ));
+        let IdeWorkerEvent::Running(imported) = next_event("imported project reopen") else {
+            panic!("IDE must reopen the project containing the native Runtime take");
+        };
+        assert_eq!(imported.recording_takes().len(), 1);
+        let take = imported
+            .recording_takes()
+            .first()
+            .expect("Runtime take was not imported");
+        assert_eq!(take.track_id(), track_id);
+        assert_eq!(
+            take.frame_count(),
+            update.handoff().metadata().frame_count()
+        );
+        assert_eq!(take.sample_rate_hz(), 48_000);
+        assert_eq!(take.channels(), 2);
+        assert!(
+            matches!(next_event("recording import completion"), IdeWorkerEvent::RuntimeRecordingUpdateImported { revision } if revision == source.project_revision() + 1)
+        );
+        let verified =
+            hyper_storage_engine::verify_project_package(creation.project().root()).unwrap();
+        assert_eq!(
+            verified.manifest().revision(),
+            source.project_revision() + 1
+        );
+        assert_eq!(
+            verified
+                .read_asset(
+                    take.asset_id(),
+                    u64::try_from(recording_bytes.len()).unwrap()
+                )
+                .unwrap(),
+            recording_bytes
+        );
+        drop(verified);
+        worker
+            .try_send(IdeWorkerCommand::ImportRuntimeRecordingUpdate {
+                path: updates[0].clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            next_event("recording replay refusal"),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportRuntimeRecordingUpdate,
+                reason: IdeWorkerCommandFailure::RuntimeRecordingUpdateImport(reason),
+            } if matches!(reason.as_ref(), IdeRuntimeRecordingUpdateImportError::ProjectRevisionMismatch {
+                update_revision, project_revision,
+            } if *update_revision == source.project_revision() && *project_revision == source.project_revision() + 1)
+        ));
+        assert_eq!(
+            hyper_storage_engine::verify_project_package(creation.project().root())
+                .unwrap()
+                .manifest()
+                .revision(),
+            source.project_revision() + 1
+        );
+        assert_eq!(fs::read(&updates[0]).unwrap(), update_bytes);
+        assert_eq!(
+            fs::read(update.handoff().recording_path()).unwrap(),
+            recording_bytes
+        );
+        let IdeWorkerShutdownOutcome::Stopped(report) = worker.shutdown(Duration::from_secs(5))
+        else {
+            panic!("IDE recording handoff must settle native shutdown");
+        };
+        assert_eq!(report.unwrap().native_failure(), None);
     }
 
     #[test]
